@@ -20,7 +20,7 @@ from config import RAW_MARKET_DATA_PATH, MARKET_DATA_PATH, TICKER_TO_CODE
 from data.data_client import DataClient
 
 
-class MarketDataProcessor:
+class MDataProcessor:
     """
     Process and format market data CSV files for HDF5 storage.
     """
@@ -674,7 +674,7 @@ def process_market_data(year: str = '25', replace: bool = True, use_threading: b
     Dict[str, int]
         Dictionary mapping ticker symbols to number of rows processed
     """
-    processor = MarketDataProcessor()
+    processor = MDataProcessor()
     results = processor.process_all_csv_files(year=year, replace=replace, use_threading=use_threading, max_workers=max_workers)
     processor.get_processing_summary(results)
     return results
@@ -698,7 +698,7 @@ def process_market_data_fast(year: str = '25', replace: bool = True, max_workers
     Dict[str, int]
         Dictionary mapping ticker symbols to number of rows processed
     """
-    processor = MarketDataProcessor()
+    processor = MDataProcessor()
     
     # Use maximum available cores for fastest processing
     if max_workers is None:
@@ -729,7 +729,7 @@ def process_single_file(ticker_prefix: str, year: str = '25', replace: bool = Tr
     Optional[int]
         Number of rows processed, or None if failed
     """
-    processor = MarketDataProcessor()
+    processor = MDataProcessor()
     
     # Find the specific file
     csv_files = processor.discover_csv_files(year)

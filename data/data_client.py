@@ -17,6 +17,10 @@ import pandas as pd
 
 # Optional dependency used by `download_cot`
 # pip install cot_reports
+from data.signals_processing import COTProcessor
+from data.ticker_classifier import get_ticker_classifier, get_cot_report_type, get_cot_storage_path, is_financial_ticker
+
+
 try:
     import cot_reports as cot
 except Exception:  # pragma: no cover - allows import of module without cot_reports installed
@@ -56,6 +60,7 @@ class DataClient:
     ) -> None:
         market_path = market_path or MARKET_DATA_PATH
         cot_path = cot_path or COT_DATA_PATH
+        self.cot_processor = COTProcessor()
         self.market_path = Path(market_path)
         self.cot_path = Path(cot_path)
         self.cot_raw_key = cot_raw_key
@@ -87,6 +92,54 @@ class DataClient:
     @staticmethod
     def _normalize_code_series(s: pd.Series) -> pd.Series:
         return s.astype(str).str.strip().str.upper()
+    
+    def _get_raw_key_for_report_type(self, report_type: str) -> str:
+        """
+        Get the appropriate raw storage key based on COT report type.
+        
+        Parameters:
+        -----------
+        report_type : str
+            The COT report type
+            
+        Returns:
+        --------
+        str
+            The storage key to use for raw data
+        """
+        if report_type == "traders_in_financial_futures_fut":
+            return "cot/tff"
+        else:
+            return self.cot_raw_key  # Default: "cot/raw"
+    
+    def _get_raw_key_for_codes(self, codes: Union[str, Sequence[str]]) -> str:
+        """
+        Determine the appropriate raw key based on the COT codes being queried.
+        
+        Parameters:
+        -----------
+        codes : str or sequence of str
+            COT codes to check
+            
+        Returns:
+        --------
+        str
+            The raw key that should contain these codes
+        """
+        if isinstance(codes, str):
+            codes = [codes]
+        
+        # Check if any of the codes correspond to financial tickers
+        for code in codes:
+            try:
+                ticker = CODE_TO_TICKER.get(code.strip().upper())
+                if ticker and is_financial_ticker(ticker):
+                    return "cot/tff"
+            except:
+                continue
+        
+        # Default to regular COT raw if no financial tickers found
+        return self.cot_raw_key
 
 
     @staticmethod
@@ -567,6 +620,468 @@ class DataClient:
         result.columns = pd.MultiIndex.from_tuples(result.columns, names=['Ticker', 'Field'])
         
         return result
+
+    async def write_all_metrics(self, selected_cot_features=None, progress: bool = True):
+        """
+        Asynchronously write COT metrics for all available tickers.
+        
+        Parameters:
+        -----------
+        selected_cot_features : list, optional
+            List of COT feature groups to calculate. If None, uses default set.
+        progress : bool, default True
+            Whether to show progress messages during processing
+            
+        Returns:
+        --------
+        dict
+            Results with success/failure status for each ticker
+        """
+        import time
+        
+        if selected_cot_features is None:
+            selected_cot_features = ['positioning', 'flows', 'extremes', 'market_structure']
+        
+        if progress:
+            print(f"COT METRICS PROCESSING: Starting async processing for {len(TICKER_TO_CODE)} tickers")
+            print("=" * 60)
+        
+        start_time = time.time()
+        
+        # Create tasks for all tickers
+        tasks = []
+        ticker_list = list(TICKER_TO_CODE.keys())
+        
+        for ticker in ticker_list:
+            task = self.write_ticker_cot_metrics(ticker, selected_cot_features)
+            tasks.append((ticker, task))
+        
+        # Execute all tasks concurrently
+        results = {
+            'success': [],
+            'failed': {},
+            'summary': {}
+        }
+        
+        import asyncio
+        
+        for i, (ticker, task) in enumerate(tasks):
+            if progress:
+                print(f"[{i+1}/{len(tasks)}] Processing {ticker}...")
+            
+            try:
+                await task
+                results['success'].append(ticker)
+                if progress:
+                    print(f"  ✓ Success: {ticker}")
+            except Exception as e:
+                results['failed'][ticker] = str(e)
+                if progress:
+                    print(f"  ✗ Failed: {ticker} - {str(e)}")
+        
+        processing_time = time.time() - start_time
+        
+        results['summary'] = {
+            'total_tickers': len(ticker_list),
+            'successful': len(results['success']),
+            'failed': len(results['failed']),
+            'processing_time': processing_time
+        }
+        
+        if progress:
+            print("\n" + "=" * 60)
+            print("COT METRICS PROCESSING COMPLETE")
+            print("=" * 60)
+            print(f"Total tickers: {results['summary']['total_tickers']}")
+            print(f"Successfully processed: {results['summary']['successful']}")
+            print(f"Failed: {results['summary']['failed']}")
+            print(f"Processing time: {processing_time:.2f} seconds")
+            
+            if results['success']:
+                print(f"\nSuccessful tickers: {', '.join(results['success'])}")
+            
+            if results['failed']:
+                print(f"\nFailed tickers:")
+                for ticker, error in results['failed'].items():
+                    print(f"  {ticker}: {error}")
+        
+        return results
+
+    def query_cot_metrics(self, ticker_symbol: str, 
+                          columns: Optional[Sequence[str]] = None,
+                          start_date: Optional[str] = None,
+                          end_date: Optional[str] = None,
+                          where: Optional[str] = None) -> pd.DataFrame:
+        """
+        Query pre-calculated COT metrics for a specific ticker with filtering options.
+        
+        Automatically determines the correct storage path based on whether ticker
+        is a financial future (stored in cot/tff/) or commodity (stored in cot/).
+        
+        Parameters:
+        -----------
+        ticker_symbol : str
+            The ticker symbol (e.g., 'ZC_F', 'CL_F')
+        columns : sequence of str, optional
+            Specific columns to retrieve
+        start_date : str, optional
+            Start date filter (YYYY-MM-DD format)
+        end_date : str, optional
+            End date filter (YYYY-MM-DD format)
+        where : str, optional
+            Additional where clause for filtering
+            
+        Returns:
+        --------
+        pd.DataFrame
+            DataFrame with calculated COT metrics
+        """
+        try:
+            # Get appropriate storage path
+            storage_path = get_cot_storage_path(ticker_symbol)
+            metrics_key = f'{storage_path}/metrics'
+            
+            with pd.HDFStore(self.cot_path, "r") as store:
+                if metrics_key not in store:
+                    raise KeyError(f"COT metrics not found for {ticker_symbol} at {metrics_key}. Run write_all_metrics() first.")
+                
+                # Build where clause for date filtering
+                where_clauses = []
+                if start_date:
+                    where_clauses.append(f"index >= '{start_date}'")
+                if end_date:
+                    where_clauses.append(f"index <= '{end_date}'")
+                if where:
+                    where_clauses.append(where)
+                
+                combined_where = ' & '.join(where_clauses) if where_clauses else None
+                
+                return store.select(metrics_key, columns=columns, where=combined_where)
+        except Exception as e:
+            raise KeyError(f"Error querying COT metrics for {ticker_symbol}: {str(e)}")
+    
+    def list_available_cot_metrics(self) -> List[str]:
+        """
+        List all tickers that have COT metrics available.
+        
+        Returns:
+        --------
+        List[str]
+            List of ticker symbols with available COT metrics
+        """
+        try:
+            with pd.HDFStore(self.cot_path, "r") as store:
+                all_keys = list(store.keys())
+                
+                # Find metrics keys and extract ticker symbols
+                metrics_keys = [key for key in all_keys if key.endswith('/metrics')]
+                tickers = []
+                
+                for key in metrics_keys:
+                    # Extract ticker from 'cot/TICKER/metrics' format
+                    if key.startswith('/cot/'):
+                        ticker = key.replace('/cot/', '').replace('/metrics', '')
+                        tickers.append(ticker)
+                
+                return sorted(tickers)
+        except Exception:
+            return []
+    
+    def get_cot_metrics_columns(self, ticker_symbol: str) -> List[str]:
+        """
+        Get the available column names for COT metrics of a specific ticker.
+        
+        Parameters:
+        -----------
+        ticker_symbol : str
+            The ticker symbol (e.g., 'ZC_F', 'CL_F')
+            
+        Returns:
+        --------
+        List[str]
+            List of available column names
+        """
+        try:
+            # Get appropriate storage path
+            storage_path = get_cot_storage_path(ticker_symbol)
+            metrics_key = f'{storage_path}/metrics'
+            
+            with pd.HDFStore(self.cot_path, "r") as store:
+                if metrics_key not in store:
+                    raise KeyError(f"COT metrics not found for {ticker_symbol} at {metrics_key}")
+                
+                # Get a small sample to check columns
+                sample = store.select(metrics_key, start=0, stop=1)
+                return list(sample.columns)
+        except Exception as e:
+            raise KeyError(f"Error getting columns for {ticker_symbol}: {str(e)}")
+    
+    def get_cot_metrics_info(self, ticker_symbol: str) -> Dict[str, Any]:
+        """
+        Get detailed information about COT metrics for a ticker.
+        
+        Parameters:
+        -----------
+        ticker_symbol : str
+            The ticker symbol (e.g., 'ZC_F', 'CL_F')
+            
+        Returns:
+        --------
+        Dict[str, Any]
+            Dictionary with metrics information including columns, date range, row count, etc.
+        """
+        try:
+            # Get appropriate storage path
+            storage_path = get_cot_storage_path(ticker_symbol)
+            metrics_key = f'{storage_path}/metrics'
+            
+            with pd.HDFStore(self.cot_path, "r") as store:
+                if metrics_key not in store:
+                    raise KeyError(f"COT metrics not found for {ticker_symbol} at {metrics_key}")
+                
+                # Get basic info
+                storer = store.get_storer(metrics_key)
+                total_rows = storer.nrows
+                
+                # Sample data to get more details
+                sample = store.select(metrics_key, start=0, stop=5)
+                
+                # Get date range
+                date_range = {}
+                try:
+                    if len(sample) > 0 and hasattr(sample.index, 'min'):
+                        # Get actual date range
+                        first_row = store.select(metrics_key, start=0, stop=1)
+                        last_row = store.select(metrics_key, start=total_rows-1, stop=total_rows)
+                        
+                        if len(first_row) > 0 and len(last_row) > 0:
+                            date_range = {
+                                'start': first_row.index.min(),
+                                'end': last_row.index.max()
+                            }
+                except:
+                    date_range = {'start': 'Unknown', 'end': 'Unknown'}
+                
+                # Column information
+                columns = list(sample.columns) if len(sample) > 0 else []
+                
+                # Group columns by category based on common naming patterns
+                column_categories = {
+                    'positioning': [col for col in columns if any(term in col.lower() for term in ['position', 'net', 'long', 'short'])],
+                    'flows': [col for col in columns if any(term in col.lower() for term in ['flow', 'change', 'delta'])],
+                    'extremes': [col for col in columns if any(term in col.lower() for term in ['extreme', 'percentile', 'zscore', 'outlier'])],
+                    'market_structure': [col for col in columns if any(term in col.lower() for term in ['concentration', 'ratio', 'structure', 'dominance'])],
+                    'other': []
+                }
+                
+                # Assign uncategorized columns to 'other'
+                categorized = set()
+                for cat_cols in column_categories.values():
+                    categorized.update(cat_cols)
+                column_categories['other'] = [col for col in columns if col not in categorized]
+                
+                # Remove empty categories
+                column_categories = {k: v for k, v in column_categories.items() if v}
+                
+                return {
+                    'ticker': ticker_symbol,
+                    'storage_path': storage_path,
+                    'metrics_key': metrics_key,
+                    'total_rows': total_rows,
+                    'total_columns': len(columns),
+                    'date_range': date_range,
+                    'columns': columns,
+                    'column_categories': column_categories,
+                    'data_types': sample.dtypes.to_dict() if len(sample) > 0 else {},
+                    'sample_data': sample.head(3) if len(sample) > 0 else None
+                }
+                
+        except Exception as e:
+            raise KeyError(f"Error getting metrics info for {ticker_symbol}: {str(e)}")
+    
+    def query_multiple_cot_metrics(self, 
+                                   ticker_symbols: Sequence[str],
+                                   columns: Optional[Sequence[str]] = None,
+                                   start_date: Optional[str] = None,
+                                   end_date: Optional[str] = None,
+                                   where: Optional[str] = None,
+                                   combine_datasets: bool = False) -> Union[Dict[str, pd.DataFrame], pd.DataFrame]:
+        """
+        Query COT metrics for multiple tickers.
+        
+        Parameters:
+        -----------
+        ticker_symbols : sequence of str
+            List of ticker symbols to query
+        columns : sequence of str, optional
+            Specific columns to retrieve from all tickers
+        start_date : str, optional
+            Start date filter (YYYY-MM-DD format)
+        end_date : str, optional
+            End date filter (YYYY-MM-DD format)
+        where : str, optional
+            Additional where clause for filtering
+        combine_datasets : bool, default False
+            If True, combine all ticker data into single DataFrame with MultiIndex columns
+            
+        Returns:
+        --------
+        Dict[str, pd.DataFrame] or pd.DataFrame
+            Dictionary mapping ticker to DataFrame, or combined DataFrame if combine_datasets=True
+        """
+        results = {}
+        
+        for ticker in ticker_symbols:
+            try:
+                df = self.query_cot_metrics(
+                    ticker, 
+                    columns=columns, 
+                    start_date=start_date, 
+                    end_date=end_date, 
+                    where=where
+                )
+                results[ticker] = df
+            except Exception as e:
+                print(f"Warning: Could not query {ticker}: {e}")
+                continue
+        
+        if not results:
+            return {} if not combine_datasets else pd.DataFrame()
+        
+        if combine_datasets and results:
+            # Create MultiIndex columns DataFrame
+            combined_data = {}
+            for ticker, df in results.items():
+                for col in df.columns:
+                    combined_data[(ticker, col)] = df[col]
+            
+            combined_df = pd.DataFrame(combined_data)
+            combined_df.columns = pd.MultiIndex.from_tuples(combined_df.columns, names=['Ticker', 'Metric'])
+            return combined_df
+        
+        return results
+    
+    def display_cot_metrics_info(self, ticker_symbol: str) -> None:
+        """
+        Display detailed information about COT metrics for a ticker in a readable format.
+        
+        Parameters:
+        -----------
+        ticker_symbol : str
+            The ticker symbol (e.g., 'ZC_F', 'CL_F')
+        """
+        try:
+            info = self.get_cot_metrics_info(ticker_symbol)
+            
+            print(f"=" * 80)
+            print(f"COT METRICS INFORMATION: {info['ticker']}")
+            print(f"=" * 80)
+            
+            print(f"Storage Path: {info['storage_path']}")
+            print(f"Metrics Key: {info['metrics_key']}")
+            print(f"Total Rows: {info['total_rows']:,}")
+            print(f"Total Columns: {info['total_columns']}")
+            
+            # Date range
+            date_range = info['date_range']
+            if 'start' in date_range and 'end' in date_range:
+                print(f"Date Range: {date_range['start']} to {date_range['end']}")
+            
+            # Column categories
+            print(f"\n" + "-" * 80)
+            print("COLUMN CATEGORIES")
+            print("-" * 80)
+            
+            for category, columns in info['column_categories'].items():
+                print(f"\n{category.upper().replace('_', ' ')} ({len(columns)} columns):")
+                for col in sorted(columns):
+                    data_type = info['data_types'].get(col, 'unknown')
+                    print(f"  • {col:<50} ({data_type})")
+            
+            # Sample data
+            if info['sample_data'] is not None and len(info['sample_data']) > 0:
+                print(f"\n" + "-" * 80)
+                print("SAMPLE DATA (First 3 rows)")
+                print("-" * 80)
+                print(info['sample_data'].to_string())
+            
+            print(f"\n" + "=" * 80)
+            
+        except Exception as e:
+            print(f"Error displaying metrics info for {ticker_symbol}: {e}")
+    
+    def display_all_cot_metrics_summary(self) -> None:
+        """
+        Display a summary of all available COT metrics.
+        """
+        try:
+            available_tickers = self.list_available_cot_metrics()
+            
+            print(f"=" * 80)
+            print(f"COT METRICS SUMMARY")
+            print(f"=" * 80)
+            print(f"Available Tickers: {len(available_tickers)}")
+            
+            if not available_tickers:
+                print("No COT metrics found. Run write_all_metrics() first.")
+                return
+            
+            print(f"\n{'Ticker':<8} {'Rows':<10} {'Columns':<10} {'Date Range':<30}")
+            print("-" * 70)
+            
+            for ticker in sorted(available_tickers):
+                try:
+                    info = self.get_cot_metrics_info(ticker)
+                    date_range_str = f"{info['date_range'].get('start', 'Unknown')} to {info['date_range'].get('end', 'Unknown')}"
+                    if len(date_range_str) > 28:
+                        date_range_str = date_range_str[:25] + "..."
+                    
+                    print(f"{ticker:<8} {info['total_rows']:<10,} {info['total_columns']:<10} {date_range_str:<30}")
+                except Exception as e:
+                    print(f"{ticker:<8} {'Error':<10} {'Error':<10} {str(e)[:30]:<30}")
+            
+            print(f"\n" + "=" * 80)
+            print("Use get_cot_metrics_info(ticker) for detailed column information")
+            print("Use display_cot_metrics_info(ticker) for formatted display")
+            
+        except Exception as e:
+            print(f"Error displaying metrics summary: {e}")
+
+    async def write_ticker_cot_metrics(self, ticker_symbol: str, selected_cot_features=None):
+        """
+        Write COT metrics for a ticker using appropriate report type and storage path.
+        
+        Automatically determines if ticker is a financial future (uses TFF) or commodity (uses disaggregated),
+        and stores data in the appropriate HDF5 path (cot/tff/ for financials, cot/ for commodities).
+        """
+        if selected_cot_features is None:
+            selected_cot_features = ['positioning', 'flows', 'extremes', 'market_structure']
+            
+        # Get appropriate report type and storage path
+        report_type = get_cot_report_type(ticker_symbol)
+        storage_path = get_cot_storage_path(ticker_symbol)
+        
+        print(f"Processing {ticker_symbol}: report_type={report_type}, storage_path={storage_path}")
+
+        df = self.query_cot_by_codes(TICKER_TO_CODE[ticker_symbol])
+        if len(df) > 0:
+            df = self.cot_processor.load_and_clean_data(df)
+            cot_metrics = self.cot_processor.calculate_enhanced_cot_features(df, selected_cot_features=selected_cot_features)
+            
+            with pd.HDFStore(COT_DATA_PATH, "a") as store:
+                # Store raw COT data
+                store.put(storage_path, df, format="table")
+                print(f"Successfully saved {storage_path} with {len(df)} rows")
+                
+                # Store calculated metrics
+                metrics_path = f"{storage_path}/metrics"
+                store.put(metrics_path, cot_metrics, format="table")
+                print(f'Successfully saved {metrics_path} with {len(cot_metrics)} rows')
+                return
+        else:
+            print(f"Failed to find COT data for {ticker_symbol}")
+            raise KeyError(f"No COT data found for ticker {ticker_symbol}")
+
     
     def create_daily_resampled_data(self,keys=None, replace: bool = True, progress: bool = True) -> Dict[str, Any]:
         """
@@ -823,6 +1338,8 @@ class DataClient:
             complevel=self.complevel,
             min_itemsize=min_itemsize or None,
         )
+        # Note: This method appends to the default raw key since report type is not specified
+        # For new usage, prefer using download_cot with write_raw=True for proper classification
         with pd.HDFStore(self.cot_path, "a") as store:
             (store.put if replace else store.append)(self.cot_raw_key, df2, **fmt)
 
@@ -833,11 +1350,14 @@ class DataClient:
         columns: Optional[Sequence[str]] = None,
         start: Optional[int] = None,
         stop: Optional[int] = None,
+        report_type: str = "disaggregated_fut",
     ) -> pd.DataFrame:
+        raw_key = self._get_raw_key_for_report_type(report_type)
+        
         with pd.HDFStore(self.cot_path, "r") as store:
-            if self.cot_raw_key not in store:
-                raise KeyError(f"Key '{self.cot_raw_key}' not found in {self.cot_path}")
-            return store.select(self.cot_raw_key, where=where, columns=columns, start=start, stop=stop)
+            if raw_key not in store:
+                raise KeyError(f"Key '{raw_key}' not found in {self.cot_path}. Available keys: {list(store.keys())}")
+            return store.select(raw_key, where=where, columns=columns, start=start, stop=stop)
     
     def query_cot_by_codes(
         self,
@@ -874,13 +1394,16 @@ class DataClient:
             codes = [codes]
         codes_norm = [str(c).strip().upper() for c in codes]
         
+        # Determine appropriate raw key based on codes
+        raw_key = self._get_raw_key_for_codes(codes_norm)
+        
         with pd.HDFStore(self.cot_path, "r") as store:
-            if self.cot_raw_key not in store:
-                raise KeyError(f"Key '{self.cot_raw_key}' not found in {self.cot_path}")
+            if raw_key not in store:
+                raise KeyError(f"Key '{raw_key}' not found in {self.cot_path}. Available keys: {list(store.keys())}")
             
             # Auto-detect code column if not provided
             if code_col is None:
-                sample = store.select(self.cot_raw_key, start=0, stop=5)
+                sample = store.select(raw_key, start=0, stop=5)
                 code_col = self._find_code_col(sample)
             
             # Build where clause for codes
@@ -901,10 +1424,10 @@ class DataClient:
             
             try:
                 # Try using HDF5 query first (faster)
-                return store.select(self.cot_raw_key, where=where_clause, columns=columns)
+                return store.select(raw_key, where=where_clause, columns=columns)
             except Exception:
                 # Fall back to loading all data and filtering in memory
-                df = store.select(self.cot_raw_key, columns=columns)
+                df = store.select(raw_key, columns=columns)
                 
                 # Filter by codes
                 code_series = self._normalize_code_series(df[code_col])
@@ -952,39 +1475,60 @@ class DataClient:
             DataFrame with unique codes and optionally market names
         """
         with pd.HDFStore(self.cot_path, "r") as store:
-            if self.cot_raw_key not in store:
-                raise KeyError(f"Key '{self.cot_raw_key}' not found in {self.cot_path}")
-            
-            # Auto-detect code column if not provided
-            if code_col is None:
-                sample = store.select(self.cot_raw_key, start=0, stop=5)
-                code_col = self._find_code_col(sample)
-            
-            # Get unique codes with market names if requested
-            if include_names:
-                columns = [code_col, 'Market_and_Exchange_Names']
-                try:
-                    df = store.select(self.cot_raw_key, columns=columns)
-                    
-                    # Get unique combinations of code and market name
-                    unique_df = df[[code_col, 'Market_and_Exchange_Names']].drop_duplicates()
-                    unique_df = unique_df.sort_values(code_col).reset_index(drop=True)
-                    
-                    # Normalize codes for consistency
-                    unique_df[code_col] = self._normalize_code_series(unique_df[code_col])
-                    
-                    return unique_df
-                    
-                except KeyError:
-                    # Market names column not found, fall back to codes only
-                    include_names = False
-            
-            if not include_names:
-                df = store.select(self.cot_raw_key, columns=[code_col])
-                unique_codes = self._normalize_code_series(df[code_col]).unique()
+            # Try both raw keys and combine results
+            available_keys = []
+            if self.cot_raw_key in store:
+                available_keys.append(self.cot_raw_key)
+            if "cot/tff/raw" in store:
+                available_keys.append("cot/tff/raw")
                 
-                result_df = pd.DataFrame({code_col: sorted(unique_codes)})
+            if not available_keys:
+                raise KeyError(f"No COT raw data found. Available keys: {list(store.keys())}")
+            
+            all_results = []
+            
+            for raw_key in available_keys:
+                # Auto-detect code column if not provided
+                if code_col is None:
+                    sample = store.select(raw_key, start=0, stop=5)
+                    code_col = self._find_code_col(sample)
+                
+                # Get unique codes with market names if requested
+                if include_names:
+                    columns = [code_col, 'Market_and_Exchange_Names']
+                    try:
+                        df = store.select(raw_key, columns=columns)
+                        
+                        # Get unique combinations of code and market name
+                        unique_df = df[[code_col, 'Market_and_Exchange_Names']].drop_duplicates()
+                        all_results.append(unique_df)
+                        
+                    except KeyError:
+                        # Market names column not found, fall back to codes only
+                        include_names = False
+                        break
+                        
+                if not include_names:
+                    df = store.select(raw_key, columns=[code_col])
+                    unique_codes = self._normalize_code_series(df[code_col]).unique()
+                    codes_df = pd.DataFrame({code_col: unique_codes})
+                    all_results.append(codes_df)
+            
+            # Combine and return results
+            if all_results:
+                combined_df = pd.concat(all_results, ignore_index=True)
+                if include_names:
+                    result_df = combined_df[[code_col, 'Market_and_Exchange_Names']].drop_duplicates()
+                else:
+                    unique_codes = self._normalize_code_series(combined_df[code_col]).unique()
+                    result_df = pd.DataFrame({code_col: sorted(unique_codes)})
+                    
+                # Normalize codes and sort
+                result_df[code_col] = self._normalize_code_series(result_df[code_col])
+                result_df = result_df.sort_values(code_col).reset_index(drop=True)
                 return result_df
+            else:
+                return pd.DataFrame({code_col: []})
     
     def get_cot_summary(self) -> Dict[str, Any]:
         """
@@ -996,15 +1540,30 @@ class DataClient:
             Summary with total rows, date range, available codes count, etc.
         """
         with pd.HDFStore(self.cot_path, "r") as store:
-            if self.cot_raw_key not in store:
-                raise KeyError(f"Key '{self.cot_raw_key}' not found in {self.cot_path}")
+            # Check available raw keys
+            available_keys = []
+            if self.cot_raw_key in store:
+                available_keys.append(self.cot_raw_key)
+            if "cot/tff/raw" in store:
+                available_keys.append("cot/tff/raw")
+                
+            if not available_keys:
+                raise KeyError(f"No COT raw data found. Available keys: {list(store.keys())}")
             
-            # Get basic info without loading all data
-            info = store.get_storer(self.cot_raw_key)
-            total_rows = info.nrows
+            # Get combined info from all raw keys
+            total_rows = 0
+            all_samples = []
             
-            # Sample data to get structure info
-            sample = store.select(self.cot_raw_key, start=0, stop=100)
+            for raw_key in available_keys:
+                info = store.get_storer(raw_key)
+                total_rows += info.nrows
+                
+                # Sample data to get structure info
+                sample = store.select(raw_key, start=0, stop=50)
+                all_samples.append(sample)
+            
+            # Use first sample for structure analysis
+            sample = all_samples[0] if all_samples else pd.DataFrame()
             
             # Try to get date range
             date_range = "Unknown"
@@ -1039,6 +1598,7 @@ class DataClient:
     def query_cot_advanced(
         self,
         *,
+        key=None,
         codes: Optional[Union[str, Sequence[str]]] = None,
         market_names: Optional[Union[str, Sequence[str]]] = None,
         columns: Optional[Sequence[str]] = None,
@@ -1078,9 +1638,18 @@ class DataClient:
         pd.DataFrame
             Filtered COT data
         """
+        if key is None:
+            # If codes are provided, determine appropriate raw key
+            if codes:
+                path_key = self._get_raw_key_for_codes(codes)
+            else:
+                path_key = self.cot_raw_key
+        else:
+            path_key = key
+
         with pd.HDFStore(self.cot_path, "r") as store:
-            if self.cot_raw_key not in store:
-                raise KeyError(f"Key '{self.cot_raw_key}' not found in {self.cot_path}")
+            if path_key not in store:
+                raise KeyError(f"Key '{path_key}' not found in {self.cot_path}. Available keys: {list(store.keys())}")
             
             # Build filtering logic
             where_clauses = []
@@ -1091,7 +1660,7 @@ class DataClient:
                     codes = [codes]
                 codes_norm = [str(c).strip().upper() for c in codes]
                 
-                sample = store.select(self.cot_raw_key, start=0, stop=5)
+                sample = store.select(path_key, start=0, stop=5)
                 code_col = self._find_code_col(sample)
                 
                 if len(codes_norm) == 1:
@@ -1116,14 +1685,14 @@ class DataClient:
             try:
                 # Try HDF5 query first
                 df = store.select(
-                    self.cot_raw_key, 
+                    path_key, 
                     where=where_clause, 
                     columns=columns,
                     stop=limit
                 )
             except Exception:
                 # Fall back to memory filtering
-                df = store.select(self.cot_raw_key, columns=columns, stop=limit)
+                df = store.select(path_key, columns=columns, stop=limit)
                 
                 # Apply filters in memory
                 if codes:
@@ -1344,10 +1913,167 @@ class DataClient:
                 complevel=self.complevel,
                 min_itemsize=min_itemsize or None,
             )
+            
+            # Use appropriate raw key based on report type
+            raw_key = self._get_raw_key_for_report_type(report_type)
+            
             with pd.HDFStore(self.cot_path, "a") as store:
-                (store.put if replace else store.append)(self.cot_raw_key, df, **fmt)
+                (store.put if replace else store.append)(raw_key, df, **fmt)
 
         return df
+
+    def download_cot_for_ticker(
+        self,
+        ticker_symbol: str,
+        *,
+        years: Optional[Union[int, Sequence[int]]] = None,
+        write_raw: bool = False,
+        replace: bool = False,
+    ) -> pd.DataFrame:
+        """
+        Download COT data for a specific ticker using the appropriate report type.
+        
+        Automatically determines if the ticker is a financial future (uses TFF) or 
+        commodity (uses disaggregated), and downloads the appropriate COT report.
+        
+        Parameters:
+        -----------
+        ticker_symbol : str
+            The ticker symbol (e.g., 'ES_F', 'ZC_F')
+        years : int or sequence of int, optional
+            Year(s) to download. If None, downloads all available years.
+        write_raw : bool, default False
+            Whether to write raw data to HDF5
+        replace : bool, default False  
+            Whether to replace existing data
+            
+        Returns:
+        --------
+        pd.DataFrame
+            Downloaded COT data
+            
+        Examples:
+        ---------
+        # Download TFF data for S&P 500 futures
+        es_data = client.download_cot_for_ticker('ES_F', years=2024)
+        
+        # Download disaggregated data for corn futures  
+        zc_data = client.download_cot_for_ticker('ZC_F', years=[2023, 2024])
+        """
+        # Get appropriate report type for this ticker
+        report_type = get_cot_report_type(ticker_symbol)
+        
+        print(f"Downloading COT data for {ticker_symbol} using report type: {report_type}")
+        
+        # Download using the appropriate report type
+        return self.download_cot(
+            report_type=report_type,
+            years=years,
+            write_raw=write_raw,
+            replace=replace
+        )
+
+    def download_all_available_cot_data(
+        self,
+        *,
+        years: Optional[Union[int, Sequence[int]]] = None,
+        write_raw: bool = True,
+        replace: bool = False,
+        progress: bool = True
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        Download COT data for all tickers that have CSV files available.
+        
+        Automatically downloads disaggregated reports for commodities and 
+        TFF reports for financial futures.
+        
+        Parameters:
+        -----------
+        years : int or sequence of int, optional
+            Year(s) to download. If None, downloads all available years.
+        write_raw : bool, default True
+            Whether to write raw data to HDF5
+        replace : bool, default False
+            Whether to replace existing data
+        progress : bool, default True
+            Whether to show progress information
+            
+        Returns:
+        --------
+        Dict[str, pd.DataFrame]
+            Dictionary mapping ticker symbols to their COT data
+        """
+        classifier = get_ticker_classifier()
+        available_tickers = [ticker.ticker_symbol for ticker in classifier.get_all_tickers()]
+        
+        results = {}
+        commodity_tickers = []
+        financial_tickers = []
+        
+        # Group by report type
+        for ticker in available_tickers:
+            if is_financial_ticker(ticker):
+                financial_tickers.append(ticker)
+            else:
+                commodity_tickers.append(ticker)
+        
+        if progress:
+            print(f"Downloading COT data for {len(available_tickers)} tickers:")
+            print(f"  - {len(commodity_tickers)} commodities (disaggregated)")
+            print(f"  - {len(financial_tickers)} financials (TFF)")
+        
+        # Download disaggregated data for commodities
+        if commodity_tickers:
+            if progress:
+                print(f"\nDownloading disaggregated data...")
+            
+            disagg_data = self.download_cot(
+                report_type="disaggregated_fut",
+                years=years,
+                write_raw=write_raw,
+                replace=replace
+            )
+            
+            # Filter for each commodity ticker
+            for ticker in commodity_tickers:
+                try:
+                    cot_code = TICKER_TO_CODE[ticker]
+                    ticker_data = disagg_data[disagg_data['CFTC_Contract_Market_Code'] == cot_code].copy()
+                    results[ticker] = ticker_data
+                    if progress:
+                        print(f"  {ticker}: {len(ticker_data)} rows")
+                except Exception as e:
+                    if progress:
+                        print(f"  {ticker}: Error - {e}")
+        
+        # Download TFF data for financials
+        if financial_tickers:
+            if progress:
+                print(f"\nDownloading TFF data...")
+            
+            tff_data = self.download_cot(
+                report_type="traders_in_financial_futures_fut",
+                years=years,
+                write_raw=write_raw,
+                replace=replace
+            )
+            
+            # Filter for each financial ticker
+            for ticker in financial_tickers:
+                try:
+                    cot_code = TICKER_TO_CODE[ticker]
+                    ticker_data = tff_data[tff_data['CFTC_Contract_Market_Code'] == cot_code].copy()
+                    results[ticker] = ticker_data
+                    if progress:
+                        print(f"  {ticker}: {len(ticker_data)} rows")
+                except Exception as e:
+                    if progress:
+                        print(f"  {ticker}: Error - {e}")
+        
+        if progress:
+            print(f"\nDownload complete. Successfully downloaded data for {len(results)} tickers.")
+        
+        return results
 
     # ---------------------------------------------------------------------
     # COT: store combined codeset under a caller-provided key
@@ -1365,19 +2091,22 @@ class DataClient:
             raise ValueError("`codes` must be a non-empty sequence.")
 
         codes_norm = [str(c).strip().upper() for c in codes]
+        
+        # Determine appropriate raw key based on codes
+        raw_key = self._get_raw_key_for_codes(codes_norm)
 
         with pd.HDFStore(self.cot_path, mode="a") as store:
-            if self.cot_raw_key not in store:
-                raise KeyError(f"Key '{self.cot_raw_key}' not found in {self.cot_path}")
+            if raw_key not in store:
+                raise KeyError(f"Key '{raw_key}' not found in {self.cot_path}")
 
             # Sample to detect code column if needed
-            sample = store.select(self.cot_raw_key, start=0, stop=5)
+            sample = store.select(raw_key, start=0, stop=5)
             code_col_resolved = self._find_code_col(sample, code_col)
 
             # Determine if we can push filters to disk
             can_query = False
             try:
-                _ = store.select(self.cot_raw_key, where=f"{code_col_resolved} == '___PROBE___'", start=0, stop=0)
+                _ = store.select(raw_key, where=f"{code_col_resolved} == '___PROBE___'", start=0, stop=0)
                 can_query = True
             except Exception:
                 can_query = False
@@ -1387,10 +2116,10 @@ class DataClient:
             series_norm = None
             for code in codes_norm:
                 if can_query:
-                    df_code = store.select(self.cot_raw_key, where=f"{code_col_resolved} == {repr(code)}")
+                    df_code = store.select(raw_key, where=f"{code_col_resolved} == {repr(code)}")
                 else:
                     if df_all is None:
-                        df_all = store.select(self.cot_raw_key)
+                        df_all = store.select(raw_key)
                         series_norm = self._normalize_code_series(df_all[code_col_resolved])
                     df_code = df_all.loc[series_norm == code]
 
@@ -1468,22 +2197,25 @@ class DataClient:
         codes_norm = [str(c).strip().upper() for c in codes]
         written: Dict[str, str] = {}
 
+        # Determine appropriate raw key based on codes
+        raw_key = self._get_raw_key_for_codes(codes_norm)
+        
         with pd.HDFStore(self.cot_path, mode="a") as store:
-            if self.cot_raw_key not in store:
-                raise KeyError(f"Key '{self.cot_raw_key}' not found in {self.cot_path}")
+            if raw_key not in store:
+                raise KeyError(f"Key '{raw_key}' not found in {self.cot_path}")
 
             can_query = False
             try:
-                _ = store.select(self.cot_raw_key, where=f"{code_col} == '___PROBE___'", start=0, stop=0)
+                _ = store.select(raw_key, where=f"{code_col} == '___PROBE___'", start=0, stop=0)
                 can_query = True
             except Exception:
                 can_query = False
 
             for code in codes_norm:
                 if can_query:
-                    df_code = store.select(self.cot_raw_key, where=f"{code_col} == {repr(code)}")
+                    df_code = store.select(raw_key, where=f"{code_col} == {repr(code)}")
                 else:
-                    df_all = store.select(self.cot_raw_key)
+                    df_all = store.select(raw_key)
                     s = self._normalize_code_series(df_all[code_col])
                     df_code = df_all.loc[s == code]
 

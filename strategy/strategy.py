@@ -55,7 +55,7 @@ class RegimeStrategy:
         """Generate 5-15 day forecast signals using your COT data"""
 
         # Prepare features using your data structure
-        features = self.forecaster.prepare_forecasting_features(df)
+        features = self.forecaster.prepare_features(df)
 
         # Current positioning analysis
         positioning_regime = self.analyze_positioning_regime(df)
