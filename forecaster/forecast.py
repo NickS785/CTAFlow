@@ -171,7 +171,15 @@ class CTAForecast:
             target = cot_index.diff(periods=forecast_horizon).shift(-forecast_horizon)
 
         self.target = target.dropna()
+        self._align_features_and_target()
         return self.target
+
+    def _align_features_and_target(self):
+        """Align self.features and self.target by their shared index."""
+        if self.features is not None and self.target is not None:
+            common_index = self.features.index.intersection(self.target.index)
+            self.features = self.features.loc[common_index]
+            self.target = self.target.loc[common_index]
     
     def resample_weekly(self, df, day_of_week='Friday', price_agg='last', volume_agg='sum', cot_agg='last'):
         """Resample data to weekly frequency on specified day
@@ -309,7 +317,9 @@ class CTAForecast:
             }
             freq = day_mapping[day_of_week]
             self.target = self.target.resample(freq).last().dropna()
-        
+
+        self._align_features_and_target()
+
         return self.features
     
     def get_technical_features_only(self, df, selected_indicators=None, normalize_momentum=False):
@@ -570,14 +580,19 @@ class CTAForecast:
         """
         if self.features is None or self.data is None:
             raise ValueError("Must load and prepare data first using load_and_prepare_data()")
-        
+
         # Create target variable
         target = self.create_target_variable(forecast_horizon, target_type)
-        
-        # Remove NaN values and align features with targets
-        valid_idx = ~(self.features.isna().any(axis=1) | target.isna())
-        X = self.features[valid_idx]
-        y = target[valid_idx]
+
+        # Align features with target index
+        common_index = self.features.index.intersection(target.index)
+        X = self.features.loc[common_index]
+        y = target.loc[common_index]
+
+        # Remove NaN values
+        valid_idx = ~(X.isna().any(axis=1) | y.isna())
+        X = X[valid_idx]
+        y = y[valid_idx]
         
         if len(X) == 0:
             raise ValueError("No valid samples after removing NaN values")
@@ -652,14 +667,19 @@ class CTAForecast:
         """
         if self.features is None or self.data is None:
             raise ValueError("Must load and prepare data first using load_and_prepare_data()")
-        
+
         # Create target variable
-        target = self.create_target_variable(self.data, forecast_horizon, target_type)
-        
-        # Remove NaN values and align features with targets
-        valid_idx = ~(self.features.isna().any(axis=1) | target.isna())
-        X = self.features[valid_idx]
-        y = target[valid_idx]
+        target = self.create_target_variable(forecast_horizon, target_type)
+
+        # Align features with target index
+        common_index = self.features.index.intersection(target.index)
+        X = self.features.loc[common_index]
+        y = target.loc[common_index]
+
+        # Remove NaN values
+        valid_idx = ~(X.isna().any(axis=1) | y.isna())
+        X = X[valid_idx]
+        y = y[valid_idx]
         
         if len(X) == 0:
             raise ValueError("No valid samples after removing NaN values")
