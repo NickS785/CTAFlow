@@ -245,10 +245,14 @@ class DataClient:
         try:
             with pd.HDFStore(self.market_path, "r") as store:
                 all_keys = list(store.keys())
-                # Filter for market data keys (they start with /market/)
-                market_keys = [key for key in all_keys if key.startswith('/market/')]
-                # Remove the leading slash for consistency with our usage
-                return [key[1:] if key.startswith('/') else key for key in market_keys]
+                # Filter for market data keys and remove leading slash for consistency
+                market_keys = []
+                for key in all_keys:
+                    if key.startswith('/market/'):
+                        # Remove leading slash to match our usage pattern
+                        clean_key = key[1:]  # Remove the leading '/'
+                        market_keys.append(clean_key)
+                return market_keys
         except Exception:
             return []
     
@@ -350,6 +354,10 @@ class DataClient:
             If True and multiple tickers requested, combines all data into single DataFrame.
             If False, returns dict with ticker as keys.
             
+        daily : bool, default False
+            If True, queries daily resampled data from market/daily/* keys instead of raw data.
+            This is much faster for analysis requiring daily frequency data.
+            
         Returns:
         --------
         pd.DataFrame or Dict[str, pd.DataFrame]
@@ -375,6 +383,12 @@ class DataClient:
         
         # Advanced filtering
         >>> df = client.query_market_data('ZC_F', where='Volume > 1000', columns=['Open', 'High', 'Low', 'Last', 'Volume'])
+        
+        # Query daily data (much faster for daily analysis)
+        >>> daily_df = client.query_market_data('ZC_F', daily=True, start_date='2024-01-01')
+        
+        # Query multiple tickers with daily data
+        >>> daily_data = client.query_market_data(['ZC_F', 'CL_F'], daily=True, columns=['Open', 'High', 'Low', 'Last'])
         """
         try:
             from config import get_ticker_symbol, COMMODITY_TO_TICKER
@@ -388,7 +402,10 @@ class DataClient:
         if tickers is None:
             # Get all available market data
             available_keys = self.list_market_data()
-            market_keys = [key for key in available_keys if key.startswith('market/')]
+            if daily:
+                market_keys = [key for key in available_keys if key.startswith('market/daily/')]
+            else:
+                market_keys = [key for key in available_keys if key.startswith('market/') and not key.startswith('market/daily/')]
         else:
             if isinstance(tickers, str):
                 tickers = [tickers]
@@ -398,14 +415,20 @@ class DataClient:
                 # Try to resolve ticker symbol
                 try:
                     resolved_ticker = get_ticker_symbol(ticker.upper())
-                    market_key = f"market/{resolved_ticker}"
+                    if daily:
+                        market_key = f"market/daily/{resolved_ticker}"
+                    else:
+                        market_key = f"market/{resolved_ticker}"
                     market_keys.append(market_key)
                 except (KeyError, ValueError):
                     # Try as direct market key
                     if ticker.startswith('market/'):
                         market_keys.append(ticker)
                     else:
-                        market_keys.append(f"market/{ticker}")
+                        if daily:
+                            market_keys.append(f"market/daily/{ticker}")
+                        else:
+                            market_keys.append(f"market/{ticker}")
         
         # Build where clause for date filtering
         date_conditions = []
@@ -447,7 +470,10 @@ class DataClient:
                     df = self._resample_ohlc_data(df, resample)
                 
                 # Extract ticker name for results key
-                ticker_name = market_key.replace('market/', '')
+                if daily:
+                    ticker_name = market_key.replace('market/daily/', '')
+                else:
+                    ticker_name = market_key.replace('market/', '')
                 results[ticker_name] = df
                 
             except Exception as e:
@@ -1279,8 +1305,8 @@ class DataClient:
         report_type: str = "disaggregated_fut",
         years: Optional[Union[int, Sequence[int]]] = None,
         code_col: Optional[str] = None,
-        write_raw: bool = True,
-        replace: bool = True,
+        write_raw: bool = False,
+        replace: bool = False,
     ) -> pd.DataFrame:
         if cot is None:
             raise ImportError(

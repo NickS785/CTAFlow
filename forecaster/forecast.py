@@ -1,4 +1,6 @@
 from data.signals_processing import DataProcessor, TechnicalAnalysis
+from data.retrieval import fetch_data_sync
+from data.data_client import DataClient as Client
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
@@ -13,100 +15,86 @@ warnings.filterwarnings('ignore')
 class CTAForecast:
     """Forecasting framework optimized for your COT-enhanced dataset"""
 
-    def __init__(self, ticker_symbol):
+    def __init__(self, ticker_symbol, use_daily_data=True, **kwargs):
         self.data_processor = DataProcessor()
         self.technical_analyzer = TechnicalAnalysis()
         self.models = {}
-        self.data = None  # Will store target/training data
-        self.features = None
-        self.target = None
+        self.symbol = ticker_symbol
+        
+        # Fetch data and apply COT column renaming
+        raw_data = fetch_data_sync(ticker_symbol, daily=use_daily_data, **kwargs)
+        if raw_data is not None:
+            # Apply COT column renaming from DataProcessor
+            self.data = self._apply_cot_column_renaming(raw_data)
 
-    def prepare_forecasting_features(self, df, include_technical=True, selected_indicators=None, 
-                                   normalize_momentum=False, vol_return_periods=[1, 5, 10, 20]):
+        else:
+            self.data = None
+            
+        self.target = None
+        self.features = None
+        self.cot_features = None
+        self.technical_features = None
+
+    def _apply_cot_column_renaming(self, df):
+        """Apply COT column renaming as done in DataProcessor"""
+        # COT column mapping from DataProcessor
+        cot_column_mapping = {
+            'Open_Interest_All': 'market_participation',
+            'Prod_Merc_Positions_Long_All': 'producer_merchant_processor_user_longs',
+            'Prod_Merc_Positions_Short_All': 'producer_merchant_processor_user_shorts',
+            'Swap_Positions_Long_All': 'swap_dealer_longs',
+            'Swap__Positions_Short_All': 'swap_dealer_shorts',
+            'Swap__Positions_Spread_All': 'swap_dealer_spreads',
+            'M_Money_Positions_Long_All': 'money_manager_longs',
+            'M_Money_Positions_Short_All': 'money_manager_shorts',
+            'M_Money_Positions_Spread_All': 'money_manager_spreads',
+            'Other_Rept_Positions_Long_All': 'other_reportable_longs',
+            'Other_Rept_Positions_Short_All': 'other_reportable_shorts',
+            'Tot_Rept_Positions_Long_All': 'total_reportable_longs',
+            'Tot_Rept_Positions_Short_All': 'total_reportable_shorts',
+            'NonRept_Positions_Long_All': 'non_reportable_longs',
+            'NonRept_Positions_Short_All': 'non_reportable_shorts'
+        }
+        
+        # Apply column renaming
+        df_renamed = df.rename(columns=cot_column_mapping)
+        
+        # Clean numeric columns - convert to numeric, keep NaN for later dropping
+        cot_columns = list(cot_column_mapping.values())
+        for col in cot_columns:
+            if col in df_renamed.columns:
+                df_renamed[col] = pd.to_numeric(df_renamed[col], errors='coerce')
+        
+        return df_renamed
+
+    def prepare_forecasting_features(self, include_technical=True, selected_indicators=None,
+                                   normalize_momentum=False, vol_return_periods=[1, 5, 10, 20],
+                                   include_cot=True, selected_cot_features=None):
         """Create comprehensive feature set from your data structure
         
         Args:
-            df: Input dataframe with market and COT data
             include_technical: Whether to include any technical indicators
             selected_indicators: List of specific technical indicator groups to include
                                ['moving_averages', 'macd', 'rsi', 'atr', 'volume', 'momentum', 'confluence', 'vol_normalized']
             normalize_momentum: Whether to include volatility-normalized momentum
             vol_return_periods: List of periods for volatility-normalized returns
+            include_cot: Whether to include COT features
+            selected_cot_features: List of COT feature groups to include
+                                 ['positioning', 'flows', 'extremes', 'market_structure', 'interactions', 'spreads']
         """
+        df = self.data.copy()
         features = pd.DataFrame(index=df.index)
-        
-        # Store data for training (always update with latest data)
-        self.data = df.copy()
 
-        # 1. COT Positioning Features (Your primary advantage)
-        features['mm_net_position'] = (
-                df['money_manager_longs'] - df['money_manager_shorts']
-        )
-        features['mm_long_ratio'] = (
-                df['money_manager_longs'] /
-                (df['money_manager_longs'] + df['money_manager_shorts'] + 1e-8)
-        )
+        # 1. COT Features (Primary advantage) - Using new selective method
+        if include_cot:
+            cot_features = self.calculate_enhanced_cot_features(selected_cot_features)
+            for col in cot_features.columns:
+                if f'cot_{col}' not in features.columns:
+                    features[f'cot_{col}'] = cot_features[col]
 
-        # Commercial positioning (contrarian indicator)
-        features['commercial_net'] = (
-                df['producer_merchant_processor_user_longs'] -
-                df['producer_merchant_processor_user_shorts']
-        )
+                self.cot_features = cot_features.columns
 
-        # Swap dealer positioning (often reflects institutional hedging)
-        features['swap_net'] = df['swap_dealer_longs'] - df['swap_dealer_shorts']
-
-
-        # 2. COT Flow Features (Changes in positioning)
-        for periods in [1, 2, 4, 8]:  # 1-week to 8-week changes
-            features[f'mm_net_flow_{periods}w'] = features['mm_net_position'].diff(periods)
-            features[f'commercial_flow_{periods}w'] = features['commercial_net'].diff(periods)
-
-        # 3. Market Structure Features
-        features['total_open_interest'] = df['market_participation']
-        features['oi_change'] = features['total_open_interest'].pct_change()
-
-        # Market concentration
-        features['mm_concentration'] = (
-                (df['money_manager_longs'] + df['money_manager_shorts']) /
-                df['market_participation']
-        )
-
-        # 4. COT Index Features (Positioning Extremes)
-        for col in ['mm_net_position', 'commercial_net', 'swap_net']:
-            features[f'{col}_cot_index'] = self.calculate_cot_index(features[col])
-            features[f'{col}_extreme'] = (
-                    (features[f'{col}_cot_index'] <= 15) |
-                    (features[f'{col}_cot_index'] >= 85)
-            ).astype(int)
-
-        # 5. Interaction Features (Key for CTA analysis)
-        features['mm_vs_commercial'] = (
-                features['mm_net_position'] - features['commercial_net']
-        )
-        features['positioning_divergence'] = (
-                features['mm_net_position'] * features['commercial_net'] < 0
-        ).astype(int)
-
-        # 6. Spread Activity Features (Sophisticated positioning indicator)
-        features['mm_spread_activity'] = df['money_manager_spreads']
-        features['spread_to_outright_ratio'] = (
-                df['money_manager_spreads'] /
-                (df['money_manager_longs'] + df['money_manager_shorts'] + 1e-8)
-        )
-
-        # 7. Price Features (if available)
-        if df['Close'].notna().any():
-            # Price momentum
-            for periods in [5, 10, 20]:
-                features[f'price_momentum_{periods}d'] = df['Close'].pct_change(periods)
-
-            # Price vs positioning alignment
-            features['price_position_alignment'] = (
-                    (df['Close'].pct_change(5) > 0) & (features['mm_net_flow_1w'] > 0)
-            ).astype(int)
-
-        # 8. Technical Indicators Features (selective calculation)
+        # 3. Technical Indicators Features (selective calculation)
         if include_technical:
             tech_indicators = self.technical_analyzer.calculate_enhanced_indicators(
                 df, 
@@ -114,16 +102,19 @@ class CTAForecast:
                 normalize_momentum=normalize_momentum,
                 vol_return_periods=vol_return_periods
             )
-            
+            self.tech_features = tech_indicators.columns
+
             # Add all calculated technical indicators with 'tech_' prefix
             for feature in tech_indicators.columns:
-                features[f'tech_{feature}'] = tech_indicators[feature]
+                if f'tech_{feature}' not in features.columns:
+                    features[f'tech_{feature}'] = tech_indicators[feature]
 
-        # 9. Seasonal Features
+        # 4. Seasonal Features
         features['month'] = df.index.month
         features['quarter'] = df.index.quarter
-        features['week_of_year'] = df.index.week
-        self.features = features.fillna(method='bfill').fillna(0)
+
+        # Store and return features (drop rows with all NaN)
+        self.features = features
 
         return self.features
 
@@ -133,15 +124,42 @@ class CTAForecast:
         rolling_min = series.rolling(window=window).min()
         rolling_max = series.rolling(window=window).max()
         cot_index = ((series - rolling_min) / (rolling_max - rolling_min + 1e-8)) * 100
-        return cot_index.fillna(50)
+        return cot_index.dropna()
+    
+    def _classify_positioning_regime(self, series, lookback=252):
+        """Classify current positioning into regime (low/medium/high)
+        
+        Args:
+            series: Series of positioning values
+            lookback: Days to look back for percentile calculation
+            
+        Returns:
+            Series with positioning regime classification (0=low, 1=medium, 2=high)
+        """
+        # Calculate rolling percentiles
+        pos_25th = series.rolling(window=lookback).quantile(0.25)
+        pos_75th = series.rolling(window=lookback).quantile(0.75)
+        
+        # Classify regime
+        regime = pd.Series(1, index=series.index)  # Default to medium
+        regime[series <= pos_25th] = 0  # Low positioning
+        regime[series >= pos_75th] = 2  # High positioning
+        
+        return regime
 
-    def create_target_variable(self, df, forecast_horizon=10, target_type='return'):
+    def create_target_variable(self, forecast_horizon=10, target_type='return'):
         """Create target variable for forecasting"""
+        df = self.data.copy()
+        
+        # Map 'Last' to 'Close' if 'Close' doesn't exist but 'Last' does
+        if 'Close' not in df.columns and 'Last' in df.columns:
+            df['Close'] = df['Last']
+            
         if target_type == 'return' and df['Close'].notna().any():
             # Price return target
             target = df['Close'].pct_change(periods=forecast_horizon).shift(-forecast_horizon)
 
-        elif target_type == 'cta_positioning':
+        elif target_type == 'positioning':
             # CTA positioning change target (useful for position forecasting)
             mm_net = df['money_manager_longs'] - df['money_manager_shorts']
             target = mm_net.pct_change(periods=forecast_horizon).shift(-forecast_horizon)
@@ -152,7 +170,7 @@ class CTAForecast:
             cot_index = self.calculate_cot_index(mm_net)
             target = cot_index.diff(periods=forecast_horizon).shift(-forecast_horizon)
 
-        self.target = target.fillna(0)
+        self.target = target.dropna()
         return self.target
     
     def resample_weekly(self, df, day_of_week='Friday', price_agg='last', volume_agg='sum', cot_agg='last'):
@@ -218,7 +236,7 @@ class CTAForecast:
         
         return resampled
     
-    def resample_features_weekly(self, features_df, day_of_week='Friday'):
+    def resample_features_weekly(self, day_of_week='Friday'):
         """Resample calculated features to weekly frequency using 'last' aggregation
         
         Args:
@@ -229,6 +247,7 @@ class CTAForecast:
             Resampled features DataFrame
         """
         # Map day names to pandas offset aliases
+
         day_mapping = {
             'Monday': 'W-MON',
             'Tuesday': 'W-TUE', 
@@ -244,17 +263,24 @@ class CTAForecast:
         
         freq = day_mapping[day_of_week]
         
+        if self.features is None:
+            raise ValueError("No features to resample. Run prepare_forecasting_features() first.")
+            
         # Use 'last' aggregation for all feature columns
-        resampled_features = features_df.resample(freq).last()
+        self.features = self.features.resample(freq).last()
         
         # Drop any rows with all NaN values
-        resampled_features = resampled_features.dropna(how='all')
+        self.features = self.features.dropna(how='all')
         
-        return resampled_features
+        return self.features
     
     def get_available_indicators(self):
         """Return list of available technical indicator groups"""
         return ['moving_averages', 'macd', 'rsi', 'atr', 'volume', 'momentum', 'confluence', 'vol_normalized']
+    
+    def get_available_cot_features(self):
+        """Return list of available COT feature groups"""
+        return ['positioning', 'flows', 'extremes', 'market_structure', 'interactions', 'spreads']
     
     def get_available_weekly_days(self):
         """Return list of available days for weekly resampling"""
@@ -273,7 +299,7 @@ class CTAForecast:
             raise ValueError("No features found. Run prepare_forecasting_features() or load_and_prepare_data() first.")
         
         # Resample the features using 'last' aggregation
-        self.features = self.resample_features_weekly(self.features, day_of_week)
+        self.resample_features_weekly(day_of_week)
         
         # Also resample target if it exists
         if self.target is not None:
@@ -300,80 +326,232 @@ class CTAForecast:
             normalize_momentum=normalize_momentum
         )
     
-    def get_cot_features_only(self, df):
-        """Get only COT-based features for separate analysis"""
-        features = pd.DataFrame(index=df.index)
-        
-        # Core COT features
-        if 'money_manager_longs' in df.columns and 'money_manager_shorts' in df.columns:
-            features['mm_net_position'] = df['money_manager_longs'] - df['money_manager_shorts']
-            features['mm_long_ratio'] = df['money_manager_longs'] / (df['money_manager_longs'] + df['money_manager_shorts'] + 1e-8)
-            
-            # Commercial positioning
-            if 'producer_merchant_processor_user_longs' in df.columns:
-                features['commercial_net'] = df['producer_merchant_processor_user_longs'] - df['producer_merchant_processor_user_shorts']
-                features['mm_vs_commercial'] = features['mm_net_position'] - features['commercial_net']
-            
-            # COT flow features
-            for periods in [1, 2, 4, 8]:
-                features[f'mm_net_flow_{periods}w'] = features['mm_net_position'].diff(periods)
-                if 'commercial_net' in features:
-                    features[f'commercial_flow_{periods}w'] = features['commercial_net'].diff(periods)
-            
-            # COT extremes
-            features['mm_net_cot_index'] = self.calculate_cot_index(features['mm_net_position'])
-            features['mm_extreme'] = ((features['mm_net_cot_index'] <= 15) | (features['mm_net_cot_index'] >= 85)).astype(int)
-        
-        return features.fillna(method='bfill').fillna(0)
-    
-    def load_and_prepare_data(self, ticker_symbol, resample_weekly=False, weekly_day='Friday',
-                             include_technical=True, selected_indicators=None, 
-                             normalize_momentum=False, vol_return_periods=[1, 5, 10, 20]):
-        """Load data and prepare all feature sets with selective technical indicators
+    def get_cot_features_only(self, selected_cot_features=None):
+        """Get only COT-based features for separate analysis with selective calculation
         
         Args:
-            ticker_symbol: Futures ticker symbol
-            resample_weekly: Whether to resample to weekly frequency
+            selected_cot_features: List of COT feature groups to calculate
+                                 ['positioning', 'flows', 'extremes', 'market_structure', 'interactions', 'spreads']
+        """
+        if selected_cot_features is None:
+            selected_cot_features = ['positioning', 'flows', 'extremes', 'market_structure', 'interactions']
+        
+        return self.calculate_enhanced_cot_features(selected_cot_features)
+    
+    def calculate_enhanced_cot_features(self, selected_cot_features=None, flow_periods=None):
+        """Calculate comprehensive COT features with selective computation
+        
+        Args:
+            df: DataFrame with COT data (must have standardized column names)
+            selected_cot_features: List of COT feature groups to calculate
+                                 ['positioning', 'flows', 'extremes', 'market_structure', 'interactions', 'spreads']
+        
+        Returns:
+            DataFrame with selected COT features
+        """
+        if selected_cot_features is None:
+            selected_cot_features = ['positioning', 'flows', 'extremes', 'market_structure', 'interactions']
+
+        df = self.data.copy()
+        
+        features = pd.DataFrame(index=df.index)
+        
+        # Check if we have required COT data
+        has_cot_data = ('money_manager_longs' in df.columns and 
+                       'money_manager_shorts' in df.columns and
+                       'market_participation' in df.columns)
+        
+        if not has_cot_data:
+            return features
+        
+        # 1. Core Positioning Features
+        if 'positioning' in selected_cot_features:
+            # Money Manager (CTA) positioning
+            features['mm_net_position'] = df['money_manager_longs'] - df['money_manager_shorts']
+            features['mm_gross_position'] = df['money_manager_longs'] + df['money_manager_shorts']
+            features['mm_long_ratio'] = (
+                df['money_manager_longs'] / 
+                (df['money_manager_longs'] + df['money_manager_shorts'] + 1e-8)
+            )
+            
+            # Commercial positioning (hedgers/producers)
+            if 'producer_merchant_processor_user_longs' in df.columns:
+                features['commercial_net'] = (
+                    df['producer_merchant_processor_user_longs'] - 
+                    df['producer_merchant_processor_user_shorts']
+                )
+                features['commercial_long_ratio'] = (
+                    df['producer_merchant_processor_user_longs'] /
+                    (df['producer_merchant_processor_user_longs'] + df['producer_merchant_processor_user_shorts'] + 1e-8)
+                )
+            
+            # Swap dealer positioning
+            if 'swap_dealer_longs' in df.columns:
+                features['swap_net'] = df['swap_dealer_longs'] - df['swap_dealer_shorts']
+                features['swap_long_ratio'] = (
+                    df['swap_dealer_longs'] / 
+                    (df['swap_dealer_longs'] + df['swap_dealer_shorts'] + 1e-8)
+                )
+            
+            # Other reportables
+            if 'other_reportable_longs' in df.columns:
+                features['other_net'] = df['other_reportable_longs'] - df['other_reportable_shorts']
+        
+        # 2. Flow Features (Changes in positioning)
+        if 'flows' in selected_cot_features and 'mm_net_position' in features:
+            if flow_periods is None:
+                flow_periods = [4, 13]
+            for periods in flow_periods:  # 1w to 26w (6 months)
+                features[f'mm_net_flow_{periods}w'] = features['mm_net_position'].diff(periods)
+
+                if 'commercial_net' in features:
+                    features[f'commercial_flow_{periods}w'] = features['commercial_net'].diff(periods)
+                
+                # Flow momentum (acceleration/deceleration)
+                if periods >= 4:
+                    flow_col = f'mm_net_flow_{periods}w'
+                    if flow_col in features:
+                        features[f'{flow_col}_momentum'] = features[flow_col].diff(periods//2)
+        
+        # 3. Positioning Extremes (COT Index methodology)
+        if 'extremes' in selected_cot_features:
+            positioning_cols = [col for col in features.columns if any(x in col for x in ['_net', '_long_ratio'])]
+            
+            for col in positioning_cols:
+                if col in features and features[col].notna().any():
+                    # COT Index (0-100 scale over 52-week window)
+                    features[f'{col}_cot_index'] = self.calculate_cot_index(features[col], window=52)
+                    
+                    # Extreme positioning flags
+                    features[f'{col}_extreme_long'] = (features[f'{col}_cot_index'] >= 85).astype(int)
+                    features[f'{col}_extreme_short'] = (features[f'{col}_cot_index'] <= 15).astype(int)
+                    features[f'{col}_extreme'] = (
+                        (features[f'{col}_cot_index'] <= 15) | 
+                        (features[f'{col}_cot_index'] >= 85)
+                    ).astype(int)
+                    
+                    # Regime classification (low/medium/high based on percentiles)
+                    features[f'{col}_regime'] = self._classify_positioning_regime(features[col])
+        
+        # 4. Market Structure Features
+        if 'market_structure' in selected_cot_features:
+            features['total_open_interest'] = df['market_participation']
+            features['oi_change'] = features['total_open_interest'].pct_change()
+            features['oi_momentum'] = features['total_open_interest'].pct_change(4)  # 4-week change
+            
+            # Market concentration
+            if 'mm_gross_position' in features:
+                features['mm_concentration'] = features['mm_gross_position'] / df['market_participation']
+            
+            if 'commercial_net' in features:
+                commercial_gross = df.get('producer_merchant_processor_user_longs', 0) + df.get('producer_merchant_processor_user_shorts', 0)
+                features['commercial_concentration'] = commercial_gross / df['market_participation']
+            
+            # Reportable vs Non-reportable
+            if 'total_reportable_longs' in df.columns:
+                features['reportable_ratio'] = (
+                    (df['total_reportable_longs'] + df['total_reportable_shorts']) / 
+                    (2 * df['market_participation'] + 1e-8)
+                )
+        
+        # 5. Interaction Features (Key for CTA analysis)
+        if 'interactions' in selected_cot_features:
+            if 'mm_net_position' in features and 'commercial_net' in features:
+                # Speculative vs Commercial positioning
+                features['mm_vs_commercial'] = features['mm_net_position'] - features['commercial_net']
+                
+                # Positioning divergence (opposite directions)
+                features['positioning_divergence'] = (
+                    features['mm_net_position'] * features['commercial_net'] < 0
+                ).astype(int)
+                
+                # Positioning alignment strength
+                features['positioning_alignment'] = np.abs(
+                    np.corrcoef(features['mm_net_position'].rolling(26).apply(lambda x: x.iloc[-1]), 
+                               features['commercial_net'].rolling(26).apply(lambda x: x.iloc[-1]))[0,1]
+                ) if len(features) > 26 else 0.5
+                
+            # Smart money vs dumb money (commercial vs speculative)
+            if 'commercial_net' in features and 'mm_net_position' in features:
+                features['smart_money_indicator'] = -features['commercial_net']  # Commercials are contrarian
+                features['dumb_money_indicator'] = features['mm_net_position']   # Speculators tend to be wrong at extremes
+        
+        # 6. Spread Activity Features (Sophisticated positioning indicator)
+        if 'spreads' in selected_cot_features and 'money_manager_spreads' in df.columns:
+            features['mm_spread_activity'] = df['money_manager_spreads']
+            
+            if 'mm_gross_position' in features:
+                features['spread_to_outright_ratio'] = (
+                    df['money_manager_spreads'] / (features['mm_gross_position'] + 1e-8)
+                )
+            
+            # Spread activity momentum
+            features['spread_activity_flow'] = features['mm_spread_activity'].diff(4)  # 4-week change
+            features['spread_ratio_change'] = features.get('spread_to_outright_ratio', pd.Series(0, index=df.index)).diff(4)
+            
+            # Complex positioning indicator (spreads suggest sophisticated strategies)
+            features['sophisticated_positioning'] = (
+                features['spread_to_outright_ratio'] > features['spread_to_outright_ratio'].rolling(52).quantile(0.75)
+            ).astype(int) if 'spread_to_outright_ratio' in features else pd.Series(0, index=df.index)
+        
+        # Remove columns that are all NaN
+        features = features.dropna(axis=1, how='all')
+        
+        return features
+    
+    def prepare_data(self, resample_weekly_first=False, resample_weekly_after=False, weekly_day='Friday',
+                     include_technical=True, selected_indicators=None,
+                     normalize_momentum=False, vol_return_periods=[1, 5, 10, 20],
+                     include_cot=True, selected_cot_features=None):
+        """Load data and prepare all feature sets with selective technical and COT indicators
+        
+        Args:
+            resample_weekly_first: Whether to resample raw data to weekly frequency before feature calculation
+            resample_weekly_after: Whether to resample calculated features to weekly frequency 
             weekly_day: Day of week for weekly resampling ('Monday' through 'Sunday', default 'Friday')
             include_technical: Whether to include technical indicators
             selected_indicators: List of specific technical groups to include
                                ['moving_averages', 'macd', 'rsi', 'atr', 'volume', 'momentum', 'confluence', 'vol_normalized']
             normalize_momentum: Whether to include volatility-normalized momentum
             vol_return_periods: List of periods for volatility-normalized returns
+            include_cot: Whether to include COT features
+            selected_cot_features: List of COT feature groups to include
+                                 ['positioning', 'flows', 'extremes', 'market_structure', 'interactions', 'spreads']
         """
         # Load data using the data processor
-        raw_data = self.data_processor.load_and_clean_data(ticker_symbol)
+        raw_data = self.data
         
         if raw_data is None:
-            raise ValueError(f"Could not load data for ticker {ticker_symbol}")
+            raise ValueError(f"Could not load data for ticker {self.symbol}")
         
         # Apply weekly resampling if requested
-        if resample_weekly:
+        if resample_weekly_first:
             raw_data = self.resample_weekly(raw_data, day_of_week=weekly_day)
         
         # Store data for training/validation use
         self.data = raw_data.copy()
         
-        # Prepare different feature sets with selective technical indicators
+        # Prepare different feature sets with selective technical and COT indicators
         all_features = self.prepare_forecasting_features(
-            raw_data, 
             include_technical=include_technical,
             selected_indicators=selected_indicators,
             normalize_momentum=normalize_momentum,
-            vol_return_periods=vol_return_periods
+            vol_return_periods=vol_return_periods,
+            include_cot=include_cot,
+            selected_cot_features=selected_cot_features
         )
-        technical_features = self.get_technical_features_only(raw_data, selected_indicators, normalize_momentum)
-        cot_features = self.get_cot_features_only(raw_data)
+        self.tech_features = self.get_technical_features_only(self.data, selected_indicators, normalize_momentum).columns.tolist()
+        self.cot_features = self.get_cot_features_only(selected_cot_features).columns.tolist()
         
         # Apply weekly resampling to calculated features if requested
-        if resample_weekly and self.features is not None:
-            self.features = self.resample_features_weekly(self.features, day_of_week=weekly_day)
+        if resample_weekly_after and self.features is not None:
+            self.features = self.resample_features_weekly(day_of_week=weekly_day)
         
         return {
-            'raw_data': raw_data,
-            'all_features': all_features,
-            'technical_features': technical_features,
-            'cot_features': cot_features
+            'raw_data': self.data,
+            'all_features': self.features,
+            'technical_features': self.tech_features,
+            'cot_features': self.cot_features
         }
     
     def train_model(self, model_type='ridge', target_type='return', forecast_horizon=10, 
@@ -394,7 +572,7 @@ class CTAForecast:
             raise ValueError("Must load and prepare data first using load_and_prepare_data()")
         
         # Create target variable
-        target = self.create_target_variable(self.data, forecast_horizon, target_type)
+        target = self.create_target_variable(forecast_horizon, target_type)
         
         # Remove NaN values and align features with targets
         valid_idx = ~(self.features.isna().any(axis=1) | target.isna())

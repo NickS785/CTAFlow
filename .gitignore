@@ -1,5 +1,5 @@
 # created by virtualenv automatically
-venv
+venv/
 venv/Lib
 CLAUDE.md
 project_goals.md

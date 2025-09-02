@@ -536,7 +536,7 @@ class MarketDataProcessor:
         
         return results
     
-    def process_all_csv_files(self, year: str = '25', replace: bool = True, use_threading: bool = True, max_workers: Optional[int] = None) -> Dict[str, int]:
+    def process_all_csv_files(self, year: str = '25', replace: bool = False, use_threading: bool = True, max_workers: Optional[int] = None) -> Dict[str, int]:
         """
         Process all CSV files matching the pattern and store in HDF5.
         Now uses multi-threading by default for improved performance.
@@ -563,7 +563,7 @@ class MarketDataProcessor:
             # Legacy single-threaded processing (kept for compatibility)
             return self._process_all_csv_files_sequential(year=year, replace=replace)
     
-    def _process_all_csv_files_sequential(self, year: str = '25', replace: bool = True) -> Dict[str, int]:
+    def _process_all_csv_files_sequential(self, year: str = '25', replace: bool = False) -> Dict[str, int]:
         """
         Sequential (single-threaded) processing - kept for compatibility and debugging.
         
