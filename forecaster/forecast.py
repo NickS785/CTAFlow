@@ -806,8 +806,34 @@ class CTAForecast:
             raise ValueError("No valid features for prediction")
         
         predictions = model.predict(last_features)
-        
+
         return predictions
+
+    def visualize_forecast(self, y_true, predictions):
+        """Visualize forecast results with scatter and time series plots"""
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("matplotlib required for plotting. Install with: pip install matplotlib")
+            return None
+
+        if not isinstance(predictions, pd.Series):
+            predictions = pd.Series(predictions, index=y_true.index)
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+        axes[0].scatter(y_true, predictions, alpha=0.6)
+        axes[0].set_xlabel('Actual')
+        axes[0].set_ylabel('Predicted')
+        axes[0].set_title('Predicted vs Actual')
+
+        axes[1].plot(y_true.index, y_true, label='Actual')
+        axes[1].plot(predictions.index, predictions, label='Predicted')
+        axes[1].set_title('Raw Data Comparison')
+        axes[1].legend()
+
+        plt.tight_layout()
+        return fig, axes
     
     def get_model_summary(self):
         """Get summary of all trained models
@@ -1215,9 +1241,11 @@ class CTALight:
         
         # Train the model
         callbacks = []
+        eval_result = {}
         if len(valid_sets) > 1:
             callbacks.append(lgb.early_stopping(early_stopping_rounds))
-            
+            callbacks.append(lgb.record_evaluation(eval_result))
+
         self.model = lgb.train(
             self.params,
             train_data,
@@ -1232,14 +1260,17 @@ class CTALight:
         # Store feature importance
         importance_vals = self.model.feature_importance(importance_type='gain')
         self.feature_importance = pd.Series(
-            importance_vals, 
+            importance_vals,
             index=self.feature_names
         ).sort_values(ascending=False)
-        
+
         # Store training history if validation was used
         if len(valid_sets) > 1:
-            self.train_history = pd.DataFrame(self.model.eval_train)
-        
+            metric = self.params.get('metric', 'rmse')
+            if isinstance(metric, list):
+                metric = metric[0]
+            self.train_history = pd.DataFrame({name: res[metric] for name, res in eval_result.items()})
+
         return self
     
     def predict(self, X, num_iteration=None):
