@@ -666,21 +666,21 @@ class CTAForecast:
 
         return cv_results
 
-    def run_selected_features(self, base_model, model_type='ridge', top_n=20,
+    def run_selected_features(self, selected_features=None, base_model=None, model_type='ridge', top_n=20,
                               test_size=0.2, **model_params):
-        """Train a secondary model on top features from a base model.
+        """Train a model on a selected set of features.
 
-        This method uses the ``feature_importance`` attribute of an
-        already-fitted ``base_model`` to select the ``top_n`` most
-        important features and trains another model using only those
-        features.
+        This method can work in two ways:
+        1. Use a directly provided list of feature names (selected_features)
+        2. Use the feature_importance from a base_model to select top_n features
 
         Args:
+            selected_features: List of feature column names to use directly
             base_model: Trained model instance or key in ``self.models``
-                with a ``feature_importance`` attribute.
+                with a ``feature_importance`` attribute (used if selected_features is None).
             model_type: Type of model to train on the selected features
                 ('linear', 'ridge', 'lasso', 'elastic_net', 'lightgbm').
-            top_n: Number of top features to use from ``base_model``.
+            top_n: Number of top features to use from ``base_model`` (ignored if selected_features provided).
             test_size: Fraction of samples for the test split.
             **model_params: Additional parameters passed to the new model.
 
@@ -689,18 +689,36 @@ class CTAForecast:
             selected feature names.
         """
 
-        if isinstance(base_model, str):
-            if base_model not in self.models:
-                raise ValueError(f"Model '{base_model}' not found in self.models")
-            base_model = self.models[base_model]
-
-        if not hasattr(base_model, 'feature_importance') or base_model.feature_importance is None:
-            raise ValueError("Base model must have feature_importance after fitting")
-
         if self.features is None or self.target is None:
-            raise ValueError("Features and target must be prepared and base model trained first")
+            raise ValueError("Features and target must be prepared first")
 
-        top_features = base_model.feature_importance.head(top_n).index.tolist()
+        # Determine which features to use
+        if selected_features is not None:
+            # Use directly provided feature list
+            if not isinstance(selected_features, list):
+                raise ValueError("selected_features must be a list of feature names")
+            
+            # Validate that all selected features exist in self.features
+            missing_features = [f for f in selected_features if f not in self.features.columns]
+            if missing_features:
+                raise ValueError(f"Features not found in dataset: {missing_features}")
+            
+            top_features = selected_features
+        else:
+            # Fall back to base_model approach
+            if base_model is None:
+                raise ValueError("Either selected_features or base_model must be provided")
+            
+            if isinstance(base_model, str):
+                if base_model not in self.models:
+                    raise ValueError(f"Model '{base_model}' not found in self.models")
+                base_model = self.models[base_model]
+
+            if not hasattr(base_model, 'feature_importance') or base_model.feature_importance is None:
+                raise ValueError("Base model must have feature_importance after fitting")
+
+            top_features = base_model.feature_importance.head(top_n).index.tolist()
+
         X = self.features[top_features]
         y = self.target
 
@@ -738,7 +756,11 @@ class CTAForecast:
         train_metrics = model.evaluate(X_train, y_train)
         test_metrics = model.evaluate(X_test, y_test)
 
-        model_key = f"fs_{model_type}_top{top_n}"
+        # Generate appropriate model key based on how features were selected
+        if selected_features is not None:
+            model_key = f"fs_{model_type}_{len(selected_features)}features"
+        else:
+            model_key = f"fs_{model_type}_top{top_n}"
         self.models[model_key] = model
 
         return {
