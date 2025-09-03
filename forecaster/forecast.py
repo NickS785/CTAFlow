@@ -35,6 +35,7 @@ class CTAForecast:
         self.features = None
         self.cot_features = None
         self.tech_features = None
+        self.intraday_features = None
 
 
 
@@ -42,6 +43,9 @@ class CTAForecast:
                          selected_indicators=None,
                          normalize_momentum=False,
                          vol_return_periods=[1, 5, 10, 20],
+                         include_intraday=True,
+                         selected_intraday_features=None,
+                         intraday_horizon=5,
                          include_cot=True,
                          selected_cot_features=None,
                          resample_before_calcs=False,
@@ -109,6 +113,23 @@ class CTAForecast:
                 if f'tech_{feature}' not in features.columns:
                     features[f'tech_{feature}'] = tech_indicators[feature]
 
+        if include_intraday:
+            intraday_feature_df = self.calculate_intraday_features(
+                                intraday_horizon,
+                                selected_intraday_features=selected_intraday_features
+                                )
+
+            self.intraday_features = intraday_feature_df.columns
+
+
+            for feature in self.intraday_features:
+                if f'ind_{feature}' not in features.columns:
+                    features[f'ind_{feature}'] = intraday_feature_df[feature]
+
+
+
+
+
         # 4. Seasonal Features
         features['month'] = df.index.month
         features['quarter'] = df.index.quarter
@@ -156,6 +177,29 @@ class CTAForecast:
             common_index = self.features.index.intersection(self.target.index)
             self.features = self.features.loc[common_index]
             self.target = self.target.loc[common_index]
+
+    def calculate_intraday_features(self, indicator_horizons=5, selected_intraday_features=None):
+        if not selected_intraday_features:
+            selected_intraday_features = ['rv', 'rsv', 'cum_delta']
+        features = pd.DataFrame(index=self.data.index)
+        ind = IntradayFeatures(self.symbol)
+
+        if 'rv' in selected_intraday_features:
+            features['rv'] = ind.historical_rv(indicator_horizons)
+
+        if 'rsv' in selected_intraday_features:
+            features[['rsv_pos', 'rsv_neg']] = ind.realized_semivariance(indicator_horizons, average=False)[["RS_pos", "RS_neg"]]
+
+        if 'cum_delta' in selected_intraday_features:
+            features['cum_delta'] = ind.cumulative_delta(indicator_horizons)
+
+
+
+        return features
+
+
+
+
 
     
     def resample_weekly(self, df, day_of_week='Friday', price_agg='last', volume_agg='sum', cot_agg='last'):
@@ -480,9 +524,6 @@ class CTAForecast:
             selected_cot_features=selected_cot_features,
             filter_valid_prices=filter_valid_prices
         )
-        self.tech_features = self.get_technical_features_only(self.data, selected_indicators, normalize_momentum).columns.tolist()
-        self.cot_features = self.get_cot_features_only(self.data, selected_cot_features).columns.tolist()
-        
         # Apply weekly resampling to calculated features if requested
 
         return {
@@ -625,7 +666,7 @@ class CTAForecast:
 
         return cv_results
 
-    def run_feature_selection(self, base_model, model_type='ridge', top_n=20,
+    def run_selected_features(self, base_model, model_type='ridge', top_n=20,
                               test_size=0.2, **model_params):
         """Train a secondary model on top features from a base model.
 
@@ -772,6 +813,103 @@ class CTAForecast:
             })
         
         return pd.DataFrame(summary_data)
+
+class IntradayFeatures:
+    client = Client()
+
+    def __init__(self, ticker_symbol, close_col="Last", bid_volume="BidVolume", ask_volume="AskVolume", volume="Volume"):
+
+        print('Loading Intraday Data')
+        self.data = self.client.query_market_data(ticker_symbol)
+        self.returns = np.log(self.data[close_col]) - np.log(self.data[close_col].shift(1))
+        self.buy_vol = self.data[ask_volume]
+        self.sell_vol = self.data[bid_volume]
+        self.volume = self.data[volume]
+
+        return
+
+    def historical_rv(self, window=21, average=True, annualize=False):
+        returns = self.returns
+
+        dr = pd.bdate_range(returns.index.date[0], returns.index.date[-1])
+        rv = np.zeros(len(dr))
+        rv[:] = np.nan
+        if average:
+            denom = window
+        else:
+            denom = 1
+
+        for idx in range(window, len(dr)):
+            d_start = dr[idx - window]
+            d_end = dr[idx]
+
+            rv[idx] = np.sqrt(np.sum(returns.loc[d_start:d_end] ** 2)) / denom
+
+        if annualize:
+            rv *= np.sqrt(252)
+
+        hrv = pd.Series(data=rv,
+                        index=dr,
+                        name=f'{window}_rv')
+
+        return hrv
+
+    def realized_semivariance(self,window=1, average=True):
+        returns = self.returns
+        data = []
+        dr = pd.bdate_range(returns.index.date[0], returns.index.date[-1])
+        denom = 1
+        if average:
+            denom = window
+
+        for idx in range(window, len(dr)):
+            start = dr[idx - window]
+            end = dr[idx]
+            rets = returns.loc[start:end]
+            rs_neg = np.sqrt((rets[rets < 0].sum() ** 2)) / denom
+            rs_pos = np.sqrt((rets[rets > 0].sum() ** 2)) / denom
+            data.append((end, rs_pos, rs_neg))
+
+        # Create a DataFrame from collected rows
+        rs_df = pd.DataFrame(data, columns=['date', 'RS_pos', 'RS_neg'])
+        rs_df.set_index('date', inplace=True)
+        return rs_df
+
+    def cumulative_delta(self, window=1):
+        """Calculate cumulative delta (buy volume - sell volume) over a rolling window
+        
+        Args:
+            window: Number of days to calculate cumulative delta over
+            
+        Returns:
+            pd.Series: Cumulative delta values indexed by date
+        """
+        returns = self.returns
+        buy_vol = self.buy_vol
+        sell_vol = self.sell_vol
+        
+        # Get unique dates from the index
+        dr = pd.bdate_range(returns.index.date[0], returns.index.date[-1])
+        cumulative_delta = np.zeros(len(dr))
+        cumulative_delta[:] = np.nan
+        
+        for idx in range(window, len(dr)):
+            d_start = dr[idx - window]
+            d_end = dr[idx]
+            
+            # Calculate delta for the window period
+            buy_volume_window = buy_vol.loc[d_start:d_end].sum()
+            sell_volume_window = sell_vol.loc[d_start:d_end].sum()
+            cumulative_delta[idx] = buy_volume_window - sell_volume_window
+        
+        cd_series = pd.Series(data=cumulative_delta,
+                             index=dr,
+                             name=f'{window}d_cumulative_delta')
+        
+        return cd_series
+
+
+
 
 
 class CTALinear:
