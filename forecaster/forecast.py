@@ -622,8 +622,100 @@ class CTAForecast:
             cv_results = model.cross_validate(X, y, cv_folds=cv_folds)
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
-        
+
         return cv_results
+
+    def run_feature_selection(self, base_model, model_type='ridge', top_n=20,
+                              test_size=0.2, **model_params):
+        """Train a secondary model on top features from a base model.
+
+        This method uses the ``feature_importance`` attribute of an
+        already-fitted ``base_model`` to select the ``top_n`` most
+        important features and trains another model using only those
+        features.
+
+        Args:
+            base_model: Trained model instance or key in ``self.models``
+                with a ``feature_importance`` attribute.
+            model_type: Type of model to train on the selected features
+                ('linear', 'ridge', 'lasso', 'elastic_net', 'lightgbm').
+            top_n: Number of top features to use from ``base_model``.
+            test_size: Fraction of samples for the test split.
+            **model_params: Additional parameters passed to the new model.
+
+        Returns:
+            Dictionary with trained model, predictions, metrics and the
+            selected feature names.
+        """
+
+        if isinstance(base_model, str):
+            if base_model not in self.models:
+                raise ValueError(f"Model '{base_model}' not found in self.models")
+            base_model = self.models[base_model]
+
+        if not hasattr(base_model, 'feature_importance') or base_model.feature_importance is None:
+            raise ValueError("Base model must have feature_importance after fitting")
+
+        if self.features is None or self.target is None:
+            raise ValueError("Features and target must be prepared and base model trained first")
+
+        top_features = base_model.feature_importance.head(top_n).index.tolist()
+        X = self.features[top_features]
+        y = self.target
+
+        valid_idx = ~(X.isna().any(axis=1) | y.isna())
+        X = X[valid_idx]
+        y = y[valid_idx]
+
+        if len(X) == 0:
+            raise ValueError("No valid samples after removing NaN values")
+
+        split_idx = int(len(X) * (1 - test_size))
+        X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+        y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+
+        if model_type in ['linear', 'ridge', 'lasso', 'elastic_net']:
+            model = CTALinear(model_type=model_type, **model_params)
+        elif model_type == 'lightgbm':
+            model = CTALight(**model_params)
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}")
+
+        if model_type == 'lightgbm':
+            val_size = int(len(X_train) * 0.2)
+            X_val = X_train.iloc[-val_size:]
+            y_val = y_train.iloc[-val_size:]
+            X_train_fit = X_train.iloc[:-val_size]
+            y_train_fit = y_train.iloc[:-val_size]
+            model.fit(X_train_fit, y_train_fit, eval_set=(X_val, y_val))
+        else:
+            model.fit(X_train, y_train)
+
+        train_pred = model.predict(X_train)
+        test_pred = model.predict(X_test)
+
+        train_metrics = model.evaluate(X_train, y_train)
+        test_metrics = model.evaluate(X_test, y_test)
+
+        model_key = f"fs_{model_type}_top{top_n}"
+        self.models[model_key] = model
+
+        return {
+            'model': model,
+            'model_key': model_key,
+            'selected_features': top_features,
+            'train_predictions': train_pred,
+            'test_predictions': test_pred,
+            'train_metrics': train_metrics,
+            'test_metrics': test_metrics,
+            'feature_importance': model.get_feature_importance(),
+            'data_split_info': {
+                'train_samples': len(X_train),
+                'test_samples': len(X_test),
+                'train_period': (X_train.index[0], X_train.index[-1]) if len(X_train) > 0 else (None, None),
+                'test_period': (X_test.index[0], X_test.index[-1]) if len(X_test) > 0 else (None, None)
+            }
+        }
     
     def predict_next_period(self, model_key, periods_ahead=1):
         """Make predictions for future periods using a trained model
