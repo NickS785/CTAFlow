@@ -513,3 +513,4 @@ class TechnicalAnalysis:
         regime[volatility_series >= vol_75th] = 2  # High volatility
 
         return regime
+
