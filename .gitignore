@@ -3,4 +3,6 @@ venv/
 venv/Lib
 CLAUDE.md
 project_goals.md
+__pycache__/
+.pyc
 
