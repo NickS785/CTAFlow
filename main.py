@@ -16,4 +16,3 @@ forecast.features.dropna(axis=0, inplace=True)
 
 res = forecast.train_model(model_type='ridge', target_type='positioning',forecast_horizon=6, alpha=0.7)
 ridge_light = forecast.run_selected_features(base_model="ridge_positioning_6d", top_n=30, model_type='xgboost', use_grid_search=True)
-forecast.save_model(ridge_light)
