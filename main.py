@@ -4,6 +4,7 @@ import numpy as np
 from data.data_client import DataClient
 from forecaster.forecast import CTAForecast
 
+# Pipeline Example
 forecast = CTAForecast("CL_F")
 forecast.prepare_features(resample_after=True,
                           resample_day="Wednesday",

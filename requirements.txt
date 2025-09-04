@@ -1,0 +1,27 @@
+# Core data processing and numerical computing
+numpy>=1.20.0
+pandas>=1.3.0
+
+# Machine learning frameworks
+scikit-learn>=1.0.0
+lightgbm>=3.0.0
+xgboost>=1.5.0
+
+# Data visualization
+matplotlib>=3.3.0
+seaborn>=0.11.0
+
+# Data storage and I/O
+tables>=3.6.0  # For HDF5 support
+toml>=0.10.0   # For configuration files
+
+# Utilities
+tqdm>=4.60.0   # Progress bars
+
+# Optional: Financial data libraries (uncomment if needed)
+# yfinance>=0.1.70
+# pandas-datareader>=0.10.0
+
+# Optional: Advanced time series libraries (uncomment if needed)  
+# statsmodels>=0.13.0
+# arch>=5.0.0

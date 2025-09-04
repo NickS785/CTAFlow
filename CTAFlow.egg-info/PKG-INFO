@@ -1,0 +1,42 @@
+Metadata-Version: 2.4
+Name: CTAFlow
+Version: 1.0.0
+Summary: CTA positioning prediction system using COT data and technical analysis
+Author: CTA Research Team
+Author-email: CTA Research Team <research@example.com>
+Project-URL: Homepage, https://github.com/yourusername/CTAFlow
+Project-URL: Documentation, https://ctaflow.readthedocs.io/
+Project-URL: Repository, https://github.com/yourusername/CTAFlow.git
+Project-URL: Bug Tracker, https://github.com/yourusername/CTAFlow/issues
+Keywords: cta,commodity,trading,advisor,machine-learning,finance,forecasting
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Financial and Insurance Industry
+Classifier: Topic :: Office/Business :: Financial :: Investment
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.20.0
+Requires-Dist: pandas>=1.3.0
+Requires-Dist: scikit-learn>=1.0.0
+Requires-Dist: lightgbm>=3.0.0
+Requires-Dist: xgboost>=1.5.0
+Requires-Dist: matplotlib>=3.3.0
+Requires-Dist: seaborn>=0.11.0
+Requires-Dist: tables>=3.6.0
+Requires-Dist: toml>=0.10.0
+Requires-Dist: tqdm>=4.60.0
+Provides-Extra: dev
+Requires-Dist: pytest>=6.0; extra == "dev"
+Requires-Dist: pytest-cov>=2.10; extra == "dev"
+Requires-Dist: black>=21.0; extra == "dev"
+Requires-Dist: flake8>=3.8; extra == "dev"
+Requires-Dist: mypy>=0.900; extra == "dev"
+Requires-Dist: jupyter>=1.0; extra == "dev"
+Requires-Dist: ipykernel>=6.0; extra == "dev"
+Dynamic: author
+Dynamic: requires-python

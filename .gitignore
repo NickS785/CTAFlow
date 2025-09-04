@@ -1,7 +1,8 @@
 # created by virtualenv automatically
-venv/
+venv/*
 venv/Lib
 project_goals.md
 __pycache__/
 .pyc
+tests/*
 
