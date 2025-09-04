@@ -6,7 +6,7 @@ A comprehensive framework for predicting institutional positioning in commodity 
 using technical indicators, COT (Commitment of Traders) data, and machine learning models.
 
 Core Components:
-- data: Data processing, retrieval, and analysis modules, works
+- data: Data processing, retrieval, and analysis modules
 - forecaster: Machine learning models for CTA positioning prediction  
 - strategy: Trading strategy implementation using forecasting framework
 - config: Configuration and data paths
@@ -29,8 +29,8 @@ Example Usage:
 
 # Version information
 __version__ = "1.0.0"
-__author__ = "Retail Risk Analytics Team"
-__email__ = "nicholas0srs1111@gmail.com"
+__author__ = "CTA Research Team"
+__email__ = "research@example.com"
 
 # Import main classes for easy access
 try:

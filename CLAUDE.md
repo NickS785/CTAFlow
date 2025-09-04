@@ -6,29 +6,56 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a CTA (Commodity Trading Advisor) positioning prediction system that uses technical indicators and COT (Commitment of Traders) data to forecast week-over-week changes in institutional positioning in commodity futures markets. The system combines quantitative finance, machine learning, and systematic trading behavior analysis.
 
+## Package Installation & Development Commands
+
+The project is structured as an installable Python package. For development:
+
+```bash
+# Install in development mode (editable)
+pip install -e .
+
+# Install with development dependencies
+pip install -e .[dev]
+
+# Run tests (requires dev dependencies)
+python -m pytest tests/
+
+# Run a specific test
+python -m pytest tests/test_cot_date_conversion.py
+
+# Run tests directly (fallback if pytest not available)
+python tests/test_cot_date_conversion.py
+```
+
+The package structure follows standard Python conventions with all modules under `CTAFlow/`:
+
 ## Core Architecture
 
 The codebase follows a modular pipeline architecture with four main components:
 
-### Data Layer (`data/`)
+### Data Layer (`CTAFlow/data/`)
 - **`retrieval.py`**: Asynchronous data loading from HDF5 stores using `fetch_data_sync()` 
 - **`signals_processing.py`**: Technical analysis and COT signal generation
-  - `DataProcessor`: Handles COT data cleaning and positioning metrics
+  - `COTProcessor`: Handles COT data cleaning and positioning metrics
   - `TechnicalAnalysis`: Calculates selective technical indicators and volatility normalization
 - **`futures_mappings.toml`**: Maps futures ticker symbols to COT commodity codes
+- **`data_client.py`**: Main data interface class
 
-### Forecasting Engine (`forecaster/`)
-- **`forecast.py`**: Main `Forecaster` class orchestrates the entire workflow
+### Forecasting Engine (`CTAFlow/forecaster/`)
+- **`forecast.py`**: Contains all forecasting classes (`CTAForecast`, `CTALinear`, `CTALight`, `CTAXGBoost`, `CTARForest`)
   - Selective technical indicator calculation (only computes requested groups)
   - Weekly resampling with configurable day-of-week (default Friday for COT alignment)
   - Feature engineering combining COT positioning with technical signals
-  - Maintains `self.data`, `self.features`, and `self.target` for training/validation
+  - Each model class maintains `self.data`, `self.features`, and `self.target` for training/validation
 
-### Strategy Layer (`strategy/`)
-- **`strategy.py`**: Trading strategy implementation using the forecasting framework
+### Strategy Layer (`CTAFlow/strategy/`)
+- **`strategy.py`**: `RegimeStrategy` class implementing trading strategies using forecasting framework
+
+### Features (`CTAFlow/features/`)
+- **`feature_engineering.py`**: Feature creation and transformation utilities
 
 ### Configuration
-- **`config.py`**: HDF5 data paths and environment setup
+- **`CTAFlow/config.py`**: HDF5 data paths and environment setup
 - **`project_goals.md`**: Detailed research methodology and indicator selection rationale
 
 ## Key Technical Concepts
@@ -64,14 +91,35 @@ vol_normalized_returns = raw_returns / (ewm_vol_63d * sqrt(period))
 
 ## Common Usage Patterns
 
-### Basic Forecasting Workflow
+### Package Import and Basic Usage
 
 ```python
-forecaster = Forecaster()
-data = forecaster.prepare_data('CL_F',
-                               selected_indicators=['moving_averages', 'rsi'],
+import CTAFlow
+
+# Main forecasting class (preferred interface)
+forecaster = CTAFlow.CTAForecast('CL_F')
+data = forecaster.prepare_data(selected_indicators=['moving_averages', 'rsi'],
                                normalize_momentum=True,
                                resample_weekly=True)
+
+# Train models
+result = forecaster.train_model(model_type='lightgbm', target_type='return')
+print(result['test_metrics'])
+```
+
+### Direct Model Access
+
+```python
+# Access specific model classes
+linear_model = CTAFlow.CTALinear('CL_F')
+lightgbm_model = CTAFlow.CTALight('CL_F') 
+xgb_model = CTAFlow.CTAXGBoost('CL_F')
+rf_model = CTAFlow.CTARForest('CL_F')
+
+# Access utility classes
+data_client = CTAFlow.DataClient()
+cot_processor = CTAFlow.COTProcessor()
+tech_analysis = CTAFlow.TechnicalAnalysis()
 ```
 
 ### Post-Calculation Resampling
@@ -103,5 +151,21 @@ tech_features = forecaster.get_technical_features_only(df,
 - Weekly resampling defaults to Friday to align with COT reporting schedule (Tuesday data published Friday)
 - The system maintains separation between COT features and technical features for flexible model development
 - Volatility normalization uses 63-day exponentially weighted standard deviation as the baseline risk measure
-- @forecaster\forecast.py CTAForecast class works off of self.data and self.features. Ensure that it uses them throughout in order to maintain one dataset per model
+- Each model class (`CTAForecast`, `CTALinear`, etc.) works off of `self.data` and `self.features`. Ensure that these attributes are used consistently throughout to maintain one dataset per model instance
 - When testing use standard ASCII characters and avoid using emojis/special characters
+- The package must be installed in development mode (`pip install -e .`) to work properly from external directories
+
+## Available Utility Functions
+
+```python
+# Package metadata and configuration
+CTAFlow.get_version()                    # Returns package version
+CTAFlow.get_supported_models()           # Lists all supported ML models  
+CTAFlow.get_supported_indicators()       # Lists technical indicator groups
+CTAFlow.get_supported_cot_features()     # Lists COT feature categories
+
+# Configuration access (from config.py)
+CTAFlow.MARKET_DATA_PATH                 # HDF5 market data location
+CTAFlow.COT_DATA_PATH                    # HDF5 COT data location  
+CTAFlow.MODEL_DATA_PATH                  # Saved models location
+```
