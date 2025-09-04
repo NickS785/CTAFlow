@@ -11,7 +11,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score, ParameterGrid, GridSearchCV
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 import lightgbm as lgb
-from xgboost import XGBRegressor, XGBClassifier
+from xgboost import XGBRegressor
 import warnings
 import pickle
 import datetime as dt
@@ -50,7 +50,7 @@ class CTAForecast:
     def prepare_features(self, include_technical=True,
                          selected_indicators=None,
                          normalize_momentum=False,
-                         vol_return_periods=[1, 5, 10, 20],
+                         vol_return_periods=None,
                          include_intraday=True,
                          selected_intraday_features=None,
                          intraday_horizon=5,
@@ -60,8 +60,7 @@ class CTAForecast:
                          resample_after=False,
                          resample_day="Wednesday",
                          remove_weekends=True,
-                         filter_valid_prices=True):
-
+                         filter_valid_price
         """Create comprehensive feature set from your data structure
 
         Args:
@@ -83,6 +82,9 @@ class CTAForecast:
 
         if resample_before_calcs:
             df = self.resample_weekly(df=df, day_of_week=resample_day)
+
+        if vol_return_periods is None:
+            vol_return_periods = [1, 5, 10, 20]
 
 
         # Filter to rows with valid price data if technical indicators are requested
@@ -492,7 +494,7 @@ class CTAForecast:
 
     def prepare_data(self, resample_weekly_first=False, resample_weekly_after=False, weekly_day='Friday',
                      include_technical=True, selected_indicators=None,
-                     normalize_momentum=False, vol_return_periods=[1, 5, 10, 20],
+                     normalize_momentum=False, vol_return_periods=None,
                      include_cot=True, selected_cot_features=None, filter_valid_prices=True):
         """Load data and prepare all feature sets with selective technical and COT indicators
         
@@ -504,7 +506,8 @@ class CTAForecast:
             selected_indicators: List of specific technical groups to include
                                ['moving_averages', 'macd', 'rsi', 'atr', 'volume', 'momentum', 'confluence', 'vol_normalized']
             normalize_momentum: Whether to include volatility-normalized momentum
-            vol_return_periods: List of periods for volatility-normalized returns
+            vol_return_periods: List of periods for volatility-normalized returns.
+                                 Defaults to [1, 5, 10, 20] when None
             include_cot: Whether to include COT features
             selected_cot_features: List of COT feature groups to include
                                  ['positioning', 'flows', 'extremes', 'market_structure', 'interactions', 'spreads']
@@ -519,6 +522,10 @@ class CTAForecast:
         # Store data for training/validation use
         self.data = raw_data.copy()
         
+        # Determine default volatility periods if not provided
+        if vol_return_periods is None:
+            vol_return_periods = [1, 5, 10, 20]
+
         # Prepare different feature sets with selective technical and COT indicators
         all_features = self.prepare_features(
             include_technical=include_technical,
@@ -537,52 +544,27 @@ class CTAForecast:
             'technical_features': self.tech_features,
             'cot_features': self.cot_features
         }
-    
-    def train_model(self, model_type='ridge', target_type='return', forecast_horizon=10,
-                   test_size=0.2, use_grid_search=False, param_grid=None,
-                   grid_search_cv=5, grid_search_scoring='neg_mean_squared_error', **model_params):
-        """Convenience method to train and validate models
-        
-        Args:
-            model_type: 'linear', 'ridge', 'lasso', 'elastic_net', 'lightgbm', 'xgboost'
-            target_type: 'return', 'cta_positioning', 'cot_index_change'
-            forecast_horizon: Days ahead to predict
-            test_size: Fraction of data for testing
-            use_grid_search: Whether to use grid search for hyperparameter tuning (LightGBM/XGBoost only)
-            param_grid: Dictionary of parameters for grid search (LightGBM/XGBoost only)
-            grid_search_cv: Number of CV folds for grid search
-            grid_search_scoring: Scoring metric for grid search
-            **model_params: Parameters to pass to the model
-            
-        Returns:
-            Dictionary with model, predictions, performance metrics, and grid search results (if used)
-        """
-        if self.features is None or self.data is None:
-            raise ValueError("Must load and prepare data first using load_and_prepare_data()")
 
-        # Create target variable
+    def _fit_model(self, X, y, model_type='ridge', test_size=0.2,
+                   use_grid_search=False, param_grid=None,
+                   grid_search_cv=5, grid_search_scoring='neg_mean_squared_error',
+                   **model_params):
+        """Internal utility for training/validation split and model fitting."""
 
-        target = self.create_target_variable(forecast_horizon, target_type)
-
-        # Align features with target index
-        common_index = self.features.index.intersection(target.index)
-        X = self.features.loc[common_index]
-        y = target.loc[common_index]
-
-        # Remove NaN values
+        # Remove samples containing NaN values
         valid_idx = ~(X.isna().any(axis=1) | y.isna())
         X = X[valid_idx]
         y = y[valid_idx]
-        
+
         if len(X) == 0:
             raise ValueError("No valid samples after removing NaN values")
-        
-        # Time-based train/test split to avoid lookahead bias
+
+        # Time-based split to avoid lookahead bias
         split_idx = int(len(X) * (1 - test_size))
         X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
         y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
-        
-        # Initialize and train model
+
+        # Initialize model
         if model_type in ['linear', 'ridge', 'lasso', 'elastic_net']:
             model = CTALinear(model_type=model_type, **model_params)
         elif model_type == 'lightgbm':
@@ -592,10 +574,8 @@ class CTAForecast:
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
 
-        # Fit the model
         grid_search_results = None
         if model_type in ['lightgbm', 'xgboost']:
-            # Use validation set for early stopping
             val_size = int(len(X_train) * 0.2)
             X_val = X_train.iloc[-val_size:]
             y_val = y_train.iloc[-val_size:]
@@ -603,7 +583,6 @@ class CTAForecast:
             y_train_fit = y_train.iloc[:-val_size]
 
             if use_grid_search:
-                # Use grid search to find best parameters
                 grid_results = model.fit_with_grid_search(
                     X_train_fit, y_train_fit,
                     param_grid=param_grid,
@@ -614,46 +593,72 @@ class CTAForecast:
                 )
                 grid_search_results = grid_results['grid_search_results']
             else:
-                # Standard fit
                 model.fit(X_train_fit, y_train_fit, eval_set=(X_val, y_val))
         else:
-            # Linear models don't support grid search in this implementation
             if use_grid_search:
                 print("Warning: Grid search not supported for linear models. Using standard fit.")
             model.fit(X_train, y_train)
-        
-        # Make predictions
+
         train_pred = model.predict(X_train)
         test_pred = model.predict(X_test)
-        
-        # Evaluate performance
-        train_metrics = model.evaluate(X_train, y_train)
-        test_metrics = model.evaluate(X_test, y_test)
-        
-        # Store model in self.models
-        model_key = f"{model_type}_{target_type}_{forecast_horizon}d"
-        self.models[model_key] = model
-        
+
         result = {
             'model': model,
-            'model_key': model_key,
             'train_predictions': train_pred,
             'test_predictions': test_pred,
-            'train_metrics': train_metrics,
-            'test_metrics': test_metrics,
+            'train_metrics': model.evaluate(X_train, y_train),
+            'test_metrics': model.evaluate(X_test, y_test),
             'feature_importance': model.get_feature_importance(),
             'data_split_info': {
                 'train_samples': len(X_train),
                 'test_samples': len(X_test),
-                'train_period': (X_train.index[0], X_train.index[-1]),
-                'test_period': (X_test.index[0], X_test.index[-1])
+                'train_period': (X_train.index[0], X_train.index[-1]) if len(X_train) > 0 else (None, None),
+                'test_period': (X_test.index[0], X_test.index[-1]) if len(X_test) > 0 else (None, None)
             }
         }
-        
-        # Add grid search results if available
+
         if grid_search_results is not None:
             result['grid_search_results'] = grid_search_results
-            
+
+        return result
+    
+    def train_model(self, model_type='ridge', target_type='return', forecast_horizon=10,
+                   test_size=0.2, use_grid_search=False, param_grid=None,
+                   grid_search_cv=5, grid_search_scoring='neg_mean_squared_error', **model_params):
+        """Convenience method to train and validate models
+
+        Args:
+            model_type: 'linear', 'ridge', 'lasso', 'elastic_net', 'lightgbm', 'xgboost'
+            target_type: 'return', 'cta_positioning', 'cot_index_change'
+            forecast_horizon: Days ahead to predict
+            test_size: Fraction of data for testing
+            use_grid_search: Whether to use grid search for hyperparameter tuning (LightGBM/XGBoost only)
+            param_grid: Dictionary of parameters for grid search (LightGBM/XGBoost only)
+            grid_search_cv: Number of CV folds for grid search
+            grid_search_scoring: Scoring metric for grid search
+            **model_params: Parameters to pass to the model
+
+        Returns:
+            Dictionary with model, predictions, performance metrics, and grid search results (if used)
+        """
+        if self.features is None or self.data is None:
+            raise ValueError("Must load and prepare data first using load_and_prepare_data()")
+
+        target = self.create_target_variable(forecast_horizon, target_type)
+        common_index = self.features.index.intersection(target.index)
+        X = self.features.loc[common_index]
+        y = target.loc[common_index]
+
+        result = self._fit_model(
+            X, y, model_type=model_type, test_size=test_size,
+            use_grid_search=use_grid_search, param_grid=param_grid,
+            grid_search_cv=grid_search_cv,
+            grid_search_scoring=grid_search_scoring, **model_params
+        )
+
+        model_key = f"{model_type}_{target_type}_{forecast_horizon}d"
+        self.models[model_key] = result['model']
+        result['model_key'] = model_key
         return result
 
     
@@ -765,79 +770,19 @@ class CTAForecast:
         X = self.features[top_features]
         y = self.target
 
-        valid_idx = ~(X.isna().any(axis=1) | y.isna())
-        X = X[valid_idx]
-        y = y[valid_idx]
+        result = self._fit_model(X, y, model_type=model_type, test_size=test_size, **model_params)
 
-        if len(X) == 0:
-            raise ValueError("No valid samples after removing NaN values")
-
-        split_idx = int(len(X) * (1 - test_size))
-        X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-        y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
-
-        if model_type in ['linear', 'ridge', 'lasso', 'elastic_net']:
-            model = CTALinear(model_type=model_type, **model_params)
-        elif model_type == 'lightgbm':
-            model = CTALight(**model_params)
-        elif model_type == 'xgboost':
-            model = CTAXGBoost(**model_params)
-        else:
-            raise ValueError(f"Unknown model_type: {model_type}")
-
-        if model_type in ['lightgbm', 'xgboost']:
-            val_size = int(len(X_train) * 0.2)
-            X_val = X_train.iloc[-val_size:]
-            y_val = y_train.iloc[-val_size:]
-            X_train_fit = X_train.iloc[:-val_size]
-            y_train_fit = y_train.iloc[:-val_size]
-            if use_grid_search:
-                # Use grid search to find best parameters
-                grid_results = model.fit_with_grid_search(
-                    X_train_fit, y_train_fit,
-                    param_grid=param_grid,
-                    eval_set=(X_val, y_val),
-                    cv_folds=grid_search_cv,
-                    scoring=grid_search_scoring,
-                    verbose=True
-                )
-                grid_search_results = grid_results['grid_search_results']
-            else:
-                # Standard fit
-                model.fit(X_train_fit, y_train_fit, eval_set=(X_val, y_val))
-
-        else:
-            model.fit(X_train, y_train)
-
-        train_pred = model.predict(X_train)
-        test_pred = model.predict(X_test)
-
-        train_metrics = model.evaluate(X_train, y_train)
-        test_metrics = model.evaluate(X_test, y_test)
-
-        # Generate appropriate model key based on how features were selected
         if selected_features is not None:
             model_key = f"fs_{model_type}_{len(selected_features)}features"
         else:
             model_key = f"fs_{model_type}_top{top_n}"
-        self.models[model_key] = model
+        self.models[model_key] = result['model']
 
-        return {
-            'model': model,
+        result.update({
             'model_key': model_key,
             'selected_features': top_features,
-            'train_predictions': train_pred,
-            'test_predictions': test_pred,
-            'train_metrics': train_metrics,
-            'test_metrics': test_metrics,
-            'feature_importance': model.get_feature_importance(),
-            'data_split_info': {
-                'train_samples': len(X_train),
-                'test_samples': len(X_test),
-                'train_period': (X_train.index[0], X_train.index[-1]) if len(X_train) > 0 else (None, None),
-                'test_period': (X_test.index[0], X_test.index[-1]) if len(X_test) > 0 else (None, None)
-            }
-        }
+        })
+        return result
     
     def predict_next_period(self, model_key, periods_ahead=1):
         """Make predictions for future periods using a trained model
@@ -869,30 +814,98 @@ class CTAForecast:
         return predictions
 
     def visualize_forecast(self, y_true, predictions):
-        """Visualize forecast results with scatter and time series plots"""
+        """Visualize forecast results using Plotly."""
         try:
-            import matplotlib.pyplot as plt
+            import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
         except ImportError:
-            print("matplotlib required for plotting. Install with: pip install matplotlib")
+            print("plotly required for plotting. Install with: pip install plotly")
             return None
 
         if not isinstance(predictions, pd.Series):
             predictions = pd.Series(predictions, index=y_true.index)
 
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        fig = make_subplots(rows=1, cols=2,
+                            subplot_titles=("Predicted vs Actual", "Raw Data Comparison"))
 
-        axes[0].scatter(y_true, predictions, alpha=0.6)
-        axes[0].set_xlabel('Actual')
-        axes[0].set_ylabel('Predicted')
-        axes[0].set_title('Predicted vs Actual')
+        fig.add_trace(
+            go.Scatter(x=y_true, y=predictions, mode="markers", name="Predicted vs Actual"),
+            row=1, col=1
+        )
+        fig.add_trace(
+            go.Scatter(x=y_true.index, y=y_true, mode="lines", name="Actual"),
+            row=1, col=2
+        )
+        fig.add_trace(
+            go.Scatter(x=predictions.index, y=predictions, mode="lines", name="Predicted"),
+            row=1, col=2
+        )
+        fig.update_layout(width=900, height=400)
 
-        axes[1].plot(y_true.index, y_true, label='Actual')
-        axes[1].plot(predictions.index, predictions, label='Predicted')
-        axes[1].set_title('Raw Data Comparison')
-        axes[1].legend()
+        return fig
 
-        plt.tight_layout()
-        return fig, axes
+    def visualize_raw_data(self, columns=None):
+        """Plot raw input data as interactive time series using Plotly.
+
+        Parameters
+        ----------
+        columns : list[str], optional
+            Specific column names from ``self.data`` to plot. Defaults to all
+            numeric columns when ``None``.
+
+        Returns
+        -------
+        plotly.graph_objects.Figure
+            Figure containing the plot, or ``None`` if plotly is not installed.
+        """
+        if self.data is None or self.data.empty:
+            raise ValueError("No raw data available to visualize")
+
+        try:
+            import plotly.express as px
+        except ImportError:
+            print("plotly required for plotting. Install with: pip install plotly")
+            return None
+
+        df = self.data
+        if columns is None:
+            columns = df.select_dtypes(include=[np.number]).columns.tolist()
+        fig = px.line(df, x=df.index, y=columns, title="Raw Data")
+        fig.update_xaxes(title="Date")
+        fig.update_yaxes(title="Value")
+        return fig
+
+    def visualize_features(self, feature_names=None):
+        """Plot engineered feature values over time using Plotly.
+
+        Parameters
+        ----------
+        feature_names : list[str], optional
+            Names of feature columns from ``self.features`` to plot. Defaults to
+            all available features when ``None``.
+
+        Returns
+        -------
+        plotly.graph_objects.Figure
+            Figure with the resulting plot, or ``None`` if plotly is not
+            installed.
+        """
+        if self.features is None or self.features.empty:
+            raise ValueError("No features available to visualize")
+
+        try:
+            import plotly.express as px
+        except ImportError:
+            print("plotly required for plotting. Install with: pip install plotly")
+            return None
+
+        df = self.features
+        if feature_names is None:
+            feature_names = df.columns.tolist()
+        fig = px.line(df, x=df.index, y=feature_names, title="Engineered Features")
+        fig.update_xaxes(title="Date")
+        fig.update_yaxes(title="Value")
+        return fig
     
     def get_model_summary(self):
         """Get summary of all trained models
