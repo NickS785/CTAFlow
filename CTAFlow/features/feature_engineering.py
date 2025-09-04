@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
-from data.data_client import DataClient
+from ..data.data_client import DataClient
 
 dclient = DataClient()
 

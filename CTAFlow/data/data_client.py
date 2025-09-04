@@ -17,8 +17,8 @@ import pandas as pd
 
 # Optional dependency used by `download_cot`
 # pip install cot_reports
-from data.signals_processing import COTProcessor
-from data.ticker_classifier import get_ticker_classifier, get_cot_report_type, get_cot_storage_path, is_financial_ticker
+from .signals_processing import COTProcessor
+from .ticker_classifier import get_ticker_classifier, get_cot_report_type, get_cot_storage_path, is_financial_ticker
 
 
 try:
@@ -26,7 +26,7 @@ try:
 except Exception:  # pragma: no cover - allows import of module without cot_reports installed
     cot = None
 
-from config import *
+from ..config import *
 
 
 class DataClient:
@@ -444,7 +444,7 @@ class DataClient:
         >>> daily_data = client.query_market_data(['ZC_F', 'CL_F'], daily=True, columns=['Open', 'High', 'Low', 'Last'])
         """
         try:
-            from config import get_ticker_symbol, COMMODITY_TO_TICKER
+            from ..config import get_ticker_symbol, COMMODITY_TO_TICKER
         except ImportError:
             # Fallback if config functions are not available
             def get_ticker_symbol(ticker):

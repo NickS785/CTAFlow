@@ -1,8 +1,8 @@
 from talib import MA, SMA, EMA, MOM
 import pandas as pd
 import numpy as np
-from data.data_client import DataClient
-from forecaster.forecast import CTAForecast
+from .data.data_client import DataClient
+from .forecaster.forecast import CTAForecast
 
 # Pipeline Example
 forecast = CTAForecast("CL_F")

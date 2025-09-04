@@ -2,8 +2,8 @@ import datetime
 import os.path
 from pathlib import Path
 
-from data.signals_processing import COTProcessor, TechnicalAnalysis
-from data.retrieval import fetch_data_sync
+from ..data.signals_processing import COTProcessor, TechnicalAnalysis
+from ..data.retrieval import fetch_data_sync
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
@@ -15,8 +15,8 @@ import lightgbm as lgb
 from xgboost import XGBRegressor
 import warnings
 import pickle
-from config import MODEL_DATA_PATH
-from features.feature_engineering import IntradayFeatures
+from ..config import MODEL_DATA_PATH
+from ..features.feature_engineering import IntradayFeatures
 
 warnings.filterwarnings('ignore')
 data_load_func = fetch_data_sync
