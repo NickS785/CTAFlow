@@ -760,6 +760,345 @@ class DataClient:
         except Exception as e:
             raise KeyError(f"Error querying COT metrics for {ticker_symbol}: {str(e)}")
     
+    def query_curve_data(
+        self,
+        symbol: str,
+        curve_types: Optional[Union[str, Sequence[str]]] = None,
+        *,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        columns: Optional[Sequence[str]] = None,
+        where: Optional[str] = None,
+        combine_datasets: bool = False
+    ) -> Union[pd.DataFrame, Dict[str, pd.DataFrame]]:
+        """
+        Query futures curve data for a given symbol.
+        
+        Parameters:
+        -----------
+        symbol : str
+            Base symbol (e.g., 'CL', 'ZC') - '_F' suffix will be added automatically
+        curve_types : str, sequence of str, or None
+            Curve data types to query. Available types:
+            - 'curve': Full curve data
+            - 'front': Front month contract data
+            - 'dte': Days to expiry data
+            - 'seq_curve': Sequential curve data
+            - 'seq_labels': Sequential curve labels
+            - 'seq_dte': Sequential days to expiry
+            - 'seq_spreads': Sequential spreads data
+            If None, queries all available curve types.
+        start_date : str, optional
+            Start date filter in 'YYYY-MM-DD' format
+        end_date : str, optional
+            End date filter in 'YYYY-MM-DD' format
+        columns : sequence of str, optional
+            Specific columns to return
+        where : str, optional
+            Custom pandas HDFStore where clause
+        combine_datasets : bool, default False
+            If True, combine all curve types into single DataFrame with MultiIndex columns
+            
+        Returns:
+        --------
+        pd.DataFrame or Dict[str, pd.DataFrame]
+            Curve data matching the query criteria
+            
+        Examples:
+        ---------
+        >>> client = DataClient()
+        
+        # Query all curve data for crude oil
+        >>> curve_data = client.query_curve_data('CL')
+        
+        # Query specific curve types
+        >>> front_data = client.query_curve_data('ZC', curve_types=['front', 'dte'])
+        
+        # Query with date filtering
+        >>> recent_curves = client.query_curve_data('CL', start_date='2024-01-01')
+        
+        # Combine all curve types into single DataFrame
+        >>> combined = client.query_curve_data('ZC', combine_datasets=True)
+        """
+        # Ensure symbol has _F suffix
+        if not symbol.endswith('_F'):
+            symbol_key = f"{symbol}_F"
+        else:
+            symbol_key = symbol
+        
+        # Define available curve types and their market keys
+        available_curve_types = {
+            "curve": f"{symbol_key}/curve",
+            "front": f"{symbol_key}/front_month", 
+            "dte": f"{symbol_key}/days_to_expiry",
+            "seq_curve": f"{symbol_key}/curve_seq",
+            "seq_labels": f"{symbol_key}/curve_seq_labels",
+            "seq_dte": f"{symbol_key}/days_to_expiry_seq",
+            "seq_spreads": f"{symbol_key}/spreads_seq"
+        }
+        
+        # Determine which curve types to query
+        if curve_types is None:
+            curve_types_to_query = list(available_curve_types.keys())
+        elif isinstance(curve_types, str):
+            curve_types_to_query = [curve_types]
+        else:
+            curve_types_to_query = list(curve_types)
+        
+        # Validate curve types
+        invalid_types = [ct for ct in curve_types_to_query if ct not in available_curve_types]
+        if invalid_types:
+            raise ValueError(f"Invalid curve types: {invalid_types}. Available types: {list(available_curve_types.keys())}")
+        
+        # Build where clause for date filtering
+        date_conditions = []
+        if start_date:
+            date_conditions.append(f"index >= '{start_date}'")
+        if end_date:
+            date_conditions.append(f"index <= '{end_date}'")
+        
+        combined_where = None
+        if date_conditions and where:
+            combined_where = f"({' & '.join(date_conditions)}) & ({where})"
+        elif date_conditions:
+            combined_where = ' & '.join(date_conditions)
+        elif where:
+            combined_where = where
+        
+        # Query each curve type
+        results = {}
+        available_keys = self.list_market_data()
+        
+        for curve_type in curve_types_to_query:
+            market_key = f"market/{available_curve_types[curve_type]}"
+            
+            if market_key not in available_keys:
+                print(f"Warning: {market_key} not found in available data")
+                continue
+            
+            try:
+                df = self.read_market(
+                    market_key,
+                    where=combined_where,
+                    columns=columns
+                )
+                results[curve_type] = df
+                
+            except Exception as e:
+                print(f"Error querying {market_key}: {e}")
+                continue
+        
+        # Return results
+        if not results:
+            return pd.DataFrame() if len(curve_types_to_query) == 1 or combine_datasets else {}
+        
+        if len(results) == 1 and not combine_datasets:
+            return list(results.values())[0]
+        elif combine_datasets:
+            return self._combine_curve_datasets(results)
+        else:
+            return results
+    
+    def _combine_curve_datasets(self, datasets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+        """
+        Combine multiple curve datasets into a single DataFrame.
+        
+        Parameters:
+        -----------
+        datasets : Dict[str, pd.DataFrame]
+            Dictionary of curve_type -> DataFrame
+            
+        Returns:
+        --------
+        pd.DataFrame
+            Combined DataFrame with MultiIndex columns (curve_type, column)
+        """
+        if not datasets:
+            return pd.DataFrame()
+        
+        if len(datasets) == 1:
+            return list(datasets.values())[0]
+        
+        # Create MultiIndex columns
+        combined_data = {}
+        for curve_type, df in datasets.items():
+            for col in df.columns:
+                combined_data[(curve_type, col)] = df[col]
+        
+        result = pd.DataFrame(combined_data)
+        result.columns = pd.MultiIndex.from_tuples(result.columns, names=['CurveType', 'Field'])
+        
+        return result
+    
+    def list_available_curve_data(self) -> Dict[str, List[str]]:
+        """
+        List all available curve data by symbol.
+        
+        Returns:
+        --------
+        Dict[str, List[str]]
+            Dictionary mapping symbol to list of available curve types
+        """
+        available_keys = self.list_market_data()
+        curve_data = {}
+        
+        # Look for curve-related keys
+        curve_patterns = {
+            'curve': '/curve',
+            'front': '/front_month',
+            'dte': '/days_to_expiry',
+            'seq_curve': '/curve_seq', 
+            'seq_labels': '/curve_seq_labels',
+            'seq_dte': '/days_to_expiry_seq',
+            'seq_spreads': '/spreads_seq'
+        }
+        
+        for key in available_keys:
+            if key.startswith('market/'):
+                # Extract potential symbol (everything before the curve type)
+                key_suffix = key.replace('market/', '')
+                
+                for curve_type, pattern in curve_patterns.items():
+                    if key_suffix.endswith(pattern):
+                        # Extract symbol by removing the pattern
+                        symbol = key_suffix.replace(pattern, '')
+                        if symbol not in curve_data:
+                            curve_data[symbol] = []
+                        curve_data[symbol].append(curve_type)
+                        break
+        
+        return curve_data
+    
+    def get_curve_data_summary(self, symbol: str) -> Dict[str, Any]:
+        """
+        Get summary information about curve data for a specific symbol.
+        
+        Parameters:
+        -----------
+        symbol : str
+            Symbol to get curve summary for (e.g., 'CL_F' or 'CL')
+            
+        Returns:
+        --------
+        Dict[str, Any]
+            Summary information including available curve types, date ranges, etc.
+        """
+        # Ensure symbol has _F suffix
+        if not symbol.endswith('_F'):
+            symbol_key = f"{symbol}_F"
+        else:
+            symbol_key = symbol
+        
+        curve_types = {
+            "curve": f"{symbol_key}/curve",
+            "front": f"{symbol_key}/front_month",
+            "dte": f"{symbol_key}/days_to_expiry", 
+            "seq_curve": f"{symbol_key}/curve_seq",
+            "seq_labels": f"{symbol_key}/curve_seq_labels",
+            "seq_dte": f"{symbol_key}/days_to_expiry_seq",
+            "seq_spreads": f"{symbol_key}/spreads_seq"
+        }
+        
+        available_keys = self.list_market_data()
+        summary = {
+            'symbol': symbol_key,
+            'available_curve_types': [],
+            'curve_info': {}
+        }
+        
+        for curve_type, curve_path in curve_types.items():
+            market_key = f"market/{curve_path}"
+            
+            if market_key in available_keys:
+                summary['available_curve_types'].append(curve_type)
+                
+                try:
+                    # Get basic info about this curve type
+                    sample = self.read_market(market_key, start=0, stop=1)
+                    
+                    with pd.HDFStore(self.market_path, "r") as store:
+                        if market_key in store:
+                            storer = store.get_storer(market_key)
+                            nrows = storer.nrows if storer else 0
+                            
+                            # Get date range efficiently
+                            if nrows > 0:
+                                first_row = store.select(market_key, start=0, stop=1)
+                                last_row = store.select(market_key, start=nrows-1, stop=nrows) if nrows > 1 else first_row
+                                
+                                summary['curve_info'][curve_type] = {
+                                    'rows': nrows,
+                                    'columns': list(sample.columns) if len(sample) > 0 else [],
+                                    'date_range': {
+                                        'start': first_row.index[0] if len(first_row) > 0 else None,
+                                        'end': last_row.index[0] if len(last_row) > 0 else None
+                                    }
+                                }
+                                
+                except Exception as e:
+                    summary['curve_info'][curve_type] = {'error': str(e)}
+        
+        return summary
+    
+    def display_curve_data_summary(self, symbol: str) -> None:
+        """
+        Display curve data summary in a readable format.
+        
+        Parameters:
+        -----------
+        symbol : str
+            Symbol to display summary for
+        """
+        try:
+            summary = self.get_curve_data_summary(symbol)
+            
+            print(f"=" * 80)
+            print(f"CURVE DATA SUMMARY: {summary['symbol']}")
+            print(f"=" * 80)
+            
+            available_types = summary['available_curve_types']
+            if not available_types:
+                print("No curve data found for this symbol.")
+                return
+            
+            print(f"Available curve types: {len(available_types)}")
+            print(f"Types: {', '.join(available_types)}")
+            print()
+            
+            # Display details for each curve type
+            for curve_type in available_types:
+                info = summary['curve_info'].get(curve_type, {})
+                
+                if 'error' in info:
+                    print(f"{curve_type.upper()}: Error - {info['error']}")
+                    continue
+                
+                print(f"{curve_type.upper()}:")
+                print(f"  Rows: {info.get('rows', 0):,}")
+                print(f"  Columns: {len(info.get('columns', []))}")
+                
+                if 'date_range' in info:
+                    date_range = info['date_range']
+                    if date_range['start'] and date_range['end']:
+                        start_str = date_range['start'].strftime('%Y-%m-%d') if hasattr(date_range['start'], 'strftime') else str(date_range['start'])
+                        end_str = date_range['end'].strftime('%Y-%m-%d') if hasattr(date_range['end'], 'strftime') else str(date_range['end'])
+                        print(f"  Date Range: {start_str} to {end_str}")
+                
+                # Show first few columns
+                columns = info.get('columns', [])
+                if columns:
+                    cols_to_show = columns[:5]  # Show first 5 columns
+                    cols_str = ', '.join(cols_to_show)
+                    if len(columns) > 5:
+                        cols_str += f" ... (+{len(columns) - 5} more)"
+                    print(f"  Columns: {cols_str}")
+                print()
+            
+            print(f"=" * 80)
+            
+        except Exception as e:
+            print(f"Error displaying curve summary for {symbol}: {e}")
+    
     def list_available_cot_metrics(self) -> List[str]:
         """
         List all tickers that have COT metrics available.
@@ -2244,3 +2583,4 @@ class DataClient:
                 written[code] = dest_key
 
         return written
+

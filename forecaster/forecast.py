@@ -5,9 +5,10 @@ import pandas as pd
 import numpy as np
 from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+from sklearn.model_selection import TimeSeriesSplit, cross_val_score, ParameterGrid, GridSearchCV
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 import lightgbm as lgb
+from xgboost import XGBRegressor, XGBClassifier
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -164,7 +165,7 @@ class CTAForecast:
         else:
             # Default to COT index change
             mm_net = df['money_manager_longs'] - df['money_manager_shorts']
-            cot_index = self.calculate_cot_index(mm_net)
+            cot_index = self.data_processor.calculate_cot_index(mm_net)
             target = cot_index.diff(periods=forecast_horizon).shift(-forecast_horizon)
 
         self.target = target.dropna()
@@ -196,11 +197,6 @@ class CTAForecast:
 
 
         return features
-
-
-
-
-
     
     def resample_weekly(self, df, day_of_week='Friday', price_agg='last', volume_agg='sum', cot_agg='last'):
         """Resample data to weekly frequency on specified day
@@ -534,7 +530,8 @@ class CTAForecast:
         }
     
     def train_model(self, model_type='ridge', target_type='return', forecast_horizon=10, 
-                   test_size=0.2, **model_params):
+                   test_size=0.2, use_grid_search=False, param_grid=None, 
+                   grid_search_cv=5, grid_search_scoring='neg_mean_squared_error', **model_params):
         """Convenience method to train and validate models
         
         Args:
@@ -542,10 +539,14 @@ class CTAForecast:
             target_type: 'return', 'cta_positioning', 'cot_index_change'
             forecast_horizon: Days ahead to predict
             test_size: Fraction of data for testing
+            use_grid_search: Whether to use grid search for hyperparameter tuning (LightGBM only)
+            param_grid: Dictionary of parameters for grid search (LightGBM only)
+            grid_search_cv: Number of CV folds for grid search
+            grid_search_scoring: Scoring metric for grid search
             **model_params: Parameters to pass to the model
             
         Returns:
-            Dictionary with model, predictions, and performance metrics
+            Dictionary with model, predictions, performance metrics, and grid search results (if used)
         """
         if self.features is None or self.data is None:
             raise ValueError("Must load and prepare data first using load_and_prepare_data()")
@@ -581,6 +582,7 @@ class CTAForecast:
             raise ValueError(f"Unknown model_type: {model_type}")
         
         # Fit the model
+        grid_search_results = None
         if model_type == 'lightgbm':
             # Use validation set for early stopping
             val_size = int(len(X_train) * 0.2)
@@ -589,8 +591,24 @@ class CTAForecast:
             X_train_fit = X_train.iloc[:-val_size]
             y_train_fit = y_train.iloc[:-val_size]
             
-            model.fit(X_train_fit, y_train_fit, eval_set=(X_val, y_val))
+            if use_grid_search:
+                # Use grid search to find best parameters
+                grid_results = model.fit_with_grid_search(
+                    X_train_fit, y_train_fit, 
+                    param_grid=param_grid,
+                    eval_set=(X_val, y_val),
+                    cv_folds=grid_search_cv,
+                    scoring=grid_search_scoring,
+                    verbose=True
+                )
+                grid_search_results = grid_results['grid_search_results']
+            else:
+                # Standard fit
+                model.fit(X_train_fit, y_train_fit, eval_set=(X_val, y_val))
         else:
+            # Linear models don't support grid search in this implementation
+            if use_grid_search:
+                print("Warning: Grid search not supported for linear models. Using standard fit.")
             model.fit(X_train, y_train)
         
         # Make predictions
@@ -605,7 +623,7 @@ class CTAForecast:
         model_key = f"{model_type}_{target_type}_{forecast_horizon}d"
         self.models[model_key] = model
         
-        return {
+        result = {
             'model': model,
             'model_key': model_key,
             'train_predictions': train_pred,
@@ -620,6 +638,12 @@ class CTAForecast:
                 'test_period': (X_test.index[0], X_test.index[-1])
             }
         }
+        
+        # Add grid search results if available
+        if grid_search_results is not None:
+            result['grid_search_results'] = grid_search_results
+            
+        return result
     
     def cross_validate_model(self, model_type='ridge', target_type='return', 
                            forecast_horizon=10, cv_folds=5, **model_params):
@@ -666,7 +690,7 @@ class CTAForecast:
 
         return cv_results
 
-    def run_selected_features(self, selected_features=None, base_model=None, model_type='ridge', top_n=20,
+    def run_selected_features(self, selected_features=None, base_model=None, model_type='ridge',top_n=20,
                               test_size=0.2, **model_params):
         """Train a model on a selected set of features.
 
@@ -1422,6 +1446,193 @@ class CTALight:
             importance = self.feature_importance
             
         return importance.head(top_n)
+    
+    def grid_search(self, X, y, param_grid=None, cv_folds=5, scoring='neg_mean_squared_error', 
+                   early_stopping_rounds=50, num_boost_round=1000, verbose=True):
+        """Perform grid search for hyperparameter optimization
+        
+        Args:
+            X: Features DataFrame or array
+            y: Target Series or array
+            param_grid: Dictionary of parameters to search over. If None, uses default grid.
+            cv_folds: Number of CV folds for validation
+            scoring: Scoring metric ('neg_mean_squared_error', 'neg_mean_absolute_error', 'r2')
+            early_stopping_rounds: Early stopping patience for each model
+            num_boost_round: Maximum boosting rounds for each model
+            verbose: Whether to print progress
+            
+        Returns:
+            Dictionary with best parameters, best score, and all results
+        """
+        # Default parameter grid if none provided
+        if param_grid is None:
+            param_grid = {
+                'num_leaves': [ 31, 50],
+                'learning_rate':  [0.05, 0.1],
+                'feature_fraction': [0.7, 0.9],
+                'bagging_fraction': [0.7, 0.8, 0.9],
+                'min_child_samples': [10, 30],
+                'reg_alpha': [0.1, 0.2],
+                'reg_lambda': [0.1, 0.2]
+            }
+        
+        # Convert to numpy arrays
+        if isinstance(X, pd.DataFrame):
+            feature_names = list(X.columns)
+            X = X.values
+        else:
+            feature_names = [f'feature_{i}' for i in range(X.shape[1])]
+            
+        if isinstance(y, pd.Series):
+            y = y.values
+            
+        # Remove rows with NaN values
+        mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
+        X_clean = X[mask]
+        y_clean = y[mask]
+        
+        # Generate all parameter combinations
+        from itertools import product
+        param_names = list(param_grid.keys())
+        param_values = list(param_grid.values())
+        param_combinations = list(product(*param_values))
+        
+        if verbose:
+            print(f"Testing {len(param_combinations)} parameter combinations...")
+        
+        # Time series cross-validation
+        tscv = TimeSeriesSplit(n_splits=cv_folds)
+        
+        best_score = float('-inf') if scoring == 'r2' else float('inf')
+        best_params = None
+        all_results = []
+        
+        for i, param_combo in enumerate(param_combinations):
+            # Create parameter dictionary for this combination
+            current_params = dict(zip(param_names, param_combo))
+            
+            # Update base parameters with current combination
+            test_params = {**self.params, **current_params}
+            
+            # Perform cross-validation for this parameter set
+            cv_scores = []
+            
+            for train_idx, val_idx in tscv.split(X_clean):
+                X_train, X_val = X_clean[train_idx], X_clean[val_idx]
+                y_train, y_val = y_clean[train_idx], y_clean[val_idx]
+                
+                # Create datasets
+                train_data = lgb.Dataset(X_train, label=y_train, feature_name=feature_names)
+                val_data = lgb.Dataset(X_val, label=y_val, reference=train_data, feature_name=feature_names)
+                
+                # Train model with current parameters
+                model = lgb.train(
+                    test_params,
+                    train_data,
+                    valid_sets=[train_data, val_data],
+                    valid_names=['train', 'valid'],
+                    callbacks=[lgb.early_stopping(early_stopping_rounds)],
+                    num_boost_round=num_boost_round,
+                )
+                
+                # Make predictions and calculate score
+                pred = model.predict(X_val)
+                
+                if scoring == 'neg_mean_squared_error':
+                    score = -mean_squared_error(y_val, pred)
+                elif scoring == 'neg_mean_absolute_error':
+                    score = -mean_absolute_error(y_val, pred)
+                elif scoring == 'r2':
+                    score = r2_score(y_val, pred)
+                else:
+                    raise ValueError(f"Unsupported scoring metric: {scoring}")
+                
+                cv_scores.append(score)
+            
+            # Calculate mean CV score
+            mean_cv_score = np.mean(cv_scores)
+            std_cv_score = np.std(cv_scores)
+            
+            # Store results
+            result = {
+                'params': current_params,
+                'mean_cv_score': mean_cv_score,
+                'std_cv_score': std_cv_score,
+                'cv_scores': cv_scores
+            }
+            all_results.append(result)
+            
+            # Check if this is the best score
+            is_better = (mean_cv_score > best_score) if scoring == 'r2' else (mean_cv_score < abs(best_score))
+            
+            if is_better:
+                best_score = mean_cv_score
+                best_params = current_params
+            
+            if verbose and (i + 1) % 10 == 0:
+                print(f"Completed {i + 1}/{len(param_combinations)} combinations. Best score so far: {best_score:.4f}")
+        
+        if verbose:
+            print(f"\nGrid search completed!")
+            print(f"Best parameters: {best_params}")
+            print(f"Best {scoring}: {best_score:.4f}")
+        
+        # Update model parameters with best found
+        self.params.update(best_params)
+        
+        return {
+            'best_params': best_params,
+            'best_score': best_score,
+            'best_params_full': {**self.params, **best_params},
+            'all_results': all_results,
+            'scoring_metric': scoring
+        }
+    
+    def fit_with_grid_search(self, X, y, param_grid=None, eval_set=None, cv_folds=5, 
+                           scoring='neg_mean_squared_error', early_stopping_rounds=50, 
+                           num_boost_round=1000, verbose=True):
+        """Perform grid search and then fit the model with best parameters
+        
+        Args:
+            X: Features DataFrame or array
+            y: Target Series or array
+            param_grid: Dictionary of parameters to search over
+            eval_set: Validation set as tuple (X_val, y_val)
+            cv_folds: Number of CV folds for grid search
+            scoring: Scoring metric for grid search
+            early_stopping_rounds: Early stopping patience
+            num_boost_round: Maximum boosting rounds
+            verbose: Whether to print progress
+            
+        Returns:
+            Dictionary with grid search results and fitted model
+        """
+        if verbose:
+            print("Starting grid search for hyperparameter optimization...")
+        
+        # Perform grid search
+        grid_results = self.grid_search(
+            X, y, param_grid=param_grid, cv_folds=cv_folds, 
+            scoring=scoring, early_stopping_rounds=early_stopping_rounds,
+            num_boost_round=num_boost_round, verbose=verbose
+        )
+        
+        if verbose:
+            print(f"\nFitting final model with best parameters...")
+        
+        # Fit model with best parameters
+        self.fit(X, y, eval_set=eval_set, early_stopping_rounds=early_stopping_rounds, 
+                num_boost_round=num_boost_round)
+        
+        if verbose:
+            print("Model fitting completed!")
+        
+        return {
+            'grid_search_results': grid_results,
+            'model': self,
+            'best_params': grid_results['best_params'],
+            'best_score': grid_results['best_score']
+        }
     
     def plot_importance(self, max_num_features=20, importance_type='gain'):
         """Plot feature importance (requires matplotlib)
