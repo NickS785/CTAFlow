@@ -1,5 +1,6 @@
 import datetime
 import os.path
+from pathlib import Path
 
 from data.signals_processing import COTProcessor, TechnicalAnalysis
 from data.retrieval import fetch_data_sync
@@ -10,6 +11,7 @@ from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score, ParameterGrid, GridSearchCV
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.ensemble import RandomForestRegressor
 import lightgbm as lgb
 from xgboost import XGBRegressor
 import warnings
@@ -60,7 +62,7 @@ class CTAForecast:
                          resample_after=False,
                          resample_day="Wednesday",
                          remove_weekends=True,
-                         filter_valid_price
+                         filter_valid_prices=True):
         """Create comprehensive feature set from your data structure
 
         Args:
@@ -204,8 +206,6 @@ class CTAForecast:
 
         if 'cum_delta' in selected_intraday_features:
             features['cum_delta'] = ind.cumulative_delta(indicator_horizons)
-
-
 
         return features
     
@@ -571,6 +571,8 @@ class CTAForecast:
             model = CTALight(**model_params)
         elif model_type == 'xgboost':
             model = CTAXGBoost(**model_params)
+        elif model_type == 'randomforest':
+            model = CTARForest(**model_params)
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -594,6 +596,19 @@ class CTAForecast:
                 grid_search_results = grid_results['grid_search_results']
             else:
                 model.fit(X_train_fit, y_train_fit, eval_set=(X_val, y_val))
+        elif model_type == 'randomforest':
+            # Random Forest doesn't need separate validation set for early stopping
+            if use_grid_search:
+                grid_results = model.fit_with_grid_search(
+                    X_train, y_train,
+                    param_grid=param_grid,
+                    cv_folds=grid_search_cv,
+                    scoring=grid_search_scoring,
+                    verbose=True
+                )
+                grid_search_results = grid_results['grid_search_results']
+            else:
+                model.fit(X_train, y_train)
         else:
             if use_grid_search:
                 print("Warning: Grid search not supported for linear models. Using standard fit.")
@@ -628,12 +643,12 @@ class CTAForecast:
         """Convenience method to train and validate models
 
         Args:
-            model_type: 'linear', 'ridge', 'lasso', 'elastic_net', 'lightgbm', 'xgboost'
+            model_type: 'linear', 'ridge', 'lasso', 'elastic_net', 'lightgbm', 'xgboost', 'randomforest'
             target_type: 'return', 'cta_positioning', 'cot_index_change'
             forecast_horizon: Days ahead to predict
             test_size: Fraction of data for testing
-            use_grid_search: Whether to use grid search for hyperparameter tuning (LightGBM/XGBoost only)
-            param_grid: Dictionary of parameters for grid search (LightGBM/XGBoost only)
+            use_grid_search: Whether to use grid search for hyperparameter tuning (LightGBM/XGBoost/RandomForest only)
+            param_grid: Dictionary of parameters for grid search (LightGBM/XGBoost/RandomForest only)
             grid_search_cv: Number of CV folds for grid search
             grid_search_scoring: Scoring metric for grid search
             **model_params: Parameters to pass to the model
@@ -667,7 +682,7 @@ class CTAForecast:
         """Perform time series cross-validation
         
         Args:
-            model_type: 'linear', 'ridge', 'lasso', 'elastic_net', 'lightgbm', 'xgboost'
+            model_type: 'linear', 'ridge', 'lasso', 'elastic_net', 'lightgbm', 'xgboost', 'randomforest'
             target_type: 'return', 'cta_positioning', 'cot_index_change'
             forecast_horizon: Days ahead to predict
             cv_folds: Number of CV folds
@@ -705,6 +720,9 @@ class CTAForecast:
         elif model_type == 'xgboost':
             model = CTAXGBoost(**model_params)
             cv_results = model.cross_validate(X, y, cv_folds=cv_folds)
+        elif model_type == 'randomforest':
+            model = CTARForest(**model_params)
+            cv_results = model.cross_validate(X, y, cv_folds=cv_folds)
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -727,7 +745,7 @@ class CTAForecast:
             base_model: Trained model instance or key in ``self.models``
                 with a ``feature_importance`` attribute (used if selected_features is None).
             model_type: Type of model to train on the selected features
-                ('linear', 'ridge', 'lasso', 'elastic_net', 'lightgbm', 'xgboost').
+                ('linear', 'ridge', 'lasso', 'elastic_net', 'lightgbm', 'xgboost', 'randomforest').
             top_n: Number of top features to use from ``base_model`` (ignored if selected_features provided).
             test_size: Fraction of samples for the test split.
             **model_params: Additional parameters passed to the new model.
@@ -770,7 +788,8 @@ class CTAForecast:
         X = self.features[top_features]
         y = self.target
 
-        result = self._fit_model(X, y, model_type=model_type, test_size=test_size, **model_params)
+        result = self._fit_model(X, y, model_type=model_type, test_size=test_size,
+                                 use_grid_search=use_grid_search,param_grid=param_grid,grid_search_cv=grid_search_cv, grid_search_scoring=grid_search_scoring, **model_params)
 
         if selected_features is not None:
             model_key = f"fs_{model_type}_{len(selected_features)}features"
@@ -934,34 +953,56 @@ class CTAForecast:
         
         return pd.DataFrame(summary_data)
 
-    def save_model(self, base_model, save_file=None):
+    def save_model(self, base_model, file_out_name=None):
         if not os.path.exists(self.saved_model_folder):
             os.mkdir(self.saved_model_folder)
 
         if isinstance(base_model, str):
             if base_model not in self.models:
                 raise ValueError(f"Model '{base_model}' not found in self.models")
-            model_key = base_model
-            saved_model = self.models[base_model]
-        if isinstance(base_model, dict):
+            else:
+                model_key = base_model
+                saved_model = self.models[base_model]
+        elif isinstance(base_model, dict):
             if 'model' in base_model.keys() and 'model_key' in base_model.keys():
                 model_key = base_model['model_key']
                 saved_model = base_model['model']
             else:
                 raise ValueError("No model/model_key pairs found in dict keys")
         else:
-
-            if isinstance(base_model, CTALinear or CTALight or CTAXGBoost):
+            if isinstance(base_model, (CTALinear, CTALight, CTAXGBoost, CTARForest)):
                 model_key = f"{self.symbol}_{datetime.datetime.now().strftime('%m-%d.%H.%M')}"
                 saved_model = base_model
                 pass
             else:
                 raise TypeError("Failed to detect model")
+        if not file_out_name:
+            file_out_name = model_key
 
-        with open(self.saved_model_folder / f"{model_key}.pkl", 'wb') as save_file:
+        file_loc = self.saved_model_folder / f"{file_out_name}.pkl"
+        with open(file_loc, 'wb') as save_file:
             pickle.dump(saved_model, save_file)
 
+        print(f"Model saved to {file_loc.__str__()}")
+
         return
+
+    def load_model(self, model_key:str, model_folder=None):
+
+        if not model_folder:
+            model_folder = self.saved_model_folder
+        if not isinstance(model_folder, Path or os.PathLike):
+            try:
+                model_folder = Path(model_folder)
+            except Exception as e:
+                raise e
+
+        file_location = model_folder / model_key
+        with open(file_location, 'rb') as file_loc:
+            self.models[model_key] = pickle.load(file_loc)
+
+        return self.models[model_key]
+
 
 
 class IntradayFeatures:
@@ -1057,6 +1098,7 @@ class IntradayFeatures:
                              name=f'{window}d_cumulative_delta')
         
         return cd_series
+
 
 class CTALinear:
     """Linear regression models optimized for CTA positioning prediction"""
@@ -1226,7 +1268,7 @@ class CTALinear:
             'directional_accuracy': np.mean(np.sign(pred_clean) == np.sign(y_clean)) if len(y_clean) > 0 else 0.0
         }
     
-    def get_feature_importance(self, top_n=30):
+    def get_feature_importance(self, top_n=35):
         """Get feature importance (coefficient magnitudes)
         
         Args:
@@ -1863,7 +1905,7 @@ class CTAXGBoost:
             'directional_accuracy': np.mean(np.sign(pred_clean) == np.sign(y_clean)) if len(y_clean) > 0 else 0.0
         }
 
-    def get_feature_importance(self, top_n=20):
+    def get_feature_importance(self, top_n=35):
         """Get feature importance"""
         if self.feature_importance is None:
             raise ValueError("Model must be fitted first")
@@ -1950,6 +1992,337 @@ class CTAXGBoost:
             'best_params': grid_results['best_params'],
             'best_score': grid_results['best_score']
         }
+
+
+class CTARForest:
+    """Random Forest model optimized for CTA positioning prediction"""
+    
+    def __init__(self, **rf_params):
+        """Initialize Random Forest model with CTA-optimized defaults
+        
+        Args:
+            **rf_params: Random Forest parameters to override defaults
+        """
+        # CTA-optimized default parameters
+        default_params = {
+            'n_estimators': 200,
+            'max_depth': 10,
+            'min_samples_split': 5,
+            'min_samples_leaf': 2,
+            'max_features': 'sqrt',
+            'bootstrap': True,
+            'oob_score': True,
+            'n_jobs': -1,
+            'random_state': 42
+        }
+        
+        # Default parameter grid for grid search
+        self.default_grid = {
+            'n_estimators': [100, 200, 300],
+            'max_depth': [5, 10, 15, None],
+            'min_samples_split': [2, 5, 10],
+            'min_samples_leaf': [1, 2, 4],
+            'max_features': ['sqrt', 'log2', None]
+        }
+        
+        self.params = {**default_params, **rf_params}
+        self.model = RandomForestRegressor(**self.params)
+        self.is_fitted = False
+        self.feature_names = None
+        self.feature_importance = None
+        
+    def fit(self, X, y, eval_set=None):
+        """Fit the Random Forest model
+        
+        Args:
+            X: Features DataFrame or array
+            y: Target Series or array  
+            eval_set: Not used for Random Forest but kept for interface consistency
+        """
+        # Convert to numpy arrays and handle missing values
+        if isinstance(X, pd.DataFrame):
+            self.feature_names = list(X.columns)
+            X = X.values
+        else:
+            self.feature_names = [f'feature_{i}' for i in range(X.shape[1])]
+            
+        if isinstance(y, pd.Series):
+            y = y.values
+            
+        # Remove rows with NaN values
+        mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
+        X_clean = X[mask]
+        y_clean = y[mask]
+        
+        if len(X_clean) == 0:
+            raise ValueError("No valid samples after removing NaN values")
+        
+        # Create and fit the model
+        self.model = RandomForestRegressor(**self.params)
+        self.model.fit(X_clean, y_clean)
+        self.is_fitted = True
+        
+        # Store feature importance
+        self.feature_importance = pd.Series(
+            self.model.feature_importances_,
+            index=self.feature_names
+        ).sort_values(ascending=False)
+        
+        return self
+    
+    def predict(self, X):
+        """Make predictions
+        
+        Args:
+            X: Features DataFrame or array
+            
+        Returns:
+            Predictions array
+        """
+        if not self.is_fitted:
+            raise ValueError("Model must be fitted before making predictions")
+        
+        # Convert to numpy array
+        if isinstance(X, pd.DataFrame):
+            X = X.values
+            
+        return self.model.predict(X)
+    
+    def cross_validate(self, X, y, cv_folds=5, scoring='neg_mean_squared_error'):
+        """Perform time series cross-validation
+        
+        Args:
+            X: Features DataFrame or array
+            y: Target Series or array
+            cv_folds: Number of CV folds
+            scoring: Scoring method
+            
+        Returns:
+            Dictionary with CV results
+        """
+        # Convert to numpy arrays
+        if isinstance(X, pd.DataFrame):
+            X = X.values
+        if isinstance(y, pd.Series):
+            y = y.values
+            
+        # Remove rows with NaN values
+        mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
+        X_clean = X[mask]
+        y_clean = y[mask]
+        
+        # Use TimeSeriesSplit for proper temporal validation
+        tscv = TimeSeriesSplit(n_splits=cv_folds)
+        model = RandomForestRegressor(**self.params)
+        
+        # Perform cross-validation
+        cv_scores = cross_val_score(
+            model, X_clean, y_clean, 
+            cv=tscv, scoring=scoring, n_jobs=-1
+        )
+        
+        return {
+            'mean_score': cv_scores.mean(),
+            'std_score': cv_scores.std(),
+            'all_scores': cv_scores,
+            'scoring_method': scoring
+        }
+    
+    def evaluate(self, X_test, y_test):
+        """Evaluate model performance on test set
+        
+        Args:
+            X_test: Test features
+            y_test: Test targets
+            
+        Returns:
+            Dictionary with performance metrics
+        """
+        predictions = self.predict(X_test)
+        
+        # Convert to numpy arrays for consistent handling
+        if isinstance(y_test, pd.Series):
+            y_test = y_test.values
+            
+        # Remove NaN values for evaluation
+        mask = ~(np.isnan(predictions) | np.isnan(y_test))
+        pred_clean = predictions[mask]
+        y_clean = y_test[mask]
+        
+        if len(pred_clean) == 0:
+            raise ValueError("No valid predictions for evaluation")
+        
+        return {
+            'mse': mean_squared_error(y_clean, pred_clean),
+            'rmse': np.sqrt(mean_squared_error(y_clean, pred_clean)),
+            'mae': mean_absolute_error(y_clean, pred_clean),
+            'r2': r2_score(y_clean, pred_clean),
+            'directional_accuracy': np.mean(np.sign(pred_clean) == np.sign(y_clean)) if len(y_clean) > 0 else 0.0,
+            'oob_score': self.model.oob_score_ if hasattr(self.model, 'oob_score_') else None
+        }
+    
+    def get_feature_importance(self, top_n=35):
+        """Get feature importance
+        
+        Args:
+            top_n: Number of top features to return
+            
+        Returns:
+            Series with top feature importances
+        """
+        if self.feature_importance is None:
+            raise ValueError("Model must be fitted first")
+            
+        return self.feature_importance.head(top_n)
+    
+    def grid_search(self, X, y, param_grid=None, cv_folds=5, 
+                   scoring='neg_mean_squared_error', verbose=True):
+        """Perform grid search for hyperparameter optimization
+        
+        Args:
+            X: Features DataFrame or array
+            y: Target Series or array
+            param_grid: Dictionary of parameters to search over. If None, uses default grid.
+            cv_folds: Number of CV folds for validation
+            scoring: Scoring metric ('neg_mean_squared_error', 'neg_mean_absolute_error', 'r2')
+            verbose: Whether to print progress
+            
+        Returns:
+            Dictionary with best parameters, best score, and all results
+        """
+        # Convert to numpy arrays
+        if isinstance(X, pd.DataFrame):
+            self.feature_names = list(X.columns)
+            X = X.values
+        else:
+            self.feature_names = [f'feature_{i}' for i in range(X.shape[1])]
+            
+        if isinstance(y, pd.Series):
+            y = y.values
+            
+        # Remove rows with NaN values
+        mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
+        X_clean = X[mask]
+        y_clean = y[mask]
+        
+        # Default parameter grid if none provided
+        if param_grid is None:
+            param_grid = {
+                'n_estimators': [100, 200],
+                'max_depth': [5, 10, None],
+                'min_samples_split': [2, 5],
+                'min_samples_leaf': [1, 2],
+                'max_features': ['sqrt', 'log2']
+            }
+        
+        if verbose:
+            print(f"Testing Random Forest grid search with {len(ParameterGrid(param_grid))} parameter combinations...")
+        
+        # Time series cross-validation
+        tscv = TimeSeriesSplit(n_splits=cv_folds)
+        base_model = RandomForestRegressor(**self.params)
+        
+        grid = GridSearchCV(
+            base_model,
+            param_grid,
+            cv=tscv,
+            scoring=scoring,
+            n_jobs=-1,
+            verbose=1 if verbose else 0
+        )
+        
+        grid.fit(X_clean, y_clean)
+        
+        if verbose:
+            print(f"\nGrid search completed!")
+            print(f"Best parameters: {grid.best_params_}")
+            print(f"Best {scoring}: {grid.best_score_:.4f}")
+        
+        # Update model parameters with best found
+        self.params.update(grid.best_params_)
+        self.model = grid.best_estimator_
+        self.is_fitted = True
+        
+        # Update feature importance
+        self.feature_importance = pd.Series(
+            self.model.feature_importances_,
+            index=self.feature_names
+        ).sort_values(ascending=False)
+        
+        return {
+            'best_params': grid.best_params_,
+            'best_score': grid.best_score_,
+            'best_params_full': self.params,
+            'cv_results': grid.cv_results_,
+            'scoring_metric': scoring
+        }
+    
+    def fit_with_grid_search(self, X, y, param_grid=None, eval_set=None, cv_folds=5,
+                           scoring='neg_mean_squared_error', verbose=True):
+        """Perform grid search and then fit the model with best parameters
+        
+        Args:
+            X: Features DataFrame or array
+            y: Target Series or array
+            param_grid: Dictionary of parameters to search over
+            eval_set: Not used for Random Forest but kept for interface consistency
+            cv_folds: Number of CV folds for grid search
+            scoring: Scoring metric for grid search
+            verbose: Whether to print progress
+            
+        Returns:
+            Dictionary with grid search results and fitted model
+        """
+        if verbose:
+            print("Starting grid search for Random Forest hyperparameter optimization...")
+        
+        param_grid = param_grid or self.default_grid
+        
+        # Perform grid search
+        grid_results = self.grid_search(
+            X, y, param_grid=param_grid, cv_folds=cv_folds,
+            scoring=scoring, verbose=verbose
+        )
+        
+        if verbose:
+            print(f"\nFitting final model with best parameters...")
+        
+        # Model is already fitted by grid_search, but we'll refit to be consistent
+        self.fit(X, y, eval_set=eval_set)
+        
+        if verbose:
+            print("Random Forest model fitting completed!")
+        
+        return {
+            'grid_search_results': grid_results,
+            'model': self,
+            'best_params': grid_results['best_params'],
+            'best_score': grid_results['best_score']
+        }
+    
+    def plot_importance(self, max_num_features=20):
+        """Plot feature importance (requires matplotlib)
+        
+        Args:
+            max_num_features: Maximum number of features to plot
+        """
+        try:
+            import matplotlib.pyplot as plt
+            
+            importance = self.get_feature_importance(max_num_features)
+            
+            plt.figure(figsize=(10, 6))
+            plt.barh(range(len(importance)), importance.values)
+            plt.yticks(range(len(importance)), importance.index)
+            plt.xlabel('Feature Importance')
+            plt.title('Random Forest Feature Importance')
+            plt.gca().invert_yaxis()
+            plt.tight_layout()
+            plt.show()
+            
+        except ImportError:
+            print("matplotlib required for plotting. Install with: pip install matplotlib")
+            return self.get_feature_importance(max_num_features)
 
 
 
