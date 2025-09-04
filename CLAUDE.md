@@ -11,7 +11,7 @@ This is a CTA (Commodity Trading Advisor) positioning prediction system that use
 The codebase follows a modular pipeline architecture with four main components:
 
 ### Data Layer (`data/`)
-- **`retrieval.py`**: Asynchronous data loading from HDF5 stores using `fetch_market_cot_data()`
+- **`retrieval.py`**: Asynchronous data loading from HDF5 stores using `fetch_data_sync()` 
 - **`signals_processing.py`**: Technical analysis and COT signal generation
   - `DataProcessor`: Handles COT data cleaning and positioning metrics
   - `TechnicalAnalysis`: Calculates selective technical indicators and volatility normalization
