@@ -4,7 +4,7 @@ import re
 import calendar
 from datetime import datetime, timedelta
 from typing import Callable, Dict, Optional, Tuple, List
-from config import *
+from ..config import *
 
 import numpy as np
 import pandas as pd
@@ -732,7 +732,7 @@ class FuturesCurveManager:
             
         # Use DataClient for consistent path structure and proper writing
         try:
-            from data.data_client import DataClient
+            from .data_client import DataClient
             client = DataClient(market_path=self.hdf_path)
             
             # Ensure symbol has _F suffix for consistency

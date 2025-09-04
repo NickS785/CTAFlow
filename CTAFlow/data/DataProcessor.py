@@ -16,9 +16,9 @@ import threading
 from queue import Queue
 import time
 
-from config import RAW_MARKET_DATA_PATH, MARKET_DATA_PATH, TICKER_TO_CODE
-from data.data_client import DataClient
-from data.futures_curve_manager import FuturesCurveManager
+from ..config import RAW_MARKET_DATA_PATH, MARKET_DATA_PATH, TICKER_TO_CODE
+from .data_client import DataClient
+from .futures_curve_manager import FuturesCurveManager
 
 
 class DataProcessor:
@@ -955,7 +955,7 @@ def query_market_data(*args, **kwargs):
     >>> # Advanced filtering
     >>> df = query_market_data('ZC_F', where='Volume > 1000', columns=['Open', 'High', 'Low', 'Last'])
     """
-    from data.data_client import DataClient
+    from .data_client import DataClient
     client = DataClient()
     return client.query_market_data(*args, **kwargs)
 
@@ -990,7 +990,7 @@ def create_daily_market_data(replace: bool = True, progress: bool = True):
     >>> # Silent processing
     >>> results = create_daily_market_data(progress=False)
     """
-    from data.data_client import DataClient
+    from .data_client import DataClient
     client = DataClient()
     return client.create_daily_resampled_data(replace=replace, progress=progress)
 
@@ -1045,7 +1045,7 @@ def process_futures_curves_for_all_tickers(
     >>> # Multi-threaded processing
     >>> results = process_futures_curves_for_all_tickers(max_workers=8)
     """
-    from data.data_client import DataClient
+    from .data_client import DataClient
     
     client = DataClient()
     processor = DataProcessor()

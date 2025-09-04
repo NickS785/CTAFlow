@@ -16,7 +16,7 @@ from typing import List, Dict, Set, Optional
 from enum import Enum
 import glob
 
-from config import RAW_MARKET_DATA_PATH, FUTURES_MAP, TICKER_TO_CODE
+from ..config import RAW_MARKET_DATA_PATH, FUTURES_MAP, TICKER_TO_CODE
 
 
 class ReportType(Enum):

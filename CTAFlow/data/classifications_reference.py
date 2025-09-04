@@ -5,8 +5,8 @@ This module provides easy access to all ticker classifications and demonstrates
 the automatic COT report type system.
 """
 
-from data.ticker_classifier import get_ticker_classifier, is_financial_ticker, get_cot_report_type, get_cot_storage_path
-from config import TICKER_TO_CODE
+from .ticker_classifier import get_ticker_classifier, is_financial_ticker, get_cot_report_type, get_cot_storage_path
+from ..config import TICKER_TO_CODE
 
 
 # Complete classification mappings for ALL 48 tickers in futures_mappings.toml
@@ -185,13 +185,13 @@ def print_classification_summary():
     print("=" * 80)
     print("""
 # Get classification info
-from data.classifications_reference import get_ticker_classification_info
+from .classifications_reference import get_ticker_classification_info
 
 info = get_ticker_classification_info('ES_F')
 print(f"{info['ticker']}: {info['classification']}, {info['report_type']}")
 
 # Use with DataClient
-from data.data_client import DataClient
+from .data_client import DataClient
 client = DataClient()
 
 # Automatic report type selection

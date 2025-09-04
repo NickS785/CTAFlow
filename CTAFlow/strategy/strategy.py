@@ -1,4 +1,4 @@
-from forecaster.forecast import CTAForecast
+from ..forecaster.forecast import CTAForecast
 import pandas as pd
 
 class RegimeStrategy:

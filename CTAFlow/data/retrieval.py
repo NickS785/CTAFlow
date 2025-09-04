@@ -2,11 +2,11 @@ import datetime
 
 import pandas as pd
 import numpy as np
-from config import MARKET_DATA_PATH, COT_DATA_PATH, APP_ROOT
+from ..config import MARKET_DATA_PATH, COT_DATA_PATH, APP_ROOT
 import toml
 import asyncio
 from pathlib import Path
-from data.data_client import DataClient as DClient
+from .data_client import DataClient as DClient
 
 
 # Load futures mappings from TOML file
