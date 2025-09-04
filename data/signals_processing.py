@@ -147,7 +147,7 @@ class COTProcessor:
         # 2. Flow Features (Changes in positioning)
         if 'flows' in selected_cot_features and 'mm_net_position' in features:
             if flow_periods is None:
-                flow_periods = [4, 13]
+                flow_periods = [8, 13]
             for periods in flow_periods:  # 1w to 26w (6 months)
                 features[f'mm_net_flow_{periods}w'] = features['mm_net_position'].diff(periods)
 
@@ -514,3 +514,9 @@ class TechnicalAnalysis:
 
         return regime
 
+class SpreadAnalysis:
+
+    def __init__(self):
+
+
+        return
