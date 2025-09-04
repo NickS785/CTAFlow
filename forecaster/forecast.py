@@ -1,6 +1,9 @@
+import datetime
+import os.path
+
 from data.signals_processing import COTProcessor, TechnicalAnalysis
 from data.retrieval import fetch_data_sync
-from data.data_client import DataClient as Client
+from data.data_client import DataClient as DataClient
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
@@ -10,6 +13,9 @@ from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 import lightgbm as lgb
 from xgboost import XGBRegressor
 import warnings
+import pickle
+import datetime as dt
+from config import MODEL_DATA_PATH
 warnings.filterwarnings('ignore')
 
 
@@ -21,6 +27,7 @@ class CTAForecast:
         self.technical_analyzer = TechnicalAnalysis()
         self.models = {}
         self.symbol = ticker_symbol
+        self.saved_model_folder = MODEL_DATA_PATH / ticker_symbol
         
         # Fetch data and apply COT column renaming
         raw_data = fetch_data_sync(ticker_symbol, daily=use_daily_data, **kwargs)
@@ -53,57 +60,21 @@ class CTAForecast:
                          resample_after=False,
                          resample_day="Wednesday",
                          remove_weekends=True,
-                         filter_valid_prices=True):
+                         filter_valid_price
+        """Create comprehensive feature set from your data structure
 
-        """Generate a comprehensive feature matrix for forecasting.
-
-        Parameters
-        ----------
-        include_technical : bool, default True
-            Whether to compute any technical indicators.
-        selected_indicators : list[str] or None, optional
-            Specific technical indicator groups to calculate. Valid options are
-            ``['moving_averages', 'macd', 'rsi', 'atr', 'volume', 'momentum',
-            'confluence', 'vol_normalized']``. If ``None`` all available
-            indicators are used when ``include_technical`` is ``True``.
-        normalize_momentum : bool, default False
-            If ``True`` volatility normalised momentum features are added.
-        vol_return_periods : list[int], optional
-            Periods over which to calculate volatility normalised returns.
-            Defaults to ``[1, 5, 10, 20]`` when ``None``.
-        include_intraday : bool, default True
-            Include intraday derived features such as realised volatility.
-        selected_intraday_features : list[str] or None, optional
-            Specific intraday feature names to compute. Defaults to
-            ``['rv', 'rsv', 'cum_delta']`` when ``None``.
-        intraday_horizon : int, default 5
-            Look-back window in days for intraday calculations.
-        include_cot : bool, default True
-            Whether to include Commitments of Traders (COT) based features.
-        selected_cot_features : list[str] or None, optional
-            COT feature groups to calculate. Valid options are
-            ``['positioning', 'flows', 'extremes', 'market_structure',
-            'interactions', 'spreads']``. If ``None`` all groups are used when
-            ``include_cot`` is ``True``.
-        resample_before_calcs : bool, default False
-            Resample the raw data to weekly frequency prior to feature
-            generation.
-        resample_after : bool, default False
-            Resample the computed feature matrix after generation.
-        resample_day : str, default ``"Wednesday"``
-            Day of week to anchor weekly resampling when ``resample_before_calcs``
-            or ``resample_after`` is ``True``.
-        remove_weekends : bool, default True
-            Drop Saturday/Sunday observations before feature creation.
-        filter_valid_prices : bool, default True
-            When technical indicators are requested, restrict calculations to
-            rows containing valid price data.
-
-        Returns
-        -------
-        pd.DataFrame
-            DataFrame containing all engineered features aligned to the input
-            data index.
+        Args:
+            include_technical: Whether to include any technical indicators
+            selected_indicators: List of specific technical indicator groups to include
+                               ['moving_averages', 'macd', 'rsi', 'atr', 'volume', 'momentum', 'confluence', 'vol_normalized']
+            normalize_momentum: Whether to include volatility-normalized momentum
+            vol_return_periods: List of periods for volatility-normalized returns
+            include_cot: Whether to include COT features
+            selected_cot_features: List of COT feature groups to include
+                                 ['positioning', 'flows', 'extremes', 'market_structure', 'interactions', 'spreads']
+            filter_valid_prices: Whether to filter to rows with valid price data when including technical features
+            :param include_intraday:
+            :param resample_before_calcs:
         """
         df = self.data.copy()
         if remove_weekends:
@@ -689,6 +660,7 @@ class CTAForecast:
         self.models[model_key] = result['model']
         result['model_key'] = model_key
         return result
+
     
     def cross_validate_model(self, model_type='ridge', target_type='return',
                            forecast_horizon=10, cv_folds=5, **model_params):
@@ -739,6 +711,10 @@ class CTAForecast:
         return cv_results
 
     def run_selected_features(self, selected_features=None, base_model=None, model_type='ridge',top_n=20,
+                              use_grid_search=False,
+                              param_grid=None,
+                              grid_search_cv=3,
+                              grid_search_scoring="neg_mean_squared_error",
                               test_size=0.2, **model_params):
         """Train a model on a selected set of features.
 
@@ -958,8 +934,38 @@ class CTAForecast:
         
         return pd.DataFrame(summary_data)
 
+    def save_model(self, base_model, save_file=None):
+        if not os.path.exists(self.saved_model_folder):
+            os.mkdir(self.saved_model_folder)
+
+        if isinstance(base_model, str):
+            if base_model not in self.models:
+                raise ValueError(f"Model '{base_model}' not found in self.models")
+            model_key = base_model
+            saved_model = self.models[base_model]
+        if isinstance(base_model, dict):
+            if 'model' in base_model.keys() and 'model_key' in base_model.keys():
+                model_key = base_model['model_key']
+                saved_model = base_model['model']
+            else:
+                raise ValueError("No model/model_key pairs found in dict keys")
+        else:
+
+            if isinstance(base_model, CTALinear or CTALight or CTAXGBoost):
+                model_key = f"{self.symbol}_{datetime.datetime.now().strftime('%m-%d.%H.%M')}"
+                saved_model = base_model
+                pass
+            else:
+                raise TypeError("Failed to detect model")
+
+        with open(self.saved_model_folder / f"{model_key}.pkl", 'wb') as save_file:
+            pickle.dump(saved_model, save_file)
+
+        return
+
+
 class IntradayFeatures:
-    client = Client()
+    client = DataClient()
 
     def __init__(self, ticker_symbol, close_col="Last", bid_volume="BidVolume", ask_volume="AskVolume", volume="Volume"):
 
@@ -1051,10 +1057,6 @@ class IntradayFeatures:
                              name=f'{window}d_cumulative_delta')
         
         return cd_series
-
-
-
-
 
 class CTALinear:
     """Linear regression models optimized for CTA positioning prediction"""
@@ -1224,7 +1226,7 @@ class CTALinear:
             'directional_accuracy': np.mean(np.sign(pred_clean) == np.sign(y_clean)) if len(y_clean) > 0 else 0.0
         }
     
-    def get_feature_importance(self, top_n=20):
+    def get_feature_importance(self, top_n=30):
         """Get feature importance (coefficient magnitudes)
         
         Args:
@@ -1746,6 +1748,11 @@ class CTAXGBoost:
             'random_state': 42,
             'n_jobs': -1
         }
+        self.default_grid = dict(learning_rate=[0.01, 0.1, 0.2],
+                                 max_depth=[3, 5, 7, 9],
+                                 subsample=[0.8, 0.9, 1.0],
+                                 n_estimators=[200],
+                                 max_leaves=[5, 7, 8])
 
         self.params = {**default_params, **xgb_params}
         self.model = XGBRegressor(**self.params)
@@ -1753,7 +1760,7 @@ class CTAXGBoost:
         self.feature_names = None
         self.feature_importance = None
 
-    def fit(self, X, y, eval_set=None, early_stopping_rounds=50):
+    def fit(self, X, y, eval_set=None,):
         """Fit the XGBoost model"""
         if isinstance(X, pd.DataFrame):
             self.feature_names = list(X.columns)
@@ -1789,7 +1796,6 @@ class CTAXGBoost:
             X_clean,
             y_clean,
             eval_set=eval_sets,
-            early_stopping_rounds=early_stopping_rounds,
             verbose=False
         )
 
@@ -1918,11 +1924,12 @@ class CTAXGBoost:
         }
 
     def fit_with_grid_search(self, X, y, param_grid=None, eval_set=None, cv_folds=5,
-                             scoring='neg_mean_squared_error', early_stopping_rounds=50,
+                             scoring='neg_mean_squared_error',
                              verbose=True):
         """Perform grid search then fit the model with best parameters"""
         if verbose:
             print("Starting grid search for hyperparameter optimization...")
+        param_grid = param_grid or self.default_grid
 
         grid_results = self.grid_search(
             X, y, param_grid=param_grid, cv_folds=cv_folds,
@@ -1932,7 +1939,7 @@ class CTAXGBoost:
         if verbose:
             print("\nFitting final model with best parameters...")
 
-        self.fit(X, y, eval_set=eval_set, early_stopping_rounds=early_stopping_rounds)
+        self.fit(X, y, eval_set=eval_set)
 
         if verbose:
             print("Model fitting completed!")

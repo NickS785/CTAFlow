@@ -16,11 +16,12 @@ import threading
 from queue import Queue
 import time
 
-from config import RAW_MARKET_DATA_PATH, MARKET_DATA_PATH, TICKER_TO_CODE
+from config import RAW_MARKET_DATA_PATH, MARKET_DATA_PATH, TICKER_TO_CODEf
 from data.data_client import DataClient
+from futures_curve_manager import FuturesCurveManager
 
 
-class MDataProcessor:
+class DataProcessor:
     """
     Process and format market data CSV files for HDF5 storage.
     """
@@ -39,6 +40,7 @@ class MDataProcessor:
         self.raw_data_path = Path(raw_data_path) if raw_data_path else RAW_MARKET_DATA_PATH
         self.hdf5_path = Path(hdf5_path) if hdf5_path else MARKET_DATA_PATH
         self.client = DataClient()
+        self.curve_manager = FuturesCurveManager()
         
         # Thread-safe progress tracking
         self._progress_lock = threading.Lock()
@@ -674,7 +676,7 @@ def process_market_data(year: str = '25', replace: bool = True, use_threading: b
     Dict[str, int]
         Dictionary mapping ticker symbols to number of rows processed
     """
-    processor = MDataProcessor()
+    processor = DataProcessor()
     results = processor.process_all_csv_files(year=year, replace=replace, use_threading=use_threading, max_workers=max_workers)
     processor.get_processing_summary(results)
     return results
@@ -698,7 +700,7 @@ def process_market_data_fast(year: str = '25', replace: bool = True, max_workers
     Dict[str, int]
         Dictionary mapping ticker symbols to number of rows processed
     """
-    processor = MDataProcessor()
+    processor = DataProcessor()
     
     # Use maximum available cores for fastest processing
     if max_workers is None:
@@ -729,7 +731,7 @@ def process_single_file(ticker_prefix: str, year: str = '25', replace: bool = Tr
     Optional[int]
         Number of rows processed, or None if failed
     """
-    processor = MDataProcessor()
+    processor = DataProcessor()
     
     # Find the specific file
     csv_files = processor.discover_csv_files(year)
