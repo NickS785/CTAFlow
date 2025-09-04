@@ -529,18 +529,18 @@ class CTAForecast:
             'cot_features': self.cot_features
         }
     
-    def train_model(self, model_type='ridge', target_type='return', forecast_horizon=10, 
-                   test_size=0.2, use_grid_search=False, param_grid=None, 
+    def train_model(self, model_type='ridge', target_type='return', forecast_horizon=10,
+                   test_size=0.2, use_grid_search=False, param_grid=None,
                    grid_search_cv=5, grid_search_scoring='neg_mean_squared_error', **model_params):
         """Convenience method to train and validate models
         
         Args:
-            model_type: 'linear', 'ridge', 'lasso', 'elastic_net', 'lightgbm'
+            model_type: 'linear', 'ridge', 'lasso', 'elastic_net', 'lightgbm', 'xgboost'
             target_type: 'return', 'cta_positioning', 'cot_index_change'
             forecast_horizon: Days ahead to predict
             test_size: Fraction of data for testing
-            use_grid_search: Whether to use grid search for hyperparameter tuning (LightGBM only)
-            param_grid: Dictionary of parameters for grid search (LightGBM only)
+            use_grid_search: Whether to use grid search for hyperparameter tuning (LightGBM/XGBoost only)
+            param_grid: Dictionary of parameters for grid search (LightGBM/XGBoost only)
             grid_search_cv: Number of CV folds for grid search
             grid_search_scoring: Scoring metric for grid search
             **model_params: Parameters to pass to the model
@@ -578,23 +578,25 @@ class CTAForecast:
             model = CTALinear(model_type=model_type, **model_params)
         elif model_type == 'lightgbm':
             model = CTALight(**model_params)
+        elif model_type == 'xgboost':
+            model = CTAXGBoost(**model_params)
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
-        
+
         # Fit the model
         grid_search_results = None
-        if model_type == 'lightgbm':
+        if model_type in ['lightgbm', 'xgboost']:
             # Use validation set for early stopping
             val_size = int(len(X_train) * 0.2)
             X_val = X_train.iloc[-val_size:]
             y_val = y_train.iloc[-val_size:]
             X_train_fit = X_train.iloc[:-val_size]
             y_train_fit = y_train.iloc[:-val_size]
-            
+
             if use_grid_search:
                 # Use grid search to find best parameters
                 grid_results = model.fit_with_grid_search(
-                    X_train_fit, y_train_fit, 
+                    X_train_fit, y_train_fit,
                     param_grid=param_grid,
                     eval_set=(X_val, y_val),
                     cv_folds=grid_search_cv,
@@ -645,12 +647,12 @@ class CTAForecast:
             
         return result
     
-    def cross_validate_model(self, model_type='ridge', target_type='return', 
+    def cross_validate_model(self, model_type='ridge', target_type='return',
                            forecast_horizon=10, cv_folds=5, **model_params):
         """Perform time series cross-validation
         
         Args:
-            model_type: 'linear', 'ridge', 'lasso', 'elastic_net', 'lightgbm'
+            model_type: 'linear', 'ridge', 'lasso', 'elastic_net', 'lightgbm', 'xgboost'
             target_type: 'return', 'cta_positioning', 'cot_index_change'
             forecast_horizon: Days ahead to predict
             cv_folds: Number of CV folds
@@ -685,6 +687,9 @@ class CTAForecast:
         elif model_type == 'lightgbm':
             model = CTALight(**model_params)
             cv_results = model.cross_validate(X, y, cv_folds=cv_folds)
+        elif model_type == 'xgboost':
+            model = CTAXGBoost(**model_params)
+            cv_results = model.cross_validate(X, y, cv_folds=cv_folds)
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -703,7 +708,7 @@ class CTAForecast:
             base_model: Trained model instance or key in ``self.models``
                 with a ``feature_importance`` attribute (used if selected_features is None).
             model_type: Type of model to train on the selected features
-                ('linear', 'ridge', 'lasso', 'elastic_net', 'lightgbm').
+                ('linear', 'ridge', 'lasso', 'elastic_net', 'lightgbm', 'xgboost').
             top_n: Number of top features to use from ``base_model`` (ignored if selected_features provided).
             test_size: Fraction of samples for the test split.
             **model_params: Additional parameters passed to the new model.
@@ -761,10 +766,12 @@ class CTAForecast:
             model = CTALinear(model_type=model_type, **model_params)
         elif model_type == 'lightgbm':
             model = CTALight(**model_params)
+        elif model_type == 'xgboost':
+            model = CTAXGBoost(**model_params)
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
 
-        if model_type == 'lightgbm':
+        if model_type in ['lightgbm', 'xgboost']:
             val_size = int(len(X_train) * 0.2)
             X_val = X_train.iloc[-val_size:]
             y_val = y_train.iloc[-val_size:]
@@ -1651,6 +1658,226 @@ class CTALight:
             print("matplotlib required for plotting. Install with: pip install matplotlib")
             return self.get_feature_importance(importance_type, max_num_features)
 
+
+class CTAXGBoost:
+    """XGBoost model optimized for CTA positioning prediction"""
+
+    def __init__(self, **xgb_params):
+        """Initialize XGBoost model with CTA-optimized defaults
+
+        Args:
+            **xgb_params: XGBoost parameters to override defaults
+        """
+        default_params = {
+            'objective': 'reg:squarederror',
+            'eval_metric': 'rmse',
+            'learning_rate': 0.05,
+            'max_depth': 6,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'n_estimators': 200,
+            'reg_alpha': 0.1,
+            'reg_lambda': 0.1,
+            'random_state': 42,
+            'n_jobs': -1
+        }
+
+        self.params = {**default_params, **xgb_params}
+        self.model = XGBRegressor(**self.params)
+        self.is_fitted = False
+        self.feature_names = None
+        self.feature_importance = None
+
+    def fit(self, X, y, eval_set=None, early_stopping_rounds=50):
+        """Fit the XGBoost model"""
+        if isinstance(X, pd.DataFrame):
+            self.feature_names = list(X.columns)
+            X = X.values
+        else:
+            self.feature_names = [f'feature_{i}' for i in range(X.shape[1])]
+
+        if isinstance(y, pd.Series):
+            y = y.values
+
+        mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
+        X_clean = X[mask]
+        y_clean = y[mask]
+
+        if len(X_clean) == 0:
+            raise ValueError("No valid samples after removing NaN values")
+
+        eval_sets = None
+        if eval_set is not None:
+            X_val, y_val = eval_set
+            if isinstance(X_val, pd.DataFrame):
+                X_val = X_val.values
+            if isinstance(y_val, pd.Series):
+                y_val = y_val.values
+            val_mask = ~(np.isnan(X_val).any(axis=1) | np.isnan(y_val))
+            X_val_clean = X_val[val_mask]
+            y_val_clean = y_val[val_mask]
+            if len(X_val_clean) > 0:
+                eval_sets = [(X_val_clean, y_val_clean)]
+
+        self.model = XGBRegressor(**self.params)
+        self.model.fit(
+            X_clean,
+            y_clean,
+            eval_set=eval_sets,
+            early_stopping_rounds=early_stopping_rounds,
+            verbose=False
+        )
+
+        self.is_fitted = True
+        self.feature_importance = pd.Series(
+            self.model.feature_importances_,
+            index=self.feature_names
+        ).sort_values(ascending=False)
+
+        return self
+
+    def predict(self, X):
+        """Make predictions"""
+        if not self.is_fitted:
+            raise ValueError("Model must be fitted before making predictions")
+
+        if isinstance(X, pd.DataFrame):
+            X = X.values
+
+        return self.model.predict(X)
+
+    def cross_validate(self, X, y, cv_folds=5, scoring='neg_mean_squared_error'):
+        """Perform time series cross-validation"""
+        if isinstance(X, pd.DataFrame):
+            X = X.values
+        if isinstance(y, pd.Series):
+            y = y.values
+
+        mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
+        X_clean = X[mask]
+        y_clean = y[mask]
+
+        tscv = TimeSeriesSplit(n_splits=cv_folds)
+        model = XGBRegressor(**self.params)
+        cv_scores = cross_val_score(
+            model, X_clean, y_clean, cv=tscv, scoring=scoring, n_jobs=-1
+        )
+
+        return {
+            'mean_score': cv_scores.mean(),
+            'std_score': cv_scores.std(),
+            'all_scores': cv_scores,
+            'scoring_method': scoring
+        }
+
+    def evaluate(self, X_test, y_test):
+        """Evaluate model performance on test set"""
+        predictions = self.predict(X_test)
+
+        if isinstance(y_test, pd.Series):
+            y_test = y_test.values
+
+        mask = ~(np.isnan(predictions) | np.isnan(y_test))
+        pred_clean = predictions[mask]
+        y_clean = y_test[mask]
+
+        if len(pred_clean) == 0:
+            raise ValueError("No valid predictions for evaluation")
+
+        return {
+            'mse': mean_squared_error(y_clean, pred_clean),
+            'rmse': np.sqrt(mean_squared_error(y_clean, pred_clean)),
+            'mae': mean_absolute_error(y_clean, pred_clean),
+            'r2': r2_score(y_clean, pred_clean),
+            'directional_accuracy': np.mean(np.sign(pred_clean) == np.sign(y_clean)) if len(y_clean) > 0 else 0.0
+        }
+
+    def get_feature_importance(self, top_n=20):
+        """Get feature importance"""
+        if self.feature_importance is None:
+            raise ValueError("Model must be fitted first")
+
+        return self.feature_importance.head(top_n)
+
+    def grid_search(self, X, y, param_grid=None, cv_folds=5,
+                    scoring='neg_mean_squared_error', verbose=True):
+        """Perform grid search over hyperparameters"""
+        if isinstance(X, pd.DataFrame):
+            self.feature_names = list(X.columns)
+            X = X.values
+        else:
+            self.feature_names = [f'feature_{i}' for i in range(X.shape[1])]
+
+        if isinstance(y, pd.Series):
+            y = y.values
+
+        mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
+        X_clean = X[mask]
+        y_clean = y[mask]
+
+        if param_grid is None:
+            param_grid = {
+                'max_depth': [3, 6, 9],
+                'learning_rate': [0.01, 0.1],
+                'subsample': [0.8, 1.0],
+                'colsample_bytree': [0.8, 1.0],
+                'n_estimators': [100, 200]
+            }
+
+        tscv = TimeSeriesSplit(n_splits=cv_folds)
+        base_model = XGBRegressor(**self.params)
+        grid = GridSearchCV(
+            base_model,
+            param_grid,
+            cv=tscv,
+            scoring=scoring,
+            n_jobs=-1,
+            verbose=1 if verbose else 0
+        )
+        grid.fit(X_clean, y_clean)
+
+        self.params.update(grid.best_params_)
+        self.model = grid.best_estimator_
+        self.is_fitted = True
+        self.feature_importance = pd.Series(
+            self.model.feature_importances_,
+            index=self.feature_names
+        ).sort_values(ascending=False)
+
+        return {
+            'best_params': grid.best_params_,
+            'best_score': grid.best_score_,
+            'best_params_full': self.params,
+            'cv_results': grid.cv_results_,
+            'scoring_metric': scoring
+        }
+
+    def fit_with_grid_search(self, X, y, param_grid=None, eval_set=None, cv_folds=5,
+                             scoring='neg_mean_squared_error', early_stopping_rounds=50,
+                             verbose=True):
+        """Perform grid search then fit the model with best parameters"""
+        if verbose:
+            print("Starting grid search for hyperparameter optimization...")
+
+        grid_results = self.grid_search(
+            X, y, param_grid=param_grid, cv_folds=cv_folds,
+            scoring=scoring, verbose=verbose
+        )
+
+        if verbose:
+            print("\nFitting final model with best parameters...")
+
+        self.fit(X, y, eval_set=eval_set, early_stopping_rounds=early_stopping_rounds)
+
+        if verbose:
+            print("Model fitting completed!")
+
+        return {
+            'grid_search_results': grid_results,
+            'model': self,
+            'best_params': grid_results['best_params'],
+            'best_score': grid_results['best_score']
+        }
 
 
 
