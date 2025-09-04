@@ -1,6 +1,6 @@
 from data.signals_processing import COTProcessor, TechnicalAnalysis
 from data.retrieval import fetch_data_sync
-from data.data_client import DataClient as Client
+from data.data_client import DataClient as DataClient
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
@@ -10,6 +10,8 @@ from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 import lightgbm as lgb
 from xgboost import XGBRegressor, XGBClassifier
 import warnings
+import pickle
+from config import MODEL_DATA_PATH
 warnings.filterwarnings('ignore')
 
 
@@ -21,6 +23,7 @@ class CTAForecast:
         self.technical_analyzer = TechnicalAnalysis()
         self.models = {}
         self.symbol = ticker_symbol
+        self.saved_model_folder = MODEL_DATA_PATH / ticker_symbol
         
         # Fetch data and apply COT column renaming
         raw_data = fetch_data_sync(ticker_symbol, daily=use_daily_data, **kwargs)
@@ -67,6 +70,8 @@ class CTAForecast:
             selected_cot_features: List of COT feature groups to include
                                  ['positioning', 'flows', 'extremes', 'market_structure', 'interactions', 'spreads']
             filter_valid_prices: Whether to filter to rows with valid price data when including technical features
+            :param include_intraday:
+            :param resample_before_calcs:
         """
         df = self.data.copy()
         if remove_weekends:
@@ -646,6 +651,7 @@ class CTAForecast:
             result['grid_search_results'] = grid_search_results
             
         return result
+
     
     def cross_validate_model(self, model_type='ridge', target_type='return',
                            forecast_horizon=10, cv_folds=5, **model_params):
@@ -696,6 +702,10 @@ class CTAForecast:
         return cv_results
 
     def run_selected_features(self, selected_features=None, base_model=None, model_type='ridge',top_n=20,
+                              use_grid_search=False,
+                              param_grid=None,
+                              grid_search_cv=3,
+                              grid_search_scoring="neg_mean_squared_error",
                               test_size=0.2, **model_params):
         """Train a model on a selected set of features.
 
@@ -777,7 +787,21 @@ class CTAForecast:
             y_val = y_train.iloc[-val_size:]
             X_train_fit = X_train.iloc[:-val_size]
             y_train_fit = y_train.iloc[:-val_size]
-            model.fit(X_train_fit, y_train_fit, eval_set=(X_val, y_val))
+            if use_grid_search:
+                # Use grid search to find best parameters
+                grid_results = model.fit_with_grid_search(
+                    X_train_fit, y_train_fit,
+                    param_grid=param_grid,
+                    eval_set=(X_val, y_val),
+                    cv_folds=grid_search_cv,
+                    scoring=grid_search_scoring,
+                    verbose=True
+                )
+                grid_search_results = grid_results['grid_search_results']
+            else:
+                # Standard fit
+                model.fit(X_train_fit, y_train_fit, eval_set=(X_val, y_val))
+
         else:
             model.fit(X_train, y_train)
 
@@ -893,8 +917,33 @@ class CTAForecast:
         
         return pd.DataFrame(summary_data)
 
+    def save_model(self, base_model, save_file=None):
+        if isinstance(base_model, str):
+            if base_model not in self.models:
+                raise ValueError(f"Model '{base_model}' not found in self.models")
+            model_key = base_model
+            saved_model = self.models[base_model]
+        if isinstance(base_model, dict):
+            if 'model' in base_model.keys() and 'model_key' in base_model.keys():
+                model_key = base_model['model_key']
+                saved_model = base_model['model']
+            else:
+                raise ValueError("No model/model_key pairs found in dict keys")
+        else:
+            if isinstance(base_model, CTALinear or CTALight or CTAXGBoost):
+                if not save_file:
+                    raise ValueError("Save file is required for a non-string/dict entry")
+                else:
+                    model_key = save_file
+                    saved_model = base_model
+        with open(self.saved_model_folder / f"{model_key}.pkl", 'w') as save_file:
+            pickle.dump(saved_model, save_file)
+
+        return
+
+
 class IntradayFeatures:
-    client = Client()
+    client = DataClient()
 
     def __init__(self, ticker_symbol, close_col="Last", bid_volume="BidVolume", ask_volume="AskVolume", volume="Volume"):
 
@@ -986,10 +1035,6 @@ class IntradayFeatures:
                              name=f'{window}d_cumulative_delta')
         
         return cd_series
-
-
-
-
 
 class CTALinear:
     """Linear regression models optimized for CTA positioning prediction"""
@@ -1159,7 +1204,7 @@ class CTALinear:
             'directional_accuracy': np.mean(np.sign(pred_clean) == np.sign(y_clean)) if len(y_clean) > 0 else 0.0
         }
     
-    def get_feature_importance(self, top_n=20):
+    def get_feature_importance(self, top_n=30):
         """Get feature importance (coefficient magnitudes)
         
         Args:
@@ -1681,6 +1726,11 @@ class CTAXGBoost:
             'random_state': 42,
             'n_jobs': -1
         }
+        self.default_grid = dict(learning_rate=[0.01, 0.1, 0.2],
+                                 max_depth=[3, 5, 7, 9],
+                                 subsample=[0.8, 0.9, 1.0],
+                                 n_estimators=[200],
+                                 max_leaves=[5, 7, 8])
 
         self.params = {**default_params, **xgb_params}
         self.model = XGBRegressor(**self.params)
@@ -1688,7 +1738,7 @@ class CTAXGBoost:
         self.feature_names = None
         self.feature_importance = None
 
-    def fit(self, X, y, eval_set=None, early_stopping_rounds=50):
+    def fit(self, X, y, eval_set=None,):
         """Fit the XGBoost model"""
         if isinstance(X, pd.DataFrame):
             self.feature_names = list(X.columns)
@@ -1724,7 +1774,6 @@ class CTAXGBoost:
             X_clean,
             y_clean,
             eval_set=eval_sets,
-            early_stopping_rounds=early_stopping_rounds,
             verbose=False
         )
 
@@ -1853,11 +1902,12 @@ class CTAXGBoost:
         }
 
     def fit_with_grid_search(self, X, y, param_grid=None, eval_set=None, cv_folds=5,
-                             scoring='neg_mean_squared_error', early_stopping_rounds=50,
+                             scoring='neg_mean_squared_error',
                              verbose=True):
         """Perform grid search then fit the model with best parameters"""
         if verbose:
             print("Starting grid search for hyperparameter optimization...")
+        param_grid = param_grid or self.default_grid
 
         grid_results = self.grid_search(
             X, y, param_grid=param_grid, cv_folds=cv_folds,
@@ -1867,7 +1917,7 @@ class CTAXGBoost:
         if verbose:
             print("\nFitting final model with best parameters...")
 
-        self.fit(X, y, eval_set=eval_set, early_stopping_rounds=early_stopping_rounds)
+        self.fit(X, y, eval_set=eval_set)
 
         if verbose:
             print("Model fitting completed!")

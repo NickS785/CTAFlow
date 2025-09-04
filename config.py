@@ -7,6 +7,7 @@ import os
 MARKET_DATA_PATH = Path("F:\\", 'Data', 'market_data.hd5')
 COT_DATA_PATH = Path("F:\\", 'Data', 'cot_data.hd5' )
 RAW_MARKET_DATA_PATH = Path("F:\\", 'charts')
+MODEL_DATA_PATH = Path("F:\\", "ML", "models")
 
 APP_ROOT = Path(__file__).parent
 with open(APP_ROOT / 'data' / 'futures_mappings.toml') as map:
