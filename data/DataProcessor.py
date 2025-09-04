@@ -16,9 +16,9 @@ import threading
 from queue import Queue
 import time
 
-from config import RAW_MARKET_DATA_PATH, MARKET_DATA_PATH, TICKER_TO_CODEf
+from config import RAW_MARKET_DATA_PATH, MARKET_DATA_PATH, TICKER_TO_CODE
 from data.data_client import DataClient
-from futures_curve_manager import FuturesCurveManager
+from data.futures_curve_manager import FuturesCurveManager
 
 
 class DataProcessor:
@@ -40,7 +40,7 @@ class DataProcessor:
         self.raw_data_path = Path(raw_data_path) if raw_data_path else RAW_MARKET_DATA_PATH
         self.hdf5_path = Path(hdf5_path) if hdf5_path else MARKET_DATA_PATH
         self.client = DataClient()
-        self.curve_manager = FuturesCurveManager()
+        self.curve_manager = FuturesCurveManager
         
         # Thread-safe progress tracking
         self._progress_lock = threading.Lock()
@@ -653,6 +653,174 @@ class DataProcessor:
                 print(f"  {ticker}: Processing failed")
         
         print("="*60)
+    
+    def process_futures_curves_for_all_market_data(
+        self, 
+        prefer_front_series: bool = True,
+        match_tol: float = 0.01,
+        rel_jump_thresh: float = 0.01,
+        robust_k: float = 4.0,
+        max_workers: Optional[int] = None,
+        progress: bool = True
+    ) -> Dict[str, any]:
+        """
+        Process futures curves for all available market data tickers using FuturesCurveManager.
+        
+        This method discovers all market data tickers available in the HDF5 store and runs
+        futures curve processing for each one using the integrated FuturesCurveManager.
+        
+        Parameters:
+        -----------
+        prefer_front_series : bool, default True
+            Whether to prefer front month series in curve construction
+        match_tol : float, default 0.01
+            Price matching tolerance for curve alignment
+        rel_jump_thresh : float, default 0.01
+            Relative jump threshold for roll detection
+        robust_k : float, default 4.0
+            Robust scaling parameter for outlier detection
+        max_workers : int, optional
+            Maximum number of worker threads for parallel processing
+        progress : bool, default True
+            Whether to show progress messages
+            
+        Returns:
+        --------
+        Dict[str, any]
+            Processing results with successful/failed tickers and summary statistics
+        """
+        try:
+            # Get list of all available market data keys
+            all_market_keys = self.client.list_market_data()
+            
+            if not all_market_keys:
+                if progress:
+                    print("No market data found for futures curve processing")
+                return {'successful': {}, 'failed': {}, 'summary': 'No market data available'}
+            
+            # Filter to get only base ticker symbols (avoid duplicates and derivative datasets)
+            base_tickers = set()
+            for key in all_market_keys:
+                # Extract ticker symbol from HDF5 key path
+                parts = key.split('/')
+                if len(parts) >= 2:
+                    # Look for patterns like 'market/ES_F', 'market/daily/ES_F'
+                    ticker_candidate = None
+                    if len(parts) == 2 and parts[0] == 'market':
+                        # Format: market/ES_F
+                        ticker_candidate = parts[1]
+                    elif len(parts) == 3 and parts[0] == 'market' and parts[1] == 'daily':
+                        # Format: market/daily/ES_F
+                        ticker_candidate = parts[2]
+                    
+                    # Only include valid ticker symbols (ends with _F and has 2+ letter prefix)
+                    if (ticker_candidate and 
+                        ticker_candidate.endswith('_F') and 
+                        len(ticker_candidate) >= 4):  # At least XX_F format
+                        base_symbol = ticker_candidate[:-2]  # Remove '_F'
+                        if len(base_symbol) >= 2 and base_symbol.isalpha():
+                            base_tickers.add(ticker_candidate)
+            
+            market_tickers = sorted(list(base_tickers))
+            
+            if not market_tickers:
+                if progress:
+                    print("No valid ticker symbols found for futures curve processing")
+                return {'successful': {}, 'failed': {}, 'summary': 'No valid tickers found'}
+            
+            if progress:
+                print(f"Found {len(market_tickers)} unique tickers for futures curve processing:")
+                for ticker in market_tickers:
+                    print(f"  {ticker}")
+                print(f"(Filtered from {len(all_market_keys)} total market data keys)")
+            
+            # Initialize results
+            results = {'successful': {}, 'failed': {}, 'summary': {}}
+            start_time = time.time()
+            
+            def process_ticker_curves(ticker_symbol: str) -> Tuple[str, bool, str]:
+                """Process futures curves for a single ticker."""
+                try:
+                    # ticker_symbol is now a clean symbol like 'ES_F' from our filtering above
+                    # Create curve manager instance for this ticker
+                    curve_manager = self.curve_manager(ticker_symbol)
+                    # Run curve processing with specified parameters
+                    curve_manager.run(
+                        prefer_front_series=prefer_front_series,
+                        match_tol=match_tol,
+                        rel_jump_thresh=rel_jump_thresh,
+                        robust_k=robust_k
+                    )
+                    
+                    return (ticker_symbol, True, f"Successfully processed curves for {ticker_symbol}")
+                    
+                except Exception as e:
+                    return (ticker_symbol, False, f"Failed processing {ticker_symbol}: {str(e)}")
+            
+            # Process with or without threading
+            if max_workers and max_workers > 1:
+                # Multi-threaded processing
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_ticker = {
+                        executor.submit(process_ticker_curves, ticker): ticker 
+                        for ticker in market_tickers
+                    }
+                    
+                    for future in concurrent.futures.as_completed(future_to_ticker):
+                        ticker, success, message = future.result()
+                        if success:
+                            results['successful'][ticker] = message
+                        else:
+                            results['failed'][ticker] = message
+                        
+                        if progress:
+                            status = "✓" if success else "✗"
+                            completed = len(results['successful']) + len(results['failed'])
+                            print(f"{status} [{completed}/{len(market_tickers)}] {message}")
+            else:
+                # Sequential processing
+                for i, ticker in enumerate(market_tickers, 1):
+                    ticker, success, message = process_ticker_curves(ticker)
+                    if success:
+                        results['successful'][ticker] = message
+                    else:
+                        results['failed'][ticker] = message
+                    
+                    if progress:
+                        status = "✓" if success else "✗"
+                        print(f"{status} [{i}/{len(market_tickers)}] {message}")
+            
+            # Generate summary
+            total_time = time.time() - start_time
+            successful_count = len(results['successful'])
+            failed_count = len(results['failed'])
+            
+            results['summary'] = {
+                'total_tickers': len(market_tickers),
+                'successful_count': successful_count,
+                'failed_count': failed_count,
+                'processing_time': total_time,
+                'success_rate': (successful_count / len(market_tickers)) * 100 if market_tickers else 0
+            }
+            
+            if progress:
+                print(f"\n" + "="*60)
+                print("FUTURES CURVE PROCESSING SUMMARY")
+                print("="*60)
+                print(f"Total tickers: {len(market_tickers)}")
+                print(f"Successfully processed: {successful_count}")
+                print(f"Failed: {failed_count}")
+                print(f"Success rate: {results['summary']['success_rate']:.1f}%")
+                print(f"Processing time: {total_time:.1f} seconds")
+                print("="*60)
+            
+            return results
+            
+        except Exception as e:
+            error_msg = f"Error in futures curve processing: {str(e)}"
+            if progress:
+                print(error_msg)
+            return {'successful': {}, 'failed': {}, 'error': error_msg}
 
 
 # Convenience functions for direct use
@@ -825,6 +993,285 @@ def create_daily_market_data(replace: bool = True, progress: bool = True):
     from data.data_client import DataClient
     client = DataClient()
     return client.create_daily_resampled_data(replace=replace, progress=progress)
+
+
+def process_futures_curves_for_all_tickers(
+    prefer_front_series: bool = True,
+    match_tol: float = 0.01,
+    rel_jump_thresh: float = 0.01,
+    robust_k: float = 4.0,
+    max_workers: Optional[int] = None,
+    progress: bool = True
+) -> Dict[str, any]:
+    """
+    Find all ticker directories with market data and process futures curves using FuturesCurveManager.
+    
+    This function discovers all available market data tickers and runs the futures curve
+    processing for each one using the FuturesCurveManager.run() method.
+    
+    Parameters:
+    -----------
+    prefer_front_series : bool, default True
+        Whether to prefer front month series in curve construction
+    match_tol : float, default 0.01
+        Price matching tolerance for curve alignment
+    rel_jump_thresh : float, default 0.01
+        Relative jump threshold for roll detection
+    robust_k : float, default 4.0
+        Robust scaling parameter for outlier detection
+    max_workers : int, optional
+        Maximum number of worker threads for parallel processing
+    progress : bool, default True
+        Whether to show progress messages
+        
+    Returns:
+    --------
+    Dict[str, any]
+        Processing results containing successful, failed, and summary statistics
+        
+    Examples:
+    ---------
+    >>> # Process curves for all available tickers
+    >>> results = process_futures_curves_for_all_tickers()
+    >>> print(f"Processed curves for {len(results['successful'])} tickers")
+    
+    >>> # Process with custom parameters
+    >>> results = process_futures_curves_for_all_tickers(
+    ...     prefer_front_series=False,
+    ...     match_tol=0.02,
+    ...     progress=True
+    ... )
+    
+    >>> # Multi-threaded processing
+    >>> results = process_futures_curves_for_all_tickers(max_workers=8)
+    """
+    from data.data_client import DataClient
+    
+    client = DataClient()
+    processor = DataProcessor()
+    
+    # Discover all available market data keys and filter for base tickers
+    try:
+        all_market_keys = client.list_market_data()
+        if progress:
+            print(f"Found {len(all_market_keys)} total market data keys")
+        
+        # Filter to get only base ticker symbols (avoid duplicates and derivative datasets)
+        base_tickers = set()
+        for key in all_market_keys:
+            # Extract ticker symbol from HDF5 key path
+            parts = key.split('/')
+            if len(parts) >= 2:
+                # Look for patterns like 'market/ES_F', 'market/daily/ES_F'
+                ticker_candidate = None
+                if len(parts) == 2 and parts[0] == 'market':
+                    # Format: market/ES_F
+                    ticker_candidate = parts[1]
+                elif len(parts) == 3 and parts[0] == 'market' and parts[1] == 'daily':
+                    # Format: market/daily/ES_F
+                    ticker_candidate = parts[2]
+                
+                # Only include valid ticker symbols (ends with _F and has 2+ letter prefix)
+                if (ticker_candidate and 
+                    ticker_candidate.endswith('_F') and 
+                    len(ticker_candidate) >= 4):  # At least XX_F format
+                    base_symbol = ticker_candidate[:-2]  # Remove '_F'
+                    if len(base_symbol) >= 2 and base_symbol.isalpha():
+                        base_tickers.add(ticker_candidate)
+        
+        market_tickers = sorted(list(base_tickers))
+        if progress:
+            print(f"Filtered to {len(market_tickers)} unique ticker symbols for futures curve processing")
+            
+    except Exception as e:
+        print(f"Error listing market data: {e}")
+        return {'successful': {}, 'failed': {}, 'error': str(e)}
+    
+    if not market_tickers:
+        print("No valid ticker symbols found")
+        return {'successful': {}, 'failed': {}, 'summary': 'No valid tickers found'}
+    
+    results = {
+        'successful': {},
+        'failed': {},
+        'summary': {}
+    }
+    
+    if progress:
+        print(f"Processing futures curves for {len(market_tickers)} tickers:")
+        for ticker in sorted(market_tickers):
+            print(f"  {ticker}")
+    
+    start_time = time.time()
+    processed_count = 0
+    
+    def process_single_ticker_curve(ticker_symbol: str) -> Tuple[str, bool, str]:
+        """
+        Worker function to process futures curves for a single ticker.
+        
+        Returns:
+        --------
+        Tuple[str, bool, str]
+            (ticker_symbol, success, message/error)
+        """
+        try:
+            # ticker_symbol is now a clean symbol like 'ES_F' from our filtering above
+            # Initialize FuturesCurveManager for this ticker
+            curve_manager = FuturesCurveManager(ticker_symbol)
+            
+            # Run the curve processing
+            curve_manager.run(
+                prefer_front_series=prefer_front_series,
+                match_tol=match_tol,
+                rel_jump_thresh=rel_jump_thresh,
+                robust_k=robust_k
+            )
+            
+            return (ticker_symbol, True, f"Successfully processed curves for {ticker_symbol}")
+            
+        except Exception as e:
+            error_msg = f"Failed to process curves for {ticker_symbol}: {str(e)}"
+            return (ticker_symbol, False, error_msg)
+    
+    # Process tickers (with optional multi-threading)
+    if max_workers and max_workers > 1:
+        # Multi-threaded processing
+        if progress:
+            print(f"Using {max_workers} threads for parallel processing...")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_ticker = {
+                executor.submit(process_single_ticker_curve, ticker): ticker 
+                for ticker in market_tickers
+            }
+            
+            # Process results as they complete
+            for future in concurrent.futures.as_completed(future_to_ticker):
+                ticker_symbol, success, message = future.result()
+                processed_count += 1
+                
+                if success:
+                    results['successful'][ticker_symbol] = message
+                    if progress:
+                        print(f"✓ [{processed_count}/{len(market_tickers)}] {message}")
+                else:
+                    results['failed'][ticker_symbol] = message
+                    if progress:
+                        print(f"✗ [{processed_count}/{len(market_tickers)}] {message}")
+    else:
+        # Sequential processing
+        if progress:
+            print("Processing sequentially...")
+        
+        for ticker in market_tickers:
+            ticker_symbol, success, message = process_single_ticker_curve(ticker)
+            processed_count += 1
+            
+            if success:
+                results['successful'][ticker_symbol] = message
+                if progress:
+                    print(f"✓ [{processed_count}/{len(market_tickers)}] {message}")
+            else:
+                results['failed'][ticker_symbol] = message
+                if progress:
+                    print(f"✗ [{processed_count}/{len(market_tickers)}] {message}")
+    
+    # Generate summary
+    total_time = time.time() - start_time
+    successful_count = len(results['successful'])
+    failed_count = len(results['failed'])
+    
+    results['summary'] = {
+        'total_tickers': len(market_tickers),
+        'successful_count': successful_count,
+        'failed_count': failed_count,
+        'processing_time': total_time,
+        'success_rate': (successful_count / len(market_tickers)) * 100 if market_tickers else 0
+    }
+    
+    if progress:
+        print(f"\n" + "="*60)
+        print("FUTURES CURVE PROCESSING SUMMARY")
+        print("="*60)
+        print(f"Total tickers processed: {len(market_tickers)}")
+        print(f"Successfully processed: {successful_count}")
+        print(f"Failed to process: {failed_count}")
+        print(f"Success rate: {results['summary']['success_rate']:.1f}%")
+        print(f"Total processing time: {total_time:.1f} seconds")
+        if successful_count > 0:
+            print(f"Average time per ticker: {total_time / len(market_tickers):.2f} seconds")
+        
+        if results['failed']:
+            print(f"\nFailed tickers:")
+            for ticker, error in results['failed'].items():
+                print(f"  {ticker}: {error}")
+        
+        print("="*60)
+    
+    return results
+
+
+# Additional convenience function for direct access
+def process_all_futures_curves(
+    prefer_front_series: bool = True,
+    match_tol: float = 0.01,
+    rel_jump_thresh: float = 0.01,
+    robust_k: float = 4.0,
+    max_workers: Optional[int] = None,
+    progress: bool = True
+) -> Dict[str, any]:
+    """
+    Convenience function to process futures curves for all available tickers.
+    
+    This function creates a DataProcessor instance and runs curve processing
+    for all available market data tickers.
+    
+    Parameters:
+    -----------
+    prefer_front_series : bool, default True
+        Whether to prefer front month series in curve construction
+    match_tol : float, default 0.01
+        Price matching tolerance for curve alignment
+    rel_jump_thresh : float, default 0.01
+        Relative jump threshold for roll detection
+    robust_k : float, default 4.0
+        Robust scaling parameter for outlier detection
+    max_workers : int, optional
+        Maximum number of worker threads for parallel processing
+    progress : bool, default True
+        Whether to show progress messages
+        
+    Returns:
+    --------
+    Dict[str, any]
+        Processing results with successful/failed tickers and summary statistics
+        
+    Examples:
+    ---------
+    >>> # Process curves for all tickers with default settings
+    >>> results = process_all_futures_curves()
+    >>> print(f"Success rate: {results['summary']['success_rate']:.1f}%")
+    
+    >>> # Multi-threaded processing with custom parameters
+    >>> results = process_all_futures_curves(
+    ...     match_tol=0.02,
+    ...     max_workers=8,
+    ...     progress=True
+    ... )
+    
+    >>> # Sequential processing (single-threaded)
+    >>> results = process_all_futures_curves(max_workers=1)
+    """
+    processor = DataProcessor()
+    return processor.process_futures_curves_for_all_market_data(
+        prefer_front_series=prefer_front_series,
+        match_tol=match_tol,
+        rel_jump_thresh=rel_jump_thresh,
+        robust_k=robust_k,
+        max_workers=max_workers,
+        progress=progress
+    )
 
 
 if __name__ == "__main__":
