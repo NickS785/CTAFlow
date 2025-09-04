@@ -19,7 +19,7 @@ import pickle
 import datetime as dt
 from config import MODEL_DATA_PATH
 warnings.filterwarnings('ignore')
-
+data_load_func = fetch_data_sync
 
 class CTAForecast:
     """Forecasting framework optimized for your COT-enhanced dataset"""
@@ -30,9 +30,8 @@ class CTAForecast:
         self.models = {}
         self.symbol = ticker_symbol
         self.saved_model_folder = MODEL_DATA_PATH / ticker_symbol
-        
         # Fetch data and apply COT column renaming
-        raw_data = fetch_data_sync(ticker_symbol, daily=use_daily_data, **kwargs)
+        raw_data = data_load_func(ticker_symbol, daily=use_daily_data, **kwargs)
 
         if raw_data is not None:
             # Apply COT column renaming from COTProcessor
