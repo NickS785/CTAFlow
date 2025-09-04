@@ -1,3 +1,6 @@
+import datetime
+import os.path
+
 from data.signals_processing import COTProcessor, TechnicalAnalysis
 from data.retrieval import fetch_data_sync
 from data.data_client import DataClient as DataClient
@@ -11,6 +14,7 @@ import lightgbm as lgb
 from xgboost import XGBRegressor, XGBClassifier
 import warnings
 import pickle
+import datetime as dt
 from config import MODEL_DATA_PATH
 warnings.filterwarnings('ignore')
 
@@ -918,6 +922,9 @@ class CTAForecast:
         return pd.DataFrame(summary_data)
 
     def save_model(self, base_model, save_file=None):
+        if not os.path.exists(self.saved_model_folder):
+            os.mkdir(self.saved_model_folder)
+
         if isinstance(base_model, str):
             if base_model not in self.models:
                 raise ValueError(f"Model '{base_model}' not found in self.models")
@@ -930,13 +937,15 @@ class CTAForecast:
             else:
                 raise ValueError("No model/model_key pairs found in dict keys")
         else:
+
             if isinstance(base_model, CTALinear or CTALight or CTAXGBoost):
-                if not save_file:
-                    raise ValueError("Save file is required for a non-string/dict entry")
-                else:
-                    model_key = save_file
-                    saved_model = base_model
-        with open(self.saved_model_folder / f"{model_key}.pkl", 'w') as save_file:
+                model_key = f"{self.symbol}_{datetime.datetime.now().strftime('%m-%d.%H.%M')}"
+                saved_model = base_model
+                pass
+            else:
+                raise TypeError("Failed to detect model")
+
+        with open(self.saved_model_folder / f"{model_key}.pkl", 'wb') as save_file:
             pickle.dump(saved_model, save_file)
 
         return
