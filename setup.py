@@ -30,7 +30,7 @@ setup(
     description="CTA positioning prediction system using COT data and technical analysis",
     long_description=read_readme(),
     long_description_content_type="text/markdown",
-    packages=["data", "forecaster", "strategy"],
+    packages=find_packages(),
     py_modules=["config", "main"],
     classifiers=[
         "Development Status :: 4 - Beta",
