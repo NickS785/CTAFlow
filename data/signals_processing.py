@@ -516,7 +516,11 @@ class TechnicalAnalysis:
 
 class SpreadAnalysis:
 
-    def __init__(self):
+    def __init__(self, curve_df, seq_spread_df, seq_labels_df, front_month):
 
+        self.curve_prices = curve_df
+        self.seq_spreads = seq_spread_df
+        self.seq_labels = seq_labels_df
+        self.front_month = front_month
 
         return
