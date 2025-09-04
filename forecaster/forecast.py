@@ -8,7 +8,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score, ParameterGrid, GridSearchCV
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 import lightgbm as lgb
-from xgboost import XGBRegressor, XGBClassifier
+from xgboost import XGBRegressor
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -43,7 +43,7 @@ class CTAForecast:
     def prepare_features(self, include_technical=True,
                          selected_indicators=None,
                          normalize_momentum=False,
-                         vol_return_periods=[1, 5, 10, 20],
+                         vol_return_periods=None,
                          include_intraday=True,
                          selected_intraday_features=None,
                          intraday_horizon=5,
@@ -68,8 +68,9 @@ class CTAForecast:
             indicators are used when ``include_technical`` is ``True``.
         normalize_momentum : bool, default False
             If ``True`` volatility normalised momentum features are added.
-        vol_return_periods : list[int], default ``[1, 5, 10, 20]``
+        vol_return_periods : list[int], optional
             Periods over which to calculate volatility normalised returns.
+            Defaults to ``[1, 5, 10, 20]`` when ``None``.
         include_intraday : bool, default True
             Include intraday derived features such as realised volatility.
         selected_intraday_features : list[str] or None, optional
@@ -110,6 +111,9 @@ class CTAForecast:
 
         if resample_before_calcs:
             df = self.resample_weekly(df=df, day_of_week=resample_day)
+
+        if vol_return_periods is None:
+            vol_return_periods = [1, 5, 10, 20]
 
 
         # Filter to rows with valid price data if technical indicators are requested
@@ -519,7 +523,7 @@ class CTAForecast:
 
     def prepare_data(self, resample_weekly_first=False, resample_weekly_after=False, weekly_day='Friday',
                      include_technical=True, selected_indicators=None,
-                     normalize_momentum=False, vol_return_periods=[1, 5, 10, 20],
+                     normalize_momentum=False, vol_return_periods=None,
                      include_cot=True, selected_cot_features=None, filter_valid_prices=True):
         """Load data and prepare all feature sets with selective technical and COT indicators
         
@@ -531,7 +535,8 @@ class CTAForecast:
             selected_indicators: List of specific technical groups to include
                                ['moving_averages', 'macd', 'rsi', 'atr', 'volume', 'momentum', 'confluence', 'vol_normalized']
             normalize_momentum: Whether to include volatility-normalized momentum
-            vol_return_periods: List of periods for volatility-normalized returns
+            vol_return_periods: List of periods for volatility-normalized returns.
+                                 Defaults to [1, 5, 10, 20] when None
             include_cot: Whether to include COT features
             selected_cot_features: List of COT feature groups to include
                                  ['positioning', 'flows', 'extremes', 'market_structure', 'interactions', 'spreads']
@@ -546,6 +551,10 @@ class CTAForecast:
         # Store data for training/validation use
         self.data = raw_data.copy()
         
+        # Determine default volatility periods if not provided
+        if vol_return_periods is None:
+            vol_return_periods = [1, 5, 10, 20]
+
         # Prepare different feature sets with selective technical and COT indicators
         all_features = self.prepare_features(
             include_technical=include_technical,
