@@ -18,7 +18,7 @@ import time
 
 from ..config import RAW_MARKET_DATA_PATH, MARKET_DATA_PATH, TICKER_TO_CODE
 from .data_client import DataClient
-from .futures_curve_manager import FuturesCurveManager
+from CTAFlow.data.contract_handling.futures_curve_manager import FuturesCurveManager
 
 
 class DataProcessor:

@@ -37,10 +37,9 @@ try:
     from .forecaster.forecast import CTAForecast, CTALinear, CTALight, CTAXGBoost, CTARForest
     from .data.data_client import DataClient
     from .features.feature_engineering import IntradayFeatures
-    from .features.curve_analysis import SpreadData, FuturesCurve, CurveShapeAnalyzer, CurveEvolution
+    from .features.curve_analysis import CurveShapeAnalyzer, CurveEvolution
     from .features.signals_processing import COTProcessor, TechnicalAnalysis
-    from .data.futures_curve_manager import FuturesCurveManager
-    from .strategy.strategy import RegimeStrategy
+    from CTAFlow.data.contract_handling.futures_curve_manager import FuturesCurveManager, FuturesCurve, SpreadData
     from .config import *
 except ImportError as e:
     # Handle cases where dependencies might not be available
@@ -64,13 +63,8 @@ __all__ = [
 
     # Feature Engineering
     'IntradayFeatures',
-    'SpreadData',
-    'FuturesCurve',
     'CurveShapeAnalyzer',
     'CurveEvolution',
-
-    # Strategy classes
-    'RegimeStrategy',
     
     # Utility functions and constants from config
     'MARKET_DATA_PATH',
