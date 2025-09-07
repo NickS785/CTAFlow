@@ -19,7 +19,7 @@ from .curve_analysis import (
     CurveShapeAnalyzer, CurveEvolution,
     SpreadAnalyzer
 )
-from .. import FuturesCurve, SpreadData
+from ..data.contract_handling.futures_curve_manager import FuturesCurve, SpreadData
 from ..data.contract_handling.futures_curve_manager import SpreadFeature, SeqData, Contract
 
 # Signal processing and technical analysis classes

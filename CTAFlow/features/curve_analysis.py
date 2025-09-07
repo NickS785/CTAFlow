@@ -11,7 +11,7 @@ from datetime import datetime
 from scipy import stats
 from scipy.stats import skew, kurtosis
 
-from .. import FuturesCurve, SpreadData
+from ..data.contract_handling.futures_curve_manager import FuturesCurve, SpreadData
 
 # Import data client if available
 try:
