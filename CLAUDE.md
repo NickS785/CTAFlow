@@ -34,12 +34,22 @@ The package structure follows standard Python conventions with all modules under
 The codebase follows a modular pipeline architecture with four main components:
 
 ### Data Layer (`CTAFlow/data/`)
+- **`data_client.py`**: Main data interface class for HDF5 operations
 - **`retrieval.py`**: Asynchronous data loading from HDF5 stores using `fetch_data_sync()` 
-- **`signals_processing.py`**: Technical analysis and COT signal generation
+- **`futures_curve_manager.py`**: Manages futures curve data and contract relationships
+- **`futures_mappings.toml`**: Maps futures ticker symbols to COT commodity codes
+- **`ticker_classifier.py`**: Automatic classification of tickers into commodity/financial types
+- **`classifications_reference.py`**: Reference mappings for all supported tickers
+
+### Features & Signal Processing (`CTAFlow/features/`) **[PRIMARY PROCESSING LOCATION]**
+**This is where all signal processing and feature engineering is concentrated:**
+- **`signals_processing.py`**: Core technical analysis and COT signal generation
   - `COTProcessor`: Handles COT data cleaning and positioning metrics
   - `TechnicalAnalysis`: Calculates selective technical indicators and volatility normalization
-- **`futures_mappings.toml`**: Maps futures ticker symbols to COT commodity codes
-- **`data_client.py`**: Main data interface class
+  - `SpreadAnalysis`: Advanced spread and curve analysis tools
+- **`feature_engineering.py`**: Advanced feature creation and transformation utilities
+  - `IntradayFeatures`: Microstructure and intraday feature extraction
+  - `SpreadData`: Futures curve and spread feature engineering
 
 ### Forecasting Engine (`CTAFlow/forecaster/`)
 - **`forecast.py`**: Contains all forecasting classes (`CTAForecast`, `CTALinear`, `CTALight`, `CTAXGBoost`, `CTARForest`)
@@ -50,9 +60,6 @@ The codebase follows a modular pipeline architecture with four main components:
 
 ### Strategy Layer (`CTAFlow/strategy/`)
 - **`strategy.py`**: `RegimeStrategy` class implementing trading strategies using forecasting framework
-
-### Features (`CTAFlow/features/`)
-- **`feature_engineering.py`**: Feature creation and transformation utilities
 
 ### Configuration
 - **`CTAFlow/config.py`**: HDF5 data paths and environment setup
@@ -118,8 +125,12 @@ rf_model = CTAFlow.CTARForest('CL_F')
 
 # Access utility classes
 data_client = CTAFlow.DataClient()
+
+# Feature processing classes (from CTAFlow/features/)
 cot_processor = CTAFlow.COTProcessor()
 tech_analysis = CTAFlow.TechnicalAnalysis()
+intraday_features = CTAFlow.IntradayFeatures('CL_F')
+spread_data = CTAFlow.SpreadData('CL_F')
 ```
 
 ### Post-Calculation Resampling
@@ -147,6 +158,7 @@ tech_features = forecaster.get_technical_features_only(df,
 
 ## Development Notes
 
+- **Signal processing is centralized in `CTAFlow/features/`**: All technical analysis, COT processing, and feature engineering should be concentrated in this module
 - All technical indicator calculations are selective - only requested groups are computed
 - Weekly resampling defaults to Friday to align with COT reporting schedule (Tuesday data published Friday)
 - The system maintains separation between COT features and technical features for flexible model development
@@ -169,3 +181,4 @@ CTAFlow.MARKET_DATA_PATH                 # HDF5 market data location
 CTAFlow.COT_DATA_PATH                    # HDF5 COT data location  
 CTAFlow.MODEL_DATA_PATH                  # Saved models location
 ```
+- FuturesCurve is a snapshot of the Futures Curve containing days to expiration, prices, spreads, etc.

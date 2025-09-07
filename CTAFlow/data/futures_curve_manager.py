@@ -66,9 +66,13 @@ class FuturesCurveManager:
         self.expiry_rules = expiry_rules or {}
         # Preload if already built by caller
         self.curve: Optional[pd.DataFrame] = None
+        self.volume_curve: Optional[pd.DataFrame] = None
+        self.oi_curve: Optional[pd.DataFrame] = None
         self.dte: Optional[pd.DataFrame] = None
         self.front: Optional[pd.Series] = None
         self.seq_prices: Optional[pd.DataFrame] = None
+        self.seq_volume: Optional[pd.DataFrame] = None
+        self.seq_oi: Optional[pd.DataFrame] = None
         self.seq_labels: Optional[pd.DataFrame] = None
         self.seq_dte: Optional[pd.DataFrame] = None
         self.seq_spreads: Optional[pd.DataFrame] = None
@@ -112,10 +116,30 @@ class FuturesCurveManager:
         )
         if close_col is None:
             raise ValueError(f"[{fp}] No close/settle-like column found. Columns={list(df.columns)}")
-        out = pd.DataFrame({
+        
+        # Look for volume and open interest columns
+        volume_col = _find_columns_ci(
+            df.columns,
+            ["volume", "vol", "total volume", "totalvolume", "Volume"]
+        )
+        oi_col = _find_columns_ci(
+            df.columns, 
+            ["open interest", "openinterest", "oi", "open_interest", "OpenInterest", "OI"]
+        )
+        
+        # Build output DataFrame with available columns
+        out_data = {
             "date": pd.to_datetime(df[date_col], errors="coerce"),
             "close": pd.to_numeric(df[close_col], errors="coerce"),
-        })
+        }
+        
+        if volume_col is not None:
+            out_data["volume"] = pd.to_numeric(df[volume_col], errors="coerce")
+            
+        if oi_col is not None:
+            out_data["oi"] = pd.to_numeric(df[oi_col], errors="coerce")
+        
+        out = pd.DataFrame(out_data)
         out = out.dropna(subset=["date"]).sort_values("date").set_index("date")
         # Deduplicate dates
         out = out[~out.index.duplicated(keep="last")]
@@ -146,13 +170,43 @@ class FuturesCurveManager:
         fmap = self.collect_symbol_contract_files()
         if not fmap:
             raise RuntimeError(f"No contract CSVs found for {self.symbol} in {self.root}")
-        frames: List[pd.DataFrame] = []
+        
+        price_frames: List[pd.DataFrame] = []
+        volume_frames: List[pd.DataFrame] = []
+        oi_frames: List[pd.DataFrame] = []
+        
+        has_volume = False
+        has_oi = False
+        
         for mcode, fp in fmap.items():
-            df = self.read_contract_csv(fp).rename(columns={"close": mcode})
-            frames.append(df[[mcode]])
-        curve = pd.concat(frames, axis=1).sort_index()
-        self.curve = curve
-        return curve
+            df = self.read_contract_csv(fp)
+            
+            # Price data (required)
+            price_df = df[["close"]].rename(columns={"close": mcode})
+            price_frames.append(price_df)
+            
+            # Volume data (optional)
+            if "volume" in df.columns:
+                has_volume = True
+                volume_df = df[["volume"]].rename(columns={"volume": mcode})
+                volume_frames.append(volume_df)
+            
+            # Open Interest data (optional)
+            if "oi" in df.columns:
+                has_oi = True
+                oi_df = df[["oi"]].rename(columns={"oi": mcode})
+                oi_frames.append(oi_df)
+        
+        # Build curves
+        self.curve = pd.concat(price_frames, axis=1).sort_index()
+        
+        if has_volume and volume_frames:
+            self.volume_curve = pd.concat(volume_frames, axis=1).sort_index()
+        
+        if has_oi and oi_frames:
+            self.oi_curve = pd.concat(oi_frames, axis=1).sort_index()
+            
+        return self.curve
 
     # ------------------------------
     # Expiry & DTE
@@ -620,7 +674,7 @@ class FuturesCurveManager:
             enforce_calendar_order: bool = True
     ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """
-        Fixed sequencing that maintains proper calendar order.
+        Enhanced sequencing that maintains proper calendar order and handles volume/OI data.
         Prevents rolled contracts from appearing in wrong positions.
         """
         curve = self.curve
@@ -634,6 +688,14 @@ class FuturesCurveManager:
         seq_prices = pd.DataFrame(index=curve.index, columns=mcols, dtype="float")
         seq_labels = pd.DataFrame(index=curve.index, columns=mcols, dtype="object")
         seq_dte = pd.DataFrame(index=curve.index, columns=mcols, dtype="float")
+        
+        # Initialize volume and OI DataFrames if data is available
+        seq_volume = None
+        seq_oi = None
+        if self.volume_curve is not None:
+            seq_volume = pd.DataFrame(index=curve.index, columns=mcols, dtype="float")
+        if self.oi_curve is not None:
+            seq_oi = pd.DataFrame(index=curve.index, columns=mcols, dtype="float")
 
         def get_calendar_position(month_code):
             if month_code in ORDER_LETTERS:
@@ -710,7 +772,25 @@ class FuturesCurveManager:
                 seq_prices.iat[date_idx, i] = contract['price']
                 seq_labels.iat[date_idx, i] = contract['code']
                 seq_dte.iat[date_idx, i] = contract['dte']
+                
+                # Fill volume data if available
+                if seq_volume is not None and self.volume_curve is not None:
+                    vol_value = self.volume_curve.at[d, contract['code']] if contract['code'] in self.volume_curve.columns else np.nan
+                    if pd.notna(vol_value):
+                        seq_volume.iat[date_idx, i] = vol_value
+                
+                # Fill OI data if available
+                if seq_oi is not None and self.oi_curve is not None:
+                    oi_value = self.oi_curve.at[d, contract['code']] if contract['code'] in self.oi_curve.columns else np.nan
+                    if pd.notna(oi_value):
+                        seq_oi.iat[date_idx, i] = oi_value
 
+        # Store volume and OI sequences as instance variables
+        if seq_volume is not None:
+            self.seq_volume = seq_volume
+        if seq_oi is not None:
+            self.seq_oi = seq_oi
+            
         return seq_prices, seq_labels, seq_dte
     # ------------------------------
     # Spreads and persistence
@@ -741,6 +821,13 @@ class FuturesCurveManager:
             # Write curve data using DataClient
             client.write_market(self.curve, f"market/{symbol_key}/curve")
             
+            # Write volume and OI curves if available
+            if self.volume_curve is not None:
+                client.write_market(self.volume_curve, f"market/{symbol_key}/volume_curve")
+            
+            if self.oi_curve is not None:
+                client.write_market(self.oi_curve, f"market/{symbol_key}/oi_curve")
+            
             if self.front is not None:
                 client.write_market(self.front.to_frame(), f"market/{symbol_key}/front_month")
             
@@ -749,6 +836,12 @@ class FuturesCurveManager:
                 
             if self.seq_prices is not None:
                 client.write_market(self.seq_prices, f"market/{symbol_key}/curve_seq")
+                
+            if self.seq_volume is not None:
+                client.write_market(self.seq_volume, f"market/{symbol_key}/volume_seq")
+                
+            if self.seq_oi is not None:
+                client.write_market(self.seq_oi, f"market/{symbol_key}/oi_seq")
                 
             if self.seq_labels is not None:
                 client.write_market(self.seq_labels, f"market/{symbol_key}/curve_seq_labels")
@@ -766,12 +859,24 @@ class FuturesCurveManager:
             
             with pd.HDFStore(self.hdf_path) as store:
                 store.put(f"market/{symbol_key}/curve", self.curve, format="table", data_columns=True)
+                
+                # Write volume and OI curves if available
+                if self.volume_curve is not None:
+                    store.put(f"market/{symbol_key}/volume_curve", self.volume_curve, format="table", data_columns=True)
+                
+                if self.oi_curve is not None:
+                    store.put(f"market/{symbol_key}/oi_curve", self.oi_curve, format="table", data_columns=True)
+                
                 if self.front is not None:
                     store.put(f"market/{symbol_key}/front_month", self.front.to_frame(), format="table", data_columns=True)
                 if self.dte is not None:
                     store.put(f"market/{symbol_key}/days_to_expiry", self.dte, format="table", data_columns=True)
                 if self.seq_prices is not None:
                     store.put(f"market/{symbol_key}/curve_seq", self.seq_prices, format="table", data_columns=True)
+                if self.seq_volume is not None:
+                    store.put(f"market/{symbol_key}/volume_seq", self.seq_volume, format="table", data_columns=True)
+                if self.seq_oi is not None:
+                    store.put(f"market/{symbol_key}/oi_seq", self.seq_oi, format="table", data_columns=True)
                 if self.seq_labels is not None:
                     store.put(f"market/{symbol_key}/curve_seq_labels", self.seq_labels, format="table", data_columns=True)
                 if self.seq_dte is not None:
@@ -949,7 +1054,8 @@ class FuturesCurveManager:
         # Return paths
         symbol_key = f"{self.symbol}_F" if not self.symbol.endswith('_F') else self.symbol
 
-        return {
+        # Return paths for all data including volume and OI
+        results = {
             "curve": f"market/{symbol_key}/curve",
             "front": f"market/{symbol_key}/front_month",
             "dte": f"market/{symbol_key}/days_to_expiry",
@@ -958,3 +1064,15 @@ class FuturesCurveManager:
             "seq_dte": f"market/{symbol_key}/days_to_expiry_seq",
             "seq_spreads": f"market/{symbol_key}/spreads_seq",
         }
+        
+        # Add volume and OI paths if data exists
+        if self.volume_curve is not None:
+            results["volume_curve"] = f"market/{symbol_key}/volume_curve"
+        if self.oi_curve is not None:
+            results["oi_curve"] = f"market/{symbol_key}/oi_curve"
+        if self.seq_volume is not None:
+            results["seq_volume"] = f"market/{symbol_key}/volume_seq"
+        if self.seq_oi is not None:
+            results["seq_oi"] = f"market/{symbol_key}/oi_seq"
+        
+        return results

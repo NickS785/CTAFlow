@@ -13,7 +13,6 @@ This module contains classes and functions for:
 
 # Core data processing classes
 from .data_client import DataClient
-from .signals_processing import COTProcessor, TechnicalAnalysis
 from .futures_curve_manager import FuturesCurveManager
 from .retrieval import fetch_market_cot_data, fetch_data_sync, convert_cot_date_to_datetime
 from .ticker_classifier import TickerClassifier
@@ -27,7 +26,7 @@ from .classifications_reference import (
 
 # Data processing utilities
 try:
-    from .DataProcessor import DataProcessor
+    from .data_processor import DataProcessor
 except ImportError:
     # Handle case where DataProcessor might not be available
     DataProcessor = None
@@ -35,8 +34,6 @@ except ImportError:
 __all__ = [
     # Core data classes
     'DataClient',
-    'COTProcessor', 
-    'TechnicalAnalysis',
     'FuturesCurveManager',
     'TickerClassifier',
     'DataProcessor',

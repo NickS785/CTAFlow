@@ -36,7 +36,9 @@ __email__ = "research@example.com"
 try:
     from .forecaster.forecast import CTAForecast, CTALinear, CTALight, CTAXGBoost, CTARForest
     from .data.data_client import DataClient
-    from .data.signals_processing import COTProcessor, TechnicalAnalysis
+    from .features.feature_engineering import IntradayFeatures
+    from .features.curve_analysis import SpreadData, FuturesCurve, CurveShapeAnalyzer, CurveEvolution
+    from .features.signals_processing import COTProcessor, TechnicalAnalysis
     from .data.futures_curve_manager import FuturesCurveManager
     from .strategy.strategy import RegimeStrategy
     from .config import *
@@ -59,7 +61,14 @@ __all__ = [
     'COTProcessor',
     'TechnicalAnalysis',
     'FuturesCurveManager',
-    
+
+    # Feature Engineering
+    'IntradayFeatures',
+    'SpreadData',
+    'FuturesCurve',
+    'CurveShapeAnalyzer',
+    'CurveEvolution',
+
     # Strategy classes
     'RegimeStrategy',
     
