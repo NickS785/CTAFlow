@@ -18,7 +18,8 @@ from .feature_engineering import IntradayFeatures
 from .curve_analysis import SpreadData, FuturesCurve, CurveShapeAnalyzer, CurveEvolution
 
 # Signal processing and technical analysis classes
-from .signals_processing import COTProcessor, TechnicalAnalysis, SpreadAnalysis
+from .signals_processing import COTProcessor, TechnicalAnalysis
+SpreadFeatures = SpreadData
 
 __all__ = [
     # Feature engineering classes
@@ -30,6 +31,6 @@ __all__ = [
     
     # Signal processing classes
     'COTProcessor',
-    'TechnicalAnalysis', 
-    'SpreadAnalysis',
+    'TechnicalAnalysis',
 ]
+SpreadFeatures
