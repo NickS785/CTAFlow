@@ -2,7 +2,7 @@ import datetime
 import os.path
 from pathlib import Path
 
-from ..data.signals_processing import COTProcessor, TechnicalAnalysis
+from ..features.signals_processing import COTProcessor, TechnicalAnalysis
 from ..data.retrieval import fetch_data_sync
 import pandas as pd
 import numpy as np

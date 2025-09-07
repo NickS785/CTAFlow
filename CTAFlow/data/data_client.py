@@ -9,15 +9,11 @@ contain strings like ".", "-" or "—").
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
 from typing import Optional, Sequence, Union, Dict, Any
-
-import pandas as pd
 
 # Optional dependency used by `download_cot`
 # pip install cot_reports
-from .signals_processing import COTProcessor
+from CTAFlow.features.signals_processing import COTProcessor
 from .ticker_classifier import get_ticker_classifier, get_cot_report_type, get_cot_storage_path, is_financial_ticker
 
 
@@ -662,9 +658,7 @@ class DataClient:
             'failed': {},
             'summary': {}
         }
-        
-        import asyncio
-        
+
         for i, (ticker, task) in enumerate(tasks):
             if progress:
                 print(f"[{i+1}/{len(tasks)}] Processing {ticker}...")
@@ -780,10 +774,14 @@ class DataClient:
             Base symbol (e.g., 'CL', 'ZC') - '_F' suffix will be added automatically
         curve_types : str, sequence of str, or None
             Curve data types to query. Available types:
-            - 'curve': Full curve data
+            - 'curve': Full curve data (price)
+            - 'volume_curve': Volume curve data
+            - 'oi_curve': Open interest curve data
             - 'front': Front month contract data
             - 'dte': Days to expiry data
-            - 'seq_curve': Sequential curve data
+            - 'seq_curve': Sequential curve data (price)
+            - 'seq_volume': Sequential volume data
+            - 'seq_oi': Sequential open interest data
             - 'seq_labels': Sequential curve labels
             - 'seq_dte': Sequential days to expiry
             - 'seq_spreads': Sequential spreads data
@@ -829,9 +827,13 @@ class DataClient:
         # Define available curve types and their market keys
         available_curve_types = {
             "curve": f"{symbol_key}/curve",
+            "volume_curve": f"{symbol_key}/volume_curve",
+            "oi_curve": f"{symbol_key}/oi_curve",
             "front": f"{symbol_key}/front_month", 
             "dte": f"{symbol_key}/days_to_expiry",
             "seq_curve": f"{symbol_key}/curve_seq",
+            "seq_volume": f"{symbol_key}/volume_seq",
+            "seq_oi": f"{symbol_key}/oi_seq",
             "seq_labels": f"{symbol_key}/curve_seq_labels",
             "seq_dte": f"{symbol_key}/days_to_expiry_seq",
             "seq_spreads": f"{symbol_key}/spreads_seq"
@@ -945,9 +947,13 @@ class DataClient:
         # Look for curve-related keys
         curve_patterns = {
             'curve': '/curve',
+            'volume_curve': '/volume_curve',
+            'oi_curve': '/oi_curve',
             'front': '/front_month',
             'dte': '/days_to_expiry',
-            'seq_curve': '/curve_seq', 
+            'seq_curve': '/curve_seq',
+            'seq_volume': '/volume_seq',
+            'seq_oi': '/oi_seq',
             'seq_labels': '/curve_seq_labels',
             'seq_dte': '/days_to_expiry_seq',
             'seq_spreads': '/spreads_seq'
@@ -991,9 +997,13 @@ class DataClient:
         
         curve_types = {
             "curve": f"{symbol_key}/curve",
+            "volume_curve": f"{symbol_key}/volume_curve",
+            "oi_curve": f"{symbol_key}/oi_curve",
             "front": f"{symbol_key}/front_month",
             "dte": f"{symbol_key}/days_to_expiry", 
             "seq_curve": f"{symbol_key}/curve_seq",
+            "seq_volume": f"{symbol_key}/volume_seq",
+            "seq_oi": f"{symbol_key}/oi_seq",
             "seq_labels": f"{symbol_key}/curve_seq_labels",
             "seq_dte": f"{symbol_key}/days_to_expiry_seq",
             "seq_spreads": f"{symbol_key}/spreads_seq"

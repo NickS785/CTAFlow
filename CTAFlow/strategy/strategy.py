@@ -1,11 +1,12 @@
 from ..forecaster.forecast import CTAForecast
+from ..features.feature_engineering import IntradayFeatures, SpreadData
 import pandas as pd
 
 class RegimeStrategy:
     """Trading strategy using your comprehensive COT dataset"""
 
-    def __init__(self):
-        self.forecaster = CTAForecast()
+    def __init__(self, ticker_symbol='CL_F'):
+        self.forecaster = CTAForecast(ticker_symbol)
 
     def analyze_positioning_regime(self, df):
         """Determine current positioning regime from your data"""

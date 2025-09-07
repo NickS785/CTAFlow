@@ -1,0 +1,35 @@
+"""
+CTAFlow Features Module
+
+Feature engineering, signal processing, and technical analysis components for the CTA positioning prediction system.
+
+This module contains classes and functions for:
+- Technical analysis and signal generation
+- COT (Commitment of Traders) data processing  
+- Feature engineering and transformation
+- Advanced futures curve analysis with Lévy areas and path signatures
+- Spread analysis and term structure features
+- Intraday microstructure features
+- Regime detection and seasonality analysis
+"""
+
+# Feature engineering classes
+from .feature_engineering import IntradayFeatures
+from .curve_analysis import SpreadData, FuturesCurve, CurveShapeAnalyzer, CurveEvolution
+
+# Signal processing and technical analysis classes
+from .signals_processing import COTProcessor, TechnicalAnalysis, SpreadAnalysis
+
+__all__ = [
+    # Feature engineering classes
+    'IntradayFeatures',
+    'SpreadData',
+    'FuturesCurve',
+    'CurveShapeAnalyzer',
+    'CurveEvolution',
+    
+    # Signal processing classes
+    'COTProcessor',
+    'TechnicalAnalysis', 
+    'SpreadAnalysis',
+]

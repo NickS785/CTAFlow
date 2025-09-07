@@ -2,8 +2,48 @@ import numpy as np
 import pandas as pd
 from dataclasses import dataclass
 from ..data.data_client import DataClient
+from ..data.futures_curve_manager import MONTH_CODE_MAP
+from datetime import datetime, date, timedelta
 
+# Dataloading class
 dclient = DataClient()
+
+
+
+"""
+Integrated Futures Curve Shape Analysis Framework
+Builds on existing SpreadData class with enhanced curve shape analysis and expiry tracking
+"""
+
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass, field
+from datetime import datetime, date, timedelta
+from typing import Dict, List, Optional, Tuple, Union, Any
+from enum import Enum
+import warnings
+from scipy import interpolate
+from scipy.stats import skew, kurtosis
+import calendar
+
+# Standard futures month code mappings (will be imported from futures_curve_manager)
+MONTH_CODE_MAP = {
+    'F': 1,  # January
+    'G': 2,  # February
+    'H': 3,  # March
+    'J': 4,  # April
+    'K': 5,  # May
+    'M': 6,  # June
+    'N': 7,  # July
+    'Q': 8,  # August
+    'U': 9,  # September
+    'V': 10,  # October
+    'X': 11,  # November
+    'Z': 12  # December
+}
+
+MONTH_CODE_ORDER = ['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z']
+
 
 class IntradayFeatures:
 
@@ -98,14 +138,4 @@ class IntradayFeatures:
 
         return cd_series
 
-@dataclass
-class SpreadFeatures:
 
-    def __init__(self, symbol):
-        self.symbol = symbol
-
-        self.summary = dclient.get_curve_data_summary(symbol)
-        curve_data = dclient.query_curve_data(symbol)
-
-
-        return
