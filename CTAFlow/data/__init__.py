@@ -13,7 +13,7 @@ This module contains classes and functions for:
 
 # Core data processing classes
 from .data_client import DataClient
-from .futures_curve_manager import FuturesCurveManager
+from CTAFlow.data.contract_handling.futures_curve_manager import FuturesCurveManager
 from .retrieval import fetch_market_cot_data, fetch_data_sync, convert_cot_date_to_datetime
 from .ticker_classifier import TickerClassifier
 from .classifications_reference import (

@@ -1,9 +1,4 @@
-import numpy as np
-import pandas as pd
-from dataclasses import dataclass
 from ..data.data_client import DataClient
-from ..data.futures_curve_manager import MONTH_CODE_MAP
-from datetime import datetime, date, timedelta
 
 # Dataloading class
 dclient = DataClient()
@@ -17,14 +12,6 @@ Builds on existing SpreadData class with enhanced curve shape analysis and expir
 
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass, field
-from datetime import datetime, date, timedelta
-from typing import Dict, List, Optional, Tuple, Union, Any
-from enum import Enum
-import warnings
-from scipy import interpolate
-from scipy.stats import skew, kurtosis
-import calendar
 
 # Standard futures month code mappings (will be imported from futures_curve_manager)
 MONTH_CODE_MAP = {
