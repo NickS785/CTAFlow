@@ -46,10 +46,22 @@ The codebase follows a modular pipeline architecture with four main components:
 - **`signals_processing.py`**: Core technical analysis and COT signal generation
   - `COTProcessor`: Handles COT data cleaning and positioning metrics
   - `TechnicalAnalysis`: Calculates selective technical indicators and volatility normalization
-  - `SpreadAnalysis`: Advanced spread and curve analysis tools
-- **`feature_engineering.py`**: Advanced feature creation and transformation utilities
+- **`feature_engineering.py`**: Intraday microstructure features
   - `IntradayFeatures`: Microstructure and intraday feature extraction
-  - `SpreadData`: Futures curve and spread feature engineering
+- **`curve_analysis.py`**: Advanced futures curve analysis framework
+  - `CurveShapeAnalyzer`: Curve shape analysis and feature extraction
+  - `CurveEvolution`: Time series evolution tracking using FuturesCurve snapshots
+  - `SpreadAnalyzer`: Spread analysis, seasonality, and Lévy areas
+
+### Data Container Classes (`CTAFlow/data/contract_handling/`)
+**Core numpy-based data structures for futures analysis:**
+- **`SpreadFeature`**: Base numpy array container with directional analysis capabilities
+  - Horizontal + Sequential: Curve shape analysis (slopes across contracts)
+  - Vertical + Sequential: Time series analysis (trends over time)
+- **`SeqData`**: Sequential data container for ordered contract data
+- **`FuturesCurve`**: Single curve snapshot with term structure metrics
+- **`SpreadData`**: Main data container (uses sequentialized data only)
+- **`Contract`**: Individual contract data with expiry tracking
 
 ### Forecasting Engine (`CTAFlow/forecaster/`)
 - **`forecast.py`**: Contains all forecasting classes (`CTAForecast`, `CTALinear`, `CTALight`, `CTAXGBoost`, `CTARForest`)
@@ -118,8 +130,12 @@ print(result['test_metrics'])
 
 ```python
 # Access specific model classes
+import CTAFlow.data.contract_handling.futures_curve_manager
+
+import CTAFlow.data.contract_handling.futures
+
 linear_model = CTAFlow.CTALinear('CL_F')
-lightgbm_model = CTAFlow.CTALight('CL_F') 
+lightgbm_model = CTAFlow.CTALight('CL_F')
 xgb_model = CTAFlow.CTAXGBoost('CL_F')
 rf_model = CTAFlow.CTARForest('CL_F')
 
@@ -130,7 +146,7 @@ data_client = CTAFlow.DataClient()
 cot_processor = CTAFlow.COTProcessor()
 tech_analysis = CTAFlow.TechnicalAnalysis()
 intraday_features = CTAFlow.IntradayFeatures('CL_F')
-spread_data = CTAFlow.SpreadData('CL_F')
+spread_data = CTAFlow.data.contract_handling.futures_curve_manager.SpreadData('CL_F')
 ```
 
 ### Post-Calculation Resampling
@@ -158,14 +174,27 @@ tech_features = forecaster.get_technical_features_only(df,
 
 ## Development Notes
 
+### Data Architecture Principles
+- **Numpy-First Approach**: All data stored as `np.ndarray` except for `index`/`timestamps` (pandas DatetimeIndex)
+- **Sequentialized Data Priority**: All calculations use sequentialized data from `seq_data`, NOT raw `self.curve` which is unordered
+- **Directional Analysis**: 
+  - Horizontal + Sequential: Curve shape analysis across contracts
+  - Vertical + Sequential: Time series analysis over time
+- **Analysis Classes**: Located in `CTAFlow/features/curve_analysis.py` for curve-specific analysis
+
+### Technical Implementation
 - **Signal processing is centralized in `CTAFlow/features/`**: All technical analysis, COT processing, and feature engineering should be concentrated in this module
 - All technical indicator calculations are selective - only requested groups are computed
 - Weekly resampling defaults to Friday to align with COT reporting schedule (Tuesday data published Friday)
 - The system maintains separation between COT features and technical features for flexible model development
 - Volatility normalization uses 63-day exponentially weighted standard deviation as the baseline risk measure
 - Each model class (`CTAForecast`, `CTALinear`, etc.) works off of `self.data` and `self.features`. Ensure that these attributes are used consistently throughout to maintain one dataset per model instance
+
+### Development Best Practices
 - When testing use standard ASCII characters and avoid using emojis/special characters
 - The package must be installed in development mode (`pip install -e .`) to work properly from external directories
+- Always validate data types: primary data should be `np.ndarray`, avoid lists of lists or mixed types
+- Use `seq_data.seq_prices`, `seq_data.seq_spreads` for analysis, not raw curve data
 
 ## Available Utility Functions
 
@@ -181,4 +210,286 @@ CTAFlow.MARKET_DATA_PATH                 # HDF5 market data location
 CTAFlow.COT_DATA_PATH                    # HDF5 COT data location  
 CTAFlow.MODEL_DATA_PATH                  # Saved models location
 ```
+
+## New Data Architecture (Post-Refactoring)
+
+### Core Data Classes Hierarchy
+```python
+# Base data container with directional analysis
+from CTAFlow.data.contract_handling.futures_curve_manager import SpreadFeature, SeqData, SpreadData, FuturesCurve, Contract
+
+# Analysis classes for curve-specific operations  
+from CTAFlow.features import CurveShapeAnalyzer, CurveEvolution, SpreadAnalyzer
+
+# Example Usage:
+# 1. Horizontal Sequential Analysis (Curve Shape)
+horizontal_feat = SpreadFeature(data=curve_data, direction='horizontal', sequential=True)
+slopes = horizontal_feat.get_slopes()  # Contango/backwardation analysis
+structures = horizontal_feat.get_market_structure()
+
+# 2. Vertical Sequential Analysis (Time Series)  
+vertical_feat = SpreadFeature(data=price_series, direction='vertical', sequential=True)
+ma = vertical_feat.calculate_moving_average(20)
+trend = vertical_feat.analyze_trend()
+
+# 3. Sequential Data Container
+seq_data = SeqData(seq_prices=prices_array, seq_labels=labels_array)
+front_month_prices = seq_data[datetime(2024,1,1), 0]  # Date, contract position
+
+# 4. Main Data Container (uses sequentialized data only)
+spread_data = SpreadData(symbol='CL_F', curve=raw_data, index=dates)  
+futures_curve = spread_data[datetime(2024,1,1)]  # Get curve snapshot
+analysis = spread_data[0:10]  # Enhanced slice with curve shape analysis
+```
+
+### Data Type Standards
+- **Primary Data**: Always `np.ndarray` (no lists, no DataFrames)
+- **Time Indexes**: `pd.DatetimeIndex` only (sole exception to numpy-first rule)
+- **Sequentialized Priority**: Use `seq_data.seq_prices` not `self.curve` (unordered)
+- **Analysis Output**: Structured arrays or dictionaries with array values
+
+### Key Features
 - FuturesCurve is a snapshot of the Futures Curve containing days to expiration, prices, spreads, etc.
+- SpreadFeature supports both horizontal (curve shape) and vertical (time series) analysis
+- SeqData provides advanced indexing: `[datetime, contract_position]`  
+- All analysis classes work exclusively with sequentialized data for accuracy
+
+## Recent Framework Enhancements
+
+### Enhanced SpreadData.__getitem__ Method (Latest Update)
+The SpreadData indexing system now supports comprehensive access patterns:
+
+```python
+spread_data = SpreadData('CL_F')
+
+# String Access Patterns:
+contract_f = spread_data['F']                    # Contract for F expiration month
+contract_m0 = spread_data['M0']                  # Front month Contract (continuous=True)
+contract_m1 = spread_data['M1']                  # Second month Contract (continuous=True)
+
+# Date String Access (NEW):
+curve_jan = spread_data['2023-01-15']            # FuturesCurve for date string
+curve_time = spread_data['2023-01-15 10:30']     # Supports time components
+
+# Integer Access:
+curve_first = spread_data[0]                     # First date's FuturesCurve
+curve_last = spread_data[-1]                     # Last date (negative indexing)
+
+# Enhanced Slice Access (NEW):
+curves_str = spread_data['2023-01-01':'2023-06-30']         # Date string slice
+curves_dt = spread_data[datetime(2023,1,1):datetime(2023,6,30)]  # Datetime slice  
+curves_mixed = spread_data['2023-01-01':100]                # Mixed bound types
+```
+
+**Key Enhancements:**
+- **Continuous Contracts**: Sequential contracts (M0, M1, M2) now return `Contract` objects with `continuous=True`
+- **Date String Support**: Full support for ISO date strings with regex validation
+- **Flexible Slicing**: Slice bounds can mix datetime, date strings, and integers
+- **Robust Parsing**: Uses `dateutil.parser` with nearest-neighbor index matching
+
+### Optimized SpreadAnalyzer with Performance Enhancements
+
+**New File**: `CTAFlow/features/spread_analyzer_optimized.py`
+
+Major performance optimizations addressing computational bottlenecks:
+
+```python
+from CTAFlow.features.spread_analyzer_optimized import OptimizedSpreadAnalyzer
+
+analyzer = OptimizedSpreadAnalyzer(spread_data)
+
+# Optimized seasonal statistics (O(n) vs O(n²))
+seasonal_stats = analyzer.calculate_seasonal_statistics_optimized('spreads', 'month', 60)
+
+# JIT-compiled Lévy area calculation (~10-100x speedup)
+levy_areas = analyzer.calculate_levy_areas_optimized(window=20)
+
+# Vectorized seasonal strength
+strength = analyzer.calculate_seasonal_strength_optimized('spreads')
+
+# New: Regime change visualization
+fig = analyzer.plot_regime_changes_f0(
+    regime_window=63,
+    regime_threshold=2.0,
+    show_seasonal=True
+)
+```
+
+**Performance Improvements:**
+- **O(n) Seasonal Statistics**: Sliding window approach replaces nested loops
+- **JIT Compilation**: Numba-optimized Lévy area calculations
+- **Smart Caching**: Avoids repeated DataFrame conversions
+- **Vectorized Operations**: NumPy-based autocorrelation and aggregations
+
+### Regime Change Analysis & Visualization (NEW)
+
+**New Method**: `plot_regime_changes_f0()` in OptimizedSpreadAnalyzer
+
+Multi-dimensional regime detection system:
+
+```python
+# Generate comprehensive regime analysis
+fig = analyzer.plot_regime_changes_f0(
+    regime_window=63,          # 3-month analysis window
+    regime_threshold=2.0,      # 2-sigma threshold sensitivity
+    min_regime_length=10,      # Minimum regime duration
+    show_seasonal=True,        # Include seasonal overlay
+    height=800
+)
+
+# Interactive 4-panel visualization:
+# 1. F0 prices with regime highlighting
+# 2. Volatility regime scores  
+# 3. Trend regime analysis
+# 4. Statistical outlier detection
+```
+
+**Regime Types Detected:**
+- **Volatility Regimes**: High/low volatility periods using rolling vol Z-scores
+- **Trend Regimes**: Bullish/bearish trends via rolling regression slopes
+- **Statistical Outliers**: Price deviations using rolling Z-scores  
+- **Combined Intensity**: Aggregate regime score across all dimensions
+
+**Visual Features:**
+- **Color-coded shading**: Red (high vol), Green (bull), Orange (bear), Purple (outliers)
+- **Interactive tooltips**: Hover data with regime details
+- **Seasonal overlay**: Optional monthly pattern background
+- **Threshold lines**: Configurable sensitivity boundaries
+
+### Enhanced SpreadReturns with Comprehensive PnL Tracking
+
+Sophisticated spread trading PnL calculation system:
+
+```python
+spread_returns = SpreadReturns(spread_data)
+
+# Calculate realistic PnL with roll costs and fees
+pnl_result = spread_returns.calculate_spread_pnl(
+    entry_date=datetime(2023, 1, 1),
+    exit_date=datetime(2023, 6, 30),
+    include_roll_costs=True,      # Account for roll yield
+    include_fees=True             # Transaction costs per contract
+)
+
+# Returns comprehensive metrics:
+# - total_pnl, cumulative_pnl, daily_pnl
+# - sharpe_ratio, max_drawdown, win_rate
+# - roll_costs, transaction_fees
+# - risk_adjusted_returns
+```
+
+### CurveEvolution with pd.Series Integration
+
+**Enhanced Architecture**: `CTAFlow/features/curve_analysis.py`
+
+```python
+# Bulk loading from SpreadData (NEW)
+curve_evolution = CurveEvolution.from_spread_data(
+    spread_data, 
+    date_range=slice('2023-01-01', '2023-12-31')
+)
+
+# pd.Series with datetime indices and FuturesCurve values
+history_series = curve_evolution.history  # pd.Series[datetime, FuturesCurve]
+
+# Broadcast analysis methods (no date iteration)
+contango_analysis = curve_evolution.analyze_contango_broadcast()
+volatility_analysis = curve_evolution.analyze_volatility_broadcast()
+```
+
+**Performance Features:**
+- **Bulk Loading**: Fast pipeline from SpreadData to CurveEvolution
+- **pd.Series Integration**: DateTime-indexed FuturesCurve storage
+- **Broadcast Methods**: Vectorized analysis across all dates
+- **Factory Methods**: Flexible construction from various data sources
+
+### Comprehensive Plotly Visualization Framework
+
+**New File**: `CTAFlow/features/curve_visualization.py`
+
+Interactive visualization methods for all curve classes:
+
+```python
+from CTAFlow.features.curve_visualization import (
+    plot_futures_curve, plot_spread_data, plot_curve_evolution,
+    plot_spread_returns_pnl, plot_contract_analysis
+)
+
+# Curve snapshots with technical indicators
+fig = plot_futures_curve(futures_curve, show_technicals=True)
+
+# 3D surface plots of curve evolution
+fig = plot_spread_data(spread_data, plot_type='surface_3d')
+
+# PnL analysis with drawdown visualization  
+fig = plot_spread_returns_pnl(spread_returns, show_drawdown=True)
+```
+
+**Visualization Types:**
+- **Term Structure Plots**: Curve shapes with contango/backwardation analysis
+- **3D Surface Charts**: Time evolution of entire curves
+- **PnL Analysis**: Returns, drawdown, and risk metrics
+- **Heatmaps**: Seasonal patterns and regime changes
+- **Interactive Features**: Hover data, zoom, pan, export capabilities
+
+## Updated Usage Patterns
+
+### Optimized Performance Analysis Workflow
+
+```python
+# 1. Load data with enhanced indexing
+spread_data = SpreadData('CL_F')
+front_month = spread_data['M0']  # Continuous contract
+historical_slice = spread_data['2023-01-01':'2023-12-31']
+
+# 2. Performance-optimized analysis
+analyzer = OptimizedSpreadAnalyzer(spread_data)
+seasonal_stats = analyzer.calculate_seasonal_statistics_optimized('spreads', 'month')
+levy_areas = analyzer.calculate_levy_areas_optimized(window=20)
+
+# 3. Regime analysis and visualization
+regime_fig = analyzer.plot_regime_changes_f0(
+    regime_threshold=1.5,
+    show_seasonal=True
+)
+
+# 4. Advanced curve evolution analysis
+curve_evolution = CurveEvolution.from_spread_data(spread_data)
+broadcast_analysis = curve_evolution.analyze_contango_broadcast()
+```
+
+### Enhanced Data Access Patterns
+
+```python
+# Flexible date-based access
+curve_today = spread_data[datetime.now()]
+curve_str = spread_data['2023-06-15']
+curve_slice = spread_data['2023-01-01':'2023-12-31':5]  # Every 5th day
+
+# Continuous contract access (NEW)
+m0_contract = spread_data['M0']  # continuous=True, is_front_month=True
+m1_contract = spread_data['M1']  # continuous=True, is_front_month=False
+
+# Mixed slice bounds (NEW)
+mixed_slice = spread_data[datetime(2023,1,1):'2023-06-30']
+```
+
+## Framework Architecture Updates
+
+### Performance Optimization Hierarchy
+- **Level 1**: Smart caching and vectorized operations
+- **Level 2**: JIT compilation with Numba for critical paths
+- **Level 3**: Broadcast methods replacing iteration patterns
+- **Level 4**: Memory-efficient numpy array operations
+
+### Enhanced Data Type Consistency
+- **Contract Objects**: Now properly support `continuous` flag for sequential data
+- **Date String Support**: Robust parsing with multiple format support
+- **Slice Flexibility**: Mixed type bounds with intelligent conversion
+- **Performance Caching**: Automatic caching of expensive computations
+
+### Visualization Integration
+- **Plotly Integration**: Full interactive visualization framework
+- **Regime Analysis**: Multi-dimensional regime detection and visualization
+- **PnL Tracking**: Comprehensive spread trading analysis
+- **3D Capabilities**: Surface plots and advanced chart types
