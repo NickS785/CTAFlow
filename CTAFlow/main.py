@@ -1,22 +1,21 @@
 from talib import MA, SMA, EMA, MOM
 import pandas as pd
 import numpy as np
-from .data.data_client import DataClient
-from .forecaster.forecast import CTAForecast
+from CTAFlow.data import DataClient
+from CTAFlow.forecaster import CTAForecast
+from CTAFlow.data import SpreadData
+from CTAFlow.features import SpreadAnalyzer,CurveEvolution, CurveShapeAnalyzer, curve_visualization
+import plotly.io as pio
+pio.renderers.default = "browser"
+
 
 # Pipeline Example
-forecast = CTAForecast("CL_F")
-forecast.prepare_features(resample_after=True,
-                          resample_day="Wednesday",
-                          include_cot=True,
-                          include_intraday=True,
-                          selected_intraday_features=['rsv', 'rv'],
-                          selected_cot_features=['positioning', 'flows', 'interactions', 'spreads'],
-                          selected_indicators=['moving_averages', 'macd', 'rsi', 'momentum'], normalize_momentum=True)
+symbol = "CL"
+sd = SpreadData(symbol)
+test_idx = slice(3700, -1, 5)
 
-forecast.features.dropna(axis=0, inplace=True)
-forecast.create_target_variable(6, 'positioning')
-res = forecast.train_model(model_type='lasso', target_type='positioning',forecast_horizon=6, alpha=0.01)
-lasso_features = set(res['feature_importance'][res['feature_importance'] > 0.0].index.tolist())
-test_2 = forecast.train_model(model_type="ridge",  target_type='positioning', forecast_horizon=6, alpha=0.7, l1_ratio=0.3)
-ridge_features = set(test_2['feature_importance'].head(20).index)
+test_curves = sd[test_idx]
+
+evol = CurveEvolution()
+evol.load_curves_bulk(test_curves, sd.index[test_idx])
+evol.plot_3d_curve_surface(sd.seq_spreads[test_idx])
