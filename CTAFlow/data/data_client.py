@@ -785,6 +785,7 @@ class DataClient:
             - 'seq_labels': Sequential curve labels
             - 'seq_dte': Sequential days to expiry
             - 'seq_spreads': Sequential spreads data
+            - 'spot': Spot price data
             If None, queries all available curve types.
         start_date : str, optional
             Start date filter in 'YYYY-MM-DD' format
@@ -836,7 +837,8 @@ class DataClient:
             "seq_oi": f"{symbol_key}/oi_seq",
             "seq_labels": f"{symbol_key}/curve_seq_labels",
             "seq_dte": f"{symbol_key}/days_to_expiry_seq",
-            "seq_spreads": f"{symbol_key}/spreads_seq"
+            "seq_spreads": f"{symbol_key}/spreads_seq",
+            "spot": f"{symbol_key}/spot"
         }
         
         # Determine which curve types to query
