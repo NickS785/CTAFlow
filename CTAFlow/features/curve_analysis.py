@@ -1901,17 +1901,26 @@ class CurveEvolutionAnalyzer:
         analyzer.spread_data = spread_data  # Store reference for spot data access
         return analyzer
     
-    def get_log_prices_matrix(self, cache: bool = True) -> np.ndarray:
-        """
-        Extract log prices matrix for all curves and contracts
-        
-        Returns:
-        --------
+    def get_log_prices_matrix(self,
+                              cache: bool = True,
+                              deseasonalize: bool = True) -> np.ndarray:
+        """Extract log prices matrix for all curves and contracts.
+
+        Parameters
+        ----------
+        cache : bool, default True
+            Use cached result if available.
+        deseasonalize : bool, default True
+            Remove simple monthly seasonal pattern from the log prices before
+            returning the matrix.
+
+        Returns
+        -------
         np.ndarray
-            Shape (n_dates, n_contracts) with log prices
+            Shape ``(n_dates, n_contracts)`` with log prices.
         """
-        
-        cache_key = 'log_prices_matrix'
+
+        cache_key = 'log_prices_matrix_deseasonalized' if deseasonalize else 'log_prices_matrix_raw'
         if cache and cache_key in self._log_price_cache:
             return self._log_price_cache[cache_key]
         
@@ -1954,10 +1963,45 @@ class CurveEvolutionAnalyzer:
                     if np.any(valid_subset):
                         log_prices[i, :max_len][valid_subset] = np.log(prices_subset[valid_subset])
         
+        if deseasonalize:
+            log_prices = self._deseasonalize_log_prices(log_prices)
+
         if cache:
             self._log_price_cache[cache_key] = log_prices
-            
+
         return log_prices
+
+    def _deseasonalize_log_prices(self, log_prices: np.ndarray) -> np.ndarray:
+        """Remove monthly seasonal pattern from log price matrix.
+
+        A simple approach that subtracts the average log price for each
+        calendar month from the corresponding observations.
+
+        Parameters
+        ----------
+        log_prices : np.ndarray
+            Matrix of log prices with shape ``(n_dates, n_contracts)``.
+
+        Returns
+        -------
+        np.ndarray
+            Deseasonalized log price matrix.
+        """
+
+        if self.curves is None or len(self.curves) == 0:
+            return log_prices
+
+        dates = self.curves.index
+        df = pd.DataFrame(log_prices, index=dates)
+        deseasonalized = np.full_like(log_prices, np.nan)
+
+        for col in df.columns:
+            series = df[col]
+            if series.notna().any():
+                monthly_means = series.groupby(series.index.month).transform('mean')
+                deseasonalized[:, col] = (series - monthly_means).values
+
+        return deseasonalized
     
     def _calculate_log_levy_areas_jit(self, 
                                      log_prices: np.ndarray,
