@@ -15,7 +15,7 @@ This module contains classes and functions for:
 
 # Feature engineering classes
 from .feature_engineering import IntradayFeatures
-from .curve_analysis import SpreadData, FuturesCurve, CurveShapeAnalyzer, CurveEvolution
+from .curve_analysis import SpreadData, FuturesCurve, CurveShapeAnalyzer, CurveEvolutionAnalyzer
 
 # Signal processing and technical analysis classes
 from .signals_processing import COTProcessor, TechnicalAnalysis
@@ -27,10 +27,9 @@ __all__ = [
     'SpreadData',
     'FuturesCurve',
     'CurveShapeAnalyzer',
-    'CurveEvolution',
+    'CurveEvolutionAnalyzer',
     
     # Signal processing classes
     'COTProcessor',
     'TechnicalAnalysis',
 ]
-SpreadFeatures
