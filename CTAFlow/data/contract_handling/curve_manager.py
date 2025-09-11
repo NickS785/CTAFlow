@@ -2285,6 +2285,13 @@ class SpreadData:
     # Volume and OI curves
     volume_curve: np.ndarray = None
     oi_curve: np.ndarray = None
+    
+    # Spot price data (separate real from synthetic) - both as Series with datetime index
+    spot_prices: Optional[pd.Series] = None  # Real spot prices from market data (intersected with futures index)
+    synthetic_spot_prices: Optional[pd.Series] = None  # Calculated synthetic spot prices with datetime index
+    
+    # Convenience yield data
+    convenience_yield: Optional[np.ndarray] = None  # Front month convenience yield
 
     # Metadata
     commodity: str = ""
@@ -2337,6 +2344,313 @@ class SpreadData:
             self.volume_curve = self.volume_curve.values
         if hasattr(self.oi_curve, 'values'):
             self.oi_curve = self.oi_curve.values
+        if hasattr(self.convenience_yield, 'values'):
+            self.convenience_yield = self.convenience_yield.values
+    
+    def calculate_synthetic_spot(self) -> Optional[pd.Series]:
+        """
+        Calculate synthetic spot prices using geometric weighted mean of all contracts.
+        
+        Uses volume-weighted geometric mean where weights are inversely proportional 
+        to days-to-expiry to emphasize near-term contracts.
+        
+        Returns:
+        --------
+        pd.Series or None
+            Synthetic spot prices time series with datetime index, or None if insufficient data
+        """
+        if self.curve is None or len(self.curve) == 0:
+            return None
+            
+        if self.seq_data is None or self.seq_data.seq_prices is None:
+            return None
+            
+        # Use sequential data for proper contract ordering
+        prices = self.seq_data.seq_prices.data
+        if prices is None or len(prices) == 0:
+            return None
+            
+        # Convert to numpy array if it's a DataFrame
+        if hasattr(prices, 'values'):
+            prices = prices.values
+        
+        # Get volume weights if available
+        volume_weights = None
+        if (self.seq_data.seq_volume is not None and 
+            self.seq_data.seq_volume.data is not None):
+            volume_weights = self.seq_data.seq_volume.data
+            # Convert to numpy array if it's a DataFrame
+            if hasattr(volume_weights, 'values'):
+                volume_weights = volume_weights.values
+        
+        # Get days-to-expiry weights if available  
+        dte_weights = None
+        if self.seq_dte is not None:
+            dte_weights = self.seq_dte
+        elif (hasattr(self.seq_data, 'seq_dte') and 
+              self.seq_data.seq_dte is not None):
+            dte_weights = self.seq_data.seq_dte
+            
+        # Convert DTE weights to numpy array if needed
+        if dte_weights is not None and hasattr(dte_weights, 'values'):
+            dte_weights = dte_weights.values
+        
+        n_times, n_contracts = prices.shape
+        synthetic_spot = np.full(n_times, np.nan)
+        
+        for t in range(n_times):
+            price_row = prices[t, :]
+            
+            # Skip if all prices are NaN
+            valid_mask = ~np.isnan(price_row)
+            if not np.any(valid_mask):
+                continue
+                
+            valid_prices = price_row[valid_mask]
+            
+            # Calculate weights
+            weights = np.ones(len(valid_prices))
+            
+            # Apply volume weighting if available
+            if volume_weights is not None and t < volume_weights.shape[0]:
+                vol_row = volume_weights[t, :]  # Get full row first
+                vol_row = vol_row[valid_mask]    # Then apply mask
+                vol_valid = ~np.isnan(vol_row) & (vol_row > 0)
+                if np.any(vol_valid):
+                    weights[vol_valid] *= vol_row[vol_valid]
+            
+            # Apply inverse days-to-expiry weighting if available
+            if dte_weights is not None and t < dte_weights.shape[0]:
+                if isinstance(dte_weights, np.ndarray) and len(dte_weights.shape) == 2:
+                    dte_row = dte_weights[t, :]  # Get full row first
+                    dte_row = dte_row[valid_mask] # Then apply mask
+                else:
+                    # Handle case where dte_weights is 1D
+                    dte_row = dte_weights[valid_mask] if len(dte_weights) >= n_contracts else np.full(len(valid_prices), 30)
+                
+                dte_valid = ~np.isnan(dte_row) & (dte_row > 0)
+                if np.any(dte_valid):
+                    # Inverse weighting - closer contracts get higher weight
+                    # Add small epsilon to avoid division by zero
+                    inverse_dte = 1.0 / (dte_row + 1.0)
+                    weights[dte_valid] *= inverse_dte[dte_valid]
+            
+            # Normalize weights
+            if np.sum(weights) > 0:
+                weights = weights / np.sum(weights)
+                
+                # Calculate geometric weighted mean
+                # log(geometric_mean) = weighted_sum(log(prices))
+                log_prices = np.log(valid_prices)
+                log_geometric_mean = np.sum(weights * log_prices)
+                synthetic_spot[t] = np.exp(log_geometric_mean)
+        
+        # Convert to pandas Series with datetime index
+        if self.seq_data.timestamps is not None:
+            return pd.Series(synthetic_spot, index=self.seq_data.timestamps, name='synthetic_spot')
+        elif self.index is not None:
+            # Ensure index length matches synthetic_spot length
+            index_to_use = self.index[:len(synthetic_spot)] if len(self.index) >= len(synthetic_spot) else self.index
+            if len(index_to_use) != len(synthetic_spot):
+                # Create a compatible index
+                index_to_use = pd.date_range(start=self.index[0], periods=len(synthetic_spot), freq='D')
+            return pd.Series(synthetic_spot, index=index_to_use, name='synthetic_spot')
+        else:
+            # Fallback: create a simple date range
+            return pd.Series(synthetic_spot, 
+                           index=pd.date_range(start='2020-01-01', periods=len(synthetic_spot), freq='D'),
+                           name='synthetic_spot')
+    
+    def get_spot_prices(self, prefer_real: bool = True) -> Optional[pd.Series]:
+        """
+        Get spot prices, preferring real over synthetic or vice versa.
+        
+        Parameters:
+        -----------
+        prefer_real : bool, default True
+            If True, returns real spot prices if available, otherwise synthetic.
+            If False, returns synthetic spot prices if available, otherwise real.
+            
+        Returns:
+        --------
+        pd.Series or None
+            Best available spot prices as Series with datetime index, 
+            or None if no spot data available.
+        """
+        if prefer_real:
+            # Return real spot prices if available (already Series with intersected index)
+            return self.spot_prices if self.spot_prices is not None else self.synthetic_spot_prices
+        else:
+            # Return synthetic spot prices if available, otherwise real
+            return self.synthetic_spot_prices if self.synthetic_spot_prices is not None else self.spot_prices
+    
+    def calculate_convenience_yield(self, 
+                                  contract_months: Optional[Union[str, List[str]]] = None,
+                                  prefer_real_spot: bool = True,
+                                  annualized: bool = True) -> Optional[np.ndarray]:
+        """
+        Calculate convenience yield as the yield from spot - futures price.
+        
+        Convenience yield = (Futures Price - Spot Price) / Spot Price * (365 / Days to Expiry)
+        
+        A positive convenience yield indicates backwardation (spot > futures),
+        suggesting scarcity or high storage costs.
+        A negative convenience yield indicates contango (futures > spot),
+        suggesting abundance or low storage costs.
+        
+        Parameters:
+        -----------
+        contract_months : str, list of str, or None
+            Contract month codes to calculate convenience yield for.
+            If None, uses the front month contract (M0).
+            Examples: 'F', ['F', 'G', 'H'], 'M0', ['M0', 'M1']
+        prefer_real_spot : bool, default True
+            Whether to prefer real spot prices over synthetic ones
+        annualized : bool, default True
+            If True, annualizes the yield using days to expiry
+            
+        Returns:
+        --------
+        np.ndarray or None
+            Convenience yield time series. Shape depends on contract_months:
+            - Single contract: 1D array of yields over time
+            - Multiple contracts: 2D array (time x contracts)
+            Returns None if insufficient data available
+            
+        Examples:
+        ---------
+        >>> spread_data = SpreadData('CL_F')
+        
+        # Front month convenience yield
+        >>> cy_front = spread_data.calculate_convenience_yield()
+        
+        # Specific contract months
+        >>> cy_specific = spread_data.calculate_convenience_yield(['F', 'G', 'H'])
+        
+        # Sequential contracts (M0=front month, M1=second month, etc.)
+        >>> cy_seq = spread_data.calculate_convenience_yield(['M0', 'M1', 'M2'])
+        """
+        # Get spot prices (as Series for proper index handling)
+        spot_data = self.get_spot_prices(prefer_real=prefer_real_spot)
+        if spot_data is None:
+            return None
+        
+        # Extract values and index for processing
+        if isinstance(spot_data, pd.Series):
+            spot_prices = spot_data.values
+            spot_index = spot_data.index
+        else:
+            spot_prices = spot_data
+            spot_index = self.index if self.index is not None else None
+            
+        # Handle contract selection
+        if contract_months is None:
+            contract_months = ['M0']  # Default to front month
+        elif isinstance(contract_months, str):
+            contract_months = [contract_months]
+            
+        convenience_yields = []
+        
+        for contract_month in contract_months:
+            # Get futures prices for this contract
+            futures_prices = None
+            days_to_expiry = None
+            
+            if contract_month.startswith('M') and contract_month[1:].isdigit():
+                # Sequential contract like M0, M1, M2
+                contract_idx = int(contract_month[1:])
+                if (self.seq_data and self.seq_data.seq_prices and 
+                    self.seq_data.seq_prices.data is not None):
+                    seq_prices = self.seq_data.seq_prices.data
+                    if contract_idx < seq_prices.shape[1]:
+                        futures_prices = seq_prices[:, contract_idx]
+                        
+                        # Get corresponding days to expiry
+                        if self.seq_dte is not None:
+                            if isinstance(self.seq_dte, np.ndarray) and len(self.seq_dte.shape) == 2:
+                                if contract_idx < self.seq_dte.shape[1]:
+                                    days_to_expiry = self.seq_dte[:, contract_idx]
+                            elif hasattr(self.seq_data, 'seq_dte') and self.seq_data.seq_dte is not None:
+                                dte_data = self.seq_data.seq_dte
+                                if hasattr(dte_data, 'shape') and len(dte_data.shape) == 2:
+                                    if contract_idx < dte_data.shape[1]:
+                                        days_to_expiry = dte_data[:, contract_idx]
+            
+            elif len(contract_month) == 1 and contract_month in MONTH_CODE_ORDER:
+                # Specific contract month like F, G, H
+                if hasattr(self, 'contracts') and contract_month in self.contracts:
+                    contract = self.contracts[contract_month]
+                    futures_prices = contract.data
+                    days_to_expiry = contract.dte
+                elif (self.curve is not None and hasattr(self.curve, 'shape') and 
+                      len(self.curve.shape) == 2):
+                    # Try to find in main curve data
+                    curve_df = pd.DataFrame(self.curve, index=self.index, 
+                                          columns=getattr(self, 'curve_columns', None))
+                    if hasattr(curve_df, 'columns') and contract_month in curve_df.columns:
+                        futures_prices = curve_df[contract_month].values
+                        
+                        # Get corresponding dte
+                        if (self.dte is not None and hasattr(self.dte, 'shape') and 
+                            len(self.dte.shape) == 2):
+                            dte_df = pd.DataFrame(self.dte, index=self.index,
+                                                columns=getattr(self, 'curve_columns', None))
+                            if hasattr(dte_df, 'columns') and contract_month in dte_df.columns:
+                                days_to_expiry = dte_df[contract_month].values
+            
+            if futures_prices is None:
+                warnings.warn(f"Could not find futures prices for contract {contract_month}")
+                convenience_yields.append(np.full(len(spot_prices), np.nan))
+                continue
+                
+            # Ensure arrays have same length and are 1D
+            min_length = min(len(spot_prices), len(futures_prices))
+            spot_truncated = np.asarray(spot_prices[:min_length]).flatten()
+            futures_truncated = np.asarray(futures_prices[:min_length]).flatten()
+            
+            # Calculate basic convenience yield: (Futures - Spot) / Spot
+            valid_mask = (spot_truncated != 0) & ~np.isnan(spot_truncated) & ~np.isnan(futures_truncated)
+            convenience_yield = np.full(min_length, np.nan)
+            
+            if np.any(valid_mask):
+                convenience_yield[valid_mask] = ((futures_truncated[valid_mask] - spot_truncated[valid_mask]) / 
+                                               spot_truncated[valid_mask])
+                
+                # Annualize if requested and dte data is available
+                if annualized and days_to_expiry is not None:
+                    dte_truncated = np.asarray(days_to_expiry[:min_length]).flatten()
+                    dte_valid = (dte_truncated > 0) & ~np.isnan(dte_truncated)
+                    # Ensure 1D boolean indexing
+                    combined_valid = valid_mask & dte_valid
+                    if np.any(combined_valid):
+                        annualization_factor = 365.25 / dte_truncated[combined_valid]
+                        convenience_yield[combined_valid] *= annualization_factor
+                elif annualized:
+                    warnings.warn(f"Cannot annualize convenience yield for {contract_month}: no days-to-expiry data")
+            
+            convenience_yields.append(convenience_yield)
+        
+        # Return format depends on number of contracts - return as pandas Series/DataFrame
+        if len(convenience_yields) == 1:
+            # Single contract - return as Series with datetime index
+            cy_data = convenience_yields[0]
+            if spot_index is not None and len(spot_index) >= len(cy_data):
+                return pd.Series(cy_data, index=spot_index[:len(cy_data)], name=f'convenience_yield_{contract_months[0]}')
+            else:
+                return pd.Series(cy_data, name=f'convenience_yield_{contract_months[0]}')
+        else:
+            # Multiple contracts - return as DataFrame with datetime index
+            max_length = max(len(cy) for cy in convenience_yields)
+            result = np.full((max_length, len(convenience_yields)), np.nan)
+            for i, cy in enumerate(convenience_yields):
+                result[:len(cy), i] = cy
+            
+            # Create DataFrame with proper index and column names
+            columns = [f'convenience_yield_{contract}' for contract in contract_months]
+            if spot_index is not None and len(spot_index) >= max_length:
+                return pd.DataFrame(result, index=spot_index[:max_length], columns=columns)
+            else:
+                return pd.DataFrame(result, columns=columns)
 
     def _calculate_slopes(self) -> Dict[str, np.ndarray]:
         """Calculate slopes for all curves simultaneously and cache results"""
@@ -2410,6 +2724,20 @@ class SpreadData:
                     self.calculate_maturity_bucket_spreads()
                 except Exception as e:
                     warnings.warn(f"Could not calculate maturity bucket spreads: {e}")
+            
+            # Always calculate synthetic spot prices (separate from real spot prices)
+            try:
+                self.synthetic_spot_prices = self.calculate_synthetic_spot()
+            except Exception as e:
+                warnings.warn(f"Could not calculate synthetic spot prices: {e}")
+                self.synthetic_spot_prices = None
+            
+            # Calculate convenience yield for front month (M0) after spot prices are available
+            try:
+                self.convenience_yield = self.calculate_convenience_yield()
+            except Exception as e:
+                warnings.warn(f"Could not calculate convenience yield: {e}")
+                self.convenience_yield = None
 
     def create_futures_curve(self, date: Optional[datetime] = None) -> FuturesCurve:
         """
@@ -3316,73 +3644,133 @@ class SpreadData:
     def load_from_client(self):
         cli = DataClient()
         
-        # Single batch query for all curve data types (much more efficient)
+        # Single batch query for all curve data types
         all_curve_types = [
             'curve', 'volume_curve', 'oi_curve', 
             'seq_curve', 'seq_volume', 'seq_oi', 'seq_labels', 'seq_spreads',
-            'dte', 'seq_dte'
+            'dte', 'seq_dte', 'spot'
         ]
         curve_data = cli.query_curve_data(self.symbol, curve_types=all_curve_types)
 
-        # Try to load roll_dates separately (different method)
+        # Load roll_dates separately (different method)
         try:
             self.roll_dates = cli.read_roll_dates(self.symbol)
         except KeyError:
-            # Roll dates not available, continue without them
             self.roll_dates = None
 
-        # Extract dte and seq_dte from batch query results
-        if 'dte' in curve_data:
-            self.dte = curve_data['dte'].values if hasattr(curve_data['dte'], 'values') else curve_data['dte']
-        else:
-            self.dte = None
+        # Optimized data extraction with minimal conversions
+        # Extract curve data first to establish index, then process scalar data that may need index intersection
+        self._extract_curve_data(curve_data)
+        self._extract_scalar_data(curve_data)
+        self._extract_sequential_data(curve_data)
 
-        if 'seq_dte' in curve_data:
-            self.seq_dte = curve_data['seq_dte'].values if hasattr(curve_data['seq_dte'], 'values') else curve_data['seq_dte']
+    def _extract_scalar_data(self, curve_data):
+        """Efficiently extract scalar arrays (dte, seq_dte, spot) from curve_data"""
+        # Extract dte data
+        if 'dte' in curve_data and curve_data['dte'] is not None:
+            dte_data = curve_data['dte']
+            self.days_to_expiration = self.dte = dte_data.values if hasattr(dte_data, 'values') else dte_data
+        else:
+            self.dte = self.days_to_expiration = None
+
+        # Extract seq_dte data
+        if 'seq_dte' in curve_data and curve_data['seq_dte'] is not None:
+            seq_dte_data = curve_data['seq_dte']
+            self.seq_dte = seq_dte_data.values if hasattr(seq_dte_data, 'values') else seq_dte_data
         else:
             self.seq_dte = None
 
-        seq_params = {}
-        for k, val in curve_data.items():
-            if isinstance(val, pd.DataFrame):
-                if k == 'curve':
-                    contracts_data = curve_data[k]
-                    # Set the curve DataFrame as well
-                    self.curve = contracts_data
-                    self.index = contracts_data.index
-                    # Also create individual Contract objects with dte data
-                    for i, col in enumerate(contracts_data.columns):
-                        # Extract dte data for this contract if available
-                        contract_dte = None
-                        if self.dte is not None and hasattr(self.dte, 'loc'):
-                            try:
-                                if col in self.dte.columns:
-                                    contract_dte = self.dte.loc[:, col].values
-                            except (KeyError, AttributeError):
-                                contract_dte = None
-                        elif self.dte is not None and isinstance(self.dte, np.ndarray):
-                            # If dte is already an array, use column index
-                            if i < self.dte.shape[1] if len(self.dte.shape) > 1 else len(self.dte):
-                                contract_dte = self.dte[:, i] if len(self.dte.shape) > 1 else self.dte
-                        
-                        self.contracts.update(
-                            {
-                                col: Contract(self.symbol,
-                                              data=contracts_data.loc[:, col].values,
-                                              labels=col,
-                                              index=contracts_data.index,
-                                              dte=contract_dte if contract_dte is not None else np.array([]))
-                            })
-                # Handle sequential data - store temporarily if seq_data doesn't exist yet
-                elif k in ['seq_curve', 'seq_prices', 'seq_spreads', 'seq_oi', 'seq_volume', 'seq_labels', 'seq_dte']:
-                    if isinstance(val, pd.DataFrame):
-                        # Store as attribute for now, will be moved to seq_data in _initialize_features
-                        # Map seq_curve to seq_prices for consistency
-                        attr_name = 'seq_prices' if k == 'seq_curve' else k
-                        setattr(self, attr_name, val)
-
+        # Extract real spot prices as Series with index intersection (keep synthetic separate)
+        if 'spot' in curve_data and curve_data['spot'] is not None:
+            spot_data = curve_data['spot']
+            # Convert to Series if not already
+            if isinstance(spot_data, pd.Series):
+                spot_series = spot_data
+            elif hasattr(spot_data, 'values') and hasattr(spot_data, 'index'):
+                # DataFrame case - take first column if multiple
+                if isinstance(spot_data, pd.DataFrame):
+                    spot_series = spot_data.iloc[:, 0] if len(spot_data.columns) > 0 else pd.Series(dtype=float)
                 else:
-                    self.__setattr__(k, val.values)
+                    spot_series = pd.Series(spot_data.values, index=spot_data.index)
+            else:
+                # Raw array case - use self.index if available
+                if hasattr(self, 'index') and self.index is not None:
+                    spot_series = pd.Series(spot_data, index=self.index)
+                else:
+                    spot_series = pd.Series(spot_data)
+            
+            # Intersect with futures index if available
+            if hasattr(self, 'index') and self.index is not None and len(spot_series) > 0:
+                # Only keep spot prices that intersect with futures index dates
+                intersecting_dates = spot_series.index.intersection(self.index)
+                if len(intersecting_dates) > 0:
+                    self.spot_prices = spot_series.loc[intersecting_dates]
+                else:
+                    self.spot_prices = None
+            else:
+                self.spot_prices = spot_series
+        else:
+            self.spot_prices = None
+
+    def _extract_curve_data(self, curve_data):
+        """Efficiently extract main curve data and create Contract objects in batch"""
+        if 'curve' not in curve_data or not isinstance(curve_data['curve'], pd.DataFrame):
+            return
+        
+        curve_df = curve_data['curve']
+        self.curve = curve_df
+        self.index = curve_df.index
+        
+        # Batch create Contract objects with pre-extracted dte data
+        contract_columns = curve_df.columns
+        contract_data = curve_df.values  # Single conversion to numpy
+        
+        # Pre-extract dte data for all contracts if available
+        dte_matrix = None
+        if self.dte is not None:
+            if hasattr(self.dte, 'values') and hasattr(self.dte, 'columns'):
+                # DataFrame case: extract matching columns
+                dte_columns = self.dte.columns
+                dte_matrix = np.full((len(self.dte), len(contract_columns)), np.nan)
+                for i, col in enumerate(contract_columns):
+                    if col in dte_columns:
+                        dte_matrix[:, i] = self.dte[col].values
+            elif isinstance(self.dte, np.ndarray):
+                # Array case: use direct indexing
+                dte_matrix = self.dte if len(self.dte.shape) > 1 else self.dte.reshape(-1, 1)
+        
+        # Batch create all Contract objects
+        self.contracts = {}
+        for i, col in enumerate(contract_columns):
+            contract_dte = dte_matrix[:, i] if dte_matrix is not None and i < dte_matrix.shape[1] else np.array([])
+            self.contracts[col] = Contract(
+                symbol=self.symbol,
+                data=contract_data[:, i],
+                label=col,
+                index=self.index,
+                dte=contract_dte
+            )
+
+    def _extract_sequential_data(self, curve_data):
+        """Efficiently extract sequential data types"""
+        seq_mapping = {
+            'seq_curve': 'seq_prices',  # Map seq_curve to seq_prices for consistency
+            'seq_prices': 'seq_prices',
+            'seq_spreads': 'seq_spreads', 
+            'seq_oi': 'seq_oi',
+            'seq_volume': 'seq_volume',
+            'seq_labels': 'seq_labels'
+        }
+        
+        for curve_key, attr_name in seq_mapping.items():
+            if curve_key in curve_data and isinstance(curve_data[curve_key], pd.DataFrame):
+                setattr(self, attr_name, curve_data[curve_key])
+        
+        # Handle other DataFrame types
+        for k, val in curve_data.items():
+            if (isinstance(val, pd.DataFrame) and 
+                k not in {'curve', 'seq_curve', 'seq_prices', 'seq_spreads', 'seq_oi', 'seq_volume', 'seq_labels'}):
+                setattr(self, k, val.values if hasattr(val, 'values') else val)
 
     def to_dataframe(self, columns = ['oi', 'volume', 'labels', 'prices', 'spreads'], use_seq = True):
         data = {name: value.data for name, value in self.seq_data.__dict__.items() if hasattr(value, 'data')}

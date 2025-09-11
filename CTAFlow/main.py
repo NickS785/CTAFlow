@@ -12,11 +12,7 @@ pio.renderers.default = "browser"
 
 # 1. Extract curves using new method
 spread_data = SpreadData('GF')
-seq_curves = spread_data[1:'2025-07-30':5]
-
-# 2. Create unified analyzer
-analyzer = CurveEvolutionAnalyzer(seq_curves)
-data = analyzer.analyze_curve_evolution_drivers(5)
+analyzer = CurveEvolutionAnalyzer(spread_data)
+analyzer.analyze_curve_evolution_drivers(21)
 analyzer.plot_curve_evolution_analysis()
-
 

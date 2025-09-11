@@ -130,7 +130,7 @@ print(result['test_metrics'])
 
 ```python
 # Access specific model classes
-import CTAFlow.data.contract_handling.futures_curve_manager
+import CTAFlow.data.contract_handling.curve_manager
 
 import CTAFlow.data.contract_handling.futures
 
@@ -214,12 +214,13 @@ CTAFlow.MODEL_DATA_PATH                  # Saved models location
 ## New Data Architecture (Post-Refactoring)
 
 ### Core Data Classes Hierarchy
+
 ```python
 # Base data container with directional analysis
-from CTAFlow.data.contract_handling.futures_curve_manager import SpreadFeature, SeqData, SpreadData, FuturesCurve, Contract
+from CTAFlow.data.contract_handling.curve_manager import SpreadFeature, SeqData, SpreadData, FuturesCurve, Contract
 
 # Analysis classes for curve-specific operations  
-from CTAFlow.features import CurveShapeAnalyzer, CurveEvolution, SpreadAnalyzer
+from CTAFlow.features import CurveShapeAnalyzer, CurveEvolution, SpreadAnalyzer, CurveEvolutionAnalyzer
 
 # Example Usage:
 # 1. Horizontal Sequential Analysis (Curve Shape)
@@ -234,11 +235,11 @@ trend = vertical_feat.analyze_trend()
 
 # 3. Sequential Data Container
 seq_data = SeqData(seq_prices=prices_array, seq_labels=labels_array)
-front_month_prices = seq_data[datetime(2024,1,1), 0]  # Date, contract position
+front_month_prices = seq_data[datetime(2024, 1, 1), 0]  # Date, contract position
 
 # 4. Main Data Container (uses sequentialized data only)
-spread_data = SpreadData(symbol='CL_F', curve=raw_data, index=dates)  
-futures_curve = spread_data[datetime(2024,1,1)]  # Get curve snapshot
+spread_data = SpreadData(symbol='CL_F', curve=raw_data, index=dates)
+futures_curve = spread_data[datetime(2024, 1, 1)]  # Get curve snapshot
 analysis = spread_data[0:10]  # Enhanced slice with curve shape analysis
 ```
 
@@ -493,3 +494,56 @@ mixed_slice = spread_data[datetime(2023,1,1):'2023-06-30']
 - **Regime Analysis**: Multi-dimensional regime detection and visualization
 - **PnL Tracking**: Comprehensive spread trading analysis
 - **3D Capabilities**: Surface plots and advanced chart types
+
+## Unified CurveEvolutionAnalyzer (Latest Integration)
+
+### Complete Merger of CurveEvolution and SpreadAnalyzer
+The new `CurveEvolutionAnalyzer` class in `CTAFlow/features/curve_analysis.py` provides a unified interface combining all previous functionality with advanced path signature analysis:
+
+```python
+from CTAFlow.features.curve_analysis import CurveEvolutionAnalyzer
+
+# Complete pipeline using SpreadData.get_seq_curves()
+spread_data = SpreadData('CL_F')
+seq_curves = spread_data.get_seq_curves('2023-01-01':'2023-12-31')
+
+# Create unified analyzer
+analyzer = CurveEvolutionAnalyzer.from_spread_data(spread_data)
+
+# Advanced driver analysis using log price Lévy areas
+driver_analysis = analyzer.analyze_curve_evolution_drivers()
+print(f"Primary driver: {driver_analysis['summary_statistics']['primary_driver']}")
+
+# Comprehensive visualization
+evolution_fig = analyzer.plot_curve_evolution_analysis(
+    show_drivers=True,
+    show_regimes=True,
+    show_levy_areas=True
+)
+
+# F0 regime analysis
+regime_fig = analyzer.plot_regime_changes_f0(
+    regime_window=63,
+    regime_threshold=2.0
+)
+```
+
+### Key Innovations
+- **Log Price Lévy Areas**: Detects fundamental curve drivers using rotational path analysis
+- **Path Signatures**: Multi-level mathematical signatures for regime identification
+- **Driver Detection**: Identifies contango, term structure, front/back-end, volatility, and momentum drivers
+- **Advanced Regime Detection**: Uses log price dynamics for structural break identification
+- **Performance Optimized**: JIT-compiled calculations with smart caching
+
+### Driver Analysis Results
+```python
+driver_analysis = analyzer.analyze_curve_evolution_drivers()
+
+# Available drivers detected from log price Lévy areas:
+drivers = {
+    'front_end_changes': "Near-term contract dynamics and front month pressure",
+    'back_end_changes': "Long-term contract structural changes and back month flows", 
+    'seasonal_deviations': "Deviations from typical seasonal curve patterns",
+    'momentum': "Rate of change in curve evolution and directional momentum"
+}
+```

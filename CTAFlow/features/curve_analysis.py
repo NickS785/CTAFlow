@@ -1342,7 +1342,7 @@ class SpreadAnalyzer:
 
         return levy_areas
 
-    def calculate_path_signatures(self, depth: int = 3) -> np.ndarray:
+    def calculate_path_signatures(self, depth: int = 2) -> np.ndarray:
         """Calculate path signatures up to specified depth using sequentialized data"""
         if not hasattr(self.sf, 'seq_data') or self.sf.seq_data is None:
             return np.array([])
@@ -1759,6 +1759,7 @@ class CurveEvolutionAnalyzer:
         """
         
         self.symbol = symbol
+        self.spread_data = None  # Reference to original SpreadData for spot data access
         self.curves = self._process_input_data(curves_data)
         
         # Core analysis components
@@ -1791,9 +1792,10 @@ class CurveEvolutionAnalyzer:
             return data
             
         elif hasattr(data, 'get_seq_curves'):
-            # SpreadData object - extract curves
+            # SpreadData object - extract curves and store reference
             try:
                 self.symbol = getattr(data, 'symbol', self.symbol)
+                self.spread_data = data  # Store reference for spot data access
                 return data.get_seq_curves()
             except Exception as e:
                 raise ValueError(f"Failed to extract curves from SpreadData: {e}")
@@ -1895,7 +1897,9 @@ class CurveEvolutionAnalyzer:
         """
         
         curves = spread_data.get_seq_curves(date_range=date_range, step=step)
-        return cls(curves, symbol=spread_data.symbol)
+        analyzer = cls(curves, symbol=spread_data.symbol)
+        analyzer.spread_data = spread_data  # Store reference for spot data access
+        return analyzer
     
     def get_log_prices_matrix(self, cache: bool = True) -> np.ndarray:
         """
@@ -1968,7 +1972,7 @@ class CurveEvolutionAnalyzer:
     
     def calculate_path_signatures(self, 
                                 window: int = None,
-                                max_signature_level: int = 3) -> Dict[str, Any]:
+                                max_signature_level: int = 2) -> Dict[str, Any]:
         """
         Calculate comprehensive path signatures for curve evolution analysis
         
@@ -2973,7 +2977,7 @@ class CurveEvolutionAnalyzer:
             n_plots += 1
         
         # Create subplot titles
-        subplot_titles = ['Front Month Price', 'Back/Front Spread']
+        subplot_titles = ['Front Month, Synthetic Spot & Spot Prices', 'Back/Front Spread']
         if show_drivers:
             subplot_titles.append('Curve Drivers (4 Core)')
         if show_seasonal_analysis:
@@ -3151,7 +3155,7 @@ class CurveEvolutionAnalyzer:
                 )
     
     def _add_front_month_plot(self, fig, row, dates):
-        """Add front month (F0) price plot using broadcasting"""
+        """Add front month (F0) price plot with synthetic spot and spot data using broadcasting"""
         
         if self.curves is not None:
             # Use broadcast method to extract F0 prices
@@ -3168,12 +3172,62 @@ class CurveEvolutionAnalyzer:
                         x=valid_dates,
                         y=front_month_prices,
                         mode='lines',
-                        name='Front Month (F0) Price',
+                        name='Front Month (F0)',
                         line=dict(color='blue', width=2),
                         hovertemplate='Date: %{x}<br>F0 Price: %{y:.2f}<extra></extra>'
                     ),
                     row=row, col=1
                 )
+                
+                # Add synthetic spot data if available
+                if self.spread_data is not None:
+                    # Get synthetic spot prices
+                    synthetic_spot = self.spread_data.get_spot_prices(prefer_real=False)
+                    if synthetic_spot is not None and len(synthetic_spot) > 0:
+                        # Handle both Series and ndarray returns
+                        if isinstance(synthetic_spot, pd.Series):
+                            x_data, y_data = synthetic_spot.index, synthetic_spot.values
+                        else:
+                            # If it's an ndarray, use the full spread_data index
+                            x_data = self.spread_data.index
+                            y_data = synthetic_spot
+                            
+                        fig.add_trace(
+                            go.Scatter(
+                                x=x_data,
+                                y=y_data,
+                                mode='lines',
+                                name='Synthetic Spot',
+                                line=dict(color='orange', width=2, dash='dot'),
+                                hovertemplate='Date: %{x}<br>Synthetic Spot: %{y:.2f}<extra></extra>'
+                            ),
+                            row=row, col=1
+                        )
+                    
+                    # Add real spot data if available
+                    real_spot = self.spread_data.get_spot_prices(prefer_real=True)
+                    if (real_spot is not None and len(real_spot) > 0 and 
+                        hasattr(self.spread_data, 'spot_prices') and 
+                        self.spread_data.spot_prices is not None):
+                        # Handle both Series and ndarray returns  
+                        if isinstance(real_spot, pd.Series):
+                            x_data, y_data = real_spot.index, real_spot.values
+                        else:
+                            # If it's an ndarray, use the full spread_data index
+                            x_data = self.spread_data.index
+                            y_data = real_spot
+                            
+                        fig.add_trace(
+                            go.Scatter(
+                                x=x_data,
+                                y=y_data,
+                                mode='lines',
+                                name='Real Spot',
+                                line=dict(color='green', width=2),
+                                hovertemplate='Date: %{x}<br>Real Spot: %{y:.2f}<extra></extra>'
+                            ),
+                            row=row, col=1
+                        )
                 
                 # Add trend line if enough data points
                 if len(front_month_prices) >= 10:
