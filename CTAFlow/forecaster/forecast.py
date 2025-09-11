@@ -16,7 +16,7 @@ from xgboost import XGBRegressor
 import warnings
 import pickle
 from ..config import MODEL_DATA_PATH
-from ..features.feature_engineering import IntradayFeatures
+from ..features import IntradayFeatures
 
 warnings.filterwarnings('ignore')
 data_load_func = fetch_data_sync
