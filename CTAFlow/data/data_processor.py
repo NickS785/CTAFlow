@@ -18,7 +18,8 @@ import time
 
 from ..config import RAW_MARKET_DATA_PATH, MARKET_DATA_PATH, TICKER_TO_CODE
 from .data_client import DataClient
-from CTAFlow.data.contract_handling.futures_curve_manager import FuturesCurveManager
+from CTAFlow.data.contract_handling.curve_manager import FuturesCurveManager
+from CTAFlow.data.contract_handling.roll_date_manager import create_enhanced_curve_manager_with_roll_tracking
 
 
 class DataProcessor:
@@ -41,6 +42,7 @@ class DataProcessor:
         self.hdf5_path = Path(hdf5_path) if hdf5_path else MARKET_DATA_PATH
         self.client = DataClient()
         self.curve_manager = FuturesCurveManager
+        self.enhanced_curve_manager = create_enhanced_curve_manager_with_roll_tracking
         
         # Thread-safe progress tracking
         self._progress_lock = threading.Lock()
@@ -661,7 +663,8 @@ class DataProcessor:
         rel_jump_thresh: float = 0.01,
         robust_k: float = 4.0,
         max_workers: Optional[int] = None,
-        progress: bool = True
+        progress: bool = True,
+        use_enhanced_roll_tracking: bool = False
     ) -> Dict[str, any]:
         """
         Process futures curves for all available market data tickers using FuturesCurveManager.
@@ -683,6 +686,8 @@ class DataProcessor:
             Maximum number of worker threads for parallel processing
         progress : bool, default True
             Whether to show progress messages
+        use_enhanced_roll_tracking : bool, default False
+            Whether to use enhanced roll tracking with comprehensive roll DataFrame
             
         Returns:
         --------
@@ -743,16 +748,39 @@ class DataProcessor:
                 try:
                     # ticker_symbol is now a clean symbol like 'ES_F' from our filtering above
                     # Create curve manager instance for this ticker
-                    curve_manager = self.curve_manager(ticker_symbol)
-                    # Run curve processing with specified parameters
-                    curve_manager.run(
-                        prefer_front_series=prefer_front_series,
-                        match_tol=match_tol,
-                        rel_jump_thresh=rel_jump_thresh,
-                        robust_k=robust_k
-                    )
-                    
-                    return (ticker_symbol, True, f"Successfully processed curves for {ticker_symbol}")
+                    if use_enhanced_roll_tracking:
+                        curve_manager = self.enhanced_curve_manager(ticker_symbol)
+                        # Run enhanced curve processing with roll tracking
+                        result = curve_manager.run(
+                            prefer_front_series=prefer_front_series,
+                            match_tol=match_tol,
+                            rel_jump_thresh=rel_jump_thresh,
+                            robust_k=robust_k,
+                            near_expiry_days=7,          # Conservative roll timing
+                            min_persistence_days=3,      # More persistence required
+                            validate_rolls=True,         # Validate roll timing
+                            track_rolls=True,            # Track roll events
+                            debug=False                  # Set to True for debugging
+                        )
+                        
+                        # Check if roll data was created
+                        roll_info = ""
+                        if hasattr(curve_manager, 'roll_dataframe') and curve_manager.roll_dataframe is not None:
+                            roll_count = len(curve_manager.roll_dataframe)
+                            roll_info = f" ({roll_count} rolls tracked)"
+                            
+                        return (ticker_symbol, True, f"Successfully processed curves for {ticker_symbol}{roll_info}")
+                    else:
+                        curve_manager = self.curve_manager(ticker_symbol)
+                        # Run standard curve processing
+                        curve_manager.run(
+                            prefer_front_series=prefer_front_series,
+                            match_tol=match_tol,
+                            rel_jump_thresh=rel_jump_thresh,
+                            robust_k=robust_k
+                        )
+                        
+                        return (ticker_symbol, True, f"Successfully processed curves for {ticker_symbol}")
                     
                 except Exception as e:
                     return (ticker_symbol, False, f"Failed processing {ticker_symbol}: {str(e)}")
@@ -995,13 +1023,14 @@ def create_daily_market_data(replace: bool = True, progress: bool = True):
     return client.create_daily_resampled_data(replace=replace, progress=progress)
 
 
-def process_futures_curves_for_all_tickers(
+def Caprocess_futures_curves_for_all_tickers(
     prefer_front_series: bool = True,
     match_tol: float = 0.01,
     rel_jump_thresh: float = 0.01,
     robust_k: float = 4.0,
     max_workers: Optional[int] = None,
-    progress: bool = True
+    progress: bool = True,
+    use_enhanced_roll_tracking: bool = False
 ) -> Dict[str, any]:
     """
     Find all ticker directories with market data and process futures curves using FuturesCurveManager.
@@ -1023,6 +1052,8 @@ def process_futures_curves_for_all_tickers(
         Maximum number of worker threads for parallel processing
     progress : bool, default True
         Whether to show progress messages
+    use_enhanced_roll_tracking : bool, default False
+        Whether to use enhanced roll tracking with comprehensive roll DataFrame
         
     Returns:
     --------
@@ -1116,18 +1147,43 @@ def process_futures_curves_for_all_tickers(
         """
         try:
             # ticker_symbol is now a clean symbol like 'ES_F' from our filtering above
-            # Initialize FuturesCurveManager for this ticker
-            curve_manager = FuturesCurveManager(ticker_symbol)
-            
-            # Run the curve processing
-            curve_manager.run(
-                prefer_front_series=prefer_front_series,
-                match_tol=match_tol,
-                rel_jump_thresh=rel_jump_thresh,
-                robust_k=robust_k
-            )
-            
-            return (ticker_symbol, True, f"Successfully processed curves for {ticker_symbol}")
+            if use_enhanced_roll_tracking:
+                # Use enhanced curve manager with roll tracking
+                curve_manager = create_enhanced_curve_manager_with_roll_tracking(ticker_symbol)
+                
+                # Run enhanced curve processing with roll tracking
+                result = curve_manager.run(
+                    prefer_front_series=prefer_front_series,
+                    match_tol=match_tol,
+                    rel_jump_thresh=rel_jump_thresh,
+                    robust_k=robust_k,
+                    near_expiry_days=7,          # Conservative roll timing
+                    min_persistence_days=3,      # More persistence required
+                    validate_rolls=True,         # Validate roll timing
+                    track_rolls=True,            # Track roll events
+                    debug=False                  # Set to True for debugging
+                )
+                
+                # Check if roll data was created
+                roll_info = ""
+                if hasattr(curve_manager, 'roll_dataframe') and curve_manager.roll_dataframe is not None:
+                    roll_count = len(curve_manager.roll_dataframe)
+                    roll_info = f" ({roll_count} rolls tracked)"
+                    
+                return (ticker_symbol, True, f"Successfully processed curves for {ticker_symbol}{roll_info}")
+            else:
+                # Initialize standard FuturesCurveManager for this ticker
+                curve_manager = FuturesCurveManager(ticker_symbol)
+                
+                # Run the curve processing
+                curve_manager.run(
+                    prefer_front_series=prefer_front_series,
+                    match_tol=match_tol,
+                    rel_jump_thresh=rel_jump_thresh,
+                    robust_k=robust_k
+                )
+                
+                return (ticker_symbol, True, f"Successfully processed curves for {ticker_symbol}")
             
         except Exception as e:
             error_msg = f"Failed to process curves for {ticker_symbol}: {str(e)}"
@@ -1219,7 +1275,8 @@ def process_all_futures_curves(
     rel_jump_thresh: float = 0.01,
     robust_k: float = 4.0,
     max_workers: Optional[int] = None,
-    progress: bool = True
+    progress: bool = True,
+    use_enhanced_roll_tracking: bool = False
 ) -> Dict[str, any]:
     """
     Convenience function to process futures curves for all available tickers.
@@ -1241,6 +1298,8 @@ def process_all_futures_curves(
         Maximum number of worker threads for parallel processing
     progress : bool, default True
         Whether to show progress messages
+    use_enhanced_roll_tracking : bool, default False
+        Whether to use enhanced roll tracking with comprehensive roll DataFrame
         
     Returns:
     --------
@@ -1270,7 +1329,8 @@ def process_all_futures_curves(
         rel_jump_thresh=rel_jump_thresh,
         robust_k=robust_k,
         max_workers=max_workers,
-        progress=progress
+        progress=progress,
+        use_enhanced_roll_tracking=use_enhanced_roll_tracking
     )
 
 

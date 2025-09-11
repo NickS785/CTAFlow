@@ -1109,6 +1109,193 @@ class DataClient:
         except Exception as e:
             print(f"Error displaying curve summary for {symbol}: {e}")
     
+    def read_roll_dates(self, symbol: str) -> pd.DataFrame:
+        """
+        Read roll dates DataFrame for a specific symbol.
+        
+        Parameters:
+        -----------
+        symbol : str
+            Symbol to get roll dates for (e.g., 'CL_F' or 'CL')
+            
+        Returns:
+        --------
+        pd.DataFrame
+            Roll dates DataFrame with comprehensive roll metadata
+            
+        Raises:
+        -------
+        KeyError
+            If roll_dates data not found for the symbol
+        """
+        # Ensure symbol has _F suffix
+        if not symbol.endswith('_F'):
+            symbol_key = f"{symbol}_F"
+        else:
+            symbol_key = symbol
+        
+        roll_dates_key = f"market/{symbol_key}/roll_dates"
+        
+        try:
+            return self.read_market(roll_dates_key)
+        except KeyError:
+            raise KeyError(f"Roll dates not found for symbol '{symbol_key}'. "
+                         f"Run enhanced curve manager with roll tracking enabled.")
+    
+    def query_roll_dates(
+        self,
+        symbol: str,
+        *,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        roll_pattern: Optional[str] = None,
+        min_confidence: Optional[float] = None,
+        columns: Optional[Sequence[str]] = None
+    ) -> pd.DataFrame:
+        """
+        Query roll dates with filtering options.
+        
+        Parameters:
+        -----------
+        symbol : str
+            Symbol to query roll dates for
+        start_date : str, optional
+            Start date filter in 'YYYY-MM-DD' format
+        end_date : str, optional  
+            End date filter in 'YYYY-MM-DD' format
+        roll_pattern : str, optional
+            Filter by specific contract transition pattern (e.g., 'H->J', 'X->Z')
+        min_confidence : float, optional
+            Minimum confidence threshold for roll events
+        columns : sequence of str, optional
+            Specific columns to return
+            
+        Returns:
+        --------
+        pd.DataFrame
+            Filtered roll dates DataFrame
+            
+        Examples:
+        ---------
+        >>> client = DataClient()
+        
+        # Get all roll dates for crude oil
+        >>> rolls = client.query_roll_dates('CL')
+        
+        # Filter by date range
+        >>> recent_rolls = client.query_roll_dates('CL', start_date='2023-01-01')
+        
+        # Filter by roll pattern and confidence
+        >>> h_to_j_rolls = client.query_roll_dates('CL', roll_pattern='H->J', min_confidence=0.8)
+        """
+        # Get the base roll dates
+        roll_df = self.read_roll_dates(symbol)
+        
+        # Build where clauses for filtering
+        where_clauses = []
+        
+        if start_date:
+            where_clauses.append(f"index >= '{start_date}'")
+        if end_date:
+            where_clauses.append(f"index <= '{end_date}'")
+        if min_confidence is not None:
+            where_clauses.append(f"confidence >= {min_confidence}")
+        if roll_pattern:
+            # Parse roll pattern like 'H->J'
+            if '->' in roll_pattern:
+                from_contract, to_contract = roll_pattern.split('->')
+                where_clauses.append(f"from_contract_expiration_code == '{from_contract.strip()}'")
+                where_clauses.append(f"to_contract_expiration_code == '{to_contract.strip()}'")
+        
+        # Apply filters
+        if where_clauses:
+            query_str = ' & '.join(where_clauses)
+            filtered_df = roll_df.query(query_str)
+        else:
+            filtered_df = roll_df
+        
+        # Select specific columns if requested
+        if columns:
+            available_cols = [col for col in columns if col in filtered_df.columns]
+            if available_cols:
+                filtered_df = filtered_df[available_cols]
+        
+        return filtered_df
+    
+    def get_roll_summary(self, symbol: str) -> Dict[str, Any]:
+        """
+        Get summary statistics for roll events of a specific symbol.
+        
+        Parameters:
+        -----------
+        symbol : str
+            Symbol to get roll summary for
+            
+        Returns:
+        --------
+        Dict[str, Any]
+            Summary statistics including roll counts, patterns, timing metrics
+        """
+        try:
+            roll_df = self.read_roll_dates(symbol)
+            
+            if len(roll_df) == 0:
+                return {'symbol': symbol, 'total_rolls': 0, 'message': 'No roll data available'}
+            
+            # Calculate summary statistics
+            summary = {
+                'symbol': symbol,
+                'total_rolls': len(roll_df),
+                'date_range': {
+                    'start': roll_df.index.min(),
+                    'end': roll_df.index.max()
+                },
+                'days_to_expiry_stats': {
+                    'mean': roll_df['days_to_expiry'].mean(),
+                    'std': roll_df['days_to_expiry'].std(),
+                    'min': roll_df['days_to_expiry'].min(),
+                    'max': roll_df['days_to_expiry'].max()
+                },
+                'confidence_stats': {
+                    'mean': roll_df['confidence'].mean(),
+                    'min': roll_df['confidence'].min(),
+                    'low_confidence_count': len(roll_df[roll_df['confidence'] < 0.7])
+                },
+                'interval_stats': {
+                    'mean_days': roll_df['interval_days'].mean(),
+                    'std_days': roll_df['interval_days'].std()
+                },
+                'roll_patterns': roll_df.groupby(['from_contract_expiration_code', 'to_contract_expiration_code']).size().to_dict(),
+                'reasons': roll_df['reason'].value_counts().to_dict()
+            }
+            
+            return summary
+            
+        except KeyError:
+            return {'symbol': symbol, 'error': 'Roll dates not available'}
+        except Exception as e:
+            return {'symbol': symbol, 'error': str(e)}
+    
+    def list_symbols_with_roll_dates(self) -> List[str]:
+        """
+        List all symbols that have roll_dates data available.
+        
+        Returns:
+        --------
+        List[str]
+            List of symbols with available roll_dates data
+        """
+        available_keys = self.list_market_data()
+        symbols_with_rolls = []
+        
+        for key in available_keys:
+            if key.endswith('/roll_dates'):
+                # Extract symbol from 'market/SYMBOL_F/roll_dates'
+                symbol = key.replace('market/', '').replace('/roll_dates', '')
+                symbols_with_rolls.append(symbol)
+        
+        return sorted(symbols_with_rolls)
+    
     def list_available_cot_metrics(self) -> List[str]:
         """
         List all tickers that have COT metrics available.

@@ -1,21 +1,22 @@
 from talib import MA, SMA, EMA, MOM
 import pandas as pd
 import numpy as np
-from CTAFlow.data import DataClient
+from CTAFlow.data import DataClient, FuturesCurveManager as FCM
 from CTAFlow.forecaster import CTAForecast
 from CTAFlow.data import SpreadData
-from CTAFlow.features import SpreadAnalyzer,CurveEvolution, CurveShapeAnalyzer, curve_visualization
+from CTAFlow.features import CurveEvolutionAnalyzer, CurveShapeAnalyzer
 import plotly.io as pio
 pio.renderers.default = "browser"
 
 
-# Pipeline Example
-symbol = "CL"
-sd = SpreadData(symbol)
-test_idx = slice(3700, -1, 5)
 
-test_curves = sd[test_idx]
+# 1. Extract curves using new method
+spread_data = SpreadData('GF')
+seq_curves = spread_data[1:'2025-07-30':5]
 
-evol = CurveEvolution()
-evol.load_curves_bulk(test_curves, sd.index[test_idx])
-evol.plot_3d_curve_surface(sd.seq_spreads[test_idx])
+# 2. Create unified analyzer
+analyzer = CurveEvolutionAnalyzer(seq_curves)
+data = analyzer.analyze_curve_evolution_drivers(5)
+analyzer.plot_curve_evolution_analysis()
+
+
