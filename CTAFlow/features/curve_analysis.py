@@ -1972,6 +1972,37 @@ class CurveEvolutionAnalyzer:
 
         return log_prices
 
+    def _deseasonalize_log_prices(self, log_prices: np.ndarray) -> np.ndarray:
+        """Remove monthly seasonal pattern from log price matrix.
+
+        A simple approach that subtracts the average log price for each
+        calendar month from the corresponding observations.
+
+        Parameters
+        ----------
+        log_prices : np.ndarray
+            Matrix of log prices with shape ``(n_dates, n_contracts)``.
+
+        Returns
+        -------
+        np.ndarray
+            Deseasonalized log price matrix.
+        """
+
+        if self.curves is None or len(self.curves) == 0:
+            return log_prices
+
+        dates = self.curves.index
+        df = pd.DataFrame(log_prices, index=dates)
+        deseasonalized = np.full_like(log_prices, np.nan)
+
+        for col in df.columns:
+            series = df[col]
+            if series.notna().any():
+                monthly_means = series.groupby(series.index.month).transform('mean')
+                deseasonalized[:, col] = (series - monthly_means).values
+
+        return deseasonalized
     
     def _calculate_log_levy_areas_jit(self, 
                                      log_prices: np.ndarray,
