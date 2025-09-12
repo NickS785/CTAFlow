@@ -12,6 +12,7 @@ from scipy import stats
 from scipy.stats import skew, kurtosis
 
 from ..data.contract_handling.curve_manager import FuturesCurve, SpreadData, SpreadFeature
+from ..utils.seasonal import deseasonalize_monthly
 
 # Import data client and utilities if available
 try:
@@ -1901,17 +1902,26 @@ class CurveEvolutionAnalyzer:
         analyzer.spread_data = spread_data  # Store reference for spot data access
         return analyzer
     
-    def get_log_prices_matrix(self, cache: bool = True) -> np.ndarray:
-        """
-        Extract log prices matrix for all curves and contracts
-        
-        Returns:
-        --------
+    def get_log_prices_matrix(self,
+                              cache: bool = True,
+                              deseasonalize: bool = True) -> np.ndarray:
+        """Extract log prices matrix for all curves and contracts.
+
+        Parameters
+        ----------
+        cache : bool, default True
+            Use cached result if available.
+        deseasonalize : bool, default True
+            Remove simple monthly seasonal pattern from the log prices before
+            returning the matrix.
+
+        Returns
+        -------
         np.ndarray
-            Shape (n_dates, n_contracts) with log prices
+            Shape ``(n_dates, n_contracts)`` with log prices.
         """
-        
-        cache_key = 'log_prices_matrix'
+
+        cache_key = 'log_prices_matrix_deseasonalized' if deseasonalize else 'log_prices_matrix_raw'
         if cache and cache_key in self._log_price_cache:
             return self._log_price_cache[cache_key]
         
@@ -1954,10 +1964,14 @@ class CurveEvolutionAnalyzer:
                     if np.any(valid_subset):
                         log_prices[i, :max_len][valid_subset] = np.log(prices_subset[valid_subset])
         
+        if deseasonalize:
+            log_prices = deseasonalize_monthly(log_prices, self.curves.index)
+
         if cache:
             self._log_price_cache[cache_key] = log_prices
-            
+
         return log_prices
+
     
     def _calculate_log_levy_areas_jit(self, 
                                      log_prices: np.ndarray,
