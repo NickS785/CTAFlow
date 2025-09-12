@@ -42,6 +42,8 @@ stub._is_empty = _is_empty
 stub.MONTH_CODE_MAP = {c: i + 1 for i, c in enumerate('FGHJKMNQUVXZ')}
 
 cta_pkg = types.ModuleType("CTAFlow")
+cta_pkg.__path__ = [str(Path(__file__).resolve().parent)]
+=======
 cta_pkg.__path__ = []
 features_pkg = types.ModuleType("CTAFlow.features")
 features_pkg.__path__ = []
@@ -55,6 +57,19 @@ sys.modules["CTAFlow.features"] = features_pkg
 sys.modules["CTAFlow.data"] = data_pkg
 sys.modules["CTAFlow.data.contract_handling"] = contract_pkg
 sys.modules["CTAFlow.data.contract_handling.curve_manager"] = stub
+
+# Minimal utils package so curve_analysis can import seasonal utilities
+utils_pkg = types.ModuleType("CTAFlow.utils")
+utils_pkg.__path__ = []
+sys.modules["CTAFlow.utils"] = utils_pkg
+
+seasonal_path = Path(__file__).resolve().parent / "CTAFlow" / "utils" / "seasonal.py"
+seasonal_spec = importlib.util.spec_from_file_location(
+    "CTAFlow.utils.seasonal", seasonal_path
+)
+seasonal_module = importlib.util.module_from_spec(seasonal_spec)
+sys.modules["CTAFlow.utils.seasonal"] = seasonal_module
+seasonal_spec.loader.exec_module(seasonal_module)
 
 # Stub numba to avoid optional dependency requirements
 numba_stub = types.ModuleType("numba")

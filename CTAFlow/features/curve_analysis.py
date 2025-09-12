@@ -12,6 +12,7 @@ from scipy import stats
 from scipy.stats import skew, kurtosis
 
 from ..data.contract_handling.curve_manager import FuturesCurve, SpreadData, SpreadFeature
+from ..utils.seasonal import deseasonalize_monthly
 
 # Import data client and utilities if available
 try:
@@ -1964,7 +1965,7 @@ class CurveEvolutionAnalyzer:
                         log_prices[i, :max_len][valid_subset] = np.log(prices_subset[valid_subset])
         
         if deseasonalize:
-            log_prices = self._deseasonalize_log_prices(log_prices)
+            log_prices = deseasonalize_monthly(log_prices, self.curves.index)
 
         if cache:
             self._log_price_cache[cache_key] = log_prices
