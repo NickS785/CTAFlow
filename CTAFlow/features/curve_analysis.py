@@ -3201,7 +3201,7 @@ class CurveEvolutionAnalyzer:
     
     def _add_front_month_plot(self, fig, row, dates):
         """Add front month (F0) price plot with synthetic spot and spot data using broadcasting"""
-        
+
         if self.curves is not None:
             # Use broadcast method to extract F0 prices
             front_month_series = self._extract_front_month_broadcast()
@@ -3294,46 +3294,143 @@ class CurveEvolutionAnalyzer:
                 
                 # Update y-axis label for this subplot
                 fig.update_yaxes(title_text="Price", row=row, col=1)
-    
+
+    def _select_contract_by_dte(self,
+                                 curve: FuturesCurve,
+                                 target_days: int,
+                                 tolerance: Optional[int] = 120,
+                                 allow_fallback: bool = True) -> Tuple[Optional[float], Optional[float]]:
+        """Select contract price closest to target days-to-expiry."""
+        if curve is None:
+            return None, None
+
+        dte_source = getattr(curve, 'days_to_expiry', None)
+        if dte_source is None and hasattr(curve, 'seq_dte'):
+            dte_source = getattr(curve, 'seq_dte')
+
+        if dte_source is None:
+            return None, None
+
+        try:
+            dte_array = np.asarray(dte_source, dtype=float)
+        except Exception:
+            return None, None
+
+        price_source = None
+        if hasattr(curve, 'seq_prices') and curve.seq_prices is not None:
+            try:
+                price_source = np.asarray(curve.seq_prices, dtype=float)
+            except Exception:
+                price_source = None
+
+        if price_source is None:
+            try:
+                price_source = np.asarray(curve.prices, dtype=float)
+            except Exception:
+                return None, None
+
+        if price_source.size == 0 or dte_array.size == 0:
+            return None, None
+
+        min_len = min(len(price_source), len(dte_array))
+        price_array = price_source[:min_len]
+        dte_array = dte_array[:min_len]
+
+        valid_mask = (~np.isnan(price_array)) & (~np.isnan(dte_array)) & (dte_array > 0)
+        if not np.any(valid_mask):
+            return None, None
+
+        valid_prices = price_array[valid_mask]
+        valid_dte = dte_array[valid_mask]
+
+        if valid_prices.size == 0:
+            return None, None
+
+        idx = int(np.argmin(np.abs(valid_dte - target_days)))
+        if tolerance is not None and abs(valid_dte[idx] - target_days) > tolerance:
+            if allow_fallback:
+                idx = int(np.argmax(valid_dte))
+            else:
+                return None, None
+
+        return float(valid_prices[idx]), float(valid_dte[idx])
+
     def _add_back_front_spread_plot(self, fig, row, dates):
         """Add back/front spread plot using new __getitem__ method"""
-        
+
         if self.curves is not None:
             # Extract back/front spread using broadcasting
-            spread_data = []
-            valid_dates = []
-            
+            spread_data: List[float] = []
+            valid_dates: List[pd.Timestamp] = []
+            back_dte_info: List[Optional[float]] = []
+
             for date, curve in self.curves.dropna().items():
+                front_price = None
+                back_price = None
+                back_dte = None
+
                 try:
-                    # Use new indexing method - M0 (front), last available (back)
                     front_price = curve['M0']
-                    # Get back month (last contract)
-                    back_price = curve[-1]  # Last contract using negative indexing
-                    
-                    if front_price is not None and back_price is not None:
-                        if not np.isnan(front_price) and not np.isnan(back_price):
-                            spread = back_price - front_price
-                            spread_data.append(spread)
-                            valid_dates.append(date)
                 except (KeyError, IndexError, AttributeError):
-                    # Fallback to direct access
+                    if hasattr(curve, 'seq_prices') and curve.seq_prices is not None and len(curve.seq_prices) > 0:
+                        front_price = curve.seq_prices[0]
+                    elif hasattr(curve, 'prices') and len(curve.prices) > 0:
+                        front_price = curve.prices[0]
+
+                back_price, back_dte = self._select_contract_by_dte(curve, target_days=730, tolerance=150)
+                if back_price is None:
+                    back_price, back_dte = self._select_contract_by_dte(curve, target_days=730, tolerance=None)
+
+                if back_price is None:
                     try:
-                        if hasattr(curve, 'seq_prices') and curve.seq_prices is not None:
-                            front_price = curve.seq_prices[0] if len(curve.seq_prices) > 0 else None
-                            back_price = curve.seq_prices[-1] if len(curve.seq_prices) > 1 else None
-                        else:
-                            front_price = curve.prices[0] if len(curve.prices) > 0 else None
-                            back_price = curve.prices[-1] if len(curve.prices) > 1 else None
-                        
-                        if front_price is not None and back_price is not None:
-                            if not np.isnan(front_price) and not np.isnan(back_price):
-                                spread = back_price - front_price
-                                spread_data.append(spread)
-                                valid_dates.append(date)
-                    except (IndexError, AttributeError):
-                        continue
-            
+                        back_price = curve[-1]
+                    except (KeyError, IndexError, AttributeError):
+                        back_price = None
+
+                if back_price is None and hasattr(curve, 'prices') and len(curve.prices) > 0:
+                    price_array = np.asarray(curve.prices, dtype=float)
+                    valid_idx = np.where(~np.isnan(price_array))[0]
+                    if len(valid_idx) > 0:
+                        back_price = price_array[valid_idx[-1]]
+                        dte_source = getattr(curve, 'days_to_expiry', None)
+                        if dte_source is not None:
+                            try:
+                                dte_array = np.asarray(dte_source, dtype=float)
+                                if len(dte_array) > valid_idx[-1] and not np.isnan(dte_array[valid_idx[-1]]):
+                                    back_dte = float(dte_array[valid_idx[-1]])
+                            except Exception:
+                                back_dte = None
+
+                try:
+                    front_price = float(front_price)
+                except (TypeError, ValueError):
+                    front_price = None
+
+                try:
+                    back_price = float(back_price)
+                except (TypeError, ValueError):
+                    back_price = None
+
+                if front_price is None or back_price is None:
+                    continue
+
+                if np.isnan(front_price) or np.isnan(back_price):
+                    continue
+
+                spread = back_price - front_price
+                spread_data.append(spread)
+                valid_dates.append(date)
+                back_dte_info.append(back_dte)
+
             if len(spread_data) > 0:
+                spread_state = ['Contango' if s > 0 else 'Backwardation' for s in spread_data]
+                hover_text = []
+                for state, dte in zip(spread_state, back_dte_info):
+                    if dte is not None and not np.isnan(dte):
+                        hover_text.append(f"State: {state}<br>Back DTE: {int(round(dte))} days")
+                    else:
+                        hover_text.append(f"State: {state}")
+
                 # Plot back/front spread
                 fig.add_trace(
                     go.Scatter(
@@ -3342,12 +3439,12 @@ class CurveEvolutionAnalyzer:
                         mode='lines',
                         name='Back/Front Spread',
                         line=dict(color='green', width=2),
-                        hovertemplate='Date: %{x}<br>Spread: %{y:.2f}<br>State: %{text}<extra></extra>',
-                        text=['Contango' if s > 0 else 'Backwardation' for s in spread_data]
+                        hovertemplate='Date: %{x}<br>Spread: %{y:.2f}<br>%{text}<extra></extra>',
+                        text=hover_text
                     ),
                     row=row, col=1
                 )
-                
+
                 # Add zero line
                 fig.add_hline(y=0, line_dash="dash", line_color="gray", 
                              annotation_text="Contango ↑ / Backwardation ↓", row=row, col=1)
