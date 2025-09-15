@@ -1988,7 +1988,7 @@ class FuturesCurve(SpreadFeature):
         else:
             self.prices = np.asarray(self.prices, dtype=float)
 
-        if not self.curve_month_labels:
+        if self.curve_month_labels is None or len(self.curve_month_labels) == 0:
             self.curve_month_labels = [f'M{i}' for i in range(len(self.prices))]
         elif len(self.curve_month_labels) != len(self.prices):
             labels = list(self.curve_month_labels)
@@ -2028,7 +2028,7 @@ class FuturesCurve(SpreadFeature):
 
     def _calculate_days_to_expiry(self) -> np.ndarray:
         """Calculate days to expiry for each contract."""
-        if self.ref_date is None or not self.curve_month_labels:
+        if self.ref_date is None or self.curve_month_labels is None or len(self.curve_month_labels) == 0:
             return np.array([])
 
         dte_list: List[float] = []
@@ -2082,14 +2082,14 @@ class FuturesCurve(SpreadFeature):
             # Return prices in calendar month order
             return np.array([p for p in self.prices if not np.isnan(p)])
 
-        elif roll_on == 'volume' and self.volumes:
+        elif roll_on == 'volume' and self.volumes is not None and len(self.volumes) > 0:
             # Sort by volume (highest first)
             paired = [(p, v, i) for i, (p, v) in enumerate(zip(self.prices, self.volumes))
                       if not np.isnan(p) and not np.isnan(v)]
             paired.sort(key=lambda x: x[1], reverse=True)
             return np.array([p for p, _, _ in paired])
 
-        elif roll_on == 'oi' and self.open_interest:
+        elif roll_on == 'oi' and self.open_interest is not None and len(self.open_interest) > 0:
             # Sort by open interest (highest first)
             paired = [(p, oi, i) for i, (p, oi) in enumerate(zip(self.prices, self.open_interest))
                       if not np.isnan(p) and not np.isnan(oi)]
@@ -2179,13 +2179,13 @@ class FuturesCurve(SpreadFeature):
             metrics['max_convexity'] = np.max(np.abs(second_diffs))
 
         # Volume/OI concentration (Herfindahl index)
-        if self.volumes:
+        if self.volumes is not None and len(self.volumes) > 0:
             valid_vols = [v for v in self.volumes if not np.isnan(v)]
             if valid_vols and sum(valid_vols) > 0:
                 vol_shares = np.array(valid_vols) / sum(valid_vols)
                 metrics['volume_concentration'] = np.sum(vol_shares ** 2)
 
-        if self.open_interest:
+        if self.open_interest is not None and len(self.open_interest) > 0:
             valid_oi = [o for o in self.open_interest if not np.isnan(o)]
             if valid_oi and sum(valid_oi) > 0:
                 oi_shares = np.array(valid_oi) / sum(valid_oi)
