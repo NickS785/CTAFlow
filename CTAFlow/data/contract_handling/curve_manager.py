@@ -35,6 +35,68 @@ MONTH_CODE_MAP = {
 ORDER_LETTERS = ["F", "G", "H", "J", "K", "M", "N", "Q", "U", "V", "X", "Z"]
 
 
+_CONTRACT_CODE_PATTERN = re.compile(r"([FGHJKMNQUVXZ])", re.IGNORECASE)
+_YEAR_SUFFIX_PATTERN = re.compile(r"(\d{2,4})")
+
+
+def normalize_contract_code(contract_code: Optional[str]) -> Optional[str]:
+    """Return the month letter embedded in a contract label.
+
+    Handles labels that include year information (e.g. "H2025", "M_25").
+    Returns ``None`` if no valid month code is found.
+    """
+    if contract_code is None:
+        return None
+
+    match = _CONTRACT_CODE_PATTERN.search(str(contract_code).upper())
+    if match:
+        return match.group(1)
+    return None
+
+
+def infer_contract_year(contract_code: Optional[str], reference_year: int) -> Optional[int]:
+    """Infer contract year from label if a numeric suffix is provided."""
+    if not contract_code:
+        return None
+
+    match = _YEAR_SUFFIX_PATTERN.search(str(contract_code))
+    if not match:
+        return None
+
+    year_str = match.group(1)
+    try:
+        year_val = int(year_str)
+    except ValueError:
+        return None
+
+    if len(year_str) == 2:
+        # Map to the closest year in the same century as reference_year
+        century = (reference_year // 100) * 100
+        candidate = century + year_val
+        if candidate < reference_year - 50:
+            candidate += 100
+        elif candidate > reference_year + 50:
+            candidate -= 100
+        return candidate
+
+    if len(year_str) == 4:
+        return year_val
+
+    return None
+
+
+def dte_to_months(dte_value: Optional[float]) -> Optional[float]:
+    """Convert days-to-expiry to approximate months."""
+    if dte_value is None:
+        return None
+    try:
+        if np.isnan(dte_value):
+            return None
+    except TypeError:
+        pass
+    return float(dte_value) / 30.4375
+
+
 def _strip_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
@@ -1164,6 +1226,12 @@ class ExpiryTracker:
     roll_date: Optional[datetime] = None
 
     def __post_init__(self):
+        self._base_month_code = normalize_contract_code(self.month_code) or self.month_code
+
+        inferred_year = infer_contract_year(self.month_code, self.year)
+        if inferred_year is not None:
+            self.year = inferred_year
+
         if self.expiry_date is None:
             self.expiry_date = self._calculate_expiry_date()
 
@@ -1172,7 +1240,13 @@ class ExpiryTracker:
 
     def _calculate_expiry_date(self) -> datetime:
         """Calculate expiry date based on standard rules"""
-        month_num = MONTH_CODE_MAP.get(self.month_code, 1)
+        month_key = normalize_contract_code(self.month_code)
+        month_num = MONTH_CODE_MAP.get(month_key, 1)
+        year = self.year
+
+        inferred_year = infer_contract_year(self.month_code, self.year)
+        if inferred_year is not None:
+            year = inferred_year
 
         # Default expiry rules (can be customized per commodity)
         expiry_rules = {
@@ -1189,10 +1263,10 @@ class ExpiryTracker:
         if commodity in expiry_rules:
             rule = expiry_rules[commodity]
             if rule['day'] > 0:
-                exp_date = datetime(self.year, month_num, rule['day'])
+                exp_date = datetime(year, month_num, rule['day'])
             else:
-                last_day = calendar.monthrange(self.year, month_num)[1]
-                exp_date = datetime(self.year, month_num, last_day) + timedelta(days=rule['day'])
+                last_day = calendar.monthrange(year, month_num)[1]
+                exp_date = datetime(year, month_num, last_day) + timedelta(days=rule['day'])
 
             # Apply business day offset
             if rule['offset'] != 0:
@@ -1201,7 +1275,7 @@ class ExpiryTracker:
             return exp_date
 
         # Default: 15th of the month
-        return datetime(self.year, month_num, 15)
+        return datetime(year, month_num, 15)
 
     def _add_business_days(self, date: datetime, days: int) -> datetime:
         """Add business days to a date"""
@@ -1909,42 +1983,89 @@ class FuturesCurve(SpreadFeature):
 
     def __post_init__(self):
         """Validate and process curve data after initialization"""
-        if len(self.curve_month_labels) != len(self.prices):
-            raise ValueError("Month codes and prices must have same length")
+        if self.prices is None:
+            self.prices = np.array([])
+        else:
+            self.prices = np.asarray(self.prices, dtype=float)
 
-        if self.volumes is not None and len(self.volumes) != len(self.prices):
-            raise ValueError("Volumes must have same length as prices")
+        if not self.curve_month_labels:
+            self.curve_month_labels = [f'M{i}' for i in range(len(self.prices))]
+        elif len(self.curve_month_labels) != len(self.prices):
+            labels = list(self.curve_month_labels)
+            if len(labels) < len(self.prices):
+                labels.extend([f'M{i}' for i in range(len(labels), len(self.prices))])
+            self.curve_month_labels = labels[:len(self.prices)]
 
-        if self.open_interest is not None and len(self.open_interest) != len(self.prices):
-            raise ValueError("Open interest must have same length as prices")
+        if self.volumes is not None:
+            self.volumes = np.asarray(self.volumes, dtype=float)
+            if len(self.volumes) != len(self.prices):
+                raise ValueError("Volumes must have same length as prices")
+
+        if self.open_interest is not None:
+            self.open_interest = np.asarray(self.open_interest, dtype=float)
+            if len(self.open_interest) != len(self.prices):
+                raise ValueError("Open interest must have same length as prices")
 
         if not self.sequential:
             self.sequence_curve()
             self.sequential = True
 
-        if self.days_to_expiry is None:
+        if self.seq_dte is not None:
+            seq_dte_array = np.asarray(self.seq_dte, dtype=float)
+            if seq_dte_array.ndim > 1:
+                seq_dte_array = np.squeeze(seq_dte_array)
+            self.seq_dte = seq_dte_array
+            self.days_to_expiry = seq_dte_array
+        elif self.days_to_expiry is not None:
+            self.days_to_expiry = np.asarray(self.days_to_expiry, dtype=float)
+
+        if self.days_to_expiry is None or len(self.days_to_expiry) == 0:
             self.days_to_expiry = self._calculate_days_to_expiry()
+        else:
+            self.days_to_expiry = np.asarray(self.days_to_expiry, dtype=float)
 
         self.direction = "horizontal"
 
-    def _calculate_days_to_expiry(self) -> List[int]:
-        """Calculate days to expiry for each contract"""
-        dte_list = []
-        for month_code in self.curve_month_labels:
-            month_num = MONTH_CODE_MAP.get(month_code, 1)
-            year = self.ref_date.year
+    def _calculate_days_to_expiry(self) -> np.ndarray:
+        """Calculate days to expiry for each contract."""
+        if self.ref_date is None or not self.curve_month_labels:
+            return np.array([])
 
-            # Infer year based on month progression
-            if month_num < self.ref_date.month:
-                year += 1
-            elif month_num == self.ref_date.month and self.ref_date.day > 15:
-                year += 1
+        dte_list: List[float] = []
+        month_occurrence: Dict[str, int] = {}
+
+        for month_code in self.curve_month_labels:
+            base_code = normalize_contract_code(month_code)
+            if base_code is None or base_code not in MONTH_CODE_MAP:
+                dte_list.append(np.nan)
+                continue
+
+            month_num = MONTH_CODE_MAP[base_code]
+            inferred_year = infer_contract_year(month_code, self.ref_date.year)
+
+            if inferred_year is not None:
+                year = inferred_year
+            else:
+                occurrence = month_occurrence.get(base_code, 0)
+                month_occurrence[base_code] = occurrence + 1
+
+                year = self.ref_date.year
+                if month_num < self.ref_date.month or (
+                        month_num == self.ref_date.month and self.ref_date.day > 15):
+                    year += 1
+                year += occurrence
 
             expiry_date = datetime(year, month_num, 15)
-            days_to_expiry = (expiry_date - self.ref_date).days
-            dte_list.append(max(0, days_to_expiry))
-        self.days_to_expiry = np.array(dte_list)
-        return dte_list
+
+            while expiry_date < self.ref_date:
+                year += 1
+                expiry_date = datetime(year, month_num, 15)
+
+            days_to_expiry = max(0, (expiry_date - self.ref_date).days)
+            dte_list.append(days_to_expiry)
+
+        self.days_to_expiry = np.asarray(dte_list, dtype=float)
+        return self.days_to_expiry
 
     def sequence_curve(self, roll_on: str = 'volume') -> np.ndarray:
         """
@@ -2074,7 +2195,7 @@ class FuturesCurve(SpreadFeature):
 
     def __getitem__(self, key):
         """
-        Access curve data by contract expiry label or sequential M{0-11} codes
+        Access curve data by contract expiry label or sequential M{0+} codes
         
         Parameters:
         - key: str (expiry label like 'F', 'G', 'H' or sequential like 'M0', 'M1') 
@@ -2089,12 +2210,19 @@ class FuturesCurve(SpreadFeature):
         - curve[0] -> First contract price (integer index)
         """
         if isinstance(key, str):
-            if len(key) == 1 and key in self.curve_month_labels:
-                # Single expiry label (F, G, H, etc.)
+            if key in self.curve_month_labels:
                 idx = self.curve_month_labels.index(key)
-                return self.prices[idx] if not np.isnan(self.prices[idx]) else None
-                
-            elif key.startswith('M') and len(key) >= 2:
+                return self.prices[idx] if idx < len(self.prices) and not np.isnan(self.prices[idx]) else None
+
+            base_code = normalize_contract_code(key)
+            if base_code and base_code in self.curve_month_labels:
+                matching_indices = [i for i, label in enumerate(self.curve_month_labels)
+                                    if normalize_contract_code(label) == base_code]
+                if len(matching_indices) == 1:
+                    idx = matching_indices[0]
+                    return self.prices[idx] if not np.isnan(self.prices[idx]) else None
+
+            if key.startswith('M') and len(key) >= 2:
                 # Sequential M{0-11} codes
                 try:
                     seq_idx = int(key[1:])
@@ -2146,11 +2274,26 @@ class Contract(SpreadFeature):
         super().__post_init__()
         # Initialize tracker if not provided
         if self.tracker is None and self.symbol and self.label:
+            year_hint = infer_contract_year(self.label, datetime.today().year) or datetime.today().year
+
+            days_hint = None
+            if isinstance(self.dte, np.ndarray) and self.dte.size > 0:
+                valid_dte = self.dte[~np.isnan(self.dte)] if self.dte.dtype != object else self.dte
+                try:
+                    valid_dte = valid_dte[~np.isnan(valid_dte)]
+                except TypeError:
+                    pass
+                if len(valid_dte) > 0:
+                    days_hint = int(float(valid_dte[0]))
+            elif isinstance(self.dte, (int, float)):
+                if not np.isnan(self.dte):
+                    days_hint = int(float(self.dte))
+
             self.tracker = ExpiryTracker(
                 self.symbol,
                 month_code=self.label,
-                year=datetime.today().year,
-                days_to_expiry=self.dte
+                year=year_hint,
+                days_to_expiry=days_hint
             )
             self.expiration_date = self.tracker.expiry_date if self.tracker else None
         if len(self.data.shape) > 1:
@@ -3390,6 +3533,7 @@ class SpreadData:
         Calculate specific maturity bucket spreads using available month codes:
         - 6mo vs 3mo spread: ~6 month contract minus ~3 month contract
         - 10-12mo vs 6mo spread: ~10-12 month contracts minus ~6 month contract
+        - 24mo vs 12mo spread: ~24 month contract minus ~12 month contract (when available)
         
         Uses actual available month codes from seq_labels to determine correct contracts
         rather than fixed indices, accommodating commodities with limited contract months.
@@ -3406,13 +3550,27 @@ class SpreadData:
             
         seq_prices_data = self.seq_data.seq_prices.data
         n_dates, n_contracts = seq_prices_data.shape
-        
-        # Initialize maturity bucket spreads array
-        maturity_spreads = np.full((n_dates, 2), np.nan)
-        
+
+        seq_dte_array = None
+        if hasattr(self.seq_data, 'seq_dte') and self.seq_data.seq_dte is not None:
+            try:
+                seq_dte_array = np.asarray(self.seq_data.seq_dte, dtype=float)
+                if seq_dte_array.ndim == 1:
+                    seq_dte_array = np.expand_dims(seq_dte_array, axis=0)
+                if seq_dte_array.shape[0] != n_dates and seq_dte_array.shape[1] == n_dates:
+                    seq_dte_array = seq_dte_array.T
+                if seq_dte_array.shape[0] != n_dates:
+                    seq_dte_array = None
+            except Exception:
+                seq_dte_array = None
+
+        # Initialize maturity bucket spreads array (6m-3m, 12m-6m, 24m-12m)
+        maturity_spreads = np.full((n_dates, 3), np.nan)
+
         for i in range(n_dates):
             prices = seq_prices_data[i]
-            
+            dte_row = seq_dte_array[i] if seq_dte_array is not None and i < seq_dte_array.shape[0] else None
+
             # Get available month codes for this date
             available_months = []
             if hasattr(self.seq_labels, 'iloc') and i < len(self.seq_labels):
@@ -3426,44 +3584,77 @@ class SpreadData:
             elif isinstance(self.seq_labels, list) and i < len(self.seq_labels):
                 # List format
                 available_months = self.seq_labels[i]
-            
+
             if not available_months:
                 continue
-                
+
             # Filter out NaN contracts and build valid month-price pairs
             valid_contracts = []
+            month_occurrences: Dict[str, int] = {}
             for j, month_code in enumerate(available_months[:n_contracts]):
-                if j < len(prices) and not np.isnan(prices[j]) and month_code in MONTH_CODE_ORDER:
-                    # Calculate approximate months to expiry based on month code position
-                    month_num = MONTH_CODE_MAP.get(month_code, 1)
-                    valid_contracts.append({
-                        'month_code': month_code,
-                        'price': prices[j],
-                        'seq_index': j,
-                        'month_num': month_num,
-                        'approx_months_out': self._estimate_months_to_expiry(month_code, month_num)
-                    })
-            
+                if j >= len(prices) or np.isnan(prices[j]):
+                    continue
+
+                base_code = normalize_contract_code(month_code)
+                month_num = MONTH_CODE_MAP.get(base_code, None)
+
+                dte_value = None
+                if dte_row is not None and j < len(dte_row):
+                    dte_value = dte_row[j]
+
+                occurrence = 0
+                if base_code:
+                    occurrence = month_occurrences.get(base_code, 0)
+                    month_occurrences[base_code] = occurrence + 1
+
+                approx_months = self._estimate_months_to_expiry(
+                    month_code,
+                    month_num,
+                    dte_value=dte_value,
+                    occurrence=occurrence
+                )
+
+                if approx_months is None:
+                    continue
+
+                valid_contracts.append({
+                    'month_code': month_code,
+                    'price': prices[j],
+                    'seq_index': j,
+                    'month_num': month_num,
+                    'approx_months_out': approx_months,
+                    'dte': dte_value
+                })
+
             if len(valid_contracts) < 2:
                 continue
-                
+
             # Sort by approximate months to expiry
             valid_contracts.sort(key=lambda x: x['approx_months_out'])
-            
+
             # Find contracts closest to target maturities
             three_month_contract = self._find_closest_maturity_contract(valid_contracts, target_months=3)
             six_month_contract = self._find_closest_maturity_contract(valid_contracts, target_months=6)
+            twelve_month_contract = self._find_closest_maturity_contract(valid_contracts, target_months=12)
+            two_year_contract = self._find_closest_maturity_contract(valid_contracts, target_months=24)
             long_contracts = self._find_long_maturity_contracts(valid_contracts, min_months=9)
-            
+
             # Calculate 6mo vs 3mo spread
             if three_month_contract and six_month_contract:
                 maturity_spreads[i, 0] = six_month_contract['price'] - three_month_contract['price']
-            
+
             # Calculate 10-12mo vs 6mo spread
             if long_contracts and six_month_contract:
                 avg_long_price = np.mean([c['price'] for c in long_contracts])
                 maturity_spreads[i, 1] = avg_long_price - six_month_contract['price']
-        
+
+            # Calculate ~24m vs 12m spread when sufficiently far contracts exist
+            if two_year_contract and twelve_month_contract:
+                if (two_year_contract['approx_months_out'] >= 18 and
+                        two_year_contract['approx_months_out'] > twelve_month_contract['approx_months_out']):
+                    maturity_spreads[i, 2] = (two_year_contract['price'] -
+                                              twelve_month_contract['price'])
+
         # Create SpreadFeature objects for the calculated spreads
         bucket_6m_3m = SpreadFeature(
             data=maturity_spreads[:, 0],
@@ -3473,38 +3664,60 @@ class SpreadData:
         )
         
         bucket_12m_6m = SpreadFeature(
-            data=maturity_spreads[:, 1], 
+            data=maturity_spreads[:, 1],
             direction="vertical",
             index=self.index,
             labels=["12m_vs_6m"]
         )
-        
+
+        bucket_24m_12m = SpreadFeature(
+            data=maturity_spreads[:, 2],
+            direction="vertical",
+            index=self.index,
+            labels=["24m_vs_12m"]
+        )
+
         # Store as attributes
         self.maturity_6m_3m_spread = bucket_6m_3m
         self.maturity_12m_6m_spread = bucket_12m_6m
-        
+        self.maturity_24m_12m_spread = bucket_24m_12m
+
         return {
             '6m_vs_3m': bucket_6m_3m,
-            '12m_vs_6m': bucket_12m_6m
+            '12m_vs_6m': bucket_12m_6m,
+            '24m_vs_12m': bucket_24m_12m
         }
-    
-    def _estimate_months_to_expiry(self, month_code: str, month_num: int) -> float:
+
+    def _estimate_months_to_expiry(self,
+                                   month_code: str,
+                                   month_num: Optional[int],
+                                   dte_value: Optional[float] = None,
+                                   occurrence: int = 0) -> Optional[float]:
         """
         Estimate approximate months to expiry based on month code.
         This is a rough approximation for sorting contracts by maturity.
         """
+        months_from_dte = dte_to_months(dte_value)
+        if months_from_dte is not None:
+            return months_from_dte
+
+        base_code = normalize_contract_code(month_code)
+        if month_num is None and base_code in MONTH_CODE_MAP:
+            month_num = MONTH_CODE_MAP[base_code]
+
+        if month_num is None:
+            return None
+
         if not hasattr(self, 'index') or len(self.index) == 0:
-            return month_num  # Fallback to month number
-            
-        # Use current date from index for better estimation
+            return float(month_num + occurrence * 12)
+
         current_month = self.index[0].month if hasattr(self.index[0], 'month') else 1
-        
-        # Calculate months forward, handling year wrap-around
         months_forward = month_num - current_month
         if months_forward <= 0:
-            months_forward += 12  # Next year's contract
-            
-        return months_forward
+            months_forward += 12
+
+        months_forward += occurrence * 12
+        return float(months_forward)
     
     def _find_closest_maturity_contract(self, contracts: list, target_months: int) -> dict:
         """Find the contract closest to the target maturity in months."""
@@ -3541,19 +3754,23 @@ class SpreadData:
         dict or pd.DataFrame
             Maturity bucket spreads indexed by datetime
         """
-        if not hasattr(self, 'maturity_6m_3m_spread') or not hasattr(self, 'maturity_12m_6m_spread'):
+        if (not hasattr(self, 'maturity_6m_3m_spread') or
+                not hasattr(self, 'maturity_12m_6m_spread') or
+                not hasattr(self, 'maturity_24m_12m_spread')):
             # Calculate if not already done
             self.calculate_maturity_bucket_spreads()
-        
+
         if as_dataframe:
             return pd.DataFrame({
                 '6m_vs_3m': self.maturity_6m_3m_spread.data,
-                '12m_vs_6m': self.maturity_12m_6m_spread.data
+                '12m_vs_6m': self.maturity_12m_6m_spread.data,
+                '24m_vs_12m': self.maturity_24m_12m_spread.data
             }, index=self.index)
         else:
             return {
                 '6m_vs_3m': self.maturity_6m_3m_spread,
-                '12m_vs_6m': self.maturity_12m_6m_spread
+                '12m_vs_6m': self.maturity_12m_6m_spread,
+                '24m_vs_12m': self.maturity_24m_12m_spread
             }
     
     def get_maturity_bucket_contracts_info(self, date_index: int = 0) -> dict:
@@ -3581,9 +3798,27 @@ class SpreadData:
         if date_index >= len(self.index):
             return {'error': f'Date index {date_index} out of range (max: {len(self.index)-1})'}
         
+        # Prepare DTE information if available
+        seq_dte_array = None
+        if hasattr(self.seq_data, 'seq_dte') and self.seq_data.seq_dte is not None:
+            try:
+                seq_dte_array = np.asarray(self.seq_data.seq_dte, dtype=float)
+                if seq_dte_array.ndim == 1:
+                    seq_dte_array = np.expand_dims(seq_dte_array, axis=0)
+                if seq_dte_array.shape[0] != self.seq_data.seq_prices.data.shape[0] and \
+                        seq_dte_array.shape[1] == self.seq_data.seq_prices.data.shape[0]:
+                    seq_dte_array = seq_dte_array.T
+                if seq_dte_array.shape[0] != self.seq_data.seq_prices.data.shape[0]:
+                    seq_dte_array = None
+            except Exception:
+                seq_dte_array = None
+
         # Get data for specified date
         prices = self.seq_data.seq_prices.data[date_index]
-        
+        dte_row = None
+        if seq_dte_array is not None and date_index < seq_dte_array.shape[0]:
+            dte_row = seq_dte_array[date_index]
+
         # Get available month codes for this date
         available_months = []
         if hasattr(self.seq_labels, 'iloc'):
@@ -3593,52 +3828,90 @@ class SpreadData:
                     available_months = labels_row.values[0]
                 else:
                     available_months = labels_row.values.tolist()
-        
+        elif isinstance(self.seq_labels, list) and date_index < len(self.seq_labels):
+            available_months = self.seq_labels[date_index]
+
         # Build valid contracts info
         valid_contracts = []
+        month_occurrences: Dict[str, int] = {}
         for j, month_code in enumerate(available_months):
-            if j < len(prices) and not np.isnan(prices[j]) and month_code in MONTH_CODE_ORDER:
-                month_num = MONTH_CODE_MAP.get(month_code, 1)
-                valid_contracts.append({
-                    'month_code': month_code,
-                    'price': float(prices[j]),
-                    'seq_index': j,
-                    'month_num': month_num,
-                    'approx_months_out': self._estimate_months_to_expiry(month_code, month_num)
-                })
-        
+            if j >= len(prices) or np.isnan(prices[j]):
+                continue
+
+            base_code = normalize_contract_code(month_code)
+            month_num = MONTH_CODE_MAP.get(base_code, None)
+
+            dte_value = None
+            if dte_row is not None and j < len(dte_row):
+                dte_value = dte_row[j]
+
+            occurrence = 0
+            if base_code:
+                occurrence = month_occurrences.get(base_code, 0)
+                month_occurrences[base_code] = occurrence + 1
+
+            approx_months = self._estimate_months_to_expiry(
+                month_code,
+                month_num,
+                dte_value=dte_value,
+                occurrence=occurrence
+            )
+
+            if approx_months is None:
+                continue
+
+            valid_contracts.append({
+                'month_code': month_code,
+                'price': float(prices[j]),
+                'seq_index': j,
+                'month_num': month_num,
+                'approx_months_out': approx_months,
+                'dte': dte_value
+            })
+
         if len(valid_contracts) < 2:
             return {'error': 'Insufficient valid contracts for analysis'}
-            
+
         # Sort by approximate months to expiry
         valid_contracts.sort(key=lambda x: x['approx_months_out'])
-        
+
         # Find selected contracts
         three_month_contract = self._find_closest_maturity_contract(valid_contracts, target_months=3)
         six_month_contract = self._find_closest_maturity_contract(valid_contracts, target_months=6)
+        twelve_month_contract = self._find_closest_maturity_contract(valid_contracts, target_months=12)
+        two_year_contract = self._find_closest_maturity_contract(valid_contracts, target_months=24)
         long_contracts = self._find_long_maturity_contracts(valid_contracts, min_months=9)
-        
+
         result = {
             'analysis_date': self.index[date_index],
             'available_contracts': valid_contracts,
             'selected_contracts': {
                 '3_month_target': three_month_contract,
                 '6_month_target': six_month_contract,
+                '12_month_target': twelve_month_contract,
+                '24_month_target': two_year_contract,
                 'long_contracts': long_contracts
             },
             'calculated_spreads': {}
         }
-        
+
         # Calculate the spreads that would be computed
         if three_month_contract and six_month_contract:
             result['calculated_spreads']['6m_vs_3m'] = (
                 six_month_contract['price'] - three_month_contract['price']
             )
-        
+
         if long_contracts and six_month_contract:
             avg_long_price = np.mean([c['price'] for c in long_contracts])
             result['calculated_spreads']['12m_vs_6m'] = avg_long_price - six_month_contract['price']
-        
+
+        if two_year_contract and twelve_month_contract:
+            if (two_year_contract['approx_months_out'] >= 18 and
+                    two_year_contract['approx_months_out'] > twelve_month_contract['approx_months_out']):
+                result['calculated_spreads']['24m_vs_12m'] = (
+                    two_year_contract['price'] - twelve_month_contract['price']
+                )
+
         return result
 
     def load_from_client(self):
