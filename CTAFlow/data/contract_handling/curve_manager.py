@@ -3275,17 +3275,31 @@ class SpreadData:
         
         # Extract date range
         date_range = self.index[start_idx:stop_idx:step]
-        
+
         # VECTORIZED CURVE CREATION (35-108x faster than original loop)
-        curves = self._create_futures_curves_batch(date_range.tolist())
-        
+        curves, actual_dates = self._create_futures_curves_batch(date_range.tolist())
+
+        # Use the actual dates pulled from seq_data for alignment
+        # Fallback to the original date if no actual timestamp is available
+        aligned_dates: List[pd.Timestamp] = []
+        for requested_date, actual_date in zip(date_range, actual_dates):
+            if pd.isna(actual_date):
+                aligned_dates.append(pd.Timestamp(requested_date))
+            else:
+                aligned_dates.append(pd.Timestamp(actual_date))
+
+        result_index = pd.DatetimeIndex(
+            aligned_dates,
+            name=getattr(self.index, 'name', None)
+        )
+
         # Return pd.Series with datetime index and FuturesCurve values
-        return pd.Series(curves, index=date_range, name='futures_curves')
-    
-    def _create_futures_curves_batch(self, dates_list: List[datetime]) -> List:
+        return pd.Series(curves, index=result_index, name='futures_curves')
+
+    def _create_futures_curves_batch(self, dates_list: List[datetime]) -> Tuple[List[Optional[FuturesCurve]], List[pd.Timestamp]]:
         """
         VECTORIZED method to create multiple FuturesCurve objects efficiently
-        
+
         This method is 35-108x faster than individual curve creation by using:
         - Vectorized date lookups with pandas get_indexer
         - Vectorized data extraction with numpy array slicing  
@@ -3295,56 +3309,90 @@ class SpreadData:
         
         if not hasattr(self, 'seq_data') or self.seq_data is None:
             raise ValueError("No seq_data available for batch curve creation")
-        
+
         if len(dates_list) == 0:
-            return []
-        
+            return [], []
+
+        if self.seq_data.timestamps is None:
+            raise ValueError("No timestamp data available for batch curve creation")
+
         # STEP 1: Vectorized date lookup (much faster than individual searches)
         dates_index = pd.DatetimeIndex(dates_list)
         timestamps = self.seq_data.timestamps
+        if not isinstance(timestamps, pd.DatetimeIndex):
+            timestamps = pd.DatetimeIndex(timestamps)
         date_indices = timestamps.get_indexer(dates_index, method='nearest')
-        
-        # STEP 2: Vectorized data extraction
-        seq_prices_data = self.seq_data.seq_prices.data
-        seq_labels = self.seq_data.seq_labels
+        date_indices = np.asarray(date_indices, dtype=int)
 
-        # Extract all price rows at once (vectorized operation)
-        price_rows = seq_prices_data[date_indices]  # Shape: (n_dates, n_contracts)
-        valid_masks = ~np.isnan(price_rows)  # Vectorized NaN checking
-        
+        # STEP 2: Vectorized data extraction with bounds validation
+        seq_prices = getattr(self.seq_data.seq_prices, 'data', None)
+        if seq_prices is None:
+            raise ValueError("No sequential price data available")
+
+        seq_prices_data = np.asarray(seq_prices)
+        if seq_prices_data.ndim == 1:
+            seq_prices_data = seq_prices_data[:, np.newaxis]
+
+        n_rows, n_contracts = seq_prices_data.shape
+        valid_index_mask = (date_indices >= 0) & (date_indices < n_rows)
+
+        price_rows = np.full((len(dates_list), n_contracts), np.nan, dtype=float)
+        if np.any(valid_index_mask):
+            price_rows_valid = seq_prices_data[date_indices[valid_index_mask]]
+            price_rows[valid_index_mask] = price_rows_valid
+
+        valid_masks = ~np.isnan(price_rows)
+
+        seq_labels = getattr(self.seq_data, 'seq_labels', None)
+
+        curves: List[Optional[FuturesCurve]] = []
+        actual_dates: List[pd.Timestamp] = []
+
         # STEP 3: Batch process results (still need loop for object creation)
-        curves = []
-        for i, (date_idx, date) in enumerate(zip(date_indices, dates_list)):
+        for i, (date_idx, requested_date) in enumerate(zip(date_indices, dates_list)):
+            if not valid_index_mask[i]:
+                curves.append(None)
+                actual_dates.append(pd.NaT)
+                continue
+
             prices_row = price_rows[i]
             valid_mask = valid_masks[i]
-            
-            if not valid_mask.any():  # No valid prices for this date
+
+            if not valid_mask.any():
+                actual_dates.append(pd.Timestamp(timestamps[date_idx]))
                 curves.append(None)
                 continue
-            
+
             # Use boolean indexing to extract valid data
             valid_prices = prices_row[valid_mask]
-            
-            # Get labels efficiently  
-            if seq_labels and len(seq_labels) > date_idx:
+
+            # Get labels efficiently while handling varying structures
+            valid_labels: List[str] = []
+            if seq_labels is not None and len(seq_labels) > date_idx:
                 date_labels = seq_labels[date_idx]
-                if isinstance(date_labels, (list, np.ndarray)) and len(date_labels)  > 0:
-                    valid_labels = np.array(date_labels)[valid_mask]
-                else:
-                    valid_labels = [f'M{j}' for j in range(len(valid_prices))]
-            else:
-                valid_labels = [f'M{j}' for j in range(len(valid_prices))]
-            
+                if isinstance(date_labels, (list, tuple, np.ndarray)):
+                    for label, include in zip(date_labels, valid_mask[:len(date_labels)]):
+                        if include:
+                            valid_labels.append(str(label))
+
+            if len(valid_labels) < len(valid_prices):
+                valid_labels.extend(
+                    [f'M{j}' for j in range(len(valid_labels), len(valid_prices))]
+                )
+
+            actual_date = pd.Timestamp(timestamps[date_idx])
+
             # Create simplified curve data structure (can be upgraded to FuturesCurve later)
             curve_data = FuturesCurve(
-                ref_date=date,
+                ref_date=actual_date,
                 prices=valid_prices,
                 seq_prices=valid_prices,
                 curve_month_labels=valid_labels,
             )
             curves.append(curve_data)
-        
-        return curves
+            actual_dates.append(actual_date)
+
+        return curves, actual_dates
     
     def get_seq_curves(self, 
                       date_range: Optional[Union[slice, pd.DatetimeIndex, List[datetime]]] = None,
