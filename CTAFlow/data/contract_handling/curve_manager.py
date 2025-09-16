@@ -1968,6 +1968,7 @@ class FuturesCurve(SpreadFeature):
     """
     Single snapshot of a futures curve at a specific point in time
     """
+    symbol: Optional[str] = None
     ref_date: datetime = None
     curve_month_labels: List[str] = field(default_factory=list)
     prices: np.ndarray = None
@@ -2422,8 +2423,13 @@ class SpreadData:
     dte: Optional[np.ndarray] = None
     seq_dte: Optional[np.ndarray] = None
 
-    # Sequential data container
-    seq_data: SeqData = None
+    # Sequential DataFrames (loaded directly from HDF5)
+    seq_prices: Optional[pd.DataFrame] = None
+    seq_volume: Optional[pd.DataFrame] = None
+    seq_oi: Optional[pd.DataFrame] = None
+    seq_labels: Optional[pd.DataFrame] = None
+    seq_spreads: Optional[pd.DataFrame] = None
+    seq_dte: Optional[pd.DataFrame] = None
 
     # Volume and OI curves
     volume_curve: np.ndarray = None
@@ -2845,24 +2851,23 @@ class SpreadData:
             if hasattr(self, 'seq_dte') and self.seq_dte is not None:
                 seq_dte_data = self.seq_dte.values if hasattr(self.seq_dte, 'values') else self.seq_dte
 
-            # Create SeqData container
-            self.seq_data = SeqData(
-                timestamps=self.index,
-                seq_labels=list(seq_labels_data) if seq_labels_data is not None else None,
-                seq_prices=SpreadFeature(data=seq_prices_data, direction="horizontal",
-                                         index=self.index) if seq_prices_data is not None else None,
-                seq_spreads=SpreadFeature(data=seq_spreads_data, direction="horizontal",
-                                          index=self.index) if seq_spreads_data is not None else None,
-                seq_oi=SpreadFeature(data=seq_oi_data, direction="horizontal",
-                                     index=self.index) if seq_oi_data is not None else None,
-                seq_volume=SpreadFeature(data=seq_volumes_data, direction="horizontal",
-                                         index=self.index) if seq_volumes_data is not None else None,
-                seq_dte=seq_dte_data,
-                roll_dates=self.roll_dates
-            )
+            # Create seq_data namespace containing all DataFrame references
+            if hasattr(self, 'seq_prices') and self.seq_prices is not None:
+                class SeqDataNamespace:
+                    def __init__(self, spread_data):
+                        self.timestamps = spread_data.index
+                        # Create objects that have .data attributes pointing to DataFrame values
+                        self.seq_prices = type('PriceContainer', (), {'data': spread_data.seq_prices.values})()
+                        self.seq_labels = spread_data.seq_labels if hasattr(spread_data, 'seq_labels') else None
+                        self.seq_volume = type('VolumeContainer', (), {'data': spread_data.seq_volume.values if hasattr(spread_data, 'seq_volume') and spread_data.seq_volume is not None else None})()
+                        self.seq_oi = type('OIContainer', (), {'data': spread_data.seq_oi.values if hasattr(spread_data, 'seq_oi') and spread_data.seq_oi is not None else None})()
+                        self.seq_dte = spread_data.seq_dte if hasattr(spread_data, 'seq_dte') else None
+                        self.roll_dates = spread_data.roll_dates if hasattr(spread_data, 'roll_dates') else None
+
+                self.seq_data = SeqDataNamespace(self)
             
             # Calculate maturity bucket spreads if seq_prices is available
-            if self.seq_data.seq_prices is not None:
+            if self.seq_prices is not None:
                 try:
                     self.calculate_maturity_bucket_spreads()
                 except Exception as e:
@@ -2889,8 +2894,8 @@ class SpreadData:
         if date is None:
             date = datetime.now()
 
-        # Use seq_data if available for better performance
-        if hasattr(self, 'seq_data') and self.seq_data is not None:
+        # Use sequential DataFrames if available for better performance
+        if self.seq_prices is not None:
             return self._create_curve_from_seq_data(date)
 
         # Fall back to original curve-based method
@@ -2947,19 +2952,30 @@ class SpreadData:
             open_interest=ois if any(not np.isnan(o) for o in ois) else None
         )
 
-    def _create_curve_from_seq_data(self, date: datetime) -> FuturesCurve:
-        """Create FuturesCurve using seq_data for better performance"""
-        if self.seq_data.timestamps is None:
-            raise ValueError("No timestamp data in seq_data")
+    def _create_curve_from_seq_data(self, date: datetime) -> Optional[FuturesCurve]:
+        """Create FuturesCurve using sequential DataFrames directly"""
+        if self.seq_prices is None or len(self.seq_prices) == 0:
+            return None
 
-        # Find date index
-        date_idx = None
-        if date in self.seq_data.timestamps:
-            date_idx = list(self.seq_data.timestamps).index(date)
-        else:
-            # Find nearest date
-            time_diffs = np.abs(self.seq_data.timestamps - date)
-            date_idx = time_diffs.argmin()
+        # Find the index for the requested date
+        if isinstance(date, pd.Timestamp):
+            date = date.to_pydatetime()
+
+        # Find closest date in the seq_prices index
+        try:
+            if date in self.seq_prices.index:
+                date_idx = self.seq_prices.index.get_loc(date)
+            else:
+                # Find nearest date
+                date_idx = self.seq_prices.index.get_indexer([date], method='nearest')[0]
+                if date_idx == -1:
+                    return None
+        except (KeyError, IndexError):
+            return None
+
+        # Check if date_idx is within bounds
+        if date_idx >= len(self.seq_prices):
+            return None
 
         # Extract data for this date - keep NaN values to maintain consistency
         prices = []
@@ -2968,51 +2984,76 @@ class SpreadData:
         seq_dtes = []
         labels = []
 
-        if self.seq_data.seq_prices and self.seq_data.seq_prices.data is not None:
-            price_row = self.seq_data.seq_prices.data[date_idx]
-            # Keep all values including NaN for consistent indexing
-            for i, p in enumerate(price_row):
-                if not np.isnan(p):
-                    prices.append(float(p))
-                    # Use corresponding label from seq_labels or default
-                    if (self.seq_data.seq_labels and
-                            isinstance(self.seq_data.seq_labels, list) and
-                            len(self.seq_data.seq_labels) > date_idx):
-                        # Handle seq_labels structure
-                        date_labels = self.seq_data.seq_labels[date_idx]
-                        if isinstance(date_labels, list) and len(date_labels) > i:
-                            labels.append(date_labels[i])
+        # Extract price data for this date
+        try:
+            price_row = self.seq_prices.iloc[date_idx]
+        except (IndexError, KeyError):
+            return None
+
+        # Keep all values including NaN for consistent indexing
+        for i, p in enumerate(price_row):
+            if not np.isnan(p):
+                prices.append(float(p))
+                # Use corresponding label from seq_labels or default
+                if self.seq_labels is not None and date_idx < len(self.seq_labels):
+                    try:
+                        label_row = self.seq_labels.iloc[date_idx]
+                        if i < len(label_row) and pd.notna(label_row.iloc[i]):
+                            labels.append(str(label_row.iloc[i]))
                         else:
-                            labels.append(MONTH_CODE_ORDER[i] if i < len(MONTH_CODE_ORDER) else f'M{i}')
-                    else:
-                        labels.append(MONTH_CODE_ORDER[i] if i < len(MONTH_CODE_ORDER) else f'M{i}')
+                            labels.append(f'M{i}')
+                    except (IndexError, KeyError):
+                        labels.append(f'M{i}')
+                else:
+                    labels.append(f'M{i}')
 
-        # Extract volume and OI data for valid contracts only  
-        if self.seq_data.seq_volume and self.seq_data.seq_volume.data is not None:
-            volume_row = self.seq_data.seq_volume.data[date_idx]
-            # Match the length of prices array
-            for i, p in enumerate(self.seq_data.seq_prices.data[date_idx]):
-                if not np.isnan(p) and i < len(volume_row):
-                    volumes.append(float(volume_row[i]) if not np.isnan(volume_row[i]) else np.nan)
+        # Extract volume data for valid contracts only
+        if self.seq_volume is not None and date_idx < len(self.seq_volume):
+            try:
+                volume_row = self.seq_volume.iloc[date_idx]
+                for i, p in enumerate(price_row):
+                    if not np.isnan(p) and i < len(volume_row):
+                        vol = volume_row.iloc[i] if hasattr(volume_row, 'iloc') else volume_row[i]
+                        volumes.append(float(vol) if pd.notna(vol) else np.nan)
+            except (IndexError, KeyError):
+                volumes = [np.nan] * len(prices)
 
-        if self.seq_data.seq_oi and self.seq_data.seq_oi.data is not None:
-            oi_row = self.seq_data.seq_oi.data[date_idx]
-            # Match the length of prices array
-            for i, p in enumerate(self.seq_data.seq_prices.data[date_idx]):
-                if not np.isnan(p) and i < len(oi_row):
-                    ois.append(float(oi_row[i]) if not np.isnan(oi_row[i]) else np.nan)
+        # Extract OI data for valid contracts only
+        if self.seq_oi is not None and date_idx < len(self.seq_oi):
+            try:
+                oi_row = self.seq_oi.iloc[date_idx]
+                for i, p in enumerate(price_row):
+                    if not np.isnan(p) and i < len(oi_row):
+                        oi = oi_row.iloc[i] if hasattr(oi_row, 'iloc') else oi_row[i]
+                        ois.append(float(oi) if pd.notna(oi) else np.nan)
+            except (IndexError, KeyError):
+                ois = [np.nan] * len(prices)
 
-        # Extract seq_dte data for valid contracts only
-        if self.seq_data.seq_dte is not None:
-            if hasattr(self.seq_data.seq_dte, '__len__') and len(self.seq_data.seq_dte) > date_idx:
-                dte_row = self.seq_data.seq_dte[date_idx]
-                # Match the length of prices array
-                for i, p in enumerate(self.seq_data.seq_prices.data[date_idx]):
-                    if not np.isnan(p) and i < len(dte_row):
-                        seq_dtes.append(float(dte_row[i]) if not np.isnan(dte_row[i]) else np.nan)
+        # Extract DTE data for valid contracts
+        if self.seq_dte is not None and date_idx < len(self.seq_dte):
+            try:
+                if isinstance(self.seq_dte, pd.DataFrame):
+                    dte_row = self.seq_dte.iloc[date_idx]
+                    for i, p in enumerate(price_row):
+                        if not np.isnan(p) and i < len(dte_row):
+                            dte = dte_row.iloc[i]
+                            seq_dtes.append(float(dte) if pd.notna(dte) else np.nan)
+                else:
+                    # Handle numpy array case
+                    dte_row = self.seq_dte[date_idx] if hasattr(self.seq_dte, '__getitem__') else []
+                    for i, p in enumerate(price_row):
+                        if not np.isnan(p) and i < len(dte_row):
+                            seq_dtes.append(float(dte_row[i]) if not np.isnan(dte_row[i]) else np.nan)
+            except (IndexError, KeyError):
+                seq_dtes = [np.nan] * len(prices)
+
+        # Check if we have enough valid contracts for a meaningful curve
+        n_contracts = len(prices)
+        min_contracts = 2  # Require at least 2 valid contracts
+        if n_contracts < min_contracts:
+            return None
 
         # Ensure all arrays have the same length as prices
-        n_contracts = len(prices)
         if len(volumes) < n_contracts:
             volumes.extend([np.nan] * (n_contracts - len(volumes)))
         if len(ois) < n_contracts:
@@ -3022,14 +3063,23 @@ class SpreadData:
         if len(labels) < n_contracts:
             labels.extend([f'M{i}' for i in range(len(labels), n_contracts)])
 
-        return FuturesCurve(
-            ref_date=self.seq_data.timestamps[date_idx],
-            curve_month_labels=labels[:n_contracts],
-            prices=prices,
-            volumes=volumes if any(not np.isnan(v) for v in volumes) else None,
-            open_interest=ois if any(not np.isnan(o) for o in ois) else None,
-            seq_dte=np.array(seq_dtes) if seq_dtes and any(not np.isnan(d) for d in seq_dtes) else None
-        )
+        try:
+            return FuturesCurve(
+                symbol=self.symbol,
+                ref_date=date,
+                curve_month_labels=labels,
+                prices=np.array(prices),
+                volumes=np.array(volumes) if not all(np.isnan(volumes)) else None,
+                open_interest=np.array(ois) if not all(np.isnan(ois)) else None,
+                seq_prices=np.array(prices),
+                seq_labels=labels,
+                seq_volumes=np.array(volumes) if not all(np.isnan(volumes)) else None,
+                seq_dte=np.array(seq_dtes) if not all(np.isnan(seq_dtes)) else None,
+                days_to_expiry=np.array(seq_dtes) if not all(np.isnan(seq_dtes)) else None
+            )
+        except Exception as e:
+            # If curve creation fails, return None
+            return None
     
     def __getitem__(self, key):
         """
@@ -3253,7 +3303,7 @@ class SpreadData:
     
     def _get_slice_analysis(self, key: slice) -> pd.Series:
         """Get pd.Series of FuturesCurve objects for date range slice"""
-        if not hasattr(self, 'seq_data') or self.seq_data is None:
+        if self.seq_prices is None:
             raise ValueError("No sequential data available")
         
         # Convert slice bounds to datetime indices if they are strings
@@ -3307,25 +3357,31 @@ class SpreadData:
         - Bulk processing instead of individual loops
         """
         
-        if not hasattr(self, 'seq_data') or self.seq_data is None:
-            raise ValueError("No seq_data available for batch curve creation")
+        if self.seq_prices is None:
+            raise ValueError("No seq_prices available for batch curve creation")
 
         if len(dates_list) == 0:
             return [], []
 
-        if self.seq_data.timestamps is None:
+        if self.index is None:
             raise ValueError("No timestamp data available for batch curve creation")
 
         # STEP 1: Vectorized date lookup (much faster than individual searches)
         dates_index = pd.DatetimeIndex(dates_list)
-        timestamps = self.seq_data.timestamps
+        timestamps = self.index
         if not isinstance(timestamps, pd.DatetimeIndex):
             timestamps = pd.DatetimeIndex(timestamps)
         date_indices = timestamps.get_indexer(dates_index, method='nearest')
         date_indices = np.asarray(date_indices, dtype=int)
 
         # STEP 2: Vectorized data extraction with bounds validation
-        seq_prices = getattr(self.seq_data.seq_prices, 'data', None)
+        if hasattr(self, 'seq_prices') and self.seq_prices is not None:
+            seq_prices = self.seq_prices.values  # Get numpy array from DataFrame
+        elif hasattr(self, 'seq_data') and hasattr(self.seq_data, 'seq_prices'):
+            seq_prices = getattr(self.seq_data.seq_prices, 'data', None)
+        else:
+            seq_prices = None
+
         if seq_prices is None:
             raise ValueError("No sequential price data available")
 
@@ -3334,6 +3390,7 @@ class SpreadData:
             seq_prices_data = seq_prices_data[:, np.newaxis]
 
         n_rows, n_contracts = seq_prices_data.shape
+        # Check bounds against actual price data length, not timestamps length
         valid_index_mask = (date_indices >= 0) & (date_indices < n_rows)
 
         price_rows = np.full((len(dates_list), n_contracts), np.nan, dtype=float)
@@ -3343,7 +3400,12 @@ class SpreadData:
 
         valid_masks = ~np.isnan(price_rows)
 
-        seq_labels = getattr(self.seq_data, 'seq_labels', None)
+        if hasattr(self, 'seq_labels') and self.seq_labels is not None:
+            seq_labels = self.seq_labels
+        elif hasattr(self, 'seq_data') and hasattr(self.seq_data, 'seq_labels'):
+            seq_labels = getattr(self.seq_data, 'seq_labels', None)
+        else:
+            seq_labels = None
 
         curves: List[Optional[FuturesCurve]] = []
         actual_dates: List[pd.Timestamp] = []
@@ -3358,7 +3420,9 @@ class SpreadData:
             prices_row = price_rows[i]
             valid_mask = valid_masks[i]
 
-            if not valid_mask.any():
+            # Require minimum number of valid contracts for meaningful curve
+            min_contracts = 2  # Require at least 2 valid contracts
+            if not valid_mask.any() or valid_mask.sum() < min_contracts:
                 actual_dates.append(pd.Timestamp(timestamps[date_idx]))
                 curves.append(None)
                 continue
@@ -3369,7 +3433,11 @@ class SpreadData:
             # Get labels efficiently while handling varying structures
             valid_labels: List[str] = []
             if seq_labels is not None and len(seq_labels) > date_idx:
-                date_labels = seq_labels[date_idx]
+                # Use .iloc for positional indexing if it's a DataFrame
+                if hasattr(seq_labels, 'iloc'):
+                    date_labels = seq_labels.iloc[date_idx]
+                else:
+                    date_labels = seq_labels[date_idx]
                 if isinstance(date_labels, (list, tuple, np.ndarray)):
                     for label, include in zip(date_labels, valid_mask[:len(date_labels)]):
                         if include:
@@ -3423,7 +3491,7 @@ class SpreadData:
         >>> evolution = CurveEvolution(seq_curves)
         """
         
-        if not hasattr(self, 'seq_data') or self.seq_data is None:
+        if self.seq_prices is None:
             raise ValueError("No sequential data available for curve extraction")
             
         if self.index is None or len(self.index) == 0:
@@ -3446,14 +3514,14 @@ class SpreadData:
         else:
             raise TypeError(f"Invalid date_range type: {type(date_range)}")
         
-        # Generate FuturesCurve objects for selected dates
+        # Generate FuturesCurve objects for selected dates using the working method
         curves_list = []
         valid_dates = []
-        
+
         for date in selected_dates:
             try:
-                # Create FuturesCurve for this date
-                curve = self.create_futures_curve(date)
+                # Use the working _create_curve_from_seq_data method directly
+                curve = self._create_curve_from_seq_data(date)
                 if curve is not None:
                     curves_list.append(curve)
                     valid_dates.append(date)
@@ -3596,7 +3664,7 @@ class SpreadData:
         if not hasattr(self, 'seq_labels') or self.seq_labels is None:
             raise ValueError("No seq_labels available for determining contract months")
             
-        seq_prices_data = self.seq_data.seq_prices.data
+        seq_prices_data = self.seq_prices.values
         n_dates, n_contracts = seq_prices_data.shape
 
         seq_dte_array = None
@@ -4040,7 +4108,12 @@ class SpreadData:
         
         curve_df = curve_data['curve']
         self.curve = curve_df
-        self.index = curve_df.index
+
+        # Use seq_curve index if available (more accurate than curve index)
+        if 'seq_curve' in curve_data and isinstance(curve_data['seq_curve'], pd.DataFrame):
+            self.index = curve_data['seq_curve'].index
+        else:
+            self.index = curve_df.index
         
         # Batch create Contract objects with pre-extracted dte data
         contract_columns = curve_df.columns

@@ -832,12 +832,12 @@ class DataClient:
             "oi_curve": f"{symbol_key}/oi_curve",
             "front": f"{symbol_key}/front_month", 
             "dte": f"{symbol_key}/days_to_expiry",
-            "seq_curve": f"{symbol_key}/curve_seq",
-            "seq_volume": f"{symbol_key}/volume_seq",
-            "seq_oi": f"{symbol_key}/oi_seq",
-            "seq_labels": f"{symbol_key}/curve_seq_labels",
-            "seq_dte": f"{symbol_key}/days_to_expiry_seq",
-            "seq_spreads": f"{symbol_key}/spreads_seq",
+            "seq_curve": f"{symbol_key}/seq_curve",
+            "seq_volume": f"{symbol_key}/seq_volume",
+            "seq_oi": f"{symbol_key}/seq_oi",
+            "seq_labels": f"{symbol_key}/seq_labels",
+            "seq_dte": f"{symbol_key}/seq_dte",
+            "seq_spreads": f"{symbol_key}/seq_spreads",
             "spot": f"{symbol_key}/spot"
         }
         
@@ -953,12 +953,12 @@ class DataClient:
             'oi_curve': '/oi_curve',
             'front': '/front_month',
             'dte': '/days_to_expiry',
-            'seq_curve': '/curve_seq',
-            'seq_volume': '/volume_seq',
-            'seq_oi': '/oi_seq',
-            'seq_labels': '/curve_seq_labels',
-            'seq_dte': '/days_to_expiry_seq',
-            'seq_spreads': '/spreads_seq'
+            'seq_curve': '/seq_curve',
+            'seq_volume': '/seq_volume',
+            'seq_oi': '/seq_oi',
+            'seq_labels': '/seq_labels',
+            'seq_dte': '/seq_dte',
+            'seq_spreads': '/seq_spreads'
         }
         
         for key in available_keys:
@@ -1003,12 +1003,12 @@ class DataClient:
             "oi_curve": f"{symbol_key}/oi_curve",
             "front": f"{symbol_key}/front_month",
             "dte": f"{symbol_key}/days_to_expiry", 
-            "seq_curve": f"{symbol_key}/curve_seq",
-            "seq_volume": f"{symbol_key}/volume_seq",
-            "seq_oi": f"{symbol_key}/oi_seq",
-            "seq_labels": f"{symbol_key}/curve_seq_labels",
-            "seq_dte": f"{symbol_key}/days_to_expiry_seq",
-            "seq_spreads": f"{symbol_key}/spreads_seq"
+            "seq_curve": f"{symbol_key}/seq_curve",
+            "seq_volume": f"{symbol_key}/seq_volume",
+            "seq_oi": f"{symbol_key}/seq_oi",
+            "seq_labels": f"{symbol_key}/seq_labels",
+            "seq_dte": f"{symbol_key}/seq_dte",
+            "seq_spreads": f"{symbol_key}/seq_spreads"
         }
         
         available_keys = self.list_market_data()
