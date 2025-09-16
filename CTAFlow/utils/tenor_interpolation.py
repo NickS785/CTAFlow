@@ -65,15 +65,16 @@ def log_interp_to_tau(
         avail = row.dropna()
         if avail.empty:
             continue
-            
-        # Calculate time to maturity in years
-        T = (expiries.loc[avail.index].values - pd.Timestamp(t)).days / 365.25
+
+        expiry_values = pd.to_datetime(expiries.loc[avail.index])
+        T = (expiry_values - pd.Timestamp(t)).dt.days / 365.25
         lnF = np.log(avail.values.astype(float))
         
         # Sort by time to maturity
-        order = np.argsort(T)
-        T = T[order]
-        lnF = lnF[order]
+        T_array = T.to_numpy()
+        order = np.argsort(T_array)
+        T = T_array[order]
+        lnF = np.asarray(lnF)[order]
         
         # Interpolate for each target tau
         for tau in taus:
