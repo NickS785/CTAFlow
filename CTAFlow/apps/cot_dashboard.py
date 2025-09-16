@@ -169,20 +169,24 @@ def load_cot_dataframe(ticker: str) -> pd.DataFrame:
             if cot_code:
                 raw_df = client.query_cot_by_codes(cot_code)
                 if raw_df is not None and not raw_df.empty:
-                    raw_df = raw_df.copy()
-                    date_cols = [
-                        "Report_Date_as_YYYY-MM-DD",
-                        "Report_Date_as_MM_DD_YYYY",
-                        "Date",
-                        "date",
-                    ]
-                    for col in date_cols:
-                        if col in raw_df.columns:
-                            raw_df.index = pd.to_datetime(raw_df.pop(col))
-                            break
+                    # Use COTProcessor's built-in cleaning first
                     raw_df = cot_processor.load_and_clean_data(raw_df)
+
+                    # Handle date conversion with error handling for mixed formats
                     if not isinstance(raw_df.index, pd.DatetimeIndex):
-                        raw_df.index = pd.to_datetime(raw_df.index)
+                        date_cols = [
+                            "Report_Date_as_YYYY-MM-DD",
+                            "Report_Date_as_MM_DD_YYYY",
+                            "Date",
+                            "date",
+                        ]
+                        for col in date_cols:
+                            if col in raw_df.columns:
+                                # Handle mixed date formats and 'None' strings
+                                raw_df.index = pd.to_datetime(raw_df[col], errors='coerce')
+                                # Remove rows with invalid dates
+                                raw_df = raw_df[raw_df.index.notna()]
+                                break
                     return raw_df.sort_index()
         except Exception:
             pass
@@ -217,8 +221,7 @@ def filter_date_range(df: pd.DataFrame, start: str | None, end: str | None) -> p
 def split_feature_columns(columns: Iterable[str]) -> FeatureSplit:
     """Categorize feature columns into visualization groups."""
 
-    line_keywords = ("net", "gross", "index")
-    pie_keywords = ("ratio", "percent", "percentage", "share")
+    line_keywords = ("net", "gross", "index", "ratio", "percent", "percentage", "share")
     bar_keywords = ("flow", "change", "momentum", "diff")
     binary_keywords = ("extreme", "regime", "indicator", "flag")
 
@@ -230,8 +233,6 @@ def split_feature_columns(columns: Iterable[str]) -> FeatureSplit:
         lower = col.lower()
         if any(keyword in lower for keyword in bar_keywords):
             bar_cols.append(col)
-        elif any(keyword in lower for keyword in pie_keywords):
-            pie_cols.append(col)
         elif any(keyword in lower for keyword in line_keywords):
             line_cols.append(col)
         elif any(keyword in lower for keyword in binary_keywords):
@@ -242,8 +243,146 @@ def split_feature_columns(columns: Iterable[str]) -> FeatureSplit:
     return FeatureSplit(line=line_cols, bar=bar_cols, pie=pie_cols)
 
 
+def build_cot_index_figure(features: pd.DataFrame) -> go.Figure:
+    """Create a specialized figure for COT index data with extreme threshold lines."""
+
+    # Filter to only the main positioning indices
+    main_indices = [
+        'mm_net_position_cot_index',
+        'mm_long_ratio_cot_index',
+        'commercial_net_cot_index',
+        'commercial_long_ratio_cot_index'
+    ]
+
+    # Find available COT index columns, filtered to main ones
+    available_cols = [col for col in main_indices if col in features.columns]
+
+    if not available_cols:
+        fig = go.Figure()
+        fig.update_layout(
+            title="COT Index Analysis",
+            annotations=[
+                {
+                    "text": "No main COT index data available",
+                    "xref": "paper",
+                    "yref": "paper",
+                    "x": 0.5,
+                    "y": 0.5,
+                    "showarrow": False,
+                    "font": {"size": 14},
+                }
+            ],
+        )
+        return fig
+
+    fig = go.Figure()
+
+    # Color scheme for the 4 main indices
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']  # blue, orange, green, red
+
+    # Calculate data range for better y-axis scaling
+    all_values = []
+
+    # Add COT index lines
+    for idx, col in enumerate(available_cols):
+        clean_data = features[col].dropna()
+        if not clean_data.empty:
+            all_values.extend(clean_data.values)
+
+            # Clean up column name for legend
+            name_mapping = {
+                'mm_net_position_cot_index': 'MM Net Position',
+                'mm_long_ratio_cot_index': 'MM Long Ratio',
+                'commercial_net_cot_index': 'Commercial Net',
+                'commercial_long_ratio_cot_index': 'Commercial Long Ratio'
+            }
+            display_name = name_mapping.get(col, col.replace('_cot_index', '').replace('_', ' ').title())
+
+            fig.add_trace(
+                go.Scatter(
+                    x=clean_data.index,
+                    y=clean_data.values,
+                    mode="lines",
+                    name=display_name,
+                    line=dict(width=2.5, color=colors[idx % len(colors)]),
+                    hovertemplate="%{x|%Y-%m-%d}<br>%{fullData.name}: %{y:.1f}<extra></extra>",
+                )
+            )
+
+    # Calculate better y-axis range with some padding
+    if all_values:
+        min_val = min(all_values)
+        max_val = max(all_values)
+        padding = (max_val - min_val) * 0.1
+        y_min = max(0, min_val - padding)
+        y_max = min(100, max_val + padding)
+
+        # Ensure we show extreme thresholds if data is near them
+        if min_val <= 25:
+            y_min = 0
+        if max_val >= 75:
+            y_max = 100
+    else:
+        y_min, y_max = 0, 100
+
+    # Add extreme threshold lines
+    fig.add_hline(
+        y=85,
+        line_dash="dash",
+        line_color="red",
+        line_width=1.5,
+        annotation_text="Extreme Long (85)",
+        annotation_position="right"
+    )
+    fig.add_hline(
+        y=15,
+        line_dash="dash",
+        line_color="red",
+        line_width=1.5,
+        annotation_text="Extreme Short (15)",
+        annotation_position="right"
+    )
+
+    # Add shaded regions for extreme zones (only if they're in view)
+    if y_max > 80:
+        fig.add_hrect(
+            y0=85, y1=100,
+            fillcolor="red", opacity=0.1,
+            line_width=0
+        )
+    if y_min < 20:
+        fig.add_hrect(
+            y0=0, y1=15,
+            fillcolor="red", opacity=0.1,
+            line_width=0
+        )
+
+    fig.update_layout(
+        title="COT Index - Key Positioning Metrics",
+        xaxis_title="Date",
+        yaxis_title="COT Index",
+        yaxis=dict(range=[y_min, y_max]),
+        height=500,
+        showlegend=True,
+        margin=dict(t=80, r=40, b=40, l=60),
+        hovermode='x unified',
+        legend=dict(
+            yanchor="top",
+            y=0.99,
+            xanchor="left",
+            x=0.01
+        )
+    )
+
+    return fig
+
+
 def build_feature_figure(group: str, features: pd.DataFrame) -> go.Figure:
     """Create a plotly figure for a specific feature group respecting visualization rules."""
+
+    # Special handling for interactions group to show COT index
+    if group == "interactions":
+        return build_cot_index_figure(features)
 
     cleaned = features.dropna(how="all")
     if cleaned.empty:
@@ -349,10 +488,23 @@ def compute_feature_groups(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
 
     features: Dict[str, pd.DataFrame] = {}
     for group in FEATURE_GROUPS:
-        group_features = cot_processor.calculate_enhanced_cot_features(
-            df, selected_cot_features=[group]
-        )
-        features[group] = group_features
+        # For interactions group, compute positioning first, then extremes to get COT index data
+        if group == "interactions":
+            combined_features = cot_processor.calculate_enhanced_cot_features(
+                df, selected_cot_features=["positioning", "interactions", "extremes"]
+            )
+            features[group] = combined_features
+        # For extremes group, also compute positioning first since extremes depends on it
+        elif group == "extremes":
+            combined_features = cot_processor.calculate_enhanced_cot_features(
+                df, selected_cot_features=["positioning", "extremes"]
+            )
+            features[group] = combined_features
+        else:
+            group_features = cot_processor.calculate_enhanced_cot_features(
+                df, selected_cot_features=[group]
+            )
+            features[group] = group_features
     return features
 
 
@@ -439,7 +591,7 @@ def build_dashboard_app() -> Dash:
 
 def main() -> None:
     app = build_dashboard_app()
-    app.run_server(debug=True)
+    app.run(debug=True)
 
 
 if __name__ == "__main__":
