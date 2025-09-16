@@ -4547,6 +4547,83 @@ class SpreadData:
             'roll_patterns': self.roll_dates.groupby(['from_contract_expiration_code', 'to_contract_expiration_code']).size().to_dict(),
             'reasons': self.roll_dates['reason'].value_counts().to_dict()
         }
+
+    @classmethod
+    def example(cls) -> 'SpreadData':
+        """
+        Create a simple example SpreadData instance with preloaded test data.
+
+        Generates 100 days of synthetic futures curve data with 6 contracts.
+        Perfect for testing operations without requiring actual market data.
+
+        Returns:
+        --------
+        SpreadData
+            Instance with synthetic test data ready for analysis
+        """
+        # Generate 100 business days starting from Jan 1, 2023
+        dates = pd.bdate_range(start='2023-01-01', periods=100, freq='B')
+        n_contracts = 6
+
+        # Generate realistic contango curve
+        base_price = 50.0
+        prices = np.zeros((100, n_contracts))
+        volumes = np.zeros((100, n_contracts))
+        open_interest = np.zeros((100, n_contracts))
+        days_to_expiry = np.zeros((100, n_contracts))
+
+        for i in range(100):
+            # Simple random walk for front month
+            if i == 0:
+                front_price = base_price
+            else:
+                front_price = prices[i-1, 0] * (1 + np.random.normal(0, 0.01))
+
+            # Generate contango curve (higher prices for longer contracts)
+            for j in range(n_contracts):
+                contango_premium = j * 0.5  # 50 cents per month
+                prices[i, j] = front_price + contango_premium + np.random.normal(0, 0.05)
+
+                # Volume decreases with contract distance
+                volumes[i, j] = max(10, 1000 * np.exp(-j * 0.3) * (1 + np.random.normal(0, 0.2)))
+
+                # Open interest pattern
+                open_interest[i, j] = max(100, 5000 * np.exp(-j * 0.2) * (1 + np.random.normal(0, 0.15)))
+
+                # Days to expiry (decreasing)
+                days_to_expiry[i, j] = 30 + j * 30 - (i % 30)
+
+        # Create contract labels
+        contract_labels = [f'M{i}' for i in range(n_contracts)]
+        month_labels = ['H', 'J', 'K', 'M', 'N', 'Q']  # Mar, Apr, May, Jun, Jul, Aug
+
+        # Create DataFrames
+        seq_prices = pd.DataFrame(prices, index=dates, columns=contract_labels)
+        seq_volume = pd.DataFrame(volumes, index=dates, columns=contract_labels)
+        seq_oi = pd.DataFrame(open_interest, index=dates, columns=contract_labels)
+        seq_labels = pd.DataFrame([month_labels] * 100, index=dates, columns=contract_labels)
+        seq_dte = pd.DataFrame(days_to_expiry, index=dates, columns=contract_labels)
+
+        # Calculate spreads vs front month
+        spreads = prices - prices[:, [0]]
+        seq_spreads = pd.DataFrame(spreads, index=dates, columns=contract_labels)
+
+        # Create SpreadData instance with all required data
+        instance = cls(
+            symbol="EXAMPLE",
+            seq_prices=seq_prices,
+            seq_volume=seq_volume,
+            seq_oi=seq_oi,
+            seq_labels=seq_labels,
+            seq_dte=seq_dte,
+            seq_spreads=seq_spreads,
+            index=dates,
+            curve=prices,
+            volume_curve=volumes,
+            oi_curve=open_interest
+        )
+
+        return instance
     
     def has_roll_data(self) -> bool:
         """
