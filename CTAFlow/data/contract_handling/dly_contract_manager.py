@@ -142,6 +142,7 @@ class DLYContractManager:
 
         self.curve: Optional[pd.DataFrame] = None
         self.dte: Optional[pd.DataFrame] = None
+        self.expiry_series: Optional[pd.Series] = None
         self.front: Optional[pd.Series] = None
         self.seq_prices: Optional[pd.DataFrame] = None
         self.seq_labels: Optional[pd.DataFrame] = None
@@ -274,6 +275,28 @@ class DLYContractManager:
         self.dte = dte
         return dte
 
+    def build_expiry_series(self) -> pd.Series:
+        """
+        Create a Series mapping contract labels to their expiry dates.
+        This is needed for TenorInterpolator which requires expiry_data as a Series.
+
+        Returns:
+        --------
+        pd.Series
+            Series with contract labels as index and expiry dates as values
+        """
+        if not self.expiries:
+            if not self.contracts:
+                self.load()
+            if not self.expiries:
+                raise RuntimeError("No expiry data available")
+
+        # Create Series from expiries dictionary
+        expiry_series = pd.Series(self.expiries, name='expiry_date')
+        expiry_series.index.name = 'contract_id'
+        self.expiry_series = expiry_series
+        return expiry_series
+
     # ---------- front & sequential ----------
     def compute_front(self) -> pd.Series:
         if self.curve is None:
@@ -401,6 +424,8 @@ class DLYContractManager:
                 store.put(f"market/{self.ticker}/curve", self.curve, format="table", data_columns=True)
             if self.dte is not None:
                 store.put(f"market/{self.ticker}/dte", self.dte, format="table", data_columns=True)
+            if self.expiry_series is not None:
+                store.put(f"market/{self.ticker}/expiry", self.expiry_series.to_frame(), format="table", data_columns=True)
             if self.front is not None:
                 store.put(f"market/{self.ticker}/front", self.front.to_frame(), format="table", data_columns=True)
             if self.seq_prices is not None:
@@ -425,6 +450,7 @@ class DLYContractManager:
         self.load()
         self.build_curve()
         self.build_dte()
+        self.build_expiry_series()
         self.compute_front()
         self.sequentialize()
         if save:
@@ -433,6 +459,7 @@ class DLYContractManager:
         result = {
             "curve": f"market/{self.ticker}/curve",
             "dte": f"market/{self.ticker}/dte",
+            "expiry": f"market/{self.ticker}/expiry",
             "front": f"market/{self.ticker}/front",
             "seq_curve": f"market/{self.ticker}/seq_curve",
             "seq_labels": f"market/{self.ticker}/seq_labels",
@@ -691,6 +718,8 @@ class DLYFolderUpdater:
                         store.put(f"market/{ticker}/curve", mgr.curve, format="table", data_columns=True)
                     if mgr.dte is not None:
                         store.put(f"market/{ticker}/dte", mgr.dte, format="table", data_columns=True)
+                    if mgr.expiry_series is not None:
+                        store.put(f"market/{ticker}/expiry", mgr.expiry_series.to_frame(), format="table", data_columns=True)
                     if mgr.front is not None:
                         store.put(f"market/{ticker}/front", mgr.front.to_frame(), format="table", data_columns=True)
                     if mgr.seq_prices is not None:

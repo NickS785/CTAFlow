@@ -4306,10 +4306,11 @@ class SpreadData:
         seq_mapping = {
             'seq_curve': 'seq_prices',  # Map seq_curve to seq_prices for consistency
             'seq_prices': 'seq_prices',
-            'seq_spreads': 'seq_spreads', 
+            'seq_spreads': 'seq_spreads',
             'seq_oi': 'seq_oi',
             'seq_volume': 'seq_volume',
-            'seq_labels': 'seq_labels'
+            'seq_labels': 'seq_labels',
+            'seq_dte': 'seq_dte'
         }
         
         for curve_key, attr_name in seq_mapping.items():
@@ -4318,8 +4319,8 @@ class SpreadData:
         
         # Handle other DataFrame types
         for k, val in curve_data.items():
-            if (isinstance(val, pd.DataFrame) and 
-                k not in {'curve', 'seq_curve', 'seq_prices', 'seq_spreads', 'seq_oi', 'seq_volume', 'seq_labels'}):
+            if (isinstance(val, pd.DataFrame) and
+                k not in {'curve', 'seq_curve', 'seq_prices', 'seq_spreads', 'seq_oi', 'seq_volume', 'seq_labels', 'seq_dte'}):
                 setattr(self, k, val.values if hasattr(val, 'values') else val)
 
     def to_dataframe(
