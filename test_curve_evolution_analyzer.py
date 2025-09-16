@@ -43,8 +43,6 @@ stub.MONTH_CODE_MAP = {c: i + 1 for i, c in enumerate('FGHJKMNQUVXZ')}
 
 cta_pkg = types.ModuleType("CTAFlow")
 cta_pkg.__path__ = [str(Path(__file__).resolve().parent)]
-=======
-cta_pkg.__path__ = []
 features_pkg = types.ModuleType("CTAFlow.features")
 features_pkg.__path__ = []
 data_pkg = types.ModuleType("CTAFlow.data")
