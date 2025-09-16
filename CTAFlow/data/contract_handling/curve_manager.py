@@ -4,7 +4,7 @@ import calendar
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Callable, Dict, Optional, Tuple, List, Any, Union
+from typing import Callable, Dict, Optional, Tuple, List, Any, Union, Sequence
 
 from scipy import stats
 from scipy.stats import skew, kurtosis
@@ -1298,10 +1298,29 @@ class SpreadFeature:
     labels: List[str] = None
     direction: str = None
     index: pd.Index = None
+    frame: Optional[pd.DataFrame] = None
 
     def __post_init__(self):
+        # Preserve an associated DataFrame when provided so utilities that
+        # expect pandas objects can retrieve the raw structure without
+        # repeated conversions.
+        if isinstance(self.data, pd.DataFrame):
+            self.frame = self.data.copy()
+            self.index = self.frame.index if self.index is None else self.index
+            self.labels = list(self.frame.columns) if self.labels is None else self.labels
+            self.data = self.frame.to_numpy(dtype=float)
+            return
+
+        if self.frame is not None:
+            if not isinstance(self.frame, pd.DataFrame):
+                raise TypeError("frame must be a pandas DataFrame when provided")
+            if self.data is None:
+                self.data = self.frame.to_numpy(dtype=float)
+            self.index = self.frame.index if self.index is None else self.index
+            self.labels = list(self.frame.columns) if self.labels is None else self.labels
+
         if self.data is not None and not isinstance(self.data, np.ndarray):
-            self.data = np.array(self.data)
+            self.data = np.array(self.data, dtype=float)
 
     def _calculate_slopes(self) -> np.ndarray:
         """
@@ -1950,11 +1969,10 @@ class SpreadReturns(SpreadFeature):
 
 @dataclass
 class SeqData:
-    """
-    Simple sequential data container - just holds the data, nothing fancy
-    """
+    """Simple sequential data container."""
+
     timestamps: Optional[pd.DatetimeIndex] = None
-    seq_labels: Optional[List[str]] = None
+    seq_labels: Optional[Union[pd.DataFrame, List[Any]]] = None
     seq_prices: Optional[SpreadFeature] = None
     seq_spreads: Optional[SpreadFeature] = None
     seq_oi: Optional[SpreadFeature] = None
@@ -2487,10 +2505,18 @@ class SpreadData:
 
     def _convert_to_arrays(self):
         """Convert DataFrame data to numpy arrays"""
+        if isinstance(self.curve, pd.DataFrame):
+            self.curve_df = self.curve.copy()
         if hasattr(self.curve, 'values'):
             self.curve = self.curve.values
+
+        if isinstance(self.volume_curve, pd.DataFrame):
+            self.volume_curve_df = self.volume_curve.copy()
         if hasattr(self.volume_curve, 'values'):
             self.volume_curve = self.volume_curve.values
+
+        if isinstance(self.oi_curve, pd.DataFrame):
+            self.oi_curve_df = self.oi_curve.copy()
         if hasattr(self.oi_curve, 'values'):
             self.oi_curve = self.oi_curve.values
         if hasattr(self.convenience_yield, 'values'):
@@ -2821,71 +2847,201 @@ class SpreadData:
 
         return self._slopes_cache
 
+    def _get_seq_dataframe(self, attr_name: str) -> Optional[pd.DataFrame]:
+        """Return sequential data as a DataFrame if available."""
+        value = getattr(self, attr_name, None)
+        if isinstance(value, pd.DataFrame):
+            return value
+        return None
+
+    def _create_seq_feature(self, df: Optional[pd.DataFrame]) -> Optional[SpreadFeature]:
+        """Convert a sequential DataFrame to a SpreadFeature with cached frame."""
+        if df is None:
+            return None
+
+        return SpreadFeature(
+            data=df.values,
+            frame=df.copy(),
+            labels=list(df.columns),
+            index=df.index,
+            sequential=True,
+            direction="horizontal"
+        )
+
+    def _feature_to_dataframe(self, feature: Optional[SpreadFeature]) -> Optional[pd.DataFrame]:
+        """Return a pandas DataFrame for a stored SpreadFeature."""
+        if feature is None:
+            return None
+
+        if feature.frame is not None:
+            return feature.frame.copy()
+
+        if feature.data is None:
+            return None
+
+        data = np.asarray(feature.data, dtype=float)
+        labels = feature.labels or [f'M{i}' for i in range(data.shape[1])]
+        index = feature.index if feature.index is not None else self.index
+        return pd.DataFrame(data, index=index, columns=labels)
+
     def _initialize_features(self):
-        """Initialize and calculate derived features and create SeqData container"""
-        if self.curve is not None and len(self.curve) > 0:
-            # Use sequential data loaded from DataClient
-            seq_labels_data = None
-            seq_spreads_data = None
-            seq_prices_data = None
-            seq_oi_data = None
-            seq_volumes_data = None
-            seq_dte_data = None
+        """Initialize derived features and construct the sequential data container."""
+        if self.curve is None or len(self.curve) == 0:
+            self.seq_data = SeqData(
+                timestamps=self.index,
+                seq_labels=getattr(self, 'seq_labels', None),
+                roll_dates=getattr(self, 'roll_dates', None)
+            )
+            return
 
-            # Use loaded sequential data
-            if hasattr(self, 'seq_labels') and self.seq_labels is not None:
-                seq_labels_data = self.seq_labels.values if hasattr(self.seq_labels, 'values') else self.seq_labels
+        seq_prices_feature = self._create_seq_feature(self._get_seq_dataframe('seq_prices'))
+        seq_spreads_feature = self._create_seq_feature(self._get_seq_dataframe('seq_spreads'))
+        seq_volume_feature = self._create_seq_feature(self._get_seq_dataframe('seq_volume'))
+        seq_oi_feature = self._create_seq_feature(self._get_seq_dataframe('seq_oi'))
 
-            if hasattr(self, 'seq_prices') and self.seq_prices is not None:
-                seq_prices_data = self.seq_prices.values if hasattr(self.seq_prices, 'values') else self.seq_prices
+        seq_dte_array = None
+        if hasattr(self, 'seq_dte') and self.seq_dte is not None:
+            seq_dte_source = self.seq_dte.values if isinstance(self.seq_dte, pd.DataFrame) else self.seq_dte
+            seq_dte_array = np.asarray(seq_dte_source, dtype=float)
+            if seq_dte_array.ndim == 1:
+                seq_dte_array = seq_dte_array[:, np.newaxis]
 
-            if hasattr(self, 'seq_spreads') and self.seq_spreads is not None:
-                seq_spreads_data = self.seq_spreads.values if hasattr(self.seq_spreads, 'values') else self.seq_spreads
+        self.seq_data = SeqData(
+            timestamps=self.index,
+            seq_labels=getattr(self, 'seq_labels', None),
+            seq_prices=seq_prices_feature,
+            seq_spreads=seq_spreads_feature,
+            seq_oi=seq_oi_feature,
+            seq_volume=seq_volume_feature,
+            seq_dte=seq_dte_array,
+            roll_dates=getattr(self, 'roll_dates', None)
+        )
 
-            if hasattr(self, 'seq_oi') and self.seq_oi is not None:
-                seq_oi_data = self.seq_oi.values if hasattr(self.seq_oi, 'values') else self.seq_oi
+        if seq_prices_feature is not None:
+            try:
+                self.calculate_maturity_bucket_spreads()
+            except Exception as exc:
+                warnings.warn(f"Could not calculate maturity bucket spreads: {exc}")
 
-            if hasattr(self, 'seq_volume') and self.seq_volume is not None:
-                seq_volumes_data = self.seq_volume.values if hasattr(self.seq_volume, 'values') else self.seq_volume
+        try:
+            self.synthetic_spot_prices = self.calculate_synthetic_spot()
+        except Exception as exc:
+            warnings.warn(f"Could not calculate synthetic spot prices: {exc}")
+            self.synthetic_spot_prices = None
 
-            if hasattr(self, 'seq_dte') and self.seq_dte is not None:
-                seq_dte_data = self.seq_dte.values if hasattr(self.seq_dte, 'values') else self.seq_dte
+        try:
+            self.convenience_yield = self.calculate_convenience_yield()
+        except Exception as exc:
+            warnings.warn(f"Could not calculate convenience yield: {exc}")
+            self.convenience_yield = None
 
-            # Create seq_data namespace containing all DataFrame references
-            if hasattr(self, 'seq_prices') and self.seq_prices is not None:
-                class SeqDataNamespace:
-                    def __init__(self, spread_data):
-                        self.timestamps = spread_data.index
-                        # Create objects that have .data attributes pointing to DataFrame values
-                        self.seq_prices = type('PriceContainer', (), {'data': spread_data.seq_prices.values})()
-                        self.seq_labels = spread_data.seq_labels if hasattr(spread_data, 'seq_labels') else None
-                        self.seq_volume = type('VolumeContainer', (), {'data': spread_data.seq_volume.values if hasattr(spread_data, 'seq_volume') and spread_data.seq_volume is not None else None})()
-                        self.seq_oi = type('OIContainer', (), {'data': spread_data.seq_oi.values if hasattr(spread_data, 'seq_oi') and spread_data.seq_oi is not None else None})()
-                        self.seq_dte = spread_data.seq_dte if hasattr(spread_data, 'seq_dte') else None
-                        self.roll_dates = spread_data.roll_dates if hasattr(spread_data, 'roll_dates') else None
+    def _get_seq_feature(self, name: str) -> Optional[SpreadFeature]:
+        if not hasattr(self, 'seq_data') or self.seq_data is None:
+            return None
+        return getattr(self.seq_data, name, None)
 
-                self.seq_data = SeqDataNamespace(self)
-            
-            # Calculate maturity bucket spreads if seq_prices is available
-            if self.seq_prices is not None:
+    def get_sequential_prices(self, dropna: bool = False) -> pd.DataFrame:
+        """Return sequential price data as a DataFrame for utility modules."""
+        feature = self._get_seq_feature('seq_prices')
+        df = self._feature_to_dataframe(feature)
+        if df is None:
+            raise ValueError("No sequential price data available")
+        return df.dropna(how='all') if dropna else df
+
+    def get_sequential_spreads(self, dropna: bool = False) -> Optional[pd.DataFrame]:
+        feature = self._get_seq_feature('seq_spreads')
+        df = self._feature_to_dataframe(feature)
+        if df is None:
+            return None
+        return df.dropna(how='all') if dropna else df
+
+    def get_sequential_volume(self, dropna: bool = False) -> Optional[pd.DataFrame]:
+        feature = self._get_seq_feature('seq_volume')
+        df = self._feature_to_dataframe(feature)
+        if df is None:
+            return None
+        return df.dropna(how='all') if dropna else df
+
+    def get_sequential_oi(self, dropna: bool = False) -> Optional[pd.DataFrame]:
+        feature = self._get_seq_feature('seq_oi')
+        df = self._feature_to_dataframe(feature)
+        if df is None:
+            return None
+        return df.dropna(how='all') if dropna else df
+
+    def get_contract_expiries(self) -> pd.Series:
+        """Return a Series mapping contract identifiers to expiry dates."""
+        expiries: Dict[str, pd.Timestamp] = {}
+
+        contracts = getattr(self, 'contracts', {}) or {}
+        for label, contract in contracts.items():
+            expiry = getattr(contract, 'expiration_date', None)
+            if expiry is not None:
+                expiries[label] = pd.Timestamp(expiry)
+
+        if not expiries:
+            dte_df: Optional[pd.DataFrame] = None
+            if isinstance(self.seq_dte, pd.DataFrame):
+                dte_df = self.seq_dte
+            elif self._get_seq_feature('seq_dte') is not None:
+                seq_dte_array = np.asarray(self.seq_data.seq_dte, dtype=float)
+                if seq_dte_array.ndim == 1:
+                    seq_dte_array = seq_dte_array[:, np.newaxis]
                 try:
-                    self.calculate_maturity_bucket_spreads()
-                except Exception as e:
-                    warnings.warn(f"Could not calculate maturity bucket spreads: {e}")
-            
-            # Always calculate synthetic spot prices (separate from real spot prices)
-            try:
-                self.synthetic_spot_prices = self.calculate_synthetic_spot()
-            except Exception as e:
-                warnings.warn(f"Could not calculate synthetic spot prices: {e}")
-                self.synthetic_spot_prices = None
-            
-            # Calculate convenience yield for front month (M0) after spot prices are available
-            try:
-                self.convenience_yield = self.calculate_convenience_yield()
-            except Exception as e:
-                warnings.warn(f"Could not calculate convenience yield: {e}")
-                self.convenience_yield = None
+                    price_df = self.get_sequential_prices()
+                except ValueError:
+                    price_df = None
+                if price_df is not None and seq_dte_array.size > 0:
+                    n_rows = min(seq_dte_array.shape[0], len(price_df.index))
+                    n_cols = min(seq_dte_array.shape[1], price_df.shape[1])
+                    dte_df = pd.DataFrame(
+                        seq_dte_array[:n_rows, :n_cols],
+                        index=price_df.index[:n_rows],
+                        columns=price_df.columns[:n_cols]
+                    )
+
+            if dte_df is not None:
+                for column in dte_df.columns:
+                    series = dte_df[column].dropna()
+                    if series.empty:
+                        continue
+                    first_date = series.index[0]
+                    dte_days = series.iloc[0]
+                    if pd.notna(dte_days):
+                        expiries[column] = pd.Timestamp(first_date) + pd.to_timedelta(int(dte_days), unit='D')
+
+        if not expiries:
+            return pd.Series(dtype="datetime64[ns]")
+
+        expiries_series = pd.Series(expiries)
+        expiries_series = pd.to_datetime(expiries_series)
+        return expiries_series
+
+    def get_constant_maturity_inputs(self) -> Tuple[pd.DataFrame, pd.Series]:
+        """Return price and expiry inputs compatible with utility interpolation code."""
+        if hasattr(self, 'curve_df') and isinstance(self.curve_df, pd.DataFrame):
+            prices = self.curve_df.copy()
+        elif isinstance(self.curve, pd.DataFrame):
+            prices = self.curve.copy()
+        elif isinstance(self.curve, np.ndarray) and hasattr(self, 'curve_columns'):
+            prices = pd.DataFrame(self.curve, index=self.index, columns=self.curve_columns)
+        else:
+            prices = self.get_sequential_prices()
+
+        expiries = self.get_contract_expiries()
+        if not expiries.empty:
+            common = [col for col in prices.columns if col in expiries.index]
+            if common:
+                prices = prices.loc[:, common]
+                expiries = expiries.loc[common]
+            else:
+                seq_prices = self.get_sequential_prices(dropna=False)
+                seq_common = [col for col in seq_prices.columns if col in expiries.index]
+                if seq_common:
+                    prices = seq_prices.loc[:, seq_common]
+                    expiries = expiries.loc[seq_common]
+
+        return prices, expiries
 
     def create_futures_curve(self, date: Optional[datetime] = None) -> FuturesCurve:
         """
@@ -4065,7 +4221,7 @@ class SpreadData:
         # Extract seq_dte data
         if 'seq_dte' in curve_data and curve_data['seq_dte'] is not None:
             seq_dte_data = curve_data['seq_dte']
-            self.seq_dte = seq_dte_data.values if hasattr(seq_dte_data, 'values') else seq_dte_data
+            self.seq_dte = seq_dte_data.copy() if isinstance(seq_dte_data, pd.DataFrame) else seq_dte_data
         else:
             self.seq_dte = None
 
@@ -4166,14 +4322,41 @@ class SpreadData:
                 k not in {'curve', 'seq_curve', 'seq_prices', 'seq_spreads', 'seq_oi', 'seq_volume', 'seq_labels'}):
                 setattr(self, k, val.values if hasattr(val, 'values') else val)
 
-    def to_dataframe(self, columns = ['oi', 'volume', 'labels', 'prices', 'spreads'], use_seq = True):
-        data = {name: value.data for name, value in self.seq_data.__dict__.items() if hasattr(value, 'data')}
-        col_names = np.concatenate([[f'{n[4:]}_{col}' for col in self.seq_labels.columns.to_list()] for n in data.keys() if n[4:] in columns])
-        dynamic_label_df = self.seq_labels
-        dynamic_label_df.columns = [f'label_{col}' for col in dynamic_label_df.columns.to_list()]
-        all_data = np.concatenate([v for v in data.values()], axis=1)
-        all_df = pd.DataFrame(all_data, self.index, col_names)
-        return pd.concat([all_df, dynamic_label_df], axis=1)
+    def to_dataframe(
+        self,
+        columns: Optional[List[str]] = None,
+        include_labels: bool = True
+    ) -> pd.DataFrame:
+        """Return a concatenated DataFrame of sequential features."""
+
+        columns = columns or ['prices', 'spreads', 'volume', 'oi']
+        if isinstance(columns, str):
+            columns = [columns]
+
+        feature_map = {
+            'prices': self._get_seq_feature('seq_prices'),
+            'spreads': self._get_seq_feature('seq_spreads'),
+            'volume': self._get_seq_feature('seq_volume'),
+            'oi': self._get_seq_feature('seq_oi')
+        }
+
+        frames: List[pd.DataFrame] = []
+        for key in columns:
+            feature = feature_map.get(key)
+            if feature is None:
+                continue
+            df = self._feature_to_dataframe(feature)
+            if df is None:
+                continue
+            frames.append(df.add_prefix(f'{key}_'))
+
+        if include_labels and isinstance(self.seq_labels, pd.DataFrame):
+            frames.append(self.seq_labels.add_prefix('label_'))
+
+        if not frames:
+            return pd.DataFrame(index=self.index)
+
+        return pd.concat(frames, axis=1)
 
     def plot_spread(self, 
                    contracts: Optional[List[str]] = None,
@@ -4603,6 +4786,7 @@ class SpreadData:
         seq_oi = pd.DataFrame(open_interest, index=dates, columns=contract_labels)
         seq_labels = pd.DataFrame([month_labels] * 100, index=dates, columns=contract_labels)
         seq_dte = pd.DataFrame(days_to_expiry, index=dates, columns=contract_labels)
+        curve_df = pd.DataFrame(prices, index=dates, columns=month_labels)
 
         # Calculate spreads vs front month
         spreads = prices - prices[:, [0]]
@@ -4618,7 +4802,7 @@ class SpreadData:
             seq_dte=seq_dte,
             seq_spreads=seq_spreads,
             index=dates,
-            curve=prices,
+            curve=curve_df,
             volume_curve=volumes,
             oi_curve=open_interest
         )
@@ -4662,9 +4846,333 @@ class SpreadData:
         
         mask = (self.roll_dates.index >= start_date) & (self.roll_dates.index <= end_date)
         filtered_df = self.roll_dates[mask]
-        
+
         return filtered_df if len(filtered_df) > 0 else None
 
+
+@dataclass
+class CrossSpreadLeg:
+    """Definition of a single leg within a multi-asset spread."""
+
+    data: 'SpreadData'
+    ratio: float = 1.0
+    contract_ratios: Optional[Dict[str, float]] = None
+    label: Optional[str] = None
+
+    def __post_init__(self):
+        if not isinstance(self.data, SpreadData):
+            raise TypeError("CrossSpreadLeg requires a SpreadData instance")
+
+        self.ratio = float(self.ratio)
+        if self.contract_ratios is not None:
+            normalized: Dict[str, float] = {}
+            for contract, weight in self.contract_ratios.items():
+                normalized[str(contract)] = float(weight)
+            self.contract_ratios = normalized
+
+    @property
+    def display_label(self) -> str:
+        return self.label or getattr(self.data, 'symbol', None) or 'LEG'
+
+    def weight_for_contract(self, contract: str) -> float:
+        if self.contract_ratios and contract in self.contract_ratios:
+            return self.contract_ratios[contract]
+        return self.ratio
+
+    def weights_for_contracts(self, contracts: Sequence[str]) -> Dict[str, float]:
+        return {contract: self.weight_for_contract(contract) for contract in contracts}
+
+
+@dataclass
+class CrossProductSpreadData:
+    """Cross-asset spread container supporting multi-leg weighted combinations."""
+
+    base: SpreadData
+    hedge: Optional[SpreadData] = None
+    align: str = "intersection"
+    base_ratio: float = 1.0
+    hedge_ratio: float = -1.0
+    base_contract_ratios: Optional[Dict[str, float]] = None
+    hedge_contract_ratios: Optional[Dict[str, float]] = None
+    additional_legs: Optional[Sequence[Union[CrossSpreadLeg, Tuple['SpreadData', float], Dict[str, Any]]]] = None
+
+    seq_spreads: SpreadFeature = field(init=False)
+    spread_dataframe: pd.DataFrame = field(init=False)
+    index: pd.DatetimeIndex = field(init=False)
+    columns: List[str] = field(init=False)
+    base_symbol: Optional[str] = field(init=False)
+    hedge_symbol: Optional[str] = field(init=False)
+    pair_label: str = field(init=False)
+    legs: List[CrossSpreadLeg] = field(init=False, repr=False)
+    leg_source_labels: List[str] = field(init=False, repr=False)
+    leg_labels: List[str] = field(init=False)
+    leg_label_map: Dict[str, str] = field(init=False, repr=False)
+    leg_contract_weights: Dict[str, Dict[str, float]] = field(init=False)
+    leg_contributions: Dict[str, pd.DataFrame] = field(init=False, repr=False)
+
+    def __post_init__(self):
+        if not isinstance(self.base, SpreadData):
+            raise TypeError("CrossProductSpreadData requires a SpreadData instance for the base leg")
+
+        legs: List[CrossSpreadLeg] = [
+            CrossSpreadLeg(
+                data=self.base,
+                ratio=self.base_ratio,
+                contract_ratios=self.base_contract_ratios,
+                label=getattr(self.base, 'symbol', None),
+            )
+        ]
+
+        if self.hedge is not None:
+            if not isinstance(self.hedge, SpreadData):
+                raise TypeError("CrossProductSpreadData requires SpreadData inputs for all legs")
+            legs.append(
+                CrossSpreadLeg(
+                    data=self.hedge,
+                    ratio=self.hedge_ratio,
+                    contract_ratios=self.hedge_contract_ratios,
+                    label=getattr(self.hedge, 'symbol', None),
+                )
+            )
+
+        if self.additional_legs:
+            for definition in self.additional_legs:
+                legs.append(self._coerce_leg(definition))
+
+        if len(legs) < 2:
+            raise ValueError("CrossProductSpreadData requires at least two legs")
+
+        if self.align not in {"intersection", "union"}:
+            raise ValueError("align must be either 'intersection' or 'union'")
+
+        price_frames: List[pd.DataFrame] = []
+        for leg in legs:
+            frame = leg.data.get_sequential_prices(dropna=False)
+            if not isinstance(frame, pd.DataFrame):
+                raise ValueError("Sequential prices must be a pandas DataFrame")
+            price_frames.append(frame)
+
+        if self.align == "intersection":
+            common_index = price_frames[0].index
+            for frame in price_frames[1:]:
+                common_index = common_index.intersection(frame.index)
+        else:
+            common_index = price_frames[0].index
+            for frame in price_frames[1:]:
+                common_index = common_index.union(frame.index)
+
+        common_index = common_index.sort_values()
+        if len(common_index) == 0:
+            raise ValueError("No overlapping dates across the provided SpreadData legs")
+
+        common_columns = price_frames[0].columns
+        for frame in price_frames[1:]:
+            common_columns = common_columns.intersection(frame.columns)
+
+        if len(common_columns) == 0:
+            raise ValueError("No overlapping contract identifiers across the provided SpreadData legs")
+
+        column_set = set(common_columns)
+        column_order = [col for col in price_frames[0].columns if col in column_set]
+        if not column_order:
+            column_order = list(common_columns)
+
+        aligned_frames = [
+            frame.reindex(index=common_index, columns=column_order).astype(float)
+            for frame in price_frames
+        ]
+
+        self.legs = legs
+        raw_labels = [leg.display_label for leg in self.legs]
+        resolved_labels = self._resolve_leg_labels(raw_labels)
+        self.leg_source_labels = raw_labels
+        self.leg_labels = resolved_labels
+        self.leg_label_map = dict(zip(resolved_labels, raw_labels))
+
+        weight_series = [
+            pd.Series(leg.weights_for_contracts(column_order), index=column_order, dtype=float)
+            for leg in self.legs
+        ]
+
+        weighted_frames = [
+            frame.multiply(weights, axis=1)
+            for frame, weights in zip(aligned_frames, weight_series)
+        ]
+
+        spread_df = weighted_frames[0].copy()
+        for weighted in weighted_frames[1:]:
+            spread_df = spread_df + weighted
+
+        spread_df = spread_df.sort_index()
+
+        self.spread_dataframe = spread_df
+        self.index = spread_df.index
+        self.columns = list(spread_df.columns)
+        self.base_symbol = getattr(self.base, 'symbol', None)
+        self.hedge_symbol = getattr(self.hedge, 'symbol', None) if self.hedge is not None else None
+
+        self.leg_contract_weights = {
+            label: weights.to_dict()
+            for label, weights in zip(self.leg_labels, weight_series)
+        }
+        self.leg_contributions = {
+            label: frame.copy()
+            for label, frame in zip(self.leg_labels, weighted_frames)
+        }
+
+        self.pair_label = " + ".join(
+            self._describe_leg(leg, label)
+            for leg, label in zip(self.legs, self.leg_labels)
+        )
+
+        self.seq_spreads = SpreadFeature(
+            data=spread_df.values,
+            frame=spread_df,
+            labels=self.columns,
+            index=self.index,
+            sequential=True,
+            direction="horizontal",
+        )
+
+    @staticmethod
+    def _coerce_leg(definition: Union[CrossSpreadLeg, Tuple['SpreadData', float], Dict[str, Any]]) -> CrossSpreadLeg:
+        if isinstance(definition, CrossSpreadLeg):
+            return definition
+
+        if isinstance(definition, tuple):
+            if len(definition) < 2:
+                raise ValueError("Tuple leg definitions must provide at least (data, ratio)")
+
+            data = definition[0]
+            ratio = definition[1]
+            contract_ratios: Optional[Dict[str, float]] = None
+            label: Optional[str] = None
+
+            if len(definition) >= 3:
+                third = definition[2]
+                if isinstance(third, dict):
+                    contract_ratios = third
+                    if len(definition) >= 4:
+                        label = definition[3]
+                else:
+                    label = third
+                    if len(definition) >= 4:
+                        contract_ratios = definition[3]
+
+            if len(definition) > 4:
+                raise ValueError("Tuple leg definitions support at most four elements")
+
+            return CrossSpreadLeg(data=data, ratio=ratio, contract_ratios=contract_ratios, label=label)
+
+        if isinstance(definition, dict):
+            leg_dict = dict(definition)
+            if 'data' not in leg_dict:
+                raise ValueError("Dictionary leg definitions require a 'data' key")
+
+            data = leg_dict.pop('data')
+            ratio = leg_dict.pop('ratio', leg_dict.pop('weight', 1.0))
+            contract_ratios = leg_dict.pop('contract_ratios', leg_dict.pop('contracts', None))
+            label = leg_dict.pop('label', None)
+
+            if leg_dict:
+                raise ValueError(f"Unsupported keys for leg definition: {sorted(leg_dict.keys())}")
+
+            return CrossSpreadLeg(data=data, ratio=ratio, contract_ratios=contract_ratios, label=label)
+
+        raise TypeError("Leg definitions must be CrossSpreadLeg instances, tuples, or dictionaries")
+
+    @staticmethod
+    def _resolve_leg_labels(labels: Sequence[str]) -> List[str]:
+        counts: Dict[str, int] = {}
+        resolved: List[str] = []
+        for label in labels:
+            count = counts.get(label, 0)
+            counts[label] = count + 1
+            if count == 0:
+                resolved.append(label)
+            else:
+                resolved.append(f"{label}_{count + 1}")
+        return resolved
+
+    @staticmethod
+    def _format_ratio(value: float) -> str:
+        if float(value).is_integer():
+            return str(int(round(value)))
+        return f"{value:.4g}"
+
+    def _describe_leg(self, leg: CrossSpreadLeg, label: str) -> str:
+        original_label = self.leg_label_map.get(label, label)
+        display_label = label if original_label == label else f"{label}({original_label})"
+        descriptor = f"{display_label}*{self._format_ratio(leg.ratio)}"
+        if leg.contract_ratios:
+            overrides = ", ".join(
+                f"{contract}:{self._format_ratio(weight)}"
+                for contract, weight in sorted(leg.contract_ratios.items())
+            )
+            descriptor += f" [{overrides}]"
+        return descriptor
+
+    def get_leg_weights(self) -> Dict[str, Dict[str, float]]:
+        """Return the weight applied to each contract for every leg."""
+        return {label: weights.copy() for label, weights in self.leg_contract_weights.items()}
+
+    def get_leg_contribution(self, label: str) -> pd.DataFrame:
+        """Return the weighted price contribution for a specific leg."""
+        if label in self.leg_contributions:
+            return self.leg_contributions[label].copy()
+
+        for resolved, original in self.leg_label_map.items():
+            if original == label and resolved in self.leg_contributions:
+                return self.leg_contributions[resolved].copy()
+
+        raise KeyError(f"Leg {label} not available in cross-product spreads")
+
+    def to_dataframe(self) -> pd.DataFrame:
+        """Return the cross-asset spread matrix."""
+        return self.spread_dataframe.copy()
+
+    def get_contract_spread(self, contract: str) -> pd.Series:
+        """Return the spread series for a given sequential contract code."""
+        if contract not in self.spread_dataframe.columns:
+            raise KeyError(f"Contract {contract} not available in cross-product spreads")
+        return self.spread_dataframe[contract].copy()
+
+    def get_front_spread(self) -> Optional[pd.Series]:
+        """Convenience accessor for the front-month spread if available."""
+        for key in ("M0", "front", "F"):
+            if key in self.spread_dataframe.columns:
+                return self.spread_dataframe[key].copy()
+        if len(self.spread_dataframe.columns) > 0:
+            return self.spread_dataframe.iloc[:, 0].copy()
+        return None
+
+    def describe(self) -> Dict[str, Any]:
+        """Basic statistics describing the cross-product spreads and leg structure."""
+        stats = {
+            'pair': self.pair_label,
+            'base_symbol': self.base_symbol,
+            'hedge_symbol': self.hedge_symbol,
+            'contracts': self.columns,
+            'date_range': {
+                'start': self.index.min() if len(self.index) else None,
+                'end': self.index.max() if len(self.index) else None,
+            },
+            'legs': [
+                {
+                    'label': label,
+                    'source_label': self.leg_label_map.get(label, label),
+                    'ratio': leg.ratio,
+                    'contract_weights': self.leg_contract_weights[label].copy(),
+                }
+                for leg, label in zip(self.legs, self.leg_labels)
+            ],
+        }
+
+        if not self.spread_dataframe.empty:
+            stats['mean_spread'] = self.spread_dataframe.mean().to_dict()
+            stats['std_spread'] = self.spread_dataframe.std().to_dict()
+
+        return stats
 
 
 
