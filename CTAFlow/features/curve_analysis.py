@@ -1789,7 +1789,14 @@ class CurveEvolutionAnalyzer:
             return None
             
         elif isinstance(data, pd.Series):
-            # Already in correct format
+            # Handle pandas Series (from SpreadData slicing)
+            # Ensure it has a datetime index if possible
+            if not isinstance(data.index, pd.DatetimeIndex):
+                try:
+                    data = data.copy()
+                    data.index = pd.to_datetime(data.index)
+                except Exception:
+                    pass  # Keep original index if conversion fails
             return data
             
         elif hasattr(data, 'get_seq_curves'):
@@ -1825,20 +1832,25 @@ class CurveEvolutionAnalyzer:
             
         else:
             raise TypeError(f"Unsupported data type: {type(data)}")
-    
+
     def _validate_curve_data(self):
         """Validate curve data consistency"""
         if self.curves is None or len(self.curves) == 0:
             raise ValueError("No curve data available")
-        
+
         # Check for consistent curve structure
-        sample_curve = next(iter(self.curves.dropna()))
+        non_null_curves = self.curves.dropna()
+        if len(non_null_curves) == 0:
+            warnings.warn("All curves are None/NaN - analysis may be limited")
+            return
+
+        sample_curve = next(iter(non_null_curves))
         if not isinstance(sample_curve, FuturesCurve):
             raise TypeError("All curves must be FuturesCurve objects")
-        
+
         # Validate minimum data requirements
-        if len(self.curves) < self.default_window:
-            warnings.warn(f"Limited data: {len(self.curves)} curves < {self.default_window} window")
+        if len(non_null_curves) < self.default_window:
+            warnings.warn(f"Limited data: {len(non_null_curves)} valid curves < {self.default_window} window")
     
     def _extract_front_month_broadcast(self) -> pd.Series:
         """
