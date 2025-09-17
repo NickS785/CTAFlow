@@ -291,6 +291,54 @@ class DataClient:
         with pd.HDFStore(self.market_path, "a") as store:
             (store.put if replace else store.append)(key, df2, **fmt)
 
+    # ------------------------------------------------------------------
+    # Market metadata helpers
+    # ------------------------------------------------------------------
+    def market_key_exists(self, key: str) -> bool:
+        """Return True if a market dataset exists for the provided key."""
+        if not self.market_path.exists():
+            return False
+
+        try:
+            with pd.HDFStore(self.market_path, "r") as store:
+                # Pandas stores keys with a leading slash
+                normalized_key = key if key.startswith("/") else f"/{key}"
+                return normalized_key in store.keys()
+        except (OSError, FileNotFoundError):
+            return False
+
+    def get_market_tail(self, key: str, nrows: int = 1) -> pd.DataFrame:
+        """
+        Return the last ``nrows`` observations for a market dataset.
+
+        Parameters
+        ----------
+        key : str
+            Market key (e.g., ``"market/CL_F"``).
+        nrows : int, default 1
+            Number of rows to retrieve from the end of the dataset.
+        """
+
+        if nrows <= 0:
+            raise ValueError("nrows must be positive")
+
+        if not self.market_path.exists():
+            return pd.DataFrame()
+
+        try:
+            with pd.HDFStore(self.market_path, "r") as store:
+                if key not in store and f"/{key}" not in store.keys():
+                    return pd.DataFrame()
+
+                storer = store.get_storer(key)
+                if storer is None or storer.nrows == 0:
+                    return pd.DataFrame()
+
+                start = max(storer.nrows - nrows, 0)
+                return store.select(key, start=start, stop=storer.nrows)
+        except (KeyError, OSError, FileNotFoundError):
+            return pd.DataFrame()
+
     def read_market(
         self,
         key: str,
