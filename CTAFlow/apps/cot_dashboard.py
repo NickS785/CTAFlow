@@ -174,44 +174,53 @@ def load_cot_dataframe(ticker: str) -> pd.DataFrame:
 
     ticker = ticker.strip().upper() if ticker else DEFAULT_TICKER
 
-    # 1) Try to load metrics via the DataClient if available
-    if DataClient is not None and TICKER_TO_CODE:
+    # 1) Try to load ticker-specific COT data first (fastest method)
+    if DataClient is not None:
         try:
             client = DataClient()
-            # Retrieve raw COT data and reprocess to ensure feature parity
-            cot_code = TICKER_TO_CODE.get(ticker)
-            if cot_code:
-                raw_df = client.query_cot_by_codes(cot_code)
-                if raw_df is not None and not raw_df.empty:
-                    # Use COTProcessor's built-in cleaning first
-                    raw_df = cot_processor.load_and_clean_data(raw_df)
-
-                    # Handle date conversion with error handling for mixed formats
-                    if not isinstance(raw_df.index, pd.DatetimeIndex):
-                        date_cols = [
-                            "Report_Date_as_YYYY-MM-DD",
-                            "Report_Date_as_MM_DD_YYYY",
-                            "Date",
-                            "date",
-                        ]
-                        for col in date_cols:
-                            if col in raw_df.columns:
-                                # Handle mixed date formats and 'None' strings
-                                raw_df.index = pd.to_datetime(raw_df[col], errors='coerce')
-                                # Remove rows with invalid dates
-                                raw_df = raw_df[raw_df.index.notna()]
-                                break
-                    return raw_df.sort_index()
+            # Try to load from ticker-specific key first
+            raw_df = cot_processor.load_ticker_cot_data(ticker, client)
+            if raw_df is not None and not raw_df.empty:
+                return raw_df.sort_index()
         except Exception:
             pass
 
-    # 2) Check for local CSV exports
+        # 2) Fallback to traditional query by codes method
+        try:
+            if TICKER_TO_CODE:
+                cot_code = TICKER_TO_CODE.get(ticker)
+                if cot_code:
+                    raw_df = client.query_cot_by_codes(cot_code)
+                    if raw_df is not None and not raw_df.empty:
+                        # Use COTProcessor's built-in cleaning first
+                        raw_df = cot_processor.load_and_clean_data(raw_df)
+
+                        # Handle date conversion with error handling for mixed formats
+                        if not isinstance(raw_df.index, pd.DatetimeIndex):
+                            date_cols = [
+                                "Report_Date_as_YYYY-MM-DD",
+                                "Report_Date_as_MM_DD_YYYY",
+                                "Date",
+                                "date",
+                            ]
+                            for col in date_cols:
+                                if col in raw_df.columns:
+                                    # Handle mixed date formats and 'None' strings
+                                    raw_df.index = pd.to_datetime(raw_df[col], errors='coerce')
+                                    # Remove rows with invalid dates
+                                    raw_df = raw_df[raw_df.index.notna()]
+                                    break
+                        return raw_df.sort_index()
+        except Exception:
+            pass
+
+    # 3) Check for local CSV exports
     csv_df = _load_csv_if_available(ticker)
     if csv_df is not None and not csv_df.empty:
         csv_df = cot_processor.load_and_clean_data(csv_df)
         return csv_df.sort_index()
 
-    # 3) Fall back to deterministic mock data
+    # 4) Fall back to deterministic mock data
     return _generate_mock_cot_data(ticker)
 
 

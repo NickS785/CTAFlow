@@ -34,6 +34,91 @@ class COTProcessor:
             }
         }
 
+    def load_ticker_cot_data(self, ticker: str, data_client=None) -> pd.DataFrame:
+        """
+        Load COT data for a specific ticker from the cot/{ticker} key.
+
+        Parameters:
+        -----------
+        ticker : str
+            Ticker symbol (e.g., 'CL_F', 'ZC_F')
+        data_client : DataClient, optional
+            DataClient instance. If None, creates a new one.
+
+        Returns:
+        --------
+        pd.DataFrame
+            Cleaned and processed COT data for the ticker
+
+        Examples:
+        ---------
+        >>> processor = COTProcessor()
+        >>> cot_data = processor.load_ticker_cot_data('CL_F')
+        >>> print(f"Loaded {len(cot_data)} rows for CL_F")
+        """
+        if data_client is None:
+            try:
+                from ..data import DataClient
+                data_client = DataClient()
+            except ImportError:
+                raise ImportError("DataClient not available. Please provide data_client parameter.")
+
+        ticker_key = f"cot/{ticker}"
+
+        try:
+            # Read ticker-specific COT data
+            with pd.HDFStore(data_client.cot_path, "r") as store:
+                if ticker_key not in store:
+                    raise KeyError(f"COT data not found for ticker '{ticker}' at key '{ticker_key}'. "
+                                 f"Run refresh_latest_cot_year(write_ticker_keys=True) first.")
+
+                df = store.select(ticker_key)
+
+            # Ensure proper date index
+            if not isinstance(df.index, pd.DatetimeIndex):
+                date_cols = [
+                    "Report_Date_as_YYYY-MM-DD",
+                    "Report_Date_as_MM_DD_YYYY",
+                    "Date",
+                    "date",
+                ]
+                for col in date_cols:
+                    if col in df.columns:
+                        df.index = pd.to_datetime(df[col], errors='coerce')
+                        df = df[df.index.notna()]
+                        break
+
+            return df.sort_index()
+
+        except Exception as e:
+            raise ValueError(f"Error loading COT data for ticker '{ticker}': {str(e)}")
+
+    def load_multiple_ticker_cot_data(self, tickers: list, data_client=None) -> dict:
+        """
+        Load COT data for multiple tickers.
+
+        Parameters:
+        -----------
+        tickers : list
+            List of ticker symbols
+        data_client : DataClient, optional
+            DataClient instance
+
+        Returns:
+        --------
+        dict
+            Dictionary mapping ticker to DataFrame
+        """
+        results = {}
+
+        for ticker in tickers:
+            try:
+                results[ticker] = self.load_ticker_cot_data(ticker, data_client)
+            except Exception as e:
+                print(f"Warning: Could not load data for {ticker}: {e}")
+
+        return results
+
     def load_and_clean_data(self, df):
         """Load and clean your specific data format"""
 

@@ -2643,8 +2643,27 @@ class DataClient:
         self,
         *,
         report_type: str = "disaggregated_fut",
-    ) -> pd.DataFrame:
-        """Replace the most recent year of raw COT data in the HDF5 store."""
+        write_ticker_keys: bool = True,
+        progress: bool = True,
+    ) -> Dict[str, Any]:
+
+        """
+        Replace the most recent year of raw COT data and optionally write ticker-specific keys.
+
+        Parameters:
+        -----------
+        report_type : str
+            COT report type to refresh
+        write_ticker_keys : bool, default True
+            If True, also filter and write individual ticker data to cot/{symbol}_F keys
+        progress : bool, default True
+            Whether to show progress messages
+
+        Returns:
+        --------
+        Dict[str, Any]
+            Results including combined data and ticker-specific results
+        """
 
         self._ensure_parent(self.cot_path)
         raw_key = self._get_raw_key_for_report_type(report_type)
@@ -2667,6 +2686,9 @@ class DataClient:
                     target_year = int(valid_dates.max().year)
             except Exception:
                 date_col = None
+
+        if progress:
+            print(f"Downloading latest COT data for year {target_year} using {report_type}...")
 
         new_data = self.download_cot(
             report_type=report_type,
@@ -2730,10 +2752,128 @@ class DataClient:
             min_itemsize=min_itemsize or None,
         )
 
+        # Write combined data to main raw key
         with pd.HDFStore(self.cot_path, "a") as store:
             store.put(raw_key, combined, **fmt)
 
-        return combined
+        if progress:
+            print(f"Updated {raw_key} with {len(combined)} rows")
+
+        results = {
+            'combined_data': combined,
+            'raw_key': raw_key,
+            'ticker_results': {},
+            'total_rows': len(combined)
+        }
+
+        # Write individual ticker keys if requested
+        if write_ticker_keys and code_col:
+            results['ticker_results'] = self._write_ticker_cot_keys(
+                combined, code_col, progress=progress
+            )
+
+        return results
+
+    def _write_ticker_cot_keys(
+        self,
+        combined_data: pd.DataFrame,
+        code_col: str,
+        progress: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Filter combined COT data by ticker codes and write to individual cot/{symbol}_F keys.
+
+        Parameters:
+        -----------
+        combined_data : pd.DataFrame
+            Combined COT data with all tickers
+        code_col : str
+            Column name containing COT codes
+        progress : bool
+            Whether to show progress messages
+
+        Returns:
+        --------
+        Dict[str, Any]
+            Results for each ticker
+        """
+        ticker_results = {
+            'success': [],
+            'failed': {},
+            'total_tickers': 0
+        }
+
+        if progress:
+            print("\nFiltering and writing ticker-specific COT data...")
+
+        # Get available ticker mappings
+        available_tickers = []
+        try:
+            from ..config import TICKER_TO_CODE, CODE_TO_TICKER
+            available_tickers = list(TICKER_TO_CODE.keys())
+            ticker_results['total_tickers'] = len(available_tickers)
+        except ImportError:
+            if progress:
+                print("Warning: TICKER_TO_CODE not available, skipping ticker-specific writes")
+            return ticker_results
+
+        # Process each ticker
+        with pd.HDFStore(self.cot_path, "a") as store:
+            for i, ticker in enumerate(available_tickers):
+                if progress and (i + 1) % 10 == 0:
+                    print(f"  Processing ticker {i+1}/{len(available_tickers)}: {ticker}")
+
+                try:
+                    cot_code = TICKER_TO_CODE[ticker]
+
+                    # Filter data for this ticker
+                    ticker_mask = combined_data[code_col].astype(str).str.strip().str.upper() == str(cot_code).strip().upper()
+                    ticker_data = combined_data[ticker_mask].copy()
+
+                    if len(ticker_data) == 0:
+                        ticker_results['failed'][ticker] = "No data found for COT code"
+                        continue
+
+                    # Clean and process with COTProcessor
+                    ticker_data = self.cot_processor.load_and_clean_data(ticker_data)
+
+                    # Set appropriate index if needed
+                    if not isinstance(ticker_data.index, pd.DatetimeIndex):
+                        date_cols = [
+                            "Report_Date_as_YYYY-MM-DD",
+                            "Report_Date_as_MM_DD_YYYY",
+                            "Date",
+                            "date",
+                        ]
+                        for col in date_cols:
+                            if col in ticker_data.columns:
+                                ticker_data.index = pd.to_datetime(ticker_data[col], errors='coerce')
+                                ticker_data = ticker_data[ticker_data.index.notna()]
+                                break
+
+                    # Write to ticker-specific key
+                    ticker_key = f"cot/{ticker}"
+                    store.put(ticker_key, ticker_data, format="table",
+                             data_columns=True, min_itemsize=self._min_itemsize_for_str_cols(ticker_data))
+
+                    ticker_results['success'].append(ticker)
+
+                    if progress and len(ticker_results['success']) <= 5:
+                        print(f"    ✓ {ticker}: {len(ticker_data)} rows -> {ticker_key}")
+
+                except Exception as e:
+                    ticker_results['failed'][ticker] = str(e)
+                    if progress and len(ticker_results['failed']) <= 3:
+                        print(f"    ✗ {ticker}: {str(e)}")
+
+        if progress:
+            print(f"\nTicker filtering complete:")
+            print(f"  Success: {len(ticker_results['success'])}")
+            print(f"  Failed: {len(ticker_results['failed'])}")
+            if ticker_results['success']:
+                print(f"  Sample successful tickers: {', '.join(ticker_results['success'][:5])}")
+
+        return ticker_results
 
     # ---------------------------------------------------------------------
     # COT: store combined codeset under a caller-provided key
