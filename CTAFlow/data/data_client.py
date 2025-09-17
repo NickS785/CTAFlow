@@ -165,6 +165,32 @@ class DataClient:
             "Pass `code_col` (e.g., 'CFTC_Contract_Market_Code')."
         )
 
+    @staticmethod
+    def _find_report_date_column(df: pd.DataFrame) -> str:
+        """Identify the column containing the COT report date."""
+
+        lower_map = {c.lower(): c for c in df.columns}
+        preferred = [
+            "report_date_as_yyyy-mm-dd",
+            "report_date_as_mm_dd_yyyy",
+            "report_date_as_mm_dd_yy",
+            "report_date",
+        ]
+        for key in preferred:
+            if key in lower_map:
+                return lower_map[key]
+
+        for col in df.columns:
+            col_lower = col.lower()
+            if "report" in col_lower and "date" in col_lower:
+                return col
+
+        for col in df.columns:
+            if "date" in col.lower():
+                return col
+
+        raise KeyError("Could not detect a report date column in DataFrame.")
+
 
     # --- NEW: dtype sanitization to avoid PyTables mixed-object errors --------
     @staticmethod
@@ -2607,11 +2633,107 @@ class DataClient:
                 except Exception as e:
                     if progress:
                         print(f"  {ticker}: Error - {e}")
-        
+
         if progress:
             print(f"\nDownload complete. Successfully downloaded data for {len(results)} tickers.")
-        
+
         return results
+
+    def refresh_latest_cot_year(
+        self,
+        *,
+        report_type: str = "disaggregated_fut",
+    ) -> pd.DataFrame:
+        """Replace the most recent year of raw COT data in the HDF5 store."""
+
+        self._ensure_parent(self.cot_path)
+        raw_key = self._get_raw_key_for_report_type(report_type)
+
+        existing = pd.DataFrame()
+        if self.cot_path.exists():
+            with pd.HDFStore(self.cot_path, "r") as store:
+                if raw_key in store:
+                    existing = store.select(raw_key)
+
+        date_col: Optional[str] = None
+        target_year = int(pd.Timestamp.today().year)
+
+        if not existing.empty:
+            try:
+                date_col = self._find_report_date_column(existing)
+                existing_dates = pd.to_datetime(existing[date_col], errors="coerce")
+                valid_dates = existing_dates.dropna()
+                if not valid_dates.empty:
+                    target_year = int(valid_dates.max().year)
+            except Exception:
+                date_col = None
+
+        new_data = self.download_cot(
+            report_type=report_type,
+            years=target_year,
+            write_raw=False,
+            replace=False,
+        )
+
+        if new_data.empty:
+            raise ValueError(
+                f"No COT data returned for year {target_year} using report type '{report_type}'."
+            )
+
+        if date_col is None or date_col not in new_data.columns:
+            date_col = self._find_report_date_column(new_data)
+
+        column_order = list(existing.columns) if not existing.empty else []
+        for col in new_data.columns:
+            if col not in column_order:
+                column_order.append(col)
+
+        historical = existing
+        if not existing.empty and date_col in existing.columns:
+            existing_dates = pd.to_datetime(existing[date_col], errors="coerce")
+            year_series = existing_dates.dt.year
+            keep_mask = (year_series != target_year) | year_series.isna()
+            historical = existing.loc[keep_mask]
+
+        historical = historical.reindex(columns=column_order)
+        new_aligned = new_data.reindex(columns=column_order)
+        combined = pd.concat([historical, new_aligned], ignore_index=True, sort=False)
+
+        try:
+            code_col = self._find_code_col(combined)
+        except KeyError:
+            code_col = None
+
+        if date_col in combined.columns:
+            combined["_sort_date"] = pd.to_datetime(combined[date_col], errors="coerce")
+            sort_cols = ["_sort_date"]
+            if code_col and code_col in combined.columns:
+                sort_cols.insert(0, code_col)
+            combined = combined.sort_values(by=sort_cols, kind="mergesort")
+            dedup_subset = [code_col, "_sort_date"] if code_col and code_col in combined.columns else ["_sort_date"]
+            combined = combined.drop_duplicates(subset=dedup_subset, keep="last")
+            if "_sort_date" in combined.columns:
+                combined = combined.drop(columns="_sort_date")
+
+        combined = self._sanitize_for_hdf(combined)
+
+        data_columns: Union[bool, Sequence[str]] = True
+        if code_col and code_col in combined.columns:
+            data_columns = [code_col]
+
+        min_itemsize = self._min_itemsize_for_str_cols(combined)
+        fmt: Dict[str, Any] = dict(
+            format="table",
+            data_columns=data_columns,
+            complib=self.complib,
+            complevel=self.complevel,
+            min_itemsize=min_itemsize or None,
+        )
+
+        with pd.HDFStore(self.cot_path, "a") as store:
+            store.put(raw_key, combined, **fmt)
+
+        return combined
 
     # ---------------------------------------------------------------------
     # COT: store combined codeset under a caller-provided key
