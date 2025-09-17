@@ -5,20 +5,23 @@ import time
 import threading
 import concurrent.futures
 from dataclasses import dataclass
+from ..data_client import DataClient
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-from CTAFlow.config import MARKET_DATA_PATH, RAW_MARKET_DATA_PATH
+from CTAFlow.config import MARKET_DATA_PATH, RAW_MARKET_DATA_PATH, DLY_DATA_PATH
+
 
 # Default location for DLY files
-DLY_DATA_PATH = RAW_MARKET_DATA_PATH / "daily"
+
 
 MONTH_CODE_MAP = {
     "F": 1,  # Jan
     "G": 2,  # Feb
     "H": 3,  # Mar
+
     "J": 4,  # Apr
     "K": 5,  # May
     "M": 6,  # Jun
@@ -129,7 +132,7 @@ class DLYContractManager:
     def __init__(self, ticker: str, folder: str = None, hdf_path: Optional[str] = None, yy_pivot: int = 1970):
         self.folder = str(folder) or str(DLY_DATA_PATH)
         self.base_ticker = ticker.upper()  # Store the base ticker for file matching
-        self.ticker = f"{ticker.upper()}_F"  # Store the display/save ticker with _F
+        self.ticker = f"{ticker.upper()}_F" if not ticker.endswith('_F') else ticker.upper() # Store the display/save ticker with _F
         self.hdf_path = hdf_path or MARKET_DATA_PATH
         self.yy_pivot = yy_pivot
 
@@ -151,6 +154,7 @@ class DLYContractManager:
         self.seq_volume: Optional[pd.DataFrame] = None
         self.curve_oi: Optional[pd.DataFrame] = None
         self.seq_oi: Optional[pd.DataFrame] = None
+        self.client = DataClient()
 
     # ---------- ingestion ----------
     def collect_files(self) -> List[Tuple[ContractInfo, str]]:
@@ -475,6 +479,16 @@ class DLYContractManager:
         if self.seq_oi is not None:
             result["seq_oi"] = f"market/{self.ticker}/seq_oi"
         return result
+    @classmethod
+    def load_existing_data(cls, ticker_symbol):
+        """Load existing curve data from HDF5 storage."""
+        cli = DataClient()
+        if not ticker_symbol.endswith("_F"):
+            ticker_symbol = f"{ticker_symbol}_F"
+        data = cli.query_market_data(ticker_symbol)
+        curve_holder = cls(ticker_symbol.replace("_F", ""))
+        # TODO: Implement data loading logic
+        return curve_holder
 
 
 class DLYFolderUpdater:

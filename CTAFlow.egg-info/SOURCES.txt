@@ -13,6 +13,8 @@ CTAFlow.egg-info/dependency_links.txt
 CTAFlow.egg-info/entry_points.txt
 CTAFlow.egg-info/requires.txt
 CTAFlow.egg-info/top_level.txt
+CTAFlow/apps/__init__.py
+CTAFlow/apps/cot_dashboard.py
 CTAFlow/data/__init__.py
 CTAFlow/data/classifications_reference.py
 CTAFlow/data/data_client.py
