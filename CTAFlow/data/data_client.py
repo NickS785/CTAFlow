@@ -943,29 +943,37 @@ class DataClient:
         elif where:
             combined_where = where
         
-        # Query each curve type
-        results = {}
-        available_keys = self.list_market_data()
-        
-        for curve_type in curve_types_to_query:
-            market_key = f"market/{available_curve_types[curve_type]}"
-            
-            if market_key not in available_keys:
-                print(f"Warning: {market_key} not found in available data")
-                continue
-            
-            try:
-                df = self.read_market(
-                    market_key,
-                    where=combined_where,
-                    columns=columns
-                )
-                results[curve_type] = df
-                
-            except Exception as e:
-                print(f"Error querying {market_key}: {e}")
-                continue
-        
+        # Query each curve type while minimizing HDF open/close cycles
+        results: Dict[str, pd.DataFrame] = {}
+
+        if not self.market_path.exists():
+            return pd.DataFrame() if len(curve_types_to_query) == 1 or combine_datasets else {}
+
+        try:
+            with pd.HDFStore(self.market_path, "r") as store:
+                store_keys = {k.lstrip("/") for k in store.keys()}
+
+                for curve_type in curve_types_to_query:
+                    market_key = f"market/{available_curve_types[curve_type]}"
+
+                    if market_key not in store_keys:
+                        print(f"Warning: {market_key} not found in available data")
+                        continue
+
+                    try:
+                        df = store.select(
+                            market_key,
+                            where=combined_where,
+                            columns=columns
+                        )
+                        results[curve_type] = df
+                    except Exception as e:
+                        print(f"Error querying {market_key}: {e}")
+                        continue
+        except (OSError, FileNotFoundError) as exc:
+            print(f"Error opening market data store: {exc}")
+            return pd.DataFrame() if len(curve_types_to_query) == 1 or combine_datasets else {}
+
         # Return results
         if not results:
             return pd.DataFrame() if len(curve_types_to_query) == 1 or combine_datasets else {}
