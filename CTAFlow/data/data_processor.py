@@ -6,20 +6,29 @@ This module processes CSV files from RAW_MARKET_DATA_PATH and stores them
 in MARKET_DATA_PATH with proper data types and datetime indexing.
 """
 
+import os
 import pandas as pd
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Sequence, Any
 import re
 import warnings
 import concurrent.futures
 import threading
 from queue import Queue
 import time
+import numpy as np
 
 from ..config import RAW_MARKET_DATA_PATH, MARKET_DATA_PATH, TICKER_TO_CODE
 from .data_client import DataClient
 from CTAFlow.data.contract_handling.curve_manager import FuturesCurveManager
 from CTAFlow.data.contract_handling.roll_date_manager import create_enhanced_curve_manager_with_roll_tracking
+from CTAFlow.data.contract_handling.dly_contract_manager import (
+    DLYContractManager,
+    DLY_DATA_PATH,
+    discover_tickers,
+    parse_contract_filename,
+    MONTH_CODE_MAP,
+)
 
 
 class DataProcessor:
@@ -40,7 +49,7 @@ class DataProcessor:
         """
         self.raw_data_path = Path(raw_data_path) if raw_data_path else RAW_MARKET_DATA_PATH
         self.hdf5_path = Path(hdf5_path) if hdf5_path else MARKET_DATA_PATH
-        self.client = DataClient()
+        self.client = DataClient(market_path=self.hdf5_path)
         self.curve_manager = FuturesCurveManager
         self.enhanced_curve_manager = create_enhanced_curve_manager_with_roll_tracking
         
@@ -81,6 +90,454 @@ class DataProcessor:
             'bid_vol': 'BidVolume',
             'askvolume': 'AskVolume',
             'ask_vol': 'AskVolume'
+        }
+
+    # ------------------------------------------------------------------
+    # Helpers for curve/market updates
+    # ------------------------------------------------------------------
+    def _get_existing_curve_state(self, symbol: str) -> Tuple[set, Optional[pd.Timestamp]]:
+        """Return existing curve contract labels and last timestamp for ``symbol``."""
+
+        contracts: set = set()
+        last_timestamp: Optional[pd.Timestamp] = None
+
+        if not self.hdf5_path.exists():
+            return contracts, last_timestamp
+
+        key = f"market/{symbol}/curve"
+        try:
+            with pd.HDFStore(self.hdf5_path, "r") as store:
+                try:
+                    sample = store.select(key, start=0, stop=1)
+                except (KeyError, ValueError):
+                    return contracts, last_timestamp
+
+                contracts = {str(col).split('~')[0] for col in sample.columns}
+
+                storer = store.get_storer(key)
+                if storer is not None and storer.nrows:
+                    last_row = store.select(key, start=storer.nrows - 1, stop=storer.nrows)
+                    if not last_row.empty:
+                        last_timestamp = last_row.index[-1]
+        except (OSError, FileNotFoundError):
+            return contracts, last_timestamp
+
+        return contracts, last_timestamp
+
+    @staticmethod
+    def _replace_extension(filename: str, new_ext: str) -> str:
+        base, _ = os.path.splitext(filename)
+        return f"{base}{new_ext}"
+
+    @staticmethod
+    def _convert_scid_datetime(values: np.ndarray) -> Optional[pd.DatetimeIndex]:
+        """Attempt to convert raw SCID datetime representations to ``DatetimeIndex``."""
+
+        candidates = [
+            ("D", "1899-12-30"),  # Excel-style days
+            ("s", "1970-01-01"),  # Unix seconds
+            ("ms", "1970-01-01"),
+            ("ns", "1970-01-01"),
+        ]
+
+        for unit, origin in candidates:
+            try:
+                dt_index = pd.to_datetime(values, unit=unit, origin=origin, errors="coerce")
+            except (OverflowError, ValueError, TypeError):
+                continue
+
+            if dt_index.isna().all():
+                continue
+
+            valid = dt_index.dropna()
+            if valid.empty:
+                continue
+
+            if valid.min() < pd.Timestamp("1980-01-01") or valid.max() > pd.Timestamp("2100-12-31"):
+                continue
+
+            return pd.DatetimeIndex(dt_index)
+
+        return None
+
+    @staticmethod
+    def _read_scid_file(path: Path) -> pd.DataFrame:
+        """Read a Sierra Chart ``.scid`` file into a DataFrame of intraday records."""
+
+        raw_bytes = path.read_bytes()
+        if not raw_bytes:
+            return pd.DataFrame()
+
+        dtype_candidates = [
+            np.dtype([
+                ("datetime", "<f8"),
+                ("open", "<f4"),
+                ("high", "<f4"),
+                ("low", "<f4"),
+                ("close", "<f4"),
+                ("num_trades", "<i4"),
+                ("volume", "<f4"),
+                ("bid_volume", "<f4"),
+                ("ask_volume", "<f4"),
+            ]),
+            np.dtype([
+                ("datetime", "<i4"),
+                ("open", "<f4"),
+                ("high", "<f4"),
+                ("low", "<f4"),
+                ("close", "<f4"),
+                ("volume", "<i4"),
+                ("num_trades", "<i4"),
+                ("bid_volume", "<i4"),
+                ("ask_volume", "<i4"),
+            ]),
+        ]
+        header_offsets = (0, 32, 48, 56, 64, 128)
+
+        for offset in header_offsets:
+            if offset >= len(raw_bytes):
+                continue
+            payload = raw_bytes[offset:]
+            for dtype in dtype_candidates:
+                if len(payload) % dtype.itemsize != 0 or len(payload) == 0:
+                    continue
+                try:
+                    records = np.frombuffer(payload, dtype=dtype)
+                except ValueError:
+                    continue
+                if records.size == 0:
+                    continue
+                dt_index = DataProcessor._convert_scid_datetime(records["datetime"])
+                if dt_index is None:
+                    continue
+
+                df = pd.DataFrame.from_records(records)
+                df.index = pd.DatetimeIndex(dt_index)
+                df.index.name = "datetime"
+                if "close" in df.columns:
+                    df = df.rename(columns={"close": "last"})
+                return df
+
+        raise ValueError(f"Unable to parse SCID file: {path}")
+
+    @staticmethod
+    def _format_scid_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+        """Normalize SCID dataframe columns to standard market schema."""
+
+        rename_map = {
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "last": "Last",
+            "close": "Last",
+            "volume": "Volume",
+            "num_trades": "NumberOfTrades",
+            "number_of_trades": "NumberOfTrades",
+            "bid_volume": "BidVolume",
+            "ask_volume": "AskVolume",
+        }
+
+        working = df.copy()
+        working.columns = [rename_map.get(col, col) for col in working.columns]
+
+        for required in ["Open", "High", "Low", "Last", "Volume", "NumberOfTrades", "BidVolume", "AskVolume"]:
+            if required not in working.columns:
+                working[required] = 0.0 if required in {"Open", "High", "Low", "Last"} else 0
+
+        float_cols = ["Open", "High", "Low", "Last"]
+        int_cols = ["Volume", "NumberOfTrades", "BidVolume", "AskVolume"]
+
+        working[float_cols] = working[float_cols].astype(float)
+        working[int_cols] = working[int_cols].astype(float)
+        return working[float_cols + int_cols]
+
+    @staticmethod
+    def _resample_intraday_bars(df: pd.DataFrame, rule: str = "1T") -> pd.DataFrame:
+        """Resample intraday records to the provided frequency."""
+
+        price = df[["Open", "High", "Low", "Last"]].resample(rule).agg({
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Last": "last",
+        })
+        volume = df[["Volume", "NumberOfTrades", "BidVolume", "AskVolume"]].resample(rule).sum()
+
+        combined = pd.concat([price, volume], axis=1)
+        combined = combined.dropna(subset=["Open", "High", "Low", "Last"], how="all")
+
+        for col in ["Volume", "NumberOfTrades", "BidVolume", "AskVolume"]:
+            combined[col] = combined[col].fillna(0).round().astype("int64")
+
+        combined.index.name = "datetime"
+        return combined.dropna(subset=["Open", "High", "Low", "Last"], how="all")
+
+    @staticmethod
+    def _find_front_scid(base_symbol: str, folder: Path, as_of: Optional[pd.Timestamp] = None) -> Tuple[Path, str]:
+        """Locate the front-month SCID file for ``base_symbol`` within ``folder``."""
+
+        as_of = (as_of or pd.Timestamp.utcnow()).normalize()
+        candidate_files: List[Tuple[pd.Timestamp, str, Path]] = []
+
+        for scid_path in folder.glob(f"{base_symbol}*.scid"):
+            info = parse_contract_filename(DataProcessor._replace_extension(scid_path.name, ".dly"))
+            if info is None:
+                continue
+            contract_month = MONTH_CODE_MAP.get(info.month)
+            if contract_month is None:
+                continue
+            contract_start = pd.Timestamp(info.year, contract_month, 1)
+            candidate_files.append((contract_start, info.contract_id, scid_path))
+
+        if not candidate_files:
+            raise FileNotFoundError(f"No SCID files found for {base_symbol} in {folder}")
+
+        candidate_files.sort(key=lambda x: x[0])
+        front = None
+        for contract_start, contract_id, scid_path in candidate_files:
+            if contract_start >= as_of.replace(day=1):
+                front = (contract_start, contract_id, scid_path)
+                break
+
+        if front is None:
+            front = candidate_files[-1]
+
+        return front[2], front[1]
+
+    # ------------------------------------------------------------------
+    # Public update helpers
+    # ------------------------------------------------------------------
+    def update_curve_data_from_dly(
+        self,
+        tickers: Optional[Sequence[str]] = None,
+        *,
+        min_contracts: int = 1,
+        progress: bool = True,
+    ) -> Dict[str, Any]:
+        """Update HDF5 curve datasets using the latest contracts discovered in ``DLY_DATA_PATH``.
+
+        Parameters
+        ----------
+        tickers : sequence of str, optional
+            Specific base tickers (without ``_F``) to refresh. When omitted all tickers present in
+            ``DLY_DATA_PATH`` are considered.
+        min_contracts : int, default 1
+            Minimum number of contracts required in the DLY folder before a ticker is processed.
+        progress : bool, default True
+            If ``True`` prints per-ticker progress messages.
+
+        Returns
+        -------
+        Dict[str, Any]
+            Dictionary with ``updated`` (list), ``skipped`` (mapping) and ``errors`` (mapping).
+        """
+
+        folder = Path(DLY_DATA_PATH)
+        if not folder.exists():
+            raise FileNotFoundError(f"DLY data path does not exist: {folder}")
+
+        if tickers is None:
+            mapping = discover_tickers(str(folder))
+            tickers = [
+                ticker
+                for ticker, files in mapping.items()
+                if len(files) >= min_contracts
+            ]
+
+        results: Dict[str, Any] = {"updated": [], "skipped": {}, "errors": {}}
+
+        for base_ticker in sorted(set(t.upper() for t in tickers)):
+            manager = DLYContractManager(base_ticker, folder=str(folder), hdf_path=str(self.hdf5_path))
+
+            try:
+                contract_files = manager.collect_files()
+            except Exception as exc:
+                results["errors"][base_ticker] = str(exc)
+                continue
+
+            if not contract_files:
+                results["skipped"][base_ticker] = "no_dly_files"
+                continue
+
+            latest_contract = contract_files[-1][0].contract_id
+            existing_contracts, existing_last = self._get_existing_curve_state(manager.ticker)
+
+            try:
+                manager.run(save=False)
+            except Exception as exc:
+                results["errors"][base_ticker] = str(exc)
+                continue
+
+            if manager.curve is None or manager.curve.empty:
+                results["skipped"][base_ticker] = "empty_curve"
+                continue
+
+            new_contracts = {str(col).split('~')[0] for col in manager.curve.columns}
+            new_last = manager.curve.index.max()
+
+            needs_update = False
+            if new_contracts.difference(existing_contracts):
+                needs_update = True
+            if existing_last is None or (new_last is not None and new_last > existing_last):
+                needs_update = True
+
+            if not needs_update:
+                results["skipped"][base_ticker] = f"up_to_date (latest {latest_contract})"
+                continue
+
+            try:
+                manager.save_hdf()
+                results["updated"].append(manager.ticker)
+                if progress:
+                    print(
+                        f"Updated curve data for {manager.ticker} (latest contract {latest_contract})"
+                    )
+            except Exception as exc:
+                results["errors"][base_ticker] = str(exc)
+
+        return results
+
+    def update_market_from_scid(
+        self,
+        symbol: str,
+        *,
+        resample_rule: str = "1T",
+        as_of: Optional[pd.Timestamp] = None,
+        include_tail_rows: int = 5,
+    ) -> Dict[str, Any]:
+        """Update ``market/{symbol}`` using the latest front-month ``.scid`` file.
+
+        Parameters
+        ----------
+        symbol : str
+            Market symbol (with or without the ``_F`` suffix).
+        resample_rule : str, default "1T"
+            Resampling frequency applied to the raw SCID observations.
+        as_of : pandas.Timestamp, optional
+            Override date used when selecting the front contract.
+        include_tail_rows : int, default 5
+            Number of existing rows to fetch from the end of the HDF dataset to guard against
+            duplicate rows when appending new data.
+
+        Returns
+        -------
+        Dict[str, Any]
+            Summary information including rows appended and the source file used.
+        """
+
+        if not symbol:
+            raise ValueError("symbol must be provided")
+
+        normalized_symbol = symbol.upper()
+        if normalized_symbol.endswith("_F"):
+            base_symbol = normalized_symbol[:-2]
+        else:
+            base_symbol = normalized_symbol
+            normalized_symbol = f"{base_symbol}_F"
+
+        folder = Path(DLY_DATA_PATH)
+        if not folder.exists():
+            raise FileNotFoundError(f"DLY data path does not exist: {folder}")
+
+        scid_path, contract_id = self._find_front_scid(base_symbol, folder, as_of=as_of)
+        raw_df = self._read_scid_file(scid_path)
+        if raw_df.empty:
+            return {
+                "symbol": normalized_symbol,
+                "scid_path": str(scid_path),
+                "front_contract": contract_id,
+                "appended_rows": 0,
+                "message": "SCID file produced no records",
+            }
+
+        formatted = self._format_scid_dataframe(raw_df).sort_index()
+        resampled = self._resample_intraday_bars(formatted, rule=resample_rule)
+
+        if resampled.empty:
+            return {
+                "symbol": normalized_symbol,
+                "scid_path": str(scid_path),
+                "front_contract": contract_id,
+                "appended_rows": 0,
+                "message": "No data after resampling",
+            }
+
+        if resampled.index.tz is not None:
+            resampled.index = resampled.index.tz_convert(None)
+
+        resampled = resampled[~resampled.index.duplicated(keep="last")]
+        resampled["ticker_prefix"] = base_symbol
+        resampled["ticker_symbol"] = normalized_symbol
+
+        column_order = [
+            "Open",
+            "High",
+            "Low",
+            "Last",
+            "Volume",
+            "NumberOfTrades",
+            "BidVolume",
+            "AskVolume",
+            "ticker_prefix",
+            "ticker_symbol",
+        ]
+
+        resampled = resampled[column_order]
+
+        tail_key = f"market/{normalized_symbol}"
+        tail_rows = max(include_tail_rows, 1)
+        existing_tail = self.client.get_market_tail(tail_key, nrows=tail_rows)
+
+        if not existing_tail.empty:
+            try:
+                existing_tail.index = pd.to_datetime(existing_tail.index)
+            except Exception:
+                existing_tail.index = pd.to_datetime(existing_tail.index, errors="coerce")
+
+            missing_cols = [c for c in column_order if c not in existing_tail.columns]
+            for col in missing_cols:
+                existing_tail[col] = pd.NA
+            existing_tail = existing_tail[column_order]
+            combined = pd.concat([existing_tail, resampled])
+        else:
+            combined = resampled
+
+        combined = combined.sort_index()
+        combined = combined[~combined.index.duplicated(keep="last")]
+
+        last_existing_timestamp = None
+        if not existing_tail.empty and existing_tail.index.notna().any():
+            last_existing_timestamp = existing_tail.index.max()
+
+        if last_existing_timestamp is not None:
+            new_rows = combined[combined.index > last_existing_timestamp]
+        else:
+            new_rows = combined
+
+        if new_rows.empty:
+            return {
+                "symbol": normalized_symbol,
+                "scid_path": str(scid_path),
+                "front_contract": contract_id,
+                "appended_rows": 0,
+                "message": "No new rows to append",
+            }
+
+        for col in ["Open", "High", "Low", "Last"]:
+            new_rows[col] = new_rows[col].astype(float)
+        for col in ["Volume", "NumberOfTrades", "BidVolume", "AskVolume"]:
+            new_rows[col] = new_rows[col].fillna(0).round().astype("int64")
+        new_rows["ticker_prefix"] = new_rows["ticker_prefix"].astype(str)
+        new_rows["ticker_symbol"] = new_rows["ticker_symbol"].astype(str)
+
+        self.client.write_market(new_rows, tail_key, replace=False)
+
+        return {
+            "symbol": normalized_symbol,
+            "scid_path": str(scid_path),
+            "front_contract": contract_id,
+            "appended_rows": len(new_rows),
+            "resample_rule": resample_rule,
         }
     
     def discover_csv_files(self, year: str = '25') -> List[Tuple[str, Path]]:
