@@ -16,10 +16,11 @@ sample dataset is generated so the visualizations remain interactive.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -68,6 +69,19 @@ class FeatureSplit:
 
     def is_empty(self) -> bool:
         return not (self.line or self.bar or self.pie)
+
+
+@dataclass
+class SubplotRow:
+    """Configuration container for building subplot rows."""
+
+    title: str
+    spec: Dict[str, Any]
+    traces: List[Tuple[go.BaseTraceType, bool]]
+    yaxis_title: str | None = None
+    secondary_yaxis_title: str | None = None
+    yaxis_tickformat: str | None = None
+    secondary_yaxis_tickformat: str | None = None
 
 
 def _get_data_directory() -> Path:
@@ -243,6 +257,257 @@ def split_feature_columns(columns: Iterable[str]) -> FeatureSplit:
     return FeatureSplit(line=line_cols, bar=bar_cols, pie=pie_cols)
 
 
+def _create_open_interest_row(df: pd.DataFrame) -> Tuple[SubplotRow | None, List[str]]:
+    total_col = "total_open_interest"
+    change_col = "oi_change"
+    momentum_col = "oi_momentum"
+
+    traces: List[Tuple[go.BaseTraceType, bool]] = []
+    used_cols: List[str] = []
+
+    has_total = total_col in df.columns and df[total_col].notna().any()
+    has_change = change_col in df.columns and df[change_col].notna().any()
+    has_momentum = momentum_col in df.columns and df[momentum_col].notna().any()
+
+    if not has_total or not (has_change or has_momentum):
+        return None, []
+
+    if has_change:
+        traces.append(
+            (
+                go.Bar(
+                    x=df.index,
+                    y=df[change_col],
+                    name="OI Change (1W)",
+                    marker_color="#1f77b4",
+                    opacity=0.6,
+                    hovertemplate="%{x|%Y-%m-%d}<br>OI Change (1W): %{y:.2%}<extra></extra>",
+                ),
+                False,
+            )
+        )
+        used_cols.append(change_col)
+
+    if has_momentum:
+        traces.append(
+            (
+                go.Scatter(
+                    x=df.index,
+                    y=df[momentum_col],
+                    mode="lines",
+                    name="OI Momentum (4W)",
+                    line=dict(color="#ff7f0e", width=2),
+                    hovertemplate="%{x|%Y-%m-%d}<br>OI Momentum (4W): %{y:.2%}<extra></extra>",
+                ),
+                False,
+            )
+        )
+        used_cols.append(momentum_col)
+
+    traces.append(
+        (
+            go.Scatter(
+                x=df.index,
+                y=df[total_col],
+                mode="lines",
+                name="Total Open Interest",
+                line=dict(color="#2ca02c", width=2.5),
+                hovertemplate="%{x|%Y-%m-%d}<br>Total Open Interest: %{y:,.0f}<extra></extra>",
+            ),
+            True,
+        )
+    )
+    used_cols.append(total_col)
+
+    row = SubplotRow(
+        title="Open Interest Dynamics",
+        spec={"secondary_y": True},
+        traces=traces,
+        yaxis_title="Change / Momentum",
+        secondary_yaxis_title="Total Open Interest",
+        yaxis_tickformat=".1%",
+        secondary_yaxis_tickformat=",.0f",
+    )
+
+    return row, used_cols
+
+
+def _create_spread_activity_row(df: pd.DataFrame) -> Tuple[SubplotRow | None, List[str]]:
+    total_col = "mm_spread_activity"
+    change_col = "spread_activity_flow"
+    momentum_col = "spread_ratio_change"
+
+    traces: List[Tuple[go.BaseTraceType, bool]] = []
+    used_cols: List[str] = []
+
+    has_total = total_col in df.columns and df[total_col].notna().any()
+    has_change = change_col in df.columns and df[change_col].notna().any()
+    has_momentum = momentum_col in df.columns and df[momentum_col].notna().any()
+
+    if not has_total or not (has_change or has_momentum):
+        return None, []
+
+    if has_change:
+        traces.append(
+            (
+                go.Bar(
+                    x=df.index,
+                    y=df[change_col],
+                    name="Spread Activity Flow (4W)",
+                    marker_color="#9467bd",
+                    opacity=0.6,
+                    hovertemplate="%{x|%Y-%m-%d}<br>Spread Activity Flow (4W): %{y:,.0f}<extra></extra>",
+                ),
+                False,
+            )
+        )
+        used_cols.append(change_col)
+
+    if has_momentum:
+        traces.append(
+            (
+                go.Scatter(
+                    x=df.index,
+                    y=df[momentum_col],
+                    mode="lines",
+                    name="Spread Ratio Change (4W)",
+                    line=dict(color="#ff9896", width=2, dash="dash"),
+                    hovertemplate="%{x|%Y-%m-%d}<br>Spread Ratio Change (4W): %{y:.3f}<extra></extra>",
+                ),
+                False,
+            )
+        )
+        used_cols.append(momentum_col)
+
+    traces.append(
+        (
+            go.Scatter(
+                x=df.index,
+                y=df[total_col],
+                mode="lines",
+                name="Total Spread Positions",
+                line=dict(color="#17becf", width=2.5),
+                hovertemplate="%{x|%Y-%m-%d}<br>Total Spread Positions: %{y:,.0f}<extra></extra>",
+            ),
+            True,
+        )
+    )
+    used_cols.append(total_col)
+
+    row = SubplotRow(
+        title="Spread Activity Overview",
+        spec={"secondary_y": True},
+        traces=traces,
+        yaxis_title="Change / Momentum",
+        secondary_yaxis_title="Total Spreads",
+        secondary_yaxis_tickformat=",.0f",
+    )
+
+    return row, used_cols
+
+
+def _create_generic_rows(df: pd.DataFrame) -> List[SubplotRow]:
+    if df.empty:
+        return []
+
+    split = split_feature_columns(df.columns)
+    rows: List[SubplotRow] = []
+
+    if split.line:
+        traces: List[Tuple[go.BaseTraceType, bool]] = []
+        for col in split.line:
+            if col not in df.columns or not df[col].notna().any():
+                continue
+            display_name = col.replace("_", " ").title()
+            traces.append(
+                (
+                    go.Scatter(
+                        x=df.index,
+                        y=df[col],
+                        mode="lines",
+                        name=display_name,
+                        hovertemplate=f"%{{x|%Y-%m-%d}}<br>{display_name}: %{{y:.2f}}<extra></extra>",
+                    ),
+                    False,
+                )
+            )
+        if traces:
+            rows.append(
+                SubplotRow(
+                    title="Trend Metrics",
+                    spec={"type": "xy"},
+                    traces=traces,
+                    yaxis_title="Value",
+                )
+            )
+
+    if split.bar:
+        traces = []
+        for col in split.bar:
+            if col not in df.columns or not df[col].notna().any():
+                continue
+            display_name = col.replace("_", " ").title()
+            traces.append(
+                (
+                    go.Bar(
+                        x=df.index,
+                        y=df[col],
+                        name=display_name,
+                        hovertemplate=f"%{{x|%Y-%m-%d}}<br>{display_name}: %{{y:.2f}}<extra></extra>",
+                    ),
+                    False,
+                )
+            )
+        if traces:
+            rows.append(
+                SubplotRow(
+                    title="Flow & Change Metrics",
+                    spec={"type": "xy"},
+                    traces=traces,
+                    yaxis_title="Value",
+                )
+            )
+
+    if split.pie:
+        traces = []
+        valid_cols = [col for col in split.pie if col in df.columns]
+        if valid_cols:
+            latest = df[valid_cols].dropna(axis=0, how="all")
+            if not latest.empty:
+                latest_row = latest.iloc[-1]
+                positive = latest_row.replace([np.inf, -np.inf], np.nan).dropna()
+                if positive.empty or np.isclose(positive.abs().sum(), 0):
+                    positive = pd.Series([1.0], index=["No meaningful ratios"])
+                traces.append(
+                    (
+                        go.Pie(
+                            labels=list(positive.index),
+                            values=positive.astype(float).tolist(),
+                            hole=0.3,
+                            name="Ratios",
+                        ),
+                        False,
+                    )
+                )
+            else:
+                traces.append(
+                    (
+                        go.Pie(labels=["No ratio data"], values=[1.0], hole=0.3, name="Ratios"),
+                        False,
+                    )
+                )
+        if traces:
+            rows.append(
+                SubplotRow(
+                    title="Latest Ratio Snapshot",
+                    spec={"type": "domain"},
+                    traces=traces,
+                )
+            )
+
+    return rows
+
+
 def build_cot_index_figure(features: pd.DataFrame) -> go.Figure:
     """Create a specialized figure for COT index data with extreme threshold lines."""
 
@@ -403,90 +668,92 @@ def build_feature_figure(group: str, features: pd.DataFrame) -> go.Figure:
         )
         return fig
 
-    split = split_feature_columns(cleaned.columns)
-    row_configs: List[Tuple[str, List[str]]] = []
-    if split.line:
-        row_configs.append(("line", split.line))
-    if split.bar:
-        row_configs.append(("bar", split.bar))
-    if split.pie:
-        row_configs.append(("pie", split.pie))
+    rows: List[SubplotRow] = []
+    used_columns: List[str] = []
 
-    specs = []
-    titles = []
-    for category, _ in row_configs:
-        if category == "pie":
-            specs.append([{"type": "domain"}])
-            titles.append("Latest Ratio Snapshot")
-        elif category == "bar":
-            specs.append([{"type": "xy"}])
-            titles.append("Flow & Change Metrics")
-        else:
-            specs.append([{"type": "xy"}])
-            titles.append("Trend Metrics")
+    if group == "market_structure":
+        oi_row, oi_cols = _create_open_interest_row(cleaned)
+        if oi_row is not None:
+            rows.append(oi_row)
+            used_columns.extend(oi_cols)
 
-    fig = make_subplots(rows=len(row_configs), cols=1, specs=specs, subplot_titles=titles)
+    if group == "spreads":
+        spread_row, spread_cols = _create_spread_activity_row(cleaned)
+        if spread_row is not None:
+            rows.append(spread_row)
+            used_columns.extend(spread_cols)
 
-    for idx, (category, cols) in enumerate(row_configs, start=1):
-        if category == "pie":
-            latest = cleaned[cols].dropna(axis=0, how="all")
-            if latest.empty:
-                fig.add_annotation(
-                    text="No ratio data",
-                    xref="paper",
-                    yref="paper",
-                    x=0.5,
-                    y=0.5,
-                    showarrow=False,
-                )
-                continue
-            latest_row = latest.iloc[-1]
-            positive = latest_row.replace([np.inf, -np.inf], np.nan).dropna()
-            if positive.empty or np.isclose(positive.abs().sum(), 0):
-                positive = pd.Series([1.0], index=["No meaningful ratios"])
-            fig.add_trace(
-                go.Pie(labels=list(positive.index), values=positive.astype(float).tolist(), hole=0.3, name="Ratios"),
-                row=idx,
-                col=1,
-            )
-        elif category == "bar":
-            for col in cols:
-                fig.add_trace(
-                    go.Bar(x=cleaned.index, y=cleaned[col], name=col, hovertemplate="%{x|%Y-%m-%d}: %{y:.2f}<extra></extra>"),
+    remaining_cols = [col for col in cleaned.columns if col not in used_columns]
+    if remaining_cols:
+        remaining_df = cleaned.loc[:, remaining_cols]
+        rows.extend(_create_generic_rows(remaining_df))
+
+    if not rows:
+        fig = go.Figure()
+        fig.update_layout(
+            title=f"{group.replace('_', ' ').title()} Features",
+            annotations=[
+                {
+                    "text": "No data available for selected range",
+                    "xref": "paper",
+                    "yref": "paper",
+                    "x": 0.5,
+                    "y": 0.5,
+                    "showarrow": False,
+                    "font": {"size": 14},
+                }
+            ],
+        )
+        return fig
+
+    specs = [[row.spec] for row in rows]
+    titles = [row.title for row in rows]
+    fig = make_subplots(rows=len(rows), cols=1, specs=specs, subplot_titles=titles)
+
+    for idx, row in enumerate(rows, start=1):
+        for trace, use_secondary in row.traces:
+            if row.spec.get("secondary_y") and use_secondary:
+                fig.add_trace(trace, row=idx, col=1, secondary_y=True)
+            else:
+                fig.add_trace(trace, row=idx, col=1)
+
+        if row.yaxis_title:
+            fig.update_yaxes(title_text=row.yaxis_title, row=idx, col=1)
+        if row.yaxis_tickformat:
+            fig.update_yaxes(tickformat=row.yaxis_tickformat, row=idx, col=1)
+
+        if row.spec.get("secondary_y"):
+            if row.secondary_yaxis_title:
+                fig.update_yaxes(
+                    title_text=row.secondary_yaxis_title,
+                    secondary_y=True,
                     row=idx,
                     col=1,
                 )
-            fig.update_yaxes(title_text="Value", row=idx, col=1)
-        else:
-            for col in cols:
-                fig.add_trace(
-                    go.Scatter(
-                        x=cleaned.index,
-                        y=cleaned[col],
-                        mode="lines",
-                        name=col,
-                        hovertemplate="%{x|%Y-%m-%d}: %{y:.2f}<extra></extra>",
-                    ),
+            if row.secondary_yaxis_tickformat:
+                fig.update_yaxes(
+                    tickformat=row.secondary_yaxis_tickformat,
+                    secondary_y=True,
                     row=idx,
                     col=1,
                 )
-            fig.update_yaxes(title_text="Value", row=idx, col=1)
 
     fig.update_layout(
-        height=max(350, 320 * len(row_configs)),
+        height=max(350, 320 * len(rows)),
         showlegend=True,
         title=f"{group.replace('_', ' ').title()} Features",
         barmode="group",
         margin=dict(t=80, r=40, b=40, l=60),
+        hovermode="x unified",
     )
 
     return fig
 
 
-def compute_feature_groups(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+def compute_feature_groups(df: pd.DataFrame) -> OrderedDict[str, pd.DataFrame]:
     """Compute feature DataFrames for each COTProcessor group."""
 
-    features: Dict[str, pd.DataFrame] = {}
+    features: OrderedDict[str, pd.DataFrame] = OrderedDict()
     for group in FEATURE_GROUPS:
         # For interactions group, compute positioning first, then extremes to get COT index data
         if group == "interactions":
