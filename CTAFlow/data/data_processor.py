@@ -24,13 +24,11 @@ from CTAFlow.data.contract_handling.curve_manager import FuturesCurveManager
 from CTAFlow.data.contract_handling.roll_date_manager import create_enhanced_curve_manager_with_roll_tracking
 from CTAFlow.data.contract_handling.dly_contract_manager import (
     DLYContractManager,
-    DLY_DATA_PATH,
     discover_tickers,
     parse_contract_filename,
     MONTH_CODE_MAP,
 )
-
-
+from CTAFlow.config import DLY_DATA_PATH
 class DataProcessor:
     """
     Process and format market data CSV files for HDF5 storage.
@@ -47,7 +45,7 @@ class DataProcessor:
         hdf5_path : Path, optional
             Path to HDF5 file for storage. Defaults to MARKET_DATA_PATH.
         """
-        self.raw_data_path = Path(raw_data_path) if raw_data_path else RAW_MARKET_DATA_PATH
+        self.raw_data_path = Path(raw_data_path) if raw_data_path else DLY_DATA_PATH
         self.hdf5_path = Path(hdf5_path) if hdf5_path else MARKET_DATA_PATH
         self.client = DataClient(market_path=self.hdf5_path)
         self.curve_manager = FuturesCurveManager
@@ -162,7 +160,84 @@ class DataProcessor:
 
     @staticmethod
     def _read_scid_file(path: Path) -> pd.DataFrame:
-        """Read a Sierra Chart ``.scid`` file into a DataFrame of intraday records."""
+        """Read a Sierra Chart ``.scid`` file into a DataFrame of intraday records using CSV parser."""
+
+        try:
+            # Try reading as CSV file with common delimiters
+            for sep in [',', '\t', ';', '|']:
+                try:
+                    df = pd.read_csv(
+                        path,
+                        sep=sep,
+                        header=0,
+                        encoding='utf-8'
+                    )
+
+                    # Check if we got reasonable data
+                    if len(df.columns) >= 4 and len(df) > 0:
+                        # Standardize datetime index
+                        datetime_cols = [col for col in df.columns if 'date' in col.lower() or 'time' in col.lower()]
+                        if datetime_cols:
+                            df['datetime'] = pd.to_datetime(df[datetime_cols[0]])
+                            df = df.set_index('datetime')
+                            df = df.drop(columns=datetime_cols)
+                        elif len(df.columns) > 0:
+                            # Try first column as datetime
+                            try:
+                                df['datetime'] = pd.to_datetime(df.iloc[:, 0])
+                                df = df.set_index('datetime')
+                                df = df.drop(columns=[df.columns[0]])
+                            except:
+                                continue
+
+                        df.index.name = "datetime"
+
+                        # Comprehensive column mapping to standard names
+                        # This ensures all variations map to consistent final column names
+                        column_mapping = {}
+
+                        # Map all open variations to 'open'
+                        for col in df.columns:
+                            col_lower = col.lower()
+                            if col_lower in ['open', 'o']:
+                                column_mapping[col] = 'open'
+                            elif col_lower in ['high', 'h']:
+                                column_mapping[col] = 'high'
+                            elif col_lower in ['low', 'l']:
+                                column_mapping[col] = 'low'
+                            elif col_lower in ['close', 'c', 'last']:
+                                column_mapping[col] = 'last'
+                            elif col_lower in ['volume', 'v', 'vol']:
+                                column_mapping[col] = 'volume'
+                            elif col_lower in ['num_trades', 'trades', 'numberoftrades', 'number_of_trades', '#oftrades']:
+                                column_mapping[col] = 'num_trades'
+                            elif col_lower in ['bid_volume', 'bidvolume', 'bid_vol', 'bvol']:
+                                column_mapping[col] = 'bidvolume'
+                            elif col_lower in ['ask_volume', 'askvolume', 'ask_vol', 'avol']:
+                                column_mapping[col] = 'askvolume'
+
+                        # Apply the mapping
+                        df = df.rename(columns=column_mapping)
+
+                        # Ensure we have at least OHLC data
+                        required_cols = ['open', 'high', 'low', 'last']
+                        if all(col in df.columns for col in required_cols):
+                            return df
+
+                except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError):
+                    continue
+                except Exception:
+                    continue
+
+            # If CSV parsing fails, fallback to the original binary method
+            return DataProcessor._read_scid_file_binary(path)
+
+        except Exception:
+            return pd.DataFrame()
+
+    @staticmethod
+    def _read_scid_file_binary(path: Path) -> pd.DataFrame:
+        """Fallback binary reader for SCID files (original implementation)."""
 
         raw_bytes = path.read_bytes()
         if not raw_bytes:
@@ -177,8 +252,8 @@ class DataProcessor:
                 ("close", "<f4"),
                 ("num_trades", "<i4"),
                 ("volume", "<f4"),
-                ("bid_volume", "<f4"),
-                ("ask_volume", "<f4"),
+                ("bidvolume", "<f4"),
+                ("askvolume", "<f4"),
             ]),
             np.dtype([
                 ("datetime", "<i4"),
@@ -274,35 +349,249 @@ class DataProcessor:
 
     @staticmethod
     def _find_front_scid(base_symbol: str, folder: Path, as_of: Optional[pd.Timestamp] = None) -> Tuple[Path, str]:
-        """Locate the front-month SCID file for ``base_symbol`` within ``folder``."""
+        """Locate the most recently modified SCID file over 50MB for ``base_symbol`` within ``folder``."""
 
-        as_of = (as_of or pd.Timestamp.utcnow()).normalize()
         candidate_files: List[Tuple[pd.Timestamp, str, Path]] = []
+        min_size_bytes = 50 * 1024 * 1024  # 50MB in bytes
 
         for scid_path in folder.glob(f"{base_symbol}*.scid"):
-            info = parse_contract_filename(DataProcessor._replace_extension(scid_path.name, ".dly"))
-            if info is None:
+            try:
+                # Get file size
+                file_size = scid_path.stat().st_size
+
+                # Skip files under 50MB
+                if file_size < min_size_bytes:
+                    continue
+
+                # Get file modification time
+                mod_time = pd.Timestamp.fromtimestamp(scid_path.stat().st_mtime)
+
+                # Try to parse contract info for the contract_id
+                info = parse_contract_filename(DataProcessor._replace_extension(scid_path.name, ".dly"))
+                if info is not None:
+                    contract_id = info.contract_id
+                else:
+                    # Fallback: extract contract ID from filename if parsing fails
+                    # e.g., "CLU25-NYMEX.scid" -> "U25"
+                    stem = scid_path.stem
+                    if '-' in stem:
+                        contract_id = stem.split('-')[0][len(base_symbol):]
+                    else:
+                        contract_id = stem[len(base_symbol):]
+
+                candidate_files.append((mod_time, contract_id, scid_path))
+
+            except (OSError, ValueError):
+                # Skip files that can't be accessed or parsed
                 continue
-            contract_month = MONTH_CODE_MAP.get(info.month)
-            if contract_month is None:
-                continue
-            contract_start = pd.Timestamp(info.year, contract_month, 1)
-            candidate_files.append((contract_start, info.contract_id, scid_path))
 
         if not candidate_files:
-            raise FileNotFoundError(f"No SCID files found for {base_symbol} in {folder}")
+            raise FileNotFoundError(f"No SCID files over 50MB found for {base_symbol} in {folder}")
 
-        candidate_files.sort(key=lambda x: x[0])
-        front = None
-        for contract_start, contract_id, scid_path in candidate_files:
-            if contract_start >= as_of.replace(day=1):
-                front = (contract_start, contract_id, scid_path)
-                break
+        # Sort by modification time (descending) to get the most recent file
+        candidate_files.sort(key=lambda x: -x[0].timestamp())
 
-        if front is None:
-            front = candidate_files[-1]
+        # Select the most recently modified file over 50MB
+        best_file = candidate_files[0]
+        return best_file[2], best_file[1]
 
-        return front[2], front[1]
+    @staticmethod
+    def _find_specific_scid(base_symbol: str, folder: Path, contract_suffix: str) -> Tuple[Path, str]:
+        """Locate a specific SCID file for ``base_symbol`` with the given contract suffix."""
+
+        # Try different filename patterns for the contract suffix
+        possible_patterns = [
+            f"{base_symbol}{contract_suffix}.scid",        # e.g., CLH25.scid
+            f"{base_symbol}{contract_suffix}-NYMEX.scid",  # e.g., CLH25-NYMEX.scid
+            f"{base_symbol}{contract_suffix}.NYMEX.scid",  # e.g., CLH25.NYMEX.scid
+        ]
+
+        for pattern in possible_patterns:
+            scid_path = folder / pattern
+            if scid_path.exists():
+                return scid_path, contract_suffix
+
+        # If direct patterns don't work, search through all files
+        for scid_path in folder.glob(f"{base_symbol}*.scid"):
+            # Extract the suffix from the filename
+            stem = scid_path.stem
+
+            # Handle different formats
+            if '-' in stem:
+                # Format: CLH25-NYMEX
+                suffix_part = stem.split('-')[0][len(base_symbol):]
+            elif '.' in stem:
+                # Format: CLH25.NYMEX
+                suffix_part = stem.split('.')[0][len(base_symbol):]
+            else:
+                # Format: CLH25
+                suffix_part = stem[len(base_symbol):]
+
+            # Check if this matches the requested suffix
+            if suffix_part == contract_suffix:
+                return scid_path, contract_suffix
+
+        raise FileNotFoundError(f"No SCID file found for {base_symbol} with contract suffix '{contract_suffix}' in {folder}")
+
+    def _find_update_files(self, ticker: str, update_folder: Optional[str] = None) -> List[Path]:
+        """Find CSV update files for ticker beyond today's date."""
+
+        today = pd.Timestamp.now().date()
+
+        if update_folder:
+            folder = Path(update_folder)
+        else:
+            folder = Path.cwd()
+
+        if not folder.exists():
+            return []
+
+        # Pattern: {ticker}-update-{date}.csv
+        pattern = f"{ticker}-update-*.csv"
+        update_files = []
+
+        for csv_file in folder.glob(pattern):
+            try:
+                # Extract date from filename: cl-update-2025-09-17.csv
+                filename = csv_file.stem
+                parts = filename.split('-')
+                if len(parts) >= 5 and parts[1] == 'update':
+                    # Get date parts: ['cl', 'update', '2025', '09', '17']
+                    year, month, day = parts[2], parts[3], parts[4]
+                    file_date = pd.Timestamp(int(year), int(month), int(day)).date()
+
+                    # Only include files beyond today
+                    if file_date > today:
+                        update_files.append(csv_file)
+
+            except (ValueError, IndexError):
+                # Skip files that don't match expected format
+                continue
+
+        # Sort by date (newest first)
+        update_files.sort(key=lambda f: f.name, reverse=True)
+        return update_files
+
+    def _process_update_files(self, update_files: List[Path]) -> pd.DataFrame:
+        """Process multiple CSV update files and combine them."""
+
+        all_dataframes = []
+
+        for csv_file in update_files:
+            try:
+                df = self._read_csv_file(csv_file)
+                if not df.empty:
+                    all_dataframes.append(df)
+            except Exception:
+                # Skip files that can't be read
+                continue
+
+        if not all_dataframes:
+            return pd.DataFrame()
+
+        # Combine all dataframes
+        combined = pd.concat(all_dataframes, axis=0, ignore_index=False)
+
+        # Remove duplicates, keeping the latest
+        combined = combined.sort_index()
+        combined = combined[~combined.index.duplicated(keep="last")]
+
+        return combined
+
+    def _read_csv_file(self, csv_path: Path) -> pd.DataFrame:
+        """Read a CSV file with automatic column detection and formatting."""
+
+        try:
+            # Try reading with different separators
+            for sep in [',', '\t', ';', '|']:
+                try:
+                    # First, try reading without parsing dates to see the structure
+                    df = pd.read_csv(
+                        csv_path,
+                        sep=sep,
+                        header=0,
+                        encoding='utf-8'
+                    )
+
+                    if len(df.columns) < 4 or len(df) == 0:
+                        continue
+
+                    # Clean column names (remove leading/trailing spaces)
+                    df.columns = df.columns.str.strip()
+
+                    # Handle different datetime formats
+                    datetime_index = None
+
+                    # Check if we have separate Date and Time columns
+                    date_cols = [col for col in df.columns if col.lower() in ['date']]
+                    time_cols = [col for col in df.columns if col.lower() in ['time']]
+
+                    if date_cols and time_cols:
+                        # Combine Date and Time columns
+                        date_col = date_cols[0]
+                        time_col = time_cols[0]
+                        df['datetime'] = pd.to_datetime(df[date_col].astype(str) + ' ' + df[time_col].astype(str))
+                        df = df.set_index('datetime')
+                        df = df.drop(columns=[date_col, time_col])
+                        datetime_index = df.index
+                    else:
+                        # Look for datetime columns
+                        datetime_cols = [col for col in df.columns if 'date' in col.lower() or 'time' in col.lower()]
+                        if datetime_cols:
+                            df['datetime'] = pd.to_datetime(df[datetime_cols[0]])
+                            df = df.set_index('datetime')
+                            df = df.drop(columns=datetime_cols)
+                            datetime_index = df.index
+                        elif len(df.columns) > 0:
+                            # Try first column as datetime
+                            try:
+                                df['datetime'] = pd.to_datetime(df.iloc[:, 0])
+                                df = df.set_index('datetime')
+                                df = df.drop(columns=[df.columns[0]])
+                                datetime_index = df.index
+                            except:
+                                continue
+
+                    if datetime_index is None:
+                        continue
+
+                    df.index.name = "datetime"
+
+                    # Apply the same column mapping as SCID files
+                    column_mapping = {}
+                    for col in df.columns:
+                        col_lower = col.lower().strip()
+                        if col_lower in ['open', 'o']:
+                            column_mapping[col] = 'open'
+                        elif col_lower in ['high', 'h']:
+                            column_mapping[col] = 'high'
+                        elif col_lower in ['low', 'l']:
+                            column_mapping[col] = 'low'
+                        elif col_lower in ['close', 'c', 'last']:
+                            column_mapping[col] = 'last'
+                        elif col_lower in ['volume', 'v', 'vol']:
+                            column_mapping[col] = 'volume'
+                        elif col_lower in ['num_trades', 'trades', 'numberoftrades', 'number_of_trades', '#oftrades']:
+                            column_mapping[col] = 'num_trades'
+                        elif col_lower in ['bid_volume', 'bidvolume', 'bid_vol', 'bvol']:
+                            column_mapping[col] = 'bidvolume'
+                        elif col_lower in ['ask_volume', 'askvolume', 'ask_vol', 'avol']:
+                            column_mapping[col] = 'askvolume'
+
+                    df = df.rename(columns=column_mapping)
+
+                    # Ensure we have OHLC data
+                    required_cols = ['open', 'high', 'low', 'last']
+                    if all(col in df.columns for col in required_cols):
+                        return df
+
+                except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError):
+                    continue
+
+        except Exception:
+            pass
+
+        return pd.DataFrame()
 
     # ------------------------------------------------------------------
     # Public update helpers
@@ -332,7 +621,7 @@ class DataProcessor:
             Dictionary with ``updated`` (list), ``skipped`` (mapping) and ``errors`` (mapping).
         """
 
-        folder = Path(DLY_DATA_PATH)
+        folder = self.raw_data_path
         if not folder.exists():
             raise FileNotFoundError(f"DLY data path does not exist: {folder}")
 
@@ -401,20 +690,20 @@ class DataProcessor:
         self,
         symbol: str,
         *,
+        update_folder: Optional[str] = None,
         resample_rule: str = "1T",
-        as_of: Optional[pd.Timestamp] = None,
         include_tail_rows: int = 5,
     ) -> Dict[str, Any]:
-        """Update ``market/{symbol}`` using the latest front-month ``.scid`` file.
+        """Update ``market/{symbol}`` using CSV update files beyond today's date.
 
         Parameters
         ----------
         symbol : str
             Market symbol (with or without the ``_F`` suffix).
+        update_folder : str, optional
+            Folder path containing CSV update files. If not provided, uses current working directory.
         resample_rule : str, default "1T"
-            Resampling frequency applied to the raw SCID observations.
-        as_of : pandas.Timestamp, optional
-            Override date used when selecting the front contract.
+            Resampling frequency applied to the raw observations.
         include_tail_rows : int, default 5
             Number of existing rows to fetch from the end of the HDF dataset to guard against
             duplicate rows when appending new data.
@@ -422,7 +711,7 @@ class DataProcessor:
         Returns
         -------
         Dict[str, Any]
-            Summary information including rows appended and the source file used.
+            Summary information including rows appended and the source files used.
         """
 
         if not symbol:
@@ -435,29 +724,35 @@ class DataProcessor:
             base_symbol = normalized_symbol
             normalized_symbol = f"{base_symbol}_F"
 
-        folder = Path(DLY_DATA_PATH)
-        if not folder.exists():
-            raise FileNotFoundError(f"DLY data path does not exist: {folder}")
+        # Find CSV update files
+        update_files = self._find_update_files(base_symbol.lower(), update_folder)
 
-        scid_path, contract_id = self._find_front_scid(base_symbol, folder, as_of=as_of)
-        raw_df = self._read_scid_file(scid_path)
-        if raw_df.empty:
+        if not update_files:
             return {
                 "symbol": normalized_symbol,
-                "scid_path": str(scid_path),
-                "front_contract": contract_id,
+                "update_files": [],
                 "appended_rows": 0,
-                "message": "SCID file produced no records",
+                "message": f"No CSV update files found for {base_symbol.lower()} beyond today's date",
             }
 
-        formatted = self._format_scid_dataframe(raw_df).sort_index()
+        # Process all update files
+        combined_df = self._process_update_files(update_files)
+
+        if combined_df.empty:
+            return {
+                "symbol": normalized_symbol,
+                "update_files": [str(f) for f in update_files],
+                "appended_rows": 0,
+                "message": "No data found in update files",
+            }
+
+        formatted = self._format_scid_dataframe(combined_df).sort_index()
         resampled = self._resample_intraday_bars(formatted, rule=resample_rule)
 
         if resampled.empty:
             return {
                 "symbol": normalized_symbol,
-                "scid_path": str(scid_path),
-                "front_contract": contract_id,
+                "update_files": [str(f) for f in update_files],
                 "appended_rows": 0,
                 "message": "No data after resampling",
             }
@@ -517,8 +812,7 @@ class DataProcessor:
         if new_rows.empty:
             return {
                 "symbol": normalized_symbol,
-                "scid_path": str(scid_path),
-                "front_contract": contract_id,
+                "update_files": [str(f) for f in update_files],
                 "appended_rows": 0,
                 "message": "No new rows to append",
             }
@@ -534,8 +828,7 @@ class DataProcessor:
 
         return {
             "symbol": normalized_symbol,
-            "scid_path": str(scid_path),
-            "front_contract": contract_id,
+            "update_files": [str(f) for f in update_files],
             "appended_rows": len(new_rows),
             "resample_rule": resample_rule,
         }

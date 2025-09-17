@@ -6,7 +6,8 @@ import os
 
 MARKET_DATA_PATH = Path("F:\\", 'Data', 'market_data.hd5')
 COT_DATA_PATH = Path("F:\\", 'Data', 'cot_data.hd5' )
-RAW_MARKET_DATA_PATH = Path("F:\\", 'charts')
+RAW_MARKET_DATA_PATH = Path("F:\\", 'charts')  # CSV market data files
+DLY_DATA_PATH = Path("F:\\", 'SierraChart', 'Data')  # DLY futures data files
 MODEL_DATA_PATH = Path("F:\\", "ML", "models")
 
 APP_ROOT = Path(__file__).parent
