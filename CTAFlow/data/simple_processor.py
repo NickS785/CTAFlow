@@ -1,11 +1,17 @@
 """Simplified CSV data processor for market data updates and FuturesCurve processing."""
 
-import pandas as pd
-import numpy as np
+import asyncio
+import fnmatch
+import re
+from functools import partial
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Set, Sequence
+
+import numpy as np
+import pandas as pd
 
 from .contract_handling.dly_contract_manager import DLYContractManager, DLYFolderUpdater
+from CTAFlow.config import RAW_MARKET_DATA_PATH
 
 
 class SimpleDataProcessor:
@@ -13,6 +19,248 @@ class SimpleDataProcessor:
 
     def __init__(self, client):
         self.client = client
+
+    def _collect_existing_curve_keys(self) -> Dict[str, Set[str]]:
+        """Collect curve-related keys for each ticker currently in the market store."""
+
+        valid_curve_keys = {
+            "curve",
+            "dte",
+            "expiry",
+            "front",
+            "seq_curve",
+            "seq_labels",
+            "seq_dte",
+            "seq_spreads",
+            "curve_volume",
+            "seq_volume",
+            "curve_oi",
+            "seq_oi",
+        }
+
+        mapping: Dict[str, Set[str]] = {}
+        for key in self.client.list_market_data():
+            if not key.startswith("market/"):
+                continue
+            parts = key.split("/")
+            if len(parts) < 2:
+                continue
+            symbol = parts[1]
+            dataset = parts[2] if len(parts) > 2 else ""
+
+            if len(parts) == 2:
+                mapping.setdefault(symbol, set())
+                continue
+
+            if dataset and dataset in valid_curve_keys:
+                mapping.setdefault(symbol, set()).add(dataset)
+
+        return mapping
+
+    def _collect_market_update_files(
+        self,
+        tickers: Sequence[str],
+        *,
+        raw_data_path: Optional[str] = None,
+    ) -> Dict[str, List[str]]:
+        """Collect CSV update files for the provided ``tickers`` from ``RAW_MARKET_DATA_PATH``."""
+
+        if not tickers:
+            return {}
+
+        folder = Path(raw_data_path or RAW_MARKET_DATA_PATH)
+        try:
+            entries = list(folder.iterdir())
+        except FileNotFoundError:
+            return {}
+
+        target_lookup = {t.upper(): t.upper() for t in tickers}
+        lowercase_lookup = {t.upper(): t.lower() for t in tickers}
+
+        mapping: Dict[str, List[str]] = {ticker.upper(): [] for ticker in tickers}
+
+        for entry in entries:
+            if not entry.is_file() or entry.suffix.lower() != ".csv":
+                continue
+
+            stem = entry.stem.lower()
+            if "-update-" not in stem:
+                continue
+
+            prefix = stem.split("-update-", 1)[0]
+            prefix_upper = prefix.upper()
+
+            if prefix_upper in target_lookup:
+                mapping.setdefault(prefix_upper, []).append(str(entry))
+            else:
+                # Some update files may include suffixes (e.g. CL_F-update-...)
+                # Try matching against known lowercase variants directly.
+                for ticker_upper, ticker_lower in lowercase_lookup.items():
+                    if stem.startswith(f"{ticker_lower}-update-"):
+                        mapping.setdefault(ticker_upper, []).append(str(entry))
+                        break
+
+        return {ticker: sorted(files) for ticker, files in mapping.items() if files}
+
+    async def update_all_tickers(
+        self,
+        *,
+        dly_folder: str,
+        pattern: Optional[str] = None,
+        pattern_mode: str = "regex",
+        selected_cot_features=None,
+        max_concurrency: int = 4,
+        raw_data_path: Optional[str] = None,
+        market_resample_rule: str = "1T",
+        cot_progress: bool = False,
+    ) -> Dict[str, Any]:
+        """Update COT metrics, market data and curve datasets for all tracked tickers."""
+
+        if max_concurrency <= 0:
+            raise ValueError("max_concurrency must be positive")
+
+        cot_result = await self.client.write_all_metrics(
+            selected_cot_features, progress=cot_progress
+        )
+
+        existing_mapping = self._collect_existing_curve_keys()
+
+        def matches(symbol: str) -> bool:
+            base = symbol[:-2] if symbol.endswith("_F") else symbol
+            if pattern is None:
+                return True
+            if pattern_mode == "glob":
+                return fnmatch.fnmatch(base, pattern)
+            return re.search(pattern, base) is not None
+
+        filtered_mapping = {
+            symbol: curve_keys
+            for symbol, curve_keys in existing_mapping.items()
+            if matches(symbol)
+        }
+
+        summary: Dict[str, Any] = {
+            "cot_metrics": cot_result,
+            "updates": {},
+            "skipped": [],
+            "errors": {},
+        }
+
+        folder_updater = DLYFolderUpdater(dly_folder)
+        base_tickers = [symbol[:-2] if symbol.endswith("_F") else symbol for symbol in filtered_mapping]
+        file_map = folder_updater.collect_update_files(base_tickers)
+        market_updates = self._collect_market_update_files(
+            base_tickers, raw_data_path=raw_data_path
+        )
+        raw_path = Path(raw_data_path or RAW_MARKET_DATA_PATH)
+
+        update_jobs: List[Dict[str, Any]] = []
+        for symbol, curve_keys in filtered_mapping.items():
+            base_symbol = symbol[:-2] if symbol.endswith("_F") else symbol
+            files = file_map.get(base_symbol, [])
+            market_files = market_updates.get(base_symbol.upper(), [])
+
+            has_curve_job = bool(files and curve_keys)
+            has_market_job = bool(market_files)
+
+            if not has_curve_job and not has_market_job:
+                summary["skipped"].append(symbol)
+                continue
+
+            update_jobs.append(
+                {
+                    "symbol": symbol,
+                    "base_symbol": base_symbol,
+                    "curve_keys": sorted(curve_keys),
+                    "curve_files": list(files),
+                    "market_files": list(market_files),
+                }
+            )
+
+        if not update_jobs:
+            summary["message"] = "No eligible tickers found for update"
+            return summary
+
+        # Run market updates sequentially to minimize memory pressure
+        for job in update_jobs:
+            symbol = job["symbol"]
+            market_files = job["market_files"]
+            details = {
+                "symbol": symbol,
+                "base_symbol": job["base_symbol"],
+                "curve_keys": list(job["curve_keys"]),
+                "curve_files": list(job["curve_files"]),
+                "market_files": list(market_files),
+            }
+            summary["updates"][symbol] = details
+            job["details"] = details
+
+            if not market_files:
+                continue
+
+            try:
+                details["market_result"] = self.update_market_from_csv(
+                    symbol,
+                    csv_folder=str(raw_path),
+                    resample_rule=market_resample_rule,
+                )
+            except Exception as exc:
+                summary["errors"].setdefault(symbol, {})["market"] = str(exc)
+
+        # Run curve updates concurrently (if any)
+        semaphore = asyncio.Semaphore(max_concurrency)
+        loop = asyncio.get_running_loop()
+
+        async def run_curve_job(job: Dict[str, Any]) -> None:
+            symbol = job["symbol"]
+            curve_files = job["curve_files"]
+            curve_keys = job["curve_keys"]
+
+            if not curve_files or not curve_keys:
+                return
+
+            async with semaphore:
+                try:
+                    task = partial(
+                        self._execute_curve_update,
+                        symbol=symbol,
+                        base_symbol=job["base_symbol"],
+                        curve_keys=tuple(curve_keys),
+                        curve_files=tuple(curve_files),
+                        folder_updater=folder_updater,
+                    )
+                    result = await loop.run_in_executor(None, task)
+                    details = job.get("details") or summary["updates"].setdefault(symbol, {})
+                    details["curve_result"] = result
+                except Exception as exc:
+                    summary["errors"].setdefault(symbol, {})["curve"] = str(exc)
+
+        await asyncio.gather(*(run_curve_job(job) for job in update_jobs))
+
+        if summary["skipped"]:
+            summary["skipped"] = sorted(set(summary["skipped"]))
+
+        return summary
+
+    def _execute_curve_update(
+        self,
+        *,
+        symbol: str,
+        base_symbol: str,
+        curve_keys: Sequence[str],
+        curve_files: Sequence[str],
+        folder_updater: DLYFolderUpdater,
+    ) -> Dict[str, Any]:
+        """Run curve updates for a single ticker synchronously."""
+
+        if not curve_files or not curve_keys:
+            return {}
+
+        return folder_updater.update_existing_ticker(
+            base_symbol,
+            existing_curve_keys=tuple(curve_keys),
+            file_paths=tuple(curve_files),
+        )
 
     def update_market_from_csv(
         self,
