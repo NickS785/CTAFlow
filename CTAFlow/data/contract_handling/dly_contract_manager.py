@@ -5,8 +5,9 @@ import time
 import threading
 import concurrent.futures
 from dataclasses import dataclass
+from pathlib import Path
 from ..data_client import DataClient
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Sequence
 
 import numpy as np
 import pandas as pd
@@ -479,6 +480,108 @@ class DLYContractManager:
         if self.seq_oi is not None:
             result["seq_oi"] = f"market/{self.ticker}/seq_oi"
         return result
+
+    def update_existing_keys(
+        self,
+        existing_curve_keys: Optional[Sequence[str]] = None,
+        *,
+        file_paths: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        """Update existing HDF5 curve datasets with the latest .dly data."""
+
+        if file_paths:
+            parsed_pairs: List[Tuple[ContractInfo, str]] = []
+            for fp in file_paths:
+                path_obj = Path(fp)
+                info = parse_contract_filename(path_obj.name, pivot=self.yy_pivot)
+                if info and info.ticker == self.base_ticker:
+                    parsed_pairs.append((info, str(path_obj)))
+            if parsed_pairs:
+                parsed_pairs.sort(key=lambda p: (p[0].year, MONTH_CODE_MAP[p[0].month]))
+                self._file_cache = parsed_pairs
+                try:
+                    self._folder_mtime = os.path.getmtime(self.folder)
+                except FileNotFoundError:
+                    self._folder_mtime = None
+
+        self.load()
+        self.build_curve()
+        self.build_dte()
+        self.build_expiry_series()
+        self.compute_front()
+        self.sequentialize()
+
+        spreads = self.spreads_vs_front()
+
+        datasets: Dict[str, pd.DataFrame] = {}
+
+        if self.curve is not None and not self.curve.empty:
+            datasets["curve"] = self.curve
+        if self.dte is not None and not self.dte.empty:
+            datasets["dte"] = self.dte
+        if self.expiry_series is not None and not self.expiry_series.empty:
+            datasets["expiry"] = self.expiry_series.to_frame()
+        if self.front is not None and not self.front.empty:
+            datasets["front"] = self.front.to_frame()
+        if self.seq_prices is not None and not self.seq_prices.empty:
+            datasets["seq_curve"] = self.seq_prices
+        if self.seq_labels is not None and not self.seq_labels.empty:
+            datasets["seq_labels"] = self.seq_labels
+        if self.seq_dte is not None and not self.seq_dte.empty:
+            datasets["seq_dte"] = self.seq_dte
+        if spreads is not None and not spreads.empty:
+            datasets["seq_spreads"] = spreads
+        if self.curve_volume is not None and not self.curve_volume.empty:
+            datasets["curve_volume"] = self.curve_volume
+        if self.seq_volume is not None and not self.seq_volume.empty:
+            datasets["seq_volume"] = self.seq_volume
+        if self.curve_oi is not None and not self.curve_oi.empty:
+            datasets["curve_oi"] = self.curve_oi
+        if self.seq_oi is not None and not self.seq_oi.empty:
+            datasets["seq_oi"] = self.seq_oi
+
+        if existing_curve_keys is not None:
+            allowed = {key for key in existing_curve_keys if key}
+        else:
+            allowed = set(datasets.keys())
+
+        results: Dict[str, Any] = {
+            "ticker": self.ticker,
+            "files_used": [fp for _, fp in (self._file_cache or [])],
+            "updated": {},
+            "skipped": [],
+        }
+
+        def merge_frames(existing: Optional[pd.DataFrame], new: pd.DataFrame) -> pd.DataFrame:
+            if existing is None or existing.empty:
+                return new.sort_index()
+            combined = pd.concat([existing, new])
+            combined = combined[~combined.index.duplicated(keep="last")]
+            return combined.sort_index()
+
+        for key, frame in datasets.items():
+            if key not in allowed:
+                results["skipped"].append(key)
+                continue
+
+            store_key = f"market/{self.ticker}/{key}"
+            try:
+                existing_df = self.client.read_market(store_key)
+            except KeyError:
+                existing_df = pd.DataFrame()
+
+            merged = merge_frames(existing_df, frame)
+            if merged.empty:
+                results["skipped"].append(key)
+                continue
+
+            self.client.write_market(merged, store_key, replace=True)
+            results["updated"][key] = {
+                "total_rows": len(merged),
+                "delta_rows": len(merged) - len(existing_df),
+            }
+
+        return results
     @classmethod
     def load_existing_data(cls, ticker_symbol):
         """Load existing curve data from HDF5 storage."""
@@ -517,6 +620,28 @@ class DLYFolderUpdater:
         # Filter by minimum contract count
         return [ticker for ticker in candidate_tickers
                 if len(mapping.get(ticker, [])) >= min_contracts]
+
+    def collect_update_files(
+        self,
+        tickers: Optional[Sequence[str]] = None,
+    ) -> Dict[str, List[str]]:
+        mapping = discover_tickers(self.folder)
+        if tickers is not None:
+            target = {t.upper() for t in tickers}
+            mapping = {k: v for k, v in mapping.items() if k.upper() in target}
+        for files in mapping.values():
+            files.sort()
+        return mapping
+
+    def update_existing_ticker(
+        self,
+        ticker: str,
+        existing_curve_keys: Optional[Sequence[str]] = None,
+        file_paths: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        base_ticker = ticker[:-2] if ticker.upper().endswith("_F") else ticker
+        manager = DLYContractManager(base_ticker, self.folder, yy_pivot=self.yy_pivot)
+        return manager.update_existing_keys(existing_curve_keys, file_paths=file_paths)
 
     def _process_single_ticker_worker(self, ticker: str, hdf_path: Optional[str],
                                     per_ticker_hdf_tpl: Optional[str],
