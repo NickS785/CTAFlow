@@ -7,9 +7,42 @@ using log-linear interpolation as specified in the PCA model.
 
 import numpy as np
 import pandas as pd
-from typing import Dict, Union, Optional, Tuple, List,Any
+from typing import Dict, Optional, Any
 from datetime import datetime, timedelta
 import warnings
+
+try:
+    from scipy.interpolate import CubicSpline  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    CubicSpline = None
+
+
+def _linear_interpolate_with_extrapolation(
+    maturities: np.ndarray,
+    log_prices: np.ndarray,
+    target_taus: np.ndarray,
+) -> np.ndarray:
+    """Vectorized log-linear interpolation with linear extrapolation."""
+
+    interpolated = np.interp(target_taus, maturities, log_prices)
+
+    # Linear extrapolation for targets outside the observed range
+    if len(maturities) >= 2:
+        left_mask = target_taus < maturities[0]
+        if left_mask.any():
+            slope = (log_prices[1] - log_prices[0]) / (maturities[1] - maturities[0])
+            interpolated[left_mask] = (
+                log_prices[0] + slope * (target_taus[left_mask] - maturities[0])
+            )
+
+        right_mask = target_taus > maturities[-1]
+        if right_mask.any():
+            slope = (log_prices[-1] - log_prices[-2]) / (maturities[-1] - maturities[-2])
+            interpolated[right_mask] = (
+                log_prices[-1] + slope * (target_taus[right_mask] - maturities[-1])
+            )
+
+    return interpolated
 
 
 def log_interp_to_tau(
@@ -58,48 +91,66 @@ def log_interp_to_tau(
         raise ValueError("No valid tau values found. All values must be positive and finite.")
     
     taus = np.array(taus_clean)
-    out = {tau: pd.Series(index=df_prices.index, dtype=float) for tau in taus}
-    
-    # Pre-compute time-to-maturity matrix in years per day
-    for t, row in df_prices.iterrows():
-        avail = row.dropna()
-        if avail.empty:
+    index = df_prices.index
+    columns = df_prices.columns
+
+    expiries = pd.to_datetime(expiries.reindex(columns))
+    expiry_values = expiries.values.astype('datetime64[D]')
+    valid_expiry_mask = ~pd.isna(expiries).to_numpy()
+
+    price_values = df_prices.to_numpy(dtype=float, copy=False)
+    trade_dates = index.values.astype('datetime64[D]')
+
+    n_dates = len(index)
+    n_taus = len(taus)
+    interpolated = np.full((n_dates, n_taus), np.nan, dtype=float)
+
+    for i in range(n_dates):
+        prices_row = price_values[i]
+        valid_prices = ~np.isnan(prices_row)
+        row_mask = valid_prices & valid_expiry_mask
+
+        if not np.any(row_mask):
             continue
 
-        expiry_values = pd.to_datetime(expiries.loc[avail.index])
-        T = (expiry_values - pd.Timestamp(t)).dt.days / 365.25
-        lnF = np.log(avail.values.astype(float))
-        
-        # Sort by time to maturity
-        T_array = T.to_numpy()
-        order = np.argsort(T_array)
-        T = T_array[order]
-        lnF = np.asarray(lnF)[order]
-        
-        # Interpolate for each target tau
-        for tau in taus:
-            if len(T) < 2:
-                # Only one contract available
-                out[tau].at[t] = lnF[0] if len(T) == 1 else np.nan
-                continue
-                
-            if tau <= T[0]:
-                # Extrapolate before first contract
-                y = lnF[0] + (lnF[1] - lnF[0]) * (tau - T[0]) / (T[1] - T[0])
-            elif tau >= T[-1]:
-                # Extrapolate after last contract
-                y = lnF[-2] + (lnF[-1] - lnF[-2]) * (tau - T[-2]) / (T[-1] - T[-2])
-            else:
-                # Interpolate between contracts
-                j = np.searchsorted(T, tau)
-                t0, t1 = T[j-1], T[j]
-                y0, y1 = lnF[j-1], lnF[j]
-                y = y0 + (y1 - y0) * (tau - t0) / (t1 - t0)
-            
-            out[tau].at[t] = y
-    
-    # Return only non-empty series
-    return {tau: s.dropna() for tau, s in out.items() if not s.dropna().empty}
+        trade_date = trade_dates[i]
+        maturities_days = (expiry_values[row_mask] - trade_date).astype('timedelta64[D]').astype(float)
+        maturities = maturities_days / 365.25
+
+        if maturities.size == 0:
+            continue
+
+        log_prices = np.log(prices_row[row_mask].astype(float))
+
+        order = np.argsort(maturities)
+        maturities = maturities[order]
+        log_prices = log_prices[order]
+
+        # Remove duplicate maturities to avoid zero-division in interpolation
+        if maturities.size > 1:
+            unique_idx = np.concatenate(([True], np.diff(maturities) != 0))
+            maturities = maturities[unique_idx]
+            log_prices = log_prices[unique_idx]
+
+        if maturities.size == 1:
+            interpolated[i, :] = log_prices[0]
+            continue
+
+        if method == 'cubic_hermite' and maturities.size >= 4:
+            if CubicSpline is None:
+                raise ImportError("scipy is required for cubic Hermite interpolation")
+            row_result = np.array([cubic_hermite_interp(maturities, log_prices, tau) for tau in taus])
+        else:
+            row_result = _linear_interpolate_with_extrapolation(maturities, log_prices, taus)
+
+        interpolated[i, :] = row_result
+
+    result_df = pd.DataFrame(interpolated, index=index, columns=taus, dtype=float)
+    return {
+        float(tau): series.dropna()
+        for tau, series in result_df.items()
+        if series.notna().any()
+    }
 
 
 def create_tenor_grid(
@@ -191,6 +242,9 @@ def cubic_hermite_interp(
     float
         Interpolated log price
     """
+    if CubicSpline is None:
+        raise ImportError("scipy is required for cubic Hermite interpolation")
+
     if len(T) < 4:
         # Fall back to linear interpolation
         j = np.searchsorted(T, tau)
@@ -198,27 +252,25 @@ def cubic_hermite_interp(
             j = 1
         elif j >= len(T):
             j = len(T) - 1
-        
+
         t0, t1 = T[j-1], T[j]
         y0, y1 = lnF[j-1], lnF[j]
         return y0 + (y1 - y0) * (tau - t0) / (t1 - t0)
-    
+
     # Cubic Hermite implementation
     j = np.searchsorted(T, tau)
     if j == 0:
         j = 1
     elif j >= len(T):
         j = len(T) - 1
-    
+
     # Use 4-point stencil around target
     i0 = max(0, j - 2)
     i1 = min(len(T), j + 2)
-    
+
     T_local = T[i0:i1]
     lnF_local = lnF[i0:i1]
-    
-    # Simple cubic spline through 4 points
-    from scipy.interpolate import CubicSpline
+
     cs = CubicSpline(T_local, lnF_local, bc_type='natural')
     return float(cs(tau))
 
@@ -315,24 +367,19 @@ def build_constant_maturity_panel(
     """
     # Get interpolated series for each tenor
     tenor_dict = log_interp_to_tau(
-        price_data, 
-        expiry_data, 
-        tenor_grid, 
+        price_data,
+        expiry_data,
+        tenor_grid,
         method=interpolation_method
     )
-    
-    # Combine into DataFrame
+
     panel = pd.DataFrame(tenor_dict)
-    
-    # Filter dates with insufficient contracts
-    valid_dates = []
-    for date in panel.index:
-        n_valid = panel.loc[date].notna().sum()
-        if n_valid >= min_contracts:
-            valid_dates.append(date)
-    
-    panel = panel.loc[valid_dates]
-    
+    if panel.empty:
+        return panel
+
+    valid_mask = panel.notna().sum(axis=1) >= min_contracts
+    panel = panel.loc[valid_mask]
+
     return panel.sort_index()
 
 
