@@ -2,7 +2,7 @@ import datetime
 import os.path
 from pathlib import Path
 
-from ..features.signals_processing import COTProcessor, TechnicalAnalysis
+from ..features.signals_processing import COTAnalyzer, TechnicalAnalysis
 from ..data.retrieval import fetch_data_sync
 import pandas as pd
 import numpy as np
@@ -25,7 +25,7 @@ class CTAForecast:
     """Forecasting framework optimized for your COT-enhanced dataset"""
 
     def __init__(self, ticker_symbol, use_daily_data=True, **kwargs):
-        self.data_processor = COTProcessor()
+        self.data_processor = COTAnalyzer()
         self.technical_analyzer = TechnicalAnalysis()
         self.models = {}
         self.symbol = ticker_symbol
@@ -34,7 +34,7 @@ class CTAForecast:
         raw_data = data_load_func(ticker_symbol, daily=use_daily_data, **kwargs)
 
         if raw_data is not None:
-            # Apply COT column renaming from COTProcessor
+            # Apply COT column renaming from COTAnalyzer
             self.data = self.data_processor.load_and_clean_data(raw_data)
 
         else:

@@ -13,6 +13,7 @@ This module contains classes and functions for:
 
 # Core data processing classes
 from .data_client import DataClient
+from  .simple_processor import SimpleDataProcessor
 from .contract_handling import *
 from .retrieval import fetch_market_cot_data, fetch_data_sync, convert_cot_date_to_datetime
 from .ticker_classifier import TickerClassifier
@@ -45,7 +46,8 @@ __all__ = [
     "FuturesCurve",
     "RollDateManager",
     "create_enhanced_curve_manager_with_roll_tracking"
-    "process_all_futures_curves"
+    "process_all_futures_curves",
+    "SimpleDataProcessor",
     
     # Data retrieval functions
     'fetch_market_cot_data',

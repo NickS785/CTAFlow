@@ -143,7 +143,7 @@ rf_model = CTAFlow.CTARForest('CL_F')
 data_client = CTAFlow.DataClient()
 
 # Feature processing classes (from CTAFlow/features/)
-cot_processor = CTAFlow.COTProcessor()
+cot_processor = CTAFlow.COTAnalyzer()
 tech_analysis = CTAFlow.TechnicalAnalysis()
 intraday_features = CTAFlow.IntradayFeatures('CL_F')
 spread_data = CTAFlow.data.contract_handling.futures_curve_manager.SpreadData('CL_F')
