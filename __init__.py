@@ -56,7 +56,7 @@ __all__ = [
     
     # Data processing classes
     'DataClient',
-    'COTProcessor',
+    'COTAnalyzer',
     'TechnicalAnalysis',
     'FuturesCurveManager',
     

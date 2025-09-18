@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 
 
-class COTProcessor:
+class COTAnalyzer:
     """Optimized processor for your specific data format"""
 
     def __init__(self):
@@ -52,7 +52,7 @@ class COTProcessor:
 
         Examples:
         ---------
-        >>> processor = COTProcessor()
+        >>> processor = COTAnalyzer()
         >>> cot_data = processor.load_ticker_cot_data('CL_F')
         >>> print(f"Loaded {len(cot_data)} rows for CL_F")
         """
@@ -367,7 +367,7 @@ class TechnicalAnalysis:
     """Technical analysis enhanced with your COT positioning data"""
 
     def __init__(self):
-        self.data_processor = COTProcessor()
+        self.data_processor = COTAnalyzer()
 
     def calculate_enhanced_indicators(self, df, selected_indicators=None, normalize_momentum=False,
                                       vol_return_periods=[1, 5, 10, 20]):

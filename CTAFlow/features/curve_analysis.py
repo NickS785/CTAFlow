@@ -2238,11 +2238,20 @@ class CurveEvolutionAnalyzer:
                     if len(dte_array) != len(prices_array):
                         continue
                     
-                    # Filter for valid contracts (positive DTE and valid prices)
-                    valid_mask = (dte_array > 0) & ~np.isnan(prices_array)
+                    # Filter for valid contracts - prioritize contracts with sufficient DTE
+                    # Allow recently expired contracts to maintain curve structure
+                    preferred_mask = (dte_array >= -30) & ~np.isnan(prices_array)
+                    fallback_mask = (dte_array > -90) & ~np.isnan(prices_array)
+
+                    # Use preferred mask if we have enough contracts, otherwise use fallback
+                    if np.sum(preferred_mask) >= 2:
+                        valid_mask = preferred_mask
+                    else:
+                        valid_mask = fallback_mask
+
                     if np.sum(valid_mask) < 2:
                         continue
-                    
+
                     valid_dte = dte_array[valid_mask]
                     valid_prices = prices_array[valid_mask]
                     
@@ -2261,9 +2270,13 @@ class CurveEvolutionAnalyzer:
                     contract_12m_price = valid_prices[idx_12m]
                     
                     # Only calculate spread if we have reasonable approximations
-                    # Accept contracts within 60 days of target (3m: 30-150 days, 12m: 305-425 days)
-                    if (abs(contract_3m_dte - target_3m) <= 60 and 
-                        abs(contract_12m_dte - target_12m) <= 60 and
+                    # More flexible tolerances to maintain spread calculation as contracts mature
+                    # Allow wider tolerances but prioritize maintaining the spread structure
+                    tolerance_3m = max(60, 0.5 * target_3m)  # At least 60 days or 50% of target
+                    tolerance_12m = max(120, 0.3 * target_12m)  # At least 120 days or 30% of target
+
+                    if (abs(contract_3m_dte - target_3m) <= tolerance_3m and
+                        abs(contract_12m_dte - target_12m) <= tolerance_12m and
                         contract_3m_dte < contract_12m_dte):  # Ensure proper ordering
                         
                         # Calculate spread (12m - 3m) normalized by 3m price
@@ -3348,7 +3361,16 @@ class CurveEvolutionAnalyzer:
         price_array = price_source[:min_len]
         dte_array = dte_array[:min_len]
 
-        valid_mask = (~np.isnan(price_array)) & (~np.isnan(dte_array)) & (dte_array > 0)
+        # Prioritize contracts with 360+ DTE, but allow shorter if absolutely necessary
+        preferred_mask = (~np.isnan(price_array)) & (~np.isnan(dte_array)) & (dte_array >= 360)
+        fallback_mask = (~np.isnan(price_array)) & (~np.isnan(dte_array)) & (dte_array > 0)
+
+        # Use preferred (360+ DTE) contracts if available
+        if np.any(preferred_mask):
+            valid_mask = preferred_mask
+        else:
+            valid_mask = fallback_mask
+
         if not np.any(valid_mask):
             return None, None
 
@@ -3361,7 +3383,14 @@ class CurveEvolutionAnalyzer:
         idx = int(np.argmin(np.abs(valid_dte - target_days)))
         if tolerance is not None and abs(valid_dte[idx] - target_days) > tolerance:
             if allow_fallback:
-                idx = int(np.argmax(valid_dte))
+                # Prefer the longest available DTE, but ensure it's at least 360 if possible
+                if np.any(preferred_mask):
+                    preferred_prices = price_array[preferred_mask]
+                    preferred_dte = dte_array[preferred_mask]
+                    idx = int(np.argmax(preferred_dte))
+                    return float(preferred_prices[idx]), float(preferred_dte[idx])
+                else:
+                    idx = int(np.argmax(valid_dte))
             else:
                 return None, None
 
@@ -3389,8 +3418,13 @@ class CurveEvolutionAnalyzer:
                     elif hasattr(curve, 'prices') and len(curve.prices) > 0:
                         front_price = curve.prices[0]
 
-                back_price, back_dte = self._select_contract_by_dte(curve, target_days=730, tolerance=150)
+                # Target longer contracts (2 years) but ensure we maintain at least 360+ DTE
+                back_price, back_dte = self._select_contract_by_dte(curve, target_days=730, tolerance=200)
                 if back_price is None:
+                    # Fallback: try for at least 1 year contract with wider tolerance
+                    back_price, back_dte = self._select_contract_by_dte(curve, target_days=365, tolerance=None)
+                if back_price is None:
+                    # Final fallback: get the longest available contract (should be 360+ due to new logic)
                     back_price, back_dte = self._select_contract_by_dte(curve, target_days=730, tolerance=None)
 
                 if back_price is None:

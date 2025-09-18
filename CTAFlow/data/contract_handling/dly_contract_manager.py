@@ -47,6 +47,55 @@ class ContractInfo:
         return f"{self.month}{str(self.year)[-2:]}"
 
 
+def calculate_contract_expiry(month_code: str, year: int, ticker: Optional[str] = None) -> pd.Timestamp:
+    """
+    Calculate the actual contract expiry date based on month code and year.
+
+    For most futures contracts, expiry patterns vary by contract type:
+    - Energy (CL, NG): Generally 3rd Friday of month before delivery month
+    - Financials (ES, NQ): 3rd Friday of expiry month
+    - Agricultural: Varies, but typically mid-month
+
+    This uses a conservative approach of the 20th of the month before the
+    delivery month for energy contracts, and 20th of expiry month for others.
+
+    Parameters:
+    -----------
+    month_code : str
+        Single letter month code (F, G, H, J, K, M, N, Q, U, V, X, Z)
+    year : int
+        4-digit year
+    ticker : str, optional
+        Contract ticker (e.g., 'CL', 'NG') for contract-specific logic
+
+    Returns:
+    --------
+    pd.Timestamp
+        Contract expiry date
+    """
+    month_num = MONTH_CODE_MAP.get(month_code.upper())
+    if month_num is None:
+        raise ValueError(f"Invalid month code: {month_code}")
+
+    # Energy contracts (CL, NG, etc.) typically expire the month before delivery
+    if ticker and ticker.upper() in ['CL', 'HO', 'RB', 'NG']:
+        # Expire in the month before delivery month
+        if month_num == 1:  # January delivery -> December expiry of previous year
+            expiry_year = year - 1
+            expiry_month = 12
+        else:
+            expiry_year = year
+            expiry_month = month_num - 1
+    else:
+        # Most other contracts expire in the delivery month
+        expiry_year = year
+        expiry_month = month_num
+
+    # Use the 20th as a reasonable expiry date approximation
+    # This avoids weekend issues and is close to typical futures expiry patterns
+    return pd.Timestamp(year=expiry_year, month=expiry_month, day=20)
+
+
 def parse_contract_filename(fn: str, pivot: int = 1970) -> Optional[ContractInfo]:
     """Parse filenames like CLH25-NYM.dly."""
     m = re.match(r"([A-Za-z]+)([FGHJKMNQUVXZ])(\d{2})-([A-Za-z]+)\.dly", fn, re.IGNORECASE)
@@ -201,7 +250,16 @@ class DLYContractManager:
             df = _read_dly(path)
             if df.empty:
                 continue
-            expiry = df.index.max()
+
+            # Calculate actual contract expiry date based on month code and year
+            # instead of using the last data date
+            try:
+                expiry = calculate_contract_expiry(info.month, info.year, ticker=info.ticker)
+            except ValueError as e:
+                print(f"Warning: Could not calculate expiry for {info.contract_id}: {e}")
+                # Fallback to last data date if expiry calculation fails
+                expiry = df.index.max()
+
             unique_label = self._unique_label_for(info)
             self.label_base_to_full.setdefault(info.contract_id, []).append(unique_label)
 
@@ -309,9 +367,19 @@ class DLYContractManager:
         if self.dte is None:
             self.build_dte()
 
-        valid_dte = self.dte.where(self.dte >= 0)
+        # Find front month as contract with smallest positive DTE, or least negative if no positive
+        valid_dte = self.dte.where(self.dte >= -30)  # Consistent with sequentialize logic
         mask_all = valid_dte.isna().all(axis=1)
-        front = valid_dte.fillna(np.inf).idxmin(axis=1)
+
+        # Prefer positive DTE, but fall back to least negative if no positive DTE available
+        positive_dte = self.dte.where(self.dte >= 0)
+        has_positive = ~positive_dte.isna().all(axis=1)
+
+        front = pd.Series(index=self.dte.index, dtype=object)
+        # For rows with positive DTE contracts, use the smallest positive
+        front[has_positive] = positive_dte[has_positive].fillna(np.inf).idxmin(axis=1)
+        # For rows without positive DTE, use the least negative (closest to expiry)
+        front[~has_positive & ~mask_all] = valid_dte[~has_positive & ~mask_all].fillna(-np.inf).idxmax(axis=1)
         front[mask_all] = None
         self.front = front.rename("front")
         return self.front
@@ -325,9 +393,14 @@ class DLYContractManager:
             self.compute_front()
 
         if max_buckets is None:
-            max_buckets = 48
+            # Increase default to accommodate longer curves (700+ DTE for CL/NG)
+            # Use the actual number of available contracts, up to a reasonable maximum
+            available_contracts = self.curve.shape[1] if self.curve is not None else 48
+            max_buckets = min(available_contracts, 120)  # Allow up to 120 sequential contracts
 
-        valid_dte = self.dte.where(self.dte >= 0)
+        # Allow recently expired contracts (within 30 days) to maintain rolling structure
+        # This prevents the curve from tapering off as contracts expire
+        valid_dte = self.dte.where(self.dte >= -30)
         dte_arr = valid_dte.values
         px_arr = self.curve.values
         vol_arr = self.curve_volume.values if self.curve_volume is not None else None
@@ -554,10 +627,45 @@ class DLYContractManager:
 
         def merge_frames(existing: Optional[pd.DataFrame], new: pd.DataFrame) -> pd.DataFrame:
             if existing is None or existing.empty:
-                return new.sort_index()
+                # Sort columns properly for new data
+                return sort_curve_columns(new.sort_index())
             combined = pd.concat([existing, new])
             combined = combined[~combined.index.duplicated(keep="last")]
-            return combined.sort_index()
+            combined = combined.sort_index()
+            # Sort columns properly after merge
+            return sort_curve_columns(combined)
+
+        def sort_curve_columns(df: pd.DataFrame) -> pd.DataFrame:
+            """Sort curve DataFrame columns by contract expiry order."""
+            if df.empty:
+                return df
+
+            def contract_sort_key(col_name: str) -> Tuple[int, int]:
+                """Extract year and month for sorting contract columns."""
+                # Handle contract names like H25, M25, U25, etc.
+                col_str = str(col_name)
+                if len(col_str) >= 3 and col_str[-2:].isdigit():
+                    month_code = col_str[-3]  # H, M, U, etc.
+                    year_suffix = int(col_str[-2:])  # 25, 26, etc.
+
+                    # Convert 2-digit year to 4-digit (assuming 2000s)
+                    year = 2000 + year_suffix if year_suffix < 70 else 1900 + year_suffix
+
+                    # Map month codes to numbers - using MONTH_CODE_MAP from module
+                    month = MONTH_CODE_MAP.get(month_code, 0)
+
+                    return (year, month)
+                else:
+                    # Non-contract columns go first
+                    return (0, 0)
+
+            # Sort columns by contract expiry
+            try:
+                sorted_columns = sorted(df.columns, key=contract_sort_key)
+                return df[sorted_columns]
+            except Exception:
+                # If sorting fails, return original DataFrame
+                return df
 
         for key, frame in datasets.items():
             if key not in allowed:

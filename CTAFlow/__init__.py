@@ -38,7 +38,7 @@ try:
     from .data.data_client import DataClient
     from .features.feature_engineering import IntradayFeatures
     from .features.curve_analysis import CurveShapeAnalyzer, CurveEvolution
-    from .features.signals_processing import COTProcessor, TechnicalAnalysis
+    from .features.signals_processing import COTAnalyzer, TechnicalAnalysis
     from .data.contract_handling.curve_manager import FuturesCurveManager, FuturesCurve, SpreadData
     from .config import *
 except ImportError as e:
@@ -57,7 +57,7 @@ __all__ = [
     
     # Data processing classes
     'DataClient',
-    'COTProcessor',
+    'COTAnalyzer',
     'TechnicalAnalysis',
     'FuturesCurveManager',
 

@@ -13,7 +13,7 @@ from typing import Optional, Sequence, Union, Dict, Any
 
 # Optional dependency used by `download_cot`
 # pip install cot_reports
-from CTAFlow.features.signals_processing import COTProcessor
+from CTAFlow.features.signals_processing import COTAnalyzer
 from .ticker_classifier import get_ticker_classifier, get_cot_report_type, get_cot_storage_path, is_financial_ticker
 
 
@@ -56,12 +56,13 @@ class DataClient:
     ) -> None:
         market_path = market_path or MARKET_DATA_PATH
         cot_path = cot_path or COT_DATA_PATH
-        self.cot_processor = COTProcessor()
+        self.cot_processor = COTAnalyzer()
         self.market_path = Path(market_path)
         self.cot_path = Path(cot_path)
         self.cot_raw_key = cot_raw_key
         self.complevel = complevel
         self.complib = complib
+        self.market_data_path = self.market_path
 
         if create_dirs:
             for p in {self.market_path.parent, self.cot_path.parent}:
@@ -2890,7 +2891,7 @@ class DataClient:
                         ticker_results['failed'][ticker] = "No data found for COT code"
                         continue
 
-                    # Clean and process with COTProcessor
+                    # Clean and process with COTAnalyzer
                     ticker_data = self.cot_processor.load_and_clean_data(ticker_data)
 
                     # Set appropriate index if needed
