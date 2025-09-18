@@ -2138,15 +2138,10 @@ class CurveEvolutionAnalyzer:
 
         dates = self.curves.index
         df = pd.DataFrame(log_prices, index=dates)
-        deseasonalized = np.full_like(log_prices, np.nan)
+        monthly_means = df.groupby(df.index.month).transform('mean')
+        deseasonalized = df - monthly_means
 
-        for col in df.columns:
-            series = df[col]
-            if series.notna().any():
-                monthly_means = series.groupby(series.index.month).transform('mean')
-                deseasonalized[:, col] = (series - monthly_means).values
-
-        return deseasonalized
+        return deseasonalized.to_numpy()
     
     def _calculate_log_levy_areas_jit(self, 
                                      log_prices: np.ndarray,
@@ -2484,99 +2479,125 @@ class CurveEvolutionAnalyzer:
             return np.array([])
         
         n_dates = log_levy_areas.shape[0]
-        seasonal_driver = np.full(n_dates, np.nan)
-        
+
         # Need at least 1 year of data for meaningful seasonal analysis
         min_seasonal_window = min(252, n_dates // 2)  # 1 year or half the dataset
-        
+
         if n_dates < min_seasonal_window:
             # Not enough data for seasonal analysis - return zeros
             return np.zeros(n_dates)
-        
-        # Calculate average Lévy area magnitude for each observation
+
         levy_magnitudes = np.sqrt(np.nansum(log_levy_areas**2, axis=1))
-        
-        # Get date information if available from curves
+
         if self.curves is not None and len(self.curves) == n_dates:
             dates = self.curves.index
         else:
-            # Fallback: create artificial date sequence starting from a reference date
             dates = pd.date_range(start='2020-01-01', periods=n_dates, freq='D')
-        
-        # Create DataFrame for easier seasonal analysis
-        seasonal_data = pd.DataFrame({
-            'levy_magnitude': levy_magnitudes,
-            'month': dates.month,
-            'day_of_year': dates.dayofyear
-        }, index=dates[:n_dates])
-        
-        # Minimum lookback for seasonal calculations (at least 2 years of monthly data)
-        min_seasonal_lookback = min(504, n_dates)  # 2 years or available data
-        
-        # For each observation, calculate deviation from historical seasonal norm (avoiding lookahead)
-        for i in range(n_dates):
-            current_month = seasonal_data.iloc[i]['month']
-            current_magnitude = seasonal_data.iloc[i]['levy_magnitude']
-            
-            if not np.isnan(current_magnitude):
-                # Use only historical data up to current point for seasonal baseline
-                # Need sufficient historical data for meaningful seasonal calculation
-                if i >= min_seasonal_lookback:
-                    # Get historical data for this month only (avoiding lookahead)
-                    historical_data = seasonal_data.iloc[:i]  # Only past data
-                    same_month_historical = historical_data[historical_data['month'] == current_month]['levy_magnitude']
-                    
-                    if len(same_month_historical) >= 10:  # Need at least 10 historical observations
-                        # Calculate rolling seasonal baseline using only historical data
-                        month_mean = same_month_historical.mean()
-                        month_std = same_month_historical.std()
-                        
-                        if not np.isnan(month_mean) and month_std > 0:
-                            # Calculate Z-score deviation from historical seasonal norm
-                            seasonal_deviation = abs(current_magnitude - month_mean) / month_std
-                            seasonal_driver[i] = seasonal_deviation
-                        else:
-                            seasonal_driver[i] = 0.0
-                    else:
-                        # Insufficient same-month historical data - use broader historical baseline
-                        historical_magnitudes = historical_data['levy_magnitude'].dropna()
-                        if len(historical_magnitudes) >= 50:  # Need reasonable historical sample
-                            hist_mean = historical_magnitudes.mean()
-                            hist_std = historical_magnitudes.std()
-                            if hist_std > 0:
-                                seasonal_driver[i] = abs(current_magnitude - hist_mean) / hist_std
-                            else:
-                                seasonal_driver[i] = 0.0
-                        else:
-                            seasonal_driver[i] = 0.0
-                else:
-                    # Insufficient data for seasonal analysis - set to 0
-                    seasonal_driver[i] = 0.0
-        
-        # Apply causal smoothing to reduce noise while avoiding lookahead bias
-        window_size = min(5, n_dates // 10)  # Small smoothing window
+
+        month_codes = dates.month.to_numpy()
+        levy_series = pd.Series(levy_magnitudes, index=dates)
+        levy_values = levy_series.to_numpy()
+
+        min_seasonal_lookback = min(504, n_dates)
+
+        # Precompute cumulative statistics for each month (12 iterations at most)
+        month_mean = np.full(n_dates, np.nan, dtype=float)
+        month_std = np.full(n_dates, np.nan, dtype=float)
+        month_count = np.zeros(n_dates, dtype=int)
+
+        for month in np.unique(month_codes):
+            month_idx = np.where(month_codes == month)[0]
+            if month_idx.size == 0:
+                continue
+
+            month_vals = levy_values[month_idx]
+            valid = ~np.isnan(month_vals)
+            cleaned = np.where(valid, month_vals, 0.0)
+            cumsum = np.cumsum(cleaned)
+            cumsum_sq = np.cumsum(np.where(valid, month_vals ** 2, 0.0))
+            counts = np.cumsum(valid.astype(int))
+
+            sum_prev = np.concatenate(([0.0], cumsum[:-1]))
+            sum_sq_prev = np.concatenate(([0.0], cumsum_sq[:-1]))
+            count_prev = np.concatenate(([0], counts[:-1]))
+
+            with np.errstate(invalid='ignore', divide='ignore'):
+                mean_prev = np.where(count_prev > 0, sum_prev / count_prev, np.nan)
+                var_prev = np.where(
+                    count_prev > 1,
+                    (sum_sq_prev - (sum_prev ** 2) / count_prev) / (count_prev - 1),
+                    np.nan,
+                )
+
+            std_prev = np.sqrt(var_prev)
+            month_mean[month_idx] = mean_prev
+            month_std[month_idx] = std_prev
+            month_count[month_idx] = count_prev
+
+        # Cumulative statistics for overall history as fallback
+        valid_all = ~np.isnan(levy_values)
+        cleaned_all = np.where(valid_all, levy_values, 0.0)
+        cumsum_all = np.cumsum(cleaned_all)
+        cumsum_sq_all = np.cumsum(np.where(valid_all, levy_values ** 2, 0.0))
+        counts_all = np.cumsum(valid_all.astype(int))
+
+        sum_prev_all = np.concatenate(([0.0], cumsum_all[:-1]))
+        sum_sq_prev_all = np.concatenate(([0.0], cumsum_sq_all[:-1]))
+        count_prev_all = np.concatenate(([0], counts_all[:-1]))
+
+        with np.errstate(invalid='ignore', divide='ignore'):
+            overall_mean = np.where(count_prev_all > 0, sum_prev_all / count_prev_all, np.nan)
+            overall_var = np.where(
+                count_prev_all > 1,
+                (sum_sq_prev_all - (sum_prev_all ** 2) / count_prev_all) / (count_prev_all - 1),
+                np.nan,
+            )
+
+        overall_std = np.sqrt(overall_var)
+
+        seasonal_driver = np.zeros(n_dates, dtype=float)
+        eligible = (
+            (np.arange(n_dates) >= min_seasonal_lookback)
+            & (~np.isnan(levy_values))
+        )
+
+        month_mask = (
+            eligible
+            & (month_count >= 10)
+            & np.isfinite(month_std)
+            & (month_std > 0)
+        )
+
+        with np.errstate(invalid='ignore', divide='ignore'):
+            month_z = np.abs(levy_values - month_mean) / month_std
+
+        seasonal_driver[month_mask] = month_z[month_mask]
+
+        fallback_mask = (
+            eligible
+            & ~month_mask
+            & (count_prev_all >= 50)
+            & np.isfinite(overall_std)
+            & (overall_std > 0)
+        )
+
+        with np.errstate(invalid='ignore', divide='ignore'):
+            overall_z = np.abs(levy_values - overall_mean) / overall_std
+
+        seasonal_driver[fallback_mask] = overall_z[fallback_mask]
+
+        seasonal_driver[~np.isfinite(seasonal_driver)] = 0.0
+
+        window_size = min(5, n_dates // 10)
         if window_size > 1:
-            # Backward-looking moving average smoothing (no lookahead)
-            smoothed_driver = np.full_like(seasonal_driver, np.nan)
-            for i in range(n_dates):
-                if i >= window_size:
-                    # Use only historical data (backward-looking window)
-                    window_data = seasonal_driver[i-window_size:i+1]  # Include current but no future
-                    valid_data = window_data[~np.isnan(window_data)]
-                    if len(valid_data) > 0:
-                        smoothed_driver[i] = np.mean(valid_data)
-                    else:
-                        smoothed_driver[i] = seasonal_driver[i]
-                else:
-                    # For early observations, use expanding window (still no lookahead)
-                    window_data = seasonal_driver[:i+1]
-                    valid_data = window_data[~np.isnan(window_data)]
-                    if len(valid_data) > 0:
-                        smoothed_driver[i] = np.mean(valid_data)
-                    else:
-                        smoothed_driver[i] = seasonal_driver[i]
-            
-            return smoothed_driver
+            seasonal_driver = (
+                pd.Series(seasonal_driver, index=dates)
+                .rolling(window=window_size, min_periods=1)
+                .mean()
+                .to_numpy()
+            )
+
+        return seasonal_driver
         
         return seasonal_driver
     
@@ -2812,67 +2833,68 @@ class CurveEvolutionAnalyzer:
         if slopes.empty:
             return pd.DataFrame()
         
-        # Detect regime changes in slope (contango/backwardation flips) - avoiding lookahead bias
         slope_changes = slopes.diff().abs()
-        
-        # Calculate expanding Z-scores to avoid lookahead bias
-        slope_zscore = pd.Series(index=slope_changes.index, dtype=float)
         min_window = 60  # Need at least 60 observations for meaningful statistics
-        
-        for i in range(len(slope_changes)):
-            if i >= min_window:
-                # Use only historical data up to current point
-                historical_changes = slope_changes.iloc[:i+1]
-                hist_mean = historical_changes.mean()
-                hist_std = historical_changes.std()
-                
-                if hist_std > 0:
-                    slope_zscore.iloc[i] = (slope_changes.iloc[i] - hist_mean) / hist_std
-                else:
-                    slope_zscore.iloc[i] = 0.0
-            else:
-                slope_zscore.iloc[i] = 0.0
-        
-        # Find significant flips
-        flip_points = slope_zscore > flip_threshold
-        
-        # Group consecutive flip periods
+
+        expanding_mean = slope_changes.expanding(min_periods=min_window).mean()
+        expanding_std = slope_changes.expanding(min_periods=min_window).std()
+
+        with np.errstate(invalid='ignore', divide='ignore'):
+            slope_zscore = (slope_changes - expanding_mean) / expanding_std
+
+        slope_zscore = slope_zscore.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        slope_zscore[expanding_std <= 0] = 0.0
+
+        flip_mask = slope_zscore > flip_threshold
+        if not flip_mask.any():
+            return pd.DataFrame()
+
+        start_mask = flip_mask & ~flip_mask.shift(fill_value=False)
+        end_mask = ~flip_mask & flip_mask.shift(fill_value=False)
+
+        start_positions = np.flatnonzero(start_mask.to_numpy())
+        end_positions = np.flatnonzero(end_mask.to_numpy())
+
+        prev_slope = slopes.ffill().shift(1).fillna(0.0)
+
         flip_events = []
-        in_flip = False
-        flip_start = None
-        flip_type = None
-        
-        for date, is_flip in flip_points.items():
-            if is_flip and not in_flip:
-                # Start of new flip
-                in_flip = True
-                flip_start = date
-                # Determine flip type based on slope direction
-                current_slope = slopes[date] if not np.isnan(slopes[date]) else 0
-                previous_slope = slopes[:date].dropna().iloc[-2] if len(slopes[:date].dropna()) > 1 else 0
-                
-                if current_slope > previous_slope:
-                    flip_type = 'backwardation_to_contango'
-                else:
-                    flip_type = 'contango_to_backwardation'
-                    
-            elif not is_flip and in_flip:
-                # End of flip - check if duration is significant
-                flip_duration = (date - flip_start).days
-                
-                if flip_duration >= min_flip_duration:
-                    flip_magnitude = slope_changes[flip_start:date].max()
-                    
-                    flip_events.append({
-                        'flip_start': flip_start,
-                        'flip_end': date,
-                        'flip_type': flip_type,
-                        'flip_magnitude': flip_magnitude,
-                        'flip_duration': flip_duration
-                    })
-                
-                in_flip = False
-        
+        end_idx = 0
+
+        for start_pos in start_positions:
+            while end_idx < len(end_positions) and end_positions[end_idx] <= start_pos:
+                end_idx += 1
+
+            if end_idx >= len(end_positions):
+                break
+
+            end_pos = end_positions[end_idx]
+            start_date = slope_zscore.index[start_pos]
+            end_date = slope_zscore.index[end_pos]
+
+            duration_days = int((end_date - start_date) / np.timedelta64(1, 'D'))
+            if duration_days < min_flip_duration:
+                continue
+
+            flip_magnitude = slope_changes.iloc[start_pos:end_pos].max()
+            current_slope = slopes.iloc[start_pos]
+            previous_slope = prev_slope.iloc[start_pos]
+
+            flip_type = (
+                'backwardation_to_contango'
+                if current_slope > previous_slope
+                else 'contango_to_backwardation'
+            )
+
+            flip_events.append({
+                'flip_start': start_date,
+                'flip_end': end_date,
+                'flip_type': flip_type,
+                'flip_magnitude': flip_magnitude,
+                'flip_duration': duration_days
+            })
+
+            end_idx += 1
+
         return pd.DataFrame(flip_events)
     
     def _calculate_curve_slopes_broadcast(self) -> pd.Series:
