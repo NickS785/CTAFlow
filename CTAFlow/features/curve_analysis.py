@@ -41,6 +41,14 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.express as px
 
+# Import tenor interpolation utilities
+try:
+    from ..utils.tenor_interpolation import TenorInterpolator, create_tenor_grid
+except ImportError:
+    TenorInterpolator = None
+    create_tenor_grid = None
+    warnings.warn("TenorInterpolator not available - constant maturity analysis disabled")
+
 MONTH_CODE_ORDER = ['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z']
 
 
@@ -1776,6 +1784,11 @@ class CurveEvolutionAnalyzer:
         # Analysis parameters
         self.default_window = 63
         self.regime_threshold = 2.0
+
+        # Constant maturity support
+        self.constant_maturity_data = None
+        self.expiry_data = None
+        self.tenor_interpolator = None
         self.min_regime_length = 5
         
         # Validate initialization
@@ -1913,6 +1926,125 @@ class CurveEvolutionAnalyzer:
         analyzer = cls(curves, symbol=spread_data.symbol)
         analyzer.spread_data = spread_data  # Store reference for spot data access
         return analyzer
+
+    def setup_constant_maturity(self,
+                               tenor_grid: Optional[np.ndarray] = None,
+                               method: str = 'log_linear',
+                               cache_results: bool = True) -> bool:
+        """
+        Setup constant maturity interpolation for the curve analysis.
+
+        Parameters:
+        -----------
+        tenor_grid : np.ndarray, optional
+            Target tenors in years. If None, creates monthly grid (1m to 36m)
+        method : str, default 'log_linear'
+            Interpolation method ('log_linear', 'cubic_hermite')
+        cache_results : bool, default True
+            Cache interpolation results
+
+        Returns:
+        --------
+        bool
+            True if setup successful, False if TenorInterpolator unavailable
+        """
+        if TenorInterpolator is None or create_tenor_grid is None:
+            warnings.warn("TenorInterpolator not available - constant maturity disabled")
+            return False
+
+        if self.spread_data is None and self.symbol is None:
+            warnings.warn("No SpreadData or symbol available - cannot setup constant maturity")
+            return False
+
+        try:
+            # Import necessary functions
+            from ..data.contract_handling.dly_contract_manager import calculate_contract_expiry
+            import pandas as pd
+            import numpy as np
+            import re
+
+            # Determine symbol and get price data
+            symbol = self.symbol or getattr(self.spread_data, 'symbol', None)
+            if not symbol:
+                warnings.warn("No symbol available for expiry calculation")
+                return False
+
+            # Get price data from SpreadData if available, otherwise use DataClient
+            if self.spread_data is not None and hasattr(self.spread_data, 'curve') and self.spread_data.curve is not None:
+                curve_data = self.spread_data.curve
+            else:
+                # Fall back to DataClient
+                from ..data.data_client import DataClient
+                client = DataClient()
+                curve_data = client.query_curve_data(symbol, curve_types=['curve'])
+
+            if curve_data.empty:
+                warnings.warn(f"No curve data available for {symbol}")
+                return False
+
+            # Extract contract IDs from curve column names and calculate expiry dates
+            contract_ids = curve_data.columns.tolist()
+            expiry_dict = {}
+
+            for contract_id in contract_ids:
+                try:
+                    # Parse contract ID (e.g., "H25" format)
+                    contract_str = str(contract_id).strip()
+                    match = re.match(r"([FGHJKMNQUVXZ])(\d{2})", contract_str, re.IGNORECASE)
+
+                    if match:
+                        month_code, yy = match.groups()
+                        yy = int(yy)
+                        # Convert 2-digit year to 4-digit year
+                        year = 2000 + yy if yy <= 50 else 1900 + yy
+
+                        # Calculate expiry date
+                        expiry_date = calculate_contract_expiry(month_code.upper(), year, symbol.upper())
+                        expiry_dict[contract_id] = expiry_date
+
+                except Exception as e:
+                    warnings.warn(f"Could not calculate expiry for {contract_id}: {e}")
+
+            if not expiry_dict:
+                warnings.warn(f"No valid expiry dates calculated for {symbol}")
+                return False
+
+            # Create expiry data Series
+            import pandas as pd
+            self.expiry_data = pd.Series(expiry_dict, name='expiry_date')
+            self.expiry_data.index.name = 'contract_id'
+            self.expiry_data = pd.to_datetime(self.expiry_data)
+
+            # Create tenor grid if not provided
+            if tenor_grid is None:
+                tenor_grid = create_tenor_grid(
+                    min_tau=1/12,  # 1 month
+                    max_tau=3.0,   # 3 years
+                    tenor_type='monthly'
+                )
+
+            # Initialize interpolator
+            self.tenor_interpolator = TenorInterpolator(
+                tenor_grid=tenor_grid,
+                method=method,
+                cache_results=cache_results
+            )
+
+            # Perform initial interpolation
+            self.constant_maturity_data = self.tenor_interpolator.interpolate(
+                curve_data,
+                self.expiry_data
+            )
+
+            return True
+
+        except Exception as e:
+            warnings.warn(f"Failed to setup constant maturity: {e}")
+            import traceback
+            print(f"DEBUG: Constant maturity setup failed with exception: {e}")
+            print("DEBUG: Traceback:")
+            traceback.print_exc()
+            return False
     
     def get_log_prices_matrix(self,
                               cache: bool = True,
@@ -2027,19 +2159,22 @@ class CurveEvolutionAnalyzer:
         """
         return _calculate_log_levy_areas_numba(log_prices, window)
     
-    def calculate_path_signatures(self, 
+    def calculate_path_signatures(self,
                                 window: int = None,
-                                max_signature_level: int = 2) -> Dict[str, Any]:
+                                max_signature_level: int = 2,
+                                constant_maturity: bool = False) -> Dict[str, Any]:
         """
         Calculate comprehensive path signatures for curve evolution analysis
-        
+
         Parameters:
         -----------
         window : int
             Rolling window for calculations
         max_signature_level : int
             Maximum level of path signature to compute
-            
+        constant_maturity : bool, default False
+            Use constant maturity tenors instead of sequential contracts
+
         Returns:
         --------
         Dict[str, Any]
@@ -2055,12 +2190,17 @@ class CurveEvolutionAnalyzer:
         if window is None:
             window = self.default_window
         
-        cache_key = f'path_signatures_{window}_{max_signature_level}'
+        cache_key = f'path_signatures_{window}_{max_signature_level}_cm_{constant_maturity}'
         if cache_key in self._cache:
             return self._cache[cache_key]
-        
-        # Get log prices matrix
-        log_prices = self.get_log_prices_matrix()
+
+        # Get log prices matrix - either constant maturity or sequential
+        if constant_maturity and self.constant_maturity_data is not None:
+            # Use constant maturity data
+            log_prices = np.log(self.constant_maturity_data.values)
+        else:
+            # Use sequential contract data
+            log_prices = self.get_log_prices_matrix()
         
         # Calculate log price Lévy areas (primary driver detection)
         log_levy_areas = self._calculate_log_levy_areas_jit(log_prices, window)
@@ -2498,10 +2638,19 @@ class CurveEvolutionAnalyzer:
         
         return (smoothed_changes > 0.3).astype(float)
     
-    def analyze_curve_evolution_drivers(self, window: int = None) -> Dict[str, Any]:
+    def analyze_curve_evolution_drivers(self,
+                                       window: int = None,
+                                       constant_maturity: bool = False) -> Dict[str, Any]:
         """
         Comprehensive analysis of curve evolution drivers
-        
+
+        Parameters:
+        -----------
+        window : int, optional
+            Analysis window size
+        constant_maturity : bool, default False
+            Use constant maturity tenors instead of sequential contracts
+
         Returns:
         --------
         Dict[str, Any]
@@ -2511,12 +2660,19 @@ class CurveEvolutionAnalyzer:
             - Regime change analysis
             - Driver importance rankings
         """
-        
+
         if window is None:
             window = self.default_window
-        
+
+        # Setup constant maturity if requested
+        if constant_maturity and self.constant_maturity_data is None:
+            success = self.setup_constant_maturity()
+            if not success:
+                warnings.warn("Constant maturity setup failed, falling back to sequential contracts")
+                constant_maturity = False
+
         # Calculate path signatures
-        path_sig = self.calculate_path_signatures(window)
+        path_sig = self.calculate_path_signatures(window, constant_maturity=constant_maturity)
         
         # Analyze driver importance
         driver_importance = self._analyze_driver_importance(path_sig['curve_drivers'])
@@ -3014,10 +3170,11 @@ class CurveEvolutionAnalyzer:
                                      show_drivers: bool = True,
                                      show_seasonal_analysis: bool = True,
                                      show_3m_12m_spread: bool = True,
+                                     constant_maturity: bool = False,
                                      height: int = 1200) -> go.Figure:
         """
         Focused visualization showing front month, back/front spread, drivers, seasonal analysis, and 3m-12m spread
-        
+
         Parameters:
         -----------
         show_drivers : bool
@@ -3026,16 +3183,18 @@ class CurveEvolutionAnalyzer:
             Show seasonal analysis of curve patterns
         show_3m_12m_spread : bool
             Show 3m-12m spread as separate bottom chart
+        constant_maturity : bool, default False
+            Use constant maturity tenors instead of sequential contracts for analysis
         height : int
             Plot height
-            
+
         Returns:
         --------
         plotly.graph_objects.Figure
         """
-        
-        if self.path_signatures is None:
-            self.calculate_path_signatures()
+
+        if self.path_signatures is None or constant_maturity:
+            self.calculate_path_signatures(constant_maturity=constant_maturity)
         
         # Fixed number of subplots: Front Month, Back/Front Spread, Drivers, Seasonal Analysis, 3m-12m Spread
         n_plots = 2  # Always show front month and back/front spread
@@ -3062,8 +3221,10 @@ class CurveEvolutionAnalyzer:
             shared_xaxes=True
         )
         
-        # Get dates for x-axis
-        if self.curves is not None:
+        # Get dates for x-axis - use constant maturity dates if available
+        if constant_maturity and hasattr(self, 'constant_maturity_data') and self.constant_maturity_data is not None:
+            dates = self.constant_maturity_data.index
+        elif self.curves is not None:
             dates = self.curves.index
         else:
             dates = pd.date_range(start='2023-01-01', periods=100, freq='D')
@@ -3071,11 +3232,11 @@ class CurveEvolutionAnalyzer:
         current_row = 1
         
         # 1. Front month price
-        self._add_front_month_plot(fig, current_row, dates)
+        self._add_front_month_plot(fig, current_row, dates, constant_maturity=constant_maturity)
         current_row += 1
         
         # 2. Back/Front spread
-        self._add_back_front_spread_plot(fig, current_row, dates)
+        self._add_back_front_spread_plot(fig, current_row, dates, constant_maturity=constant_maturity)
         current_row += 1
         
         # 3. Curve drivers
@@ -3090,7 +3251,7 @@ class CurveEvolutionAnalyzer:
         
         # 5. 3m-12m spread
         if show_3m_12m_spread:
-            self._add_3m_12m_spread_plot(fig, current_row, dates)
+            self._add_3m_12m_spread_plot(fig, current_row, dates, constant_maturity=constant_maturity)
         
         # Update layout
         title = f'Curve Evolution Analysis'
@@ -3161,8 +3322,14 @@ class CurveEvolutionAnalyzer:
                 valid_mask = ~np.isnan(driver_values)
                 
                 if np.sum(valid_mask) > 0:
-                    valid_dates = dates[:len(driver_values)][valid_mask]
-                    valid_values = driver_values[valid_mask]
+                    # Ensure we align dates and driver values correctly
+                    aligned_length = min(len(dates), len(driver_values))
+                    aligned_dates = dates[:aligned_length]
+                    aligned_driver_values = driver_values[:aligned_length]
+                    aligned_valid_mask = valid_mask[:aligned_length]
+
+                    valid_dates = aligned_dates[aligned_valid_mask]
+                    valid_values = aligned_driver_values[aligned_valid_mask]
                     
                     fig.add_trace(
                         go.Scatter(
@@ -3208,8 +3375,14 @@ class CurveEvolutionAnalyzer:
             valid_mask = ~np.isnan(mean_levy)
             
             if np.sum(valid_mask) > 0:
-                plot_dates = dates[:len(mean_levy)][valid_mask]
-                plot_values = mean_levy[valid_mask]
+                # Ensure we align dates and levy values correctly
+                aligned_length = min(len(dates), len(mean_levy))
+                aligned_dates = dates[:aligned_length]
+                aligned_mean_levy = mean_levy[:aligned_length]
+                aligned_valid_mask = valid_mask[:aligned_length]
+
+                plot_dates = aligned_dates[aligned_valid_mask]
+                plot_values = aligned_mean_levy[aligned_valid_mask]
                 
                 fig.add_trace(
                     go.Scatter(
@@ -3224,8 +3397,41 @@ class CurveEvolutionAnalyzer:
                     row=row, col=1
                 )
     
-    def _add_front_month_plot(self, fig, row, dates):
+    def _add_front_month_plot(self, fig, row, dates, constant_maturity=False):
         """Add front month (F0) price plot with synthetic spot and spot data using broadcasting"""
+
+        if constant_maturity and hasattr(self, 'constant_maturity_data') and self.constant_maturity_data is not None:
+            # Use constant maturity data for front month plot
+            cm_data = self.constant_maturity_data
+
+            # Try to get 1M (front month equivalent) from constant maturity data
+            if '1M' in cm_data.columns:
+                front_month_series = cm_data['1M']
+            elif '3M' in cm_data.columns:
+                # Fallback to 3M if 1M not available
+                front_month_series = cm_data['3M']
+            else:
+                # Use first available tenor
+                front_month_series = cm_data.iloc[:, 0]
+
+            valid_mask = ~np.isnan(front_month_series)
+            if np.sum(valid_mask) > 0:
+                valid_dates = front_month_series.index[valid_mask]
+                front_month_prices = front_month_series.values[valid_mask]
+
+                # Plot front month constant maturity price series
+                fig.add_trace(
+                    go.Scatter(
+                        x=valid_dates,
+                        y=front_month_prices,
+                        mode='lines',
+                        name='Front Month (Constant Maturity)',
+                        line=dict(color='blue', width=2),
+                        hovertemplate='Date: %{x}<br>Front Month Price: %{y:.2f}<extra></extra>'
+                    ),
+                    row=row, col=1
+                )
+                return
 
         if self.curves is not None:
             # Use broadcast method to extract F0 prices
@@ -3396,8 +3602,76 @@ class CurveEvolutionAnalyzer:
 
         return float(valid_prices[idx]), float(valid_dte[idx])
 
-    def _add_back_front_spread_plot(self, fig, row, dates):
-        """Add back/front spread plot using new __getitem__ method"""
+    def _add_back_front_spread_plot(self, fig, row, dates, constant_maturity=False):
+        """Add back/front spread plot using new __getitem__ method or constant maturity data"""
+
+        if constant_maturity and hasattr(self, 'constant_maturity_data') and self.constant_maturity_data is not None:
+            # Use constant maturity data for spread calculation
+            cm_data = self.constant_maturity_data
+
+            # Get front month (1 month) and back month (24 months) from constant maturity data
+            if '1M' in cm_data.columns and '24M' in cm_data.columns:
+                front_prices = cm_data['1M']
+                back_prices = cm_data['24M']
+
+                # Calculate spread
+                spread_values = back_prices - front_prices
+
+                # Remove NaN values
+                valid_mask = ~(np.isnan(spread_values))
+                if np.sum(valid_mask) > 0:
+                    valid_dates = cm_data.index[valid_mask]
+                    valid_spreads = spread_values[valid_mask]
+
+                    # Plot constant maturity back/front spread
+                    fig.add_trace(
+                        go.Scatter(
+                            x=valid_dates,
+                            y=valid_spreads,
+                            mode='lines',
+                            name='24M-1M Spread (Constant Maturity)',
+                            line=dict(color='purple', width=2),
+                            hovertemplate='Date: %{x}<br>24M-1M Spread: %{y:.3f}<br>Positive = Contango<extra></extra>'
+                        ),
+                        row=row, col=1
+                    )
+
+                    # Add zero line for reference
+                    fig.add_hline(y=0, line_dash="solid", line_color="gray",
+                                 annotation_text="Zero Spread", row=row, col=1)
+                    return
+
+            # Fallback: try 3M and 18M if 1M and 24M not available
+            elif '3M' in cm_data.columns and '18M' in cm_data.columns:
+                front_prices = cm_data['3M']
+                back_prices = cm_data['18M']
+
+                # Calculate spread
+                spread_values = back_prices - front_prices
+
+                # Remove NaN values
+                valid_mask = ~(np.isnan(spread_values))
+                if np.sum(valid_mask) > 0:
+                    valid_dates = cm_data.index[valid_mask]
+                    valid_spreads = spread_values[valid_mask]
+
+                    # Plot constant maturity back/front spread
+                    fig.add_trace(
+                        go.Scatter(
+                            x=valid_dates,
+                            y=valid_spreads,
+                            mode='lines',
+                            name='18M-3M Spread (Constant Maturity)',
+                            line=dict(color='purple', width=2),
+                            hovertemplate='Date: %{x}<br>18M-3M Spread: %{y:.3f}<br>Positive = Contango<extra></extra>'
+                        ),
+                        row=row, col=1
+                    )
+
+                    # Add zero line for reference
+                    fig.add_hline(y=0, line_dash="solid", line_color="gray",
+                                 annotation_text="Zero Spread", row=row, col=1)
+                    return
 
         if self.curves is not None:
             # Extract back/front spread using broadcasting
@@ -3527,8 +3801,14 @@ class CurveEvolutionAnalyzer:
                 valid_mask = ~np.isnan(seasonal_values)
                 
                 if np.sum(valid_mask) > 0:
-                    valid_dates = dates[:len(seasonal_values)][valid_mask]
-                    valid_values = seasonal_values[valid_mask]
+                    # Ensure we align dates and seasonal values correctly
+                    aligned_length = min(len(dates), len(seasonal_values))
+                    aligned_dates = dates[:aligned_length]
+                    aligned_seasonal_values = seasonal_values[:aligned_length]
+                    aligned_valid_mask = valid_mask[:aligned_length]
+
+                    valid_dates = aligned_dates[aligned_valid_mask]
+                    valid_values = aligned_seasonal_values[aligned_valid_mask]
                     
                     # Plot seasonal deviations time series
                     fig.add_trace(
@@ -3599,9 +3879,57 @@ class CurveEvolutionAnalyzer:
         # Update y-axis label
         fig.update_yaxes(title_text="Seasonal Deviations (Z-Score)", row=row, col=1)
     
-    def _add_3m_12m_spread_plot(self, fig, row, dates):
+    def _add_3m_12m_spread_plot(self, fig, row, dates, constant_maturity=False):
         """Add 3m-12m spread plot as a separate bottom chart"""
-        
+
+        if constant_maturity and hasattr(self, 'constant_maturity_data') and self.constant_maturity_data is not None:
+            # Use constant maturity data for 3m-12m spread calculation
+            cm_data = self.constant_maturity_data
+
+            # Try to get 3M and 12M from constant maturity data
+            if '3M' in cm_data.columns and '12M' in cm_data.columns:
+                spread_3m_12m = cm_data['12M'] - cm_data['3M']
+                plot_dates = cm_data.index
+
+                # Remove NaN values
+                valid_mask = ~np.isnan(spread_3m_12m)
+                if np.sum(valid_mask) > 0:
+                    valid_dates = plot_dates[valid_mask]
+                    valid_spreads = spread_3m_12m[valid_mask]
+
+                    # Plot 3m-12m spread
+                    fig.add_trace(
+                        go.Scatter(
+                            x=valid_dates,
+                            y=valid_spreads,
+                            mode='lines',
+                            name='12M-3M Spread (Constant Maturity)',
+                            line=dict(color='#1f77b4', width=2),
+                            fill='tonexty',
+                            fillcolor='rgba(31, 119, 180, 0.1)',
+                            hovertemplate='Date: %{x}<br>12M-3M Spread: %{y:.3f}<br>Positive = Contango<extra></extra>'
+                        ),
+                        row=row, col=1
+                    )
+
+                    # Add zero line for reference
+                    fig.add_hline(y=0, line_dash="solid", line_color="gray",
+                                 annotation_text="Zero Spread", row=row, col=1)
+
+                    # Add percentile lines for context
+                    if len(valid_spreads) > 10:
+                        spread_75th = np.percentile(valid_spreads, 75)
+                        spread_25th = np.percentile(valid_spreads, 25)
+
+                        fig.add_hline(y=spread_75th, line_dash="dash", line_color="green",
+                                     annotation_text="75th Percentile", row=row, col=1)
+                        fig.add_hline(y=spread_25th, line_dash="dash", line_color="red",
+                                     annotation_text="25th Percentile", row=row, col=1)
+
+                    # Update y-axis label
+                    fig.update_yaxes(title_text="12M-3M Spread (Constant Maturity)", row=row, col=1)
+                    return
+
         # Calculate 3m-12m spread using the existing method
         spread_3m_12m = self._calculate_3m_12m_spread_driver()
         
@@ -3831,11 +4159,12 @@ class CurveEvolutionAnalyzer:
                               regime_threshold: float = 2.0,
                               min_regime_length: int = 10,
                               show_seasonal: bool = True,
+                              constant_maturity: bool = False,
                               height: int = 800,
                               title: Optional[str] = None) -> go.Figure:
         """
         Plot regime changes along the F0 (front month) contract prices
-        
+
         Parameters:
         -----------
         regime_window : int
@@ -3846,21 +4175,32 @@ class CurveEvolutionAnalyzer:
             Minimum length of a regime to avoid noise
         show_seasonal : bool
             Whether to overlay seasonal patterns
+        constant_maturity : bool, default False
+            Use constant maturity tenor (1-month) instead of sequential F0 contract
         height : int
             Plot height in pixels
         title : str, optional
             Custom plot title
-            
+
         Returns:
         --------
         plotly.graph_objects.Figure
         """
-        
-        if self.curves is None:
-            raise ValueError("No curve data available for regime analysis")
-        
-        # Extract F0 prices using broadcasting
-        f0_series = self._extract_front_month_broadcast()
+
+        if constant_maturity and self.constant_maturity_data is not None:
+            # Use 1-month constant maturity tenor
+            if '1M' in self.constant_maturity_data.columns:
+                f0_series = self.constant_maturity_data['1M'].dropna()
+            elif 0.083333 in self.constant_maturity_data.columns:  # 1/12 ≈ 1 month
+                f0_series = self.constant_maturity_data[0.083333].dropna()
+            else:
+                # Fall back to shortest tenor available
+                f0_series = self.constant_maturity_data.iloc[:, 0].dropna()
+        else:
+            # Use sequential F0 contract
+            if self.curves is None:
+                raise ValueError("No curve data available for regime analysis")
+            f0_series = self._extract_front_month_broadcast()
         
         if len(f0_series) < regime_window * 2:
             raise ValueError(f"Insufficient data for regime analysis. Need at least {regime_window * 2} points")

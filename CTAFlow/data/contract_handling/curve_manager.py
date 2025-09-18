@@ -2504,12 +2504,14 @@ class SpreadData:
         self._initialize_features()
 
     def _convert_to_arrays(self):
-        """Convert DataFrame data to numpy arrays"""
+        """Keep curve data as DataFrames with labels, convert other data to numpy arrays"""
+        # Keep curve data as DataFrame to preserve column labels (contract names)
         if isinstance(self.curve, pd.DataFrame):
-            self.curve_df = self.curve.copy()
-        if hasattr(self.curve, 'values'):
-            self.curve = self.curve.values
+            # Store DataFrame version (curve already is a DataFrame)
+            self.curve_df = self.curve
+            # Don't convert curve to numpy - keep as DataFrame for constant maturity functionality
 
+        # Convert volume and oi curves to numpy arrays as before
         if isinstance(self.volume_curve, pd.DataFrame):
             self.volume_curve_df = self.volume_curve.copy()
         if hasattr(self.volume_curve, 'values'):
@@ -2541,7 +2543,13 @@ class SpreadData:
             return None
             
         # Use sequential data for proper contract ordering
-        prices = self.seq_data.seq_prices.data
+        if hasattr(self, 'seq_prices') and self.seq_prices is not None:
+            prices = self.seq_prices.values if hasattr(self.seq_prices, 'values') else self.seq_prices
+        elif hasattr(self, 'seq_data') and hasattr(self.seq_data, 'seq_prices') and self.seq_data.seq_prices is not None:
+            prices = self.seq_data.seq_prices.values if hasattr(self.seq_data.seq_prices, 'values') else self.seq_data.seq_prices
+        else:
+            return None
+
         if prices is None or len(prices) == 0:
             return None
             
@@ -2552,8 +2560,8 @@ class SpreadData:
         # Get volume weights if available
         volume_weights = None
         if (self.seq_data.seq_volume is not None and 
-            self.seq_data.seq_volume.data is not None):
-            volume_weights = self.seq_data.seq_volume.data
+            self.seq_data.seq_volume.values if hasattr(self.seq_data.seq_volume, 'values') else self.seq_data.seq_volume is not None):
+            volume_weights = self.seq_data.seq_volume.values if hasattr(self.seq_data.seq_volume, 'values') else self.seq_data.seq_volume
             # Convert to numpy array if it's a DataFrame
             if hasattr(volume_weights, 'values'):
                 volume_weights = volume_weights.values
@@ -2734,9 +2742,8 @@ class SpreadData:
             if contract_month.startswith('M') and contract_month[1:].isdigit():
                 # Sequential contract like M0, M1, M2
                 contract_idx = int(contract_month[1:])
-                if (self.seq_data and self.seq_data.seq_prices and 
-                    self.seq_data.seq_prices.data is not None):
-                    seq_prices = self.seq_data.seq_prices.data
+                if (self.seq_data and hasattr(self.seq_data, 'seq_prices') and self.seq_data.seq_prices is not None):
+                    seq_prices = self.seq_data.seq_prices.values if hasattr(self.seq_data.seq_prices, 'values') else self.seq_data.seq_prices
                     if contract_idx < seq_prices.shape[1]:
                         futures_prices = seq_prices[:, contract_idx]
                         
@@ -2854,119 +2861,101 @@ class SpreadData:
             return value
         return None
 
-    def _create_seq_feature(self, df: Optional[pd.DataFrame]) -> Optional[SpreadFeature]:
-        """Convert a sequential DataFrame to a SpreadFeature with cached frame."""
-        if df is None:
-            return None
-
-        return SpreadFeature(
-            data=df.values,
-            frame=df.copy(),
-            labels=list(df.columns),
-            index=df.index,
-            sequential=True,
-            direction="horizontal"
-        )
-
-    def _feature_to_dataframe(self, feature: Optional[SpreadFeature]) -> Optional[pd.DataFrame]:
-        """Return a pandas DataFrame for a stored SpreadFeature."""
-        if feature is None:
-            return None
-
-        if feature.frame is not None:
-            return feature.frame.copy()
-
-        if feature.data is None:
-            return None
-
-        data = np.asarray(feature.data, dtype=float)
-        labels = feature.labels or [f'M{i}' for i in range(data.shape[1])]
-        index = feature.index if feature.index is not None else self.index
-        return pd.DataFrame(data, index=index, columns=labels)
+    # Removed _create_seq_feature and _feature_to_dataframe methods
+    # They were unnecessary complexity - we now store DataFrames directly
 
     def _initialize_features(self):
-        """Initialize derived features and construct the sequential data container."""
+        """Initialize sequential data directly without unnecessary SpreadFeature wrappers."""
+        # For backward compatibility, keep seq_data attribute but simplify internal structure
+        # Store sequential data directly as DataFrames/arrays for faster access
+
+        # No need to create seq_data if no curve data
         if self.curve is None or len(self.curve) == 0:
-            self.seq_data = SeqData(
-                timestamps=self.index,
-                seq_labels=getattr(self, 'seq_labels', None),
-                roll_dates=getattr(self, 'roll_dates', None)
-            )
             return
 
-        seq_prices_feature = self._create_seq_feature(self._get_seq_dataframe('seq_prices'))
-        seq_spreads_feature = self._create_seq_feature(self._get_seq_dataframe('seq_spreads'))
-        seq_volume_feature = self._create_seq_feature(self._get_seq_dataframe('seq_volume'))
-        seq_oi_feature = self._create_seq_feature(self._get_seq_dataframe('seq_oi'))
+        # Sequential DataFrames are already loaded in _extract_sequential_data
+        # Just ensure they exist and are properly formatted
 
-        seq_dte_array = None
-        if hasattr(self, 'seq_dte') and self.seq_dte is not None:
-            seq_dte_source = self.seq_dte.values if isinstance(self.seq_dte, pd.DataFrame) else self.seq_dte
-            seq_dte_array = np.asarray(seq_dte_source, dtype=float)
-            if seq_dte_array.ndim == 1:
-                seq_dte_array = seq_dte_array[:, np.newaxis]
+        # Handle seq_dte specially as it may need array conversion
+        if hasattr(self, 'seq_dte') and self.seq_dte is not None and not isinstance(self.seq_dte, np.ndarray):
+            if isinstance(self.seq_dte, pd.DataFrame):
+                self.seq_dte = self.seq_dte.values
+            else:
+                self.seq_dte = np.asarray(self.seq_dte, dtype=float)
+                if self.seq_dte.ndim == 1:
+                    self.seq_dte = self.seq_dte[:, np.newaxis]
 
-        self.seq_data = SeqData(
-            timestamps=self.index,
-            seq_labels=getattr(self, 'seq_labels', None),
-            seq_prices=seq_prices_feature,
-            seq_spreads=seq_spreads_feature,
-            seq_oi=seq_oi_feature,
-            seq_volume=seq_volume_feature,
-            seq_dte=seq_dte_array,
-            roll_dates=getattr(self, 'roll_dates', None)
-        )
+        # Create a simple namespace object for backward compatibility
+        # This allows access like self.seq_data.seq_prices but stores DataFrames directly
+        self.seq_data = type('SeqData', (), {
+            'timestamps': self.index,
+            'seq_labels': getattr(self, 'seq_labels', None),
+            'seq_prices': getattr(self, 'seq_prices', None),
+            'seq_spreads': getattr(self, 'seq_spreads', None),
+            'seq_oi': getattr(self, 'seq_oi', None),
+            'seq_volume': getattr(self, 'seq_volume', None),
+            'seq_dte': getattr(self, 'seq_dte', None),
+            'roll_dates': getattr(self, 'roll_dates', None)
+        })()
 
-        if seq_prices_feature is not None:
+        # Calculate derived features if we have price data
+        if hasattr(self, 'seq_prices') and self.seq_prices is not None:
             try:
                 self.calculate_maturity_bucket_spreads()
             except Exception as exc:
                 warnings.warn(f"Could not calculate maturity bucket spreads: {exc}")
 
-        try:
-            self.synthetic_spot_prices = self.calculate_synthetic_spot()
-        except Exception as exc:
-            warnings.warn(f"Could not calculate synthetic spot prices: {exc}")
-            self.synthetic_spot_prices = None
+            try:
+                self.synthetic_spot_prices = self.calculate_synthetic_spot()
+            except Exception as exc:
+                warnings.warn(f"Could not calculate synthetic spot prices: {exc}")
+                self.synthetic_spot_prices = None
 
-        try:
-            self.convenience_yield = self.calculate_convenience_yield()
-        except Exception as exc:
-            warnings.warn(f"Could not calculate convenience yield: {exc}")
-            self.convenience_yield = None
-
-    def _get_seq_feature(self, name: str) -> Optional[SpreadFeature]:
-        if not hasattr(self, 'seq_data') or self.seq_data is None:
-            return None
-        return getattr(self.seq_data, name, None)
+            try:
+                self.convenience_yield = self.calculate_convenience_yield()
+            except Exception as exc:
+                warnings.warn(f"Could not calculate convenience yield: {exc}")
+                self.convenience_yield = None
 
     def get_sequential_prices(self, dropna: bool = False) -> pd.DataFrame:
         """Return sequential price data as a DataFrame for utility modules."""
-        feature = self._get_seq_feature('seq_prices')
-        df = self._feature_to_dataframe(feature)
-        if df is None:
+        if hasattr(self, 'seq_prices') and self.seq_prices is not None:
+            df = self.seq_prices
+        elif hasattr(self, 'seq_data') and hasattr(self.seq_data, 'seq_prices') and self.seq_data.seq_prices is not None:
+            df = self.seq_data.seq_prices
+        else:
             raise ValueError("No sequential price data available")
+
         return df.dropna(how='all') if dropna else df
 
     def get_sequential_spreads(self, dropna: bool = False) -> Optional[pd.DataFrame]:
-        feature = self._get_seq_feature('seq_spreads')
-        df = self._feature_to_dataframe(feature)
-        if df is None:
+        if hasattr(self, 'seq_spreads') and self.seq_spreads is not None:
+            df = self.seq_spreads
+        elif hasattr(self, 'seq_data') and hasattr(self.seq_data, 'seq_spreads') and self.seq_data.seq_spreads is not None:
+            df = self.seq_data.seq_spreads
+        else:
             return None
+
         return df.dropna(how='all') if dropna else df
 
     def get_sequential_volume(self, dropna: bool = False) -> Optional[pd.DataFrame]:
-        feature = self._get_seq_feature('seq_volume')
-        df = self._feature_to_dataframe(feature)
-        if df is None:
+        if hasattr(self, 'seq_volume') and self.seq_volume is not None:
+            df = self.seq_volume
+        elif hasattr(self, 'seq_data') and hasattr(self.seq_data, 'seq_volume') and self.seq_data.seq_volume is not None:
+            df = self.seq_data.seq_volume
+        else:
             return None
+
         return df.dropna(how='all') if dropna else df
 
     def get_sequential_oi(self, dropna: bool = False) -> Optional[pd.DataFrame]:
-        feature = self._get_seq_feature('seq_oi')
-        df = self._feature_to_dataframe(feature)
-        if df is None:
+        if hasattr(self, 'seq_oi') and self.seq_oi is not None:
+            df = self.seq_oi
+        elif hasattr(self, 'seq_data') and hasattr(self.seq_data, 'seq_oi') and self.seq_data.seq_oi is not None:
+            df = self.seq_data.seq_oi
+        else:
             return None
+
         return df.dropna(how='all') if dropna else df
 
     def get_contract_expiries(self) -> pd.Series:
@@ -3359,7 +3348,7 @@ class SpreadData:
         if not hasattr(self, 'seq_data') or self.seq_data is None:
             raise ValueError("No sequential data available")
             
-        if self.seq_data.seq_prices is None or self.seq_data.seq_prices.data is None:
+        if not hasattr(self.seq_data, 'seq_prices') or self.seq_data.seq_prices is None:
             raise ValueError("No price data available")
         
         # Find month code in available data
@@ -3379,19 +3368,19 @@ class SpreadData:
                 raise KeyError(f"Month code '{month_code}' not found in data")
         
         # Extract time series for this contract
-        if month_idx < self.seq_data.seq_prices.data.shape[1]:
-            contract_prices = self.seq_data.seq_prices.data[:, month_idx]
+        if month_idx < self.seq_data.seq_prices.values if hasattr(self.seq_data.seq_prices, 'values') else self.seq_data.seq_prices.shape[1]:
+            contract_prices = self.seq_data.seq_prices.values if hasattr(self.seq_data.seq_prices, 'values') else self.seq_data.seq_prices[:, month_idx]
             
             # Extract volumes and OI if available
             contract_volumes = None
-            if self.seq_data.seq_volume is not None and self.seq_data.seq_volume.data is not None:
-                if month_idx < self.seq_data.seq_volume.data.shape[1]:
-                    contract_volumes = self.seq_data.seq_volume.data[:, month_idx]
+            if self.seq_data.seq_volume is not None and self.seq_data.seq_volume.values if hasattr(self.seq_data.seq_volume, 'values') else self.seq_data.seq_volume is not None:
+                if month_idx < self.seq_data.seq_volume.values if hasattr(self.seq_data.seq_volume, 'values') else self.seq_data.seq_volume.shape[1]:
+                    contract_volumes = self.seq_data.seq_volume.values if hasattr(self.seq_data.seq_volume, 'values') else self.seq_data.seq_volume[:, month_idx]
             
             contract_oi = None
-            if self.seq_data.seq_oi is not None and self.seq_data.seq_oi.data is not None:
-                if month_idx < self.seq_data.seq_oi.data.shape[1]:
-                    contract_oi = self.seq_data.seq_oi.data[:, month_idx]
+            if self.seq_data.seq_oi is not None and self.seq_data.seq_oi.values if hasattr(self.seq_data.seq_oi, 'values') else self.seq_data.seq_oi is not None:
+                if month_idx < self.seq_data.seq_oi.values if hasattr(self.seq_data.seq_oi, 'values') else self.seq_data.seq_oi.shape[1]:
+                    contract_oi = self.seq_data.seq_oi.values if hasattr(self.seq_data.seq_oi, 'values') else self.seq_data.seq_oi[:, month_idx]
             
             # Calculate days to expiry (simplified)
             dte_array = np.full(len(contract_prices), np.nan)
@@ -3414,14 +3403,14 @@ class SpreadData:
         if not hasattr(self, 'seq_data') or self.seq_data is None:
             raise ValueError("No sequential data available")
             
-        if self.seq_data.seq_prices is None or self.seq_data.seq_prices.data is None:
+        if not hasattr(self.seq_data, 'seq_prices') or self.seq_data.seq_prices is None:
             raise ValueError("No price data available")
         
-        if contract_idx >= self.seq_data.seq_prices.data.shape[1]:
-            raise IndexError(f"Contract index {contract_idx} exceeds available contracts ({self.seq_data.seq_prices.data.shape[1]})")
+        if contract_idx >= self.seq_data.seq_prices.values if hasattr(self.seq_data.seq_prices, 'values') else self.seq_data.seq_prices.shape[1]:
+            raise IndexError(f"Contract index {contract_idx} exceeds available contracts ({self.seq_data.seq_prices.values if hasattr(self.seq_data.seq_prices, 'values') else self.seq_data.seq_prices.shape[1]})")
         
         # Extract time series for this sequential position
-        contract_prices = self.seq_data.seq_prices.data[:, contract_idx]
+        contract_prices = self.seq_data.seq_prices.values if hasattr(self.seq_data.seq_prices, 'values') else self.seq_data.seq_prices[:, contract_idx]
         
         # Extract volume and oi if available
         contract_volume = np.array([])
@@ -3429,19 +3418,19 @@ class SpreadData:
         contract_dte = np.array([])
         
         if (hasattr(self.seq_data, 'seq_volume') and self.seq_data.seq_volume is not None and 
-            hasattr(self.seq_data.seq_volume, 'data') and self.seq_data.seq_volume.data is not None):
-            if contract_idx < self.seq_data.seq_volume.data.shape[1]:
-                contract_volume = self.seq_data.seq_volume.data[:, contract_idx]
+            hasattr(self.seq_data.seq_volume, 'data') and self.seq_data.seq_volume.values if hasattr(self.seq_data.seq_volume, 'values') else self.seq_data.seq_volume is not None):
+            if contract_idx < self.seq_data.seq_volume.values if hasattr(self.seq_data.seq_volume, 'values') else self.seq_data.seq_volume.shape[1]:
+                contract_volume = self.seq_data.seq_volume.values if hasattr(self.seq_data.seq_volume, 'values') else self.seq_data.seq_volume[:, contract_idx]
                 
         if (hasattr(self.seq_data, 'seq_oi') and self.seq_data.seq_oi is not None and 
-            hasattr(self.seq_data.seq_oi, 'data') and self.seq_data.seq_oi.data is not None):
-            if contract_idx < self.seq_data.seq_oi.data.shape[1]:
-                contract_oi = self.seq_data.seq_oi.data[:, contract_idx]
+            hasattr(self.seq_data.seq_oi, 'data') and self.seq_data.seq_oi.values if hasattr(self.seq_data.seq_oi, 'values') else self.seq_data.seq_oi is not None):
+            if contract_idx < self.seq_data.seq_oi.values if hasattr(self.seq_data.seq_oi, 'values') else self.seq_data.seq_oi.shape[1]:
+                contract_oi = self.seq_data.seq_oi.values if hasattr(self.seq_data.seq_oi, 'values') else self.seq_data.seq_oi[:, contract_idx]
                 
         if (hasattr(self.seq_data, 'seq_dte') and self.seq_data.seq_dte is not None and 
-            hasattr(self.seq_data.seq_dte, 'data') and self.seq_data.seq_dte.data is not None):
-            if contract_idx < self.seq_data.seq_dte.data.shape[1]:
-                contract_dte = self.seq_data.seq_dte.data[:, contract_idx]
+            hasattr(self.seq_data.seq_dte, 'data') and self.seq_data.seq_dte is not None):
+            if contract_idx < self.seq_data.seq_dte.shape[1]:
+                contract_dte = self.seq_data.seq_dte[:, contract_idx]
         
         return Contract(
             symbol=self.symbol,
@@ -3813,7 +3802,7 @@ class SpreadData:
         if not hasattr(self, 'seq_data') or self.seq_data is None:
             raise ValueError("No sequential data available for maturity bucket calculations")
             
-        if self.seq_data.seq_prices is None or self.seq_data.seq_prices.data is None:
+        if self.seq_data.seq_prices is None or self.seq_data.seq_prices.values if hasattr(self.seq_data.seq_prices, 'values') else self.seq_data.seq_prices is None:
             raise ValueError("No sequential price data available")
         
         # Get available sequential labels if present
@@ -4077,16 +4066,16 @@ class SpreadData:
                 seq_dte_array = np.asarray(self.seq_data.seq_dte, dtype=float)
                 if seq_dte_array.ndim == 1:
                     seq_dte_array = np.expand_dims(seq_dte_array, axis=0)
-                if seq_dte_array.shape[0] != self.seq_data.seq_prices.data.shape[0] and \
-                        seq_dte_array.shape[1] == self.seq_data.seq_prices.data.shape[0]:
+                if seq_dte_array.shape[0] != self.seq_data.seq_prices.values if hasattr(self.seq_data.seq_prices, 'values') else self.seq_data.seq_prices.shape[0] and \
+                        seq_dte_array.shape[1] == self.seq_data.seq_prices.values if hasattr(self.seq_data.seq_prices, 'values') else self.seq_data.seq_prices.shape[0]:
                     seq_dte_array = seq_dte_array.T
-                if seq_dte_array.shape[0] != self.seq_data.seq_prices.data.shape[0]:
+                if seq_dte_array.shape[0] != self.seq_data.seq_prices.values if hasattr(self.seq_data.seq_prices, 'values') else self.seq_data.seq_prices.shape[0]:
                     seq_dte_array = None
             except Exception:
                 seq_dte_array = None
 
         # Get data for specified date
-        prices = self.seq_data.seq_prices.data[date_index]
+        prices = self.seq_data.seq_prices.values if hasattr(self.seq_data.seq_prices, 'values') else self.seq_data.seq_prices[date_index]
         dte_row = None
         if seq_dte_array is not None and date_index < seq_dte_array.shape[0]:
             dte_row = seq_dte_array[date_index]
