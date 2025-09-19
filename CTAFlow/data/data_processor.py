@@ -1152,14 +1152,17 @@ class DataProcessor:
                 print(f"[THREAD] Failed {ticker_prefix} after {elapsed:.1f}s: {e}")
     
     def process_all_csv_files_threaded(
-        self, 
-        year: str = '25', 
+        self,
+        year: str = '25',
         replace: bool = True,
         max_workers: Optional[int] = None
     ) -> Dict[str, int]:
         """
         Process all CSV files using multi-threading for improved performance.
-        
+
+        DEPRECATED: Use SimpleDataProcessor.update_all_tickers() instead for simpler,
+        more efficient processing with better error handling.
+
         Parameters:
         -----------
         year : str, default '25'
@@ -1168,14 +1171,22 @@ class DataProcessor:
             Whether to replace existing data or append
         max_workers : int, optional
             Maximum number of worker threads. Defaults to CPU count.
-            
+
         Returns:
         --------
         Dict[str, int]
             Dictionary mapping ticker symbols to number of rows processed
         """
+        import warnings
+        warnings.warn(
+            "DataProcessor.process_all_csv_files_threaded() is deprecated. "
+            "Use SimpleDataProcessor.update_all_tickers() instead for better performance and reliability.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+
         results = {}
-        
+
         # Discover CSV files
         csv_files = self.discover_csv_files(year)
         

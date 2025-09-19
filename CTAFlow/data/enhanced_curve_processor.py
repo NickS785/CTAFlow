@@ -30,7 +30,10 @@ def process_enhanced_curves_for_ticker_list(
 ) -> Dict[str, Any]:
     """
     Process futures curves with enhanced roll tracking for a specific list of tickers.
-    
+
+    DEPRECATED: Use SimpleDataProcessor.batch_update_futures_curves() instead for
+    simpler and more reliable curve processing.
+
     This function creates enhanced curve managers with roll tracking for each ticker
     in the provided list, allowing selective processing instead of all available data.
     
@@ -95,7 +98,14 @@ def process_enhanced_curves_for_ticker_list(
     >>> for ticker, roll_info in results['roll_tracking'].items():
     ...     print(f"{ticker}: {roll_info['roll_count']} rolls tracked")
     """
-    
+    import warnings
+    warnings.warn(
+        "process_enhanced_curves_for_ticker_list() is deprecated. "
+        "Use SimpleDataProcessor.batch_update_futures_curves() instead for better reliability.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+
     if not ticker_list:
         return {
             'successful': {},

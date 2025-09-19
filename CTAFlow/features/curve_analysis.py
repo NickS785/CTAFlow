@@ -10,7 +10,7 @@ import warnings
 from datetime import datetime
 from scipy import stats
 from scipy.stats import skew, kurtosis
-
+from numpy.linalg import svd
 from ..data.contract_handling.curve_manager import FuturesCurve, SpreadData, SpreadFeature
 from ..utils.seasonal import deseasonalize_monthly
 
@@ -51,6 +51,13 @@ except ImportError:
 
 MONTH_CODE_ORDER = ['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z']
 
+
+def _as_2d_df(arr: np.ndarray, index: pd.DatetimeIndex, cols: Optional[list] = None) -> pd.DataFrame:
+    """Utility: shape check + DF wrap."""
+    df = pd.DataFrame(arr, index=index)
+    if cols is not None and len(cols) == df.shape[1]:
+        df.columns = cols
+    return df
 
 class CurveShapeAnalyzer:
     """
@@ -281,877 +288,62 @@ class CurveShapeAnalyzer:
 
         return 0.0
 
+    # ==================================================================================
+    # EVOLUTION TRACKING METHODS (Migrated from CurveEvolution)
+    # ==================================================================================
 
-class CurveEvolution:
-    """Track and analyze curve evolution over time using FuturesCurve snapshots"""
+    def calculate_curve_changes(self, lookback: int = 1) -> Dict[str, float]:
+        """Calculate curve shape changes over time (migrated from CurveEvolution)"""
+        # This would track changes in the current curve vs historical curves
+        # For now, return basic shape metrics that can be compared over time
+        current_features = self.get_shape_features()
 
-    def __init__(self, 
-                 curves_data: Optional[Union[pd.Series, List[FuturesCurve], np.ndarray]] = None,
-                 dates: Optional[Union[pd.DatetimeIndex, List[datetime], np.ndarray]] = None):
-        """
-        Initialize evolution tracker with validated data structures
-        
-        Parameters:
-        - curves_data: Optional bulk data input (pd.Series, list, or array of FuturesCurves)
-        - dates: Optional datetime index (required if curves_data is list/array)
-        """
-        self.history: pd.Series = pd.Series(dtype=object, name='futures_curves')
-        self.shape_history: pd.DataFrame = pd.DataFrame()
-        self._feature_cache: Dict[str, pd.DataFrame] = {}
-        
-        # Handle bulk data input during initialization
-        if curves_data is not None:
-            self.load_curves_bulk(curves_data, dates)
+        # Could be extended to store historical features and calculate changes
+        changes = {}
+        for key, value in current_features.items():
+            changes[f'{key}_current'] = value
 
-    def load_curves_bulk(self, 
-                        curves_data: Union[pd.Series, List[FuturesCurve], np.ndarray],
-                        dates: Optional[Union[pd.DatetimeIndex, List[datetime], np.ndarray]] = None):
-        """
-        Load multiple curves at once for fast pipeline creation
-        
-        Parameters:
-        - curves_data: Series, list, or array of FuturesCurve objects
-        - dates: Datetime index (required if curves_data is list/array)
-        """
-        if isinstance(curves_data, pd.Series):
-            # Direct Series input with datetime index
-            if not pd.api.types.is_datetime64_any_dtype(curves_data.index):
-                raise ValueError("Series index must be datetime-like")
-            
-            self.history = curves_data.copy()
-            
-        elif isinstance(curves_data, (list, np.ndarray)):
-            # List or array input - dates parameter required
-            if dates is None:
-                raise ValueError("dates parameter required when curves_data is list or array")
-            
-            # Convert dates to DatetimeIndex if needed
-            if not isinstance(dates, pd.DatetimeIndex):
-                dates = pd.DatetimeIndex(dates)
-            
-            if len(curves_data) != len(dates):
-                raise ValueError(f"Length mismatch: curves_data ({len(curves_data)}) vs dates ({len(dates)})")
-            
-            # Create Series
-            self.history = pd.Series(curves_data, index=dates, name='futures_curves')
-            
-        else:
-            raise TypeError(f"curves_data must be pd.Series, list, or np.ndarray, got {type(curves_data)}")
-        
-        # Validate all entries are FuturesCurve objects or None
-        for idx, curve in self.history.items():
-            if curve is not None and not isinstance(curve, FuturesCurve):
-                raise TypeError(f"All curves must be FuturesCurve objects or None, got {type(curve)} at {idx}")
-        
-        # Calculate features for all curves using broadcast method
-        self._calculate_all_features_bulk()
-        
-        print(f"Loaded {len(self.history)} curves covering {self.history.index.min()} to {self.history.index.max()}")
+        return changes
 
-    def _calculate_all_features_bulk(self):
-        """Calculate features for all curves in bulk using vectorized operations"""
-        if self.history.empty:
-            return
-        
-        # Extract all curves and organize data
-        valid_entries = []
-        timestamps = []
-        
-        for timestamp, curve in self.history.items():
-            if curve is not None:
-                try:
-                    # Extract features using existing method
-                    features = self._extract_curve_features(curve)
-                    valid_entries.append((timestamp, features))
-                    timestamps.append(timestamp)
-                except Exception as e:
-                    # Skip problematic curves but log the issue
-                    warnings.warn(f"Failed to extract features for curve at {timestamp}: {e}")
-                    continue
-        
-        if not valid_entries:
-            self.shape_history = pd.DataFrame()
-            return
-        
-        # Create DataFrame from all features at once
-        features_list = [entry[1] for entry in valid_entries]
-        self.shape_history = pd.DataFrame(features_list, index=timestamps)
-        
-        # Clear cache since we have new data
-        self._feature_cache.clear()
+    def analyze_structural_changes(self) -> Dict[str, float]:
+        """Analyze structural changes in curve shape (migrated from CurveEvolution)"""
+        if self._current_prices_array is None or len(self._current_prices_array) < 3:
+            return {}
 
-    @classmethod
-    def from_spread_data(cls, 
-                        spread_data: 'SpreadData',
-                        date_range: Optional[Union[slice, pd.DatetimeIndex, List[datetime]]] = None) -> 'CurveEvolution':
-        """
-        Create CurveEvolution directly from SpreadData for fast pipeline
-        
-        Parameters:
-        - spread_data: SpreadData object with seq_data
-        - date_range: Optional date range to extract (slice, DatetimeIndex, or list)
-        
-        Returns:
-        - CurveEvolution instance with curves pre-loaded
-        """
-        if not hasattr(spread_data, 'seq_data') or spread_data.seq_data is None:
-            raise ValueError("SpreadData must have seq_data for bulk curve creation")
-        
-        # Determine date range
-        if date_range is None:
-            dates_to_use = spread_data.index
-        elif isinstance(date_range, slice):
-            dates_to_use = spread_data.index[date_range]
-        elif isinstance(date_range, (pd.DatetimeIndex, list, np.ndarray)):
-            # Filter to dates that exist in spread_data
-            available_dates = set(spread_data.index)
-            dates_to_use = [d for d in date_range if d in available_dates]
-            if not dates_to_use:
-                raise ValueError("No valid dates found in date_range")
-            dates_to_use = pd.DatetimeIndex(dates_to_use)
-        else:
-            raise TypeError("date_range must be slice, DatetimeIndex, list, or None")
-        
-        # Create curves for all dates using vectorized approach
-        curves_list = []
-        valid_dates = []
-        
-        # Use batch processing for efficiency
-        for date in dates_to_use:
-            try:
-                curve = spread_data.create_futures_curve(date)
-                curves_list.append(curve)
-                valid_dates.append(date)
-            except Exception as e:
-                warnings.warn(f"Failed to create curve for {date}: {e}")
-                curves_list.append(None)
-                valid_dates.append(date)
-        
-        # Create instance with bulk data
-        instance = cls(curves_list, valid_dates)
-        
-        # Store reference to source data for potential re-use
-        instance._source_spread_data = spread_data
-        
-        return instance
-    
-    @classmethod 
-    def from_series(cls, curves_series: pd.Series) -> 'CurveEvolution':
-        """
-        Create CurveEvolution from pd.Series of FuturesCurve objects
-        
-        Parameters:
-        - curves_series: pd.Series with datetime index and FuturesCurve values
-        """
-        return cls(curves_series)
-    
-    def add_curves_bulk(self, 
-                       curves_data: Union[pd.Series, List[FuturesCurve], np.ndarray],
-                       dates: Optional[Union[pd.DatetimeIndex, List[datetime], np.ndarray]] = None):
-        """
-        Add multiple curves to existing CurveEvolution instance
-        
-        Parameters:
-        - curves_data: Series, list, or array of FuturesCurve objects  
-        - dates: Datetime index (required if curves_data is list/array)
-        """
-        # Create temporary instance to validate and process input
-        temp_instance = CurveEvolution(curves_data, dates)
-        
-        # Merge with existing history
-        if self.history.empty:
-            self.history = temp_instance.history.copy()
-            self.shape_history = temp_instance.shape_history.copy()
-        else:
-            # Concatenate and sort
-            combined_history = pd.concat([self.history, temp_instance.history])
-            combined_features = pd.concat([self.shape_history, temp_instance.shape_history])
-            
-            # Remove duplicates (keep last) and sort
-            self.history = combined_history[~combined_history.index.duplicated(keep='last')].sort_index()
-            self.shape_history = combined_features[~combined_features.index.duplicated(keep='last')].sort_index()
-        
-        # Clear cache
-        self._feature_cache.clear()
-        
-        print(f"Added curves. Total: {len(self.history)} curves from {self.history.index.min()} to {self.history.index.max()}")
+        prices = self._current_prices_array
+        changes = {}
 
-    def update_from_spread_data(self, 
-                               spread_data: 'SpreadData',
-                               date_range: Optional[Union[slice, pd.DatetimeIndex, List[datetime]]] = None):
-        """
-        Update existing CurveEvolution with new data from SpreadData
-        
-        Parameters:
-        - spread_data: SpreadData object
-        - date_range: Optional date range to update
-        """
-        # Create new instance from spread_data
-        new_instance = self.from_spread_data(spread_data, date_range)
-        
-        # Add to existing data
-        self.add_curves_bulk(new_instance.history)
-
-    def add_snapshot(self, futures_curve: FuturesCurve) -> None:
-        """Add a FuturesCurve snapshot to history with validation"""
-        if not isinstance(futures_curve, FuturesCurve):
-            raise TypeError(f"Expected FuturesCurve, got {type(futures_curve)}")
-        
-        # Add to history Series with datetime index
-        self.history.loc[futures_curve.ref_date] = futures_curve
-        
-        # Calculate features from the futures curve
-        features = self._extract_curve_features(futures_curve)
-        
-        # Add features to DataFrame
-        if self.shape_history.empty:
-            self.shape_history = pd.DataFrame([features], index=[futures_curve.ref_date])
-        else:
-            # Concatenate new features
-            new_row = pd.DataFrame([features], index=[futures_curve.ref_date])
-            self.shape_history = pd.concat([self.shape_history, new_row])
-        
-        # Clear cache when new data is added
-        self._feature_cache.clear()
-    
-    def add_snapshot_from_spread_data(self, spread_data: SpreadData, date: Optional[datetime] = None):
-        """Add a snapshot from SpreadData by creating a FuturesCurve"""
-        if date is None:
-            date = datetime.now()
-        
-        futures_curve = spread_data.create_futures_curve(date)
-        self.add_snapshot(futures_curve)
-    
-    def _extract_curve_features(self, curve: FuturesCurve) -> Dict[str, float]:
-        """Extract features from a FuturesCurve"""
-        features = {}
-        
-        # Use seq_prices if available, otherwise regular prices - ensure array consistency
-        if curve.seq_prices is not None:
-            prices = np.array(curve.seq_prices) if not isinstance(curve.seq_prices, np.ndarray) else curve.seq_prices
-        else:
-            prices = np.array(curve.prices) if not isinstance(curve.prices, np.ndarray) else curve.prices
-        
+        # Calculate structural curve metrics
         if len(prices) >= 2:
-            features['mean_price'] = np.mean(prices)
-            features['std_price'] = np.std(prices)
-            features['min_price'] = np.min(prices)
-            features['max_price'] = np.max(prices)
-            features['price_range'] = features['max_price'] - features['min_price']
-            features['overall_slope'] = (prices[-1] - prices[0]) / len(prices)
-            
-            # Shape metrics
-            features['skewness'] = skew(prices)
-            features['kurtosis'] = kurtosis(prices)
-            
-            # Contango/backwardation
-            if len(prices) > 1:
-                price_diffs = np.diff(prices)
-                features['contango_ratio'] = np.sum(price_diffs > 0) / len(price_diffs)
-                features['avg_calendar_spread'] = np.mean(price_diffs)
-                
-                # Curvature if enough points
-                if len(prices) >= 3:
-                    second_diffs = np.diff(price_diffs)
-                    features['convexity'] = np.mean(second_diffs)
-                    features['max_convexity'] = np.max(np.abs(second_diffs))
-        
-        # Volume concentration if available - use numpy operations
-        if curve.volumes is not None and len(curve.volumes) > 0:
-            volumes = np.array(curve.volumes) if not isinstance(curve.volumes, np.ndarray) else curve.volumes
-            valid_vols = volumes[~np.isnan(volumes)]
-            if len(valid_vols) > 0 and np.sum(valid_vols) > 0:
-                vol_shares = valid_vols / np.sum(valid_vols)
-                features['volume_concentration'] = np.sum(vol_shares ** 2)
-        
-        # OI concentration if available - use numpy operations
-        if curve.open_interest is not None and len(curve.open_interest) > 0:
-            oi = np.array(curve.open_interest) if not isinstance(curve.open_interest, np.ndarray) else curve.open_interest
-            valid_oi = oi[~np.isnan(oi)]
-            if len(valid_oi) > 0 and np.sum(valid_oi) > 0:
-                oi_shares = valid_oi / np.sum(valid_oi)
-                features['oi_concentration'] = np.sum(oi_shares ** 2)
-                
-        return features
+            # Parallel shift proxy (average price level)
+            changes['price_level'] = np.mean(prices)
 
-    def calculate_changes(self, lookback: int = 1) -> Dict[str, float]:
-        """Calculate changes over lookback periods using DataFrame structure"""
-        if len(self.history) < lookback + 1:
-            return {}
+            # Twist proxy (front vs back)
+            if len(prices) >= 4:
+                front_avg = np.mean(prices[:2])
+                back_avg = np.mean(prices[-2:])
+                changes['twist'] = back_avg - front_avg
 
-        # Get current and previous rows from DataFrame
-        current = self.shape_history.iloc[-1]
-        previous = self.shape_history.iloc[-lookback - 1]
-
-        changes = {}
-        for key in current.index:
-            if key in previous.index and pd.notna(current[key]) and pd.notna(previous[key]):
-                changes[f'{key}_change'] = current[key] - previous[key]
-                if previous[key] != 0:
-                    changes[f'{key}_pct_change'] = ((current[key] - previous[key]) / previous[key]) * 100
-
-        # Add structural changes
-        structural_changes = self._calculate_structural_changes(lookback)
-        changes.update(structural_changes)
+            # Butterfly proxy (middle vs edges)
+            if len(prices) >= 3:
+                mid_idx = len(prices) // 2
+                mid_price = prices[mid_idx]
+                edge_avg = np.mean([prices[0], prices[-1]])
+                changes['butterfly'] = mid_price - edge_avg
 
         return changes
 
-    def _calculate_structural_changes(self, lookback: int = 1) -> Dict[str, float]:
-        """Calculate structural curve changes using FuturesCurve objects from Series"""
-        if len(self.history) < lookback + 1:
-            return {}
+    def get_evolution_summary(self) -> Dict[str, Any]:
+        """Get evolution summary combining shape and structural analysis"""
+        shape_features = self.get_shape_features()
+        structural_changes = self.analyze_structural_changes()
 
-        # Get current and previous curves from Series
-        current_curve = self.history.iloc[-1]
-        previous_curve = self.history.iloc[-lookback - 1]
-
-        changes = {}
-
-        # Get prices from FuturesCurve objects (prefer seq_prices if available)
-        current_prices = np.array(current_curve.seq_prices if current_curve.seq_prices is not None else current_curve.prices)
-        previous_prices = np.array(previous_curve.seq_prices if previous_curve.seq_prices is not None else previous_curve.prices)
-
-        # Align by length
-        min_len = min(len(current_prices), len(previous_prices))
-
-        if min_len > 0:
-            current_prices = current_prices[:min_len]
-            previous_prices = previous_prices[:min_len]
-
-            mask = ~(np.isnan(current_prices) | np.isnan(previous_prices))
-            if np.any(mask):
-                current_prices = current_prices[mask]
-                previous_prices = previous_prices[mask]
-
-                # Parallel shift
-                changes['parallel_shift'] = np.mean(current_prices - previous_prices)
-
-                # Twist
-                if len(current_prices) >= 4:
-                    front_change = np.mean(current_prices[:2] - previous_prices[:2])
-                    back_change = np.mean(current_prices[-2:] - previous_prices[-2:])
-                    changes['curve_twist'] = back_change - front_change
-
-                # Butterfly
-                if len(current_prices) >= 3:
-                    mid_idx = len(current_prices) // 2
-                    mid_change = current_prices[mid_idx] - previous_prices[mid_idx]
-                    edge_change = np.mean([
-                        current_prices[0] - previous_prices[0],
-                        current_prices[-1] - previous_prices[-1]
-                    ])
-                    changes['curve_butterfly'] = mid_change - edge_change
-
-                # RMSE
-                changes['rmse'] = np.sqrt(np.mean((current_prices - previous_prices) ** 2))
-
-        return changes
-
-    def get_feature_timeseries(self, feature_name: str) -> pd.Series:
-        """Get time series of a specific feature from DataFrame"""
-        if self.shape_history.empty:
-            return pd.Series()
-
-        if feature_name not in self.shape_history.columns:
-            return pd.Series(index=self.shape_history.index, name=feature_name, dtype=float)
-
-        return self.shape_history[feature_name].copy()
-    
-    def generate_dataframe(self, include_prices: bool = True, include_metadata: bool = True) -> pd.DataFrame:
-        """
-        Generate a DataFrame aggregating all history data
-        
-        Parameters:
-        - include_prices: Whether to include individual price series
-        - include_metadata: Whether to include ref_date, labels, etc.
-        
-        Returns:
-        - DataFrame with timestamps as index and features/prices as columns
-        """
-        if self.history.empty:
-            return pd.DataFrame()
-        
-        # Start with shape_history as base DataFrame
-        result_df = self.shape_history.copy()
-        
-        # Add price and metadata columns if requested
-        if include_prices or include_metadata:
-            for timestamp, curve in self.history.items():
-                if curve is None:
-                    continue
-                
-                # Add metadata if requested
-                if include_metadata:
-                    result_df.loc[timestamp, 'ref_date'] = curve.ref_date
-                    if curve.seq_labels:
-                        result_df.loc[timestamp, 'seq_labels'] = '|'.join(curve.seq_labels)
-                    if curve.curve_month_labels:
-                        result_df.loc[timestamp, 'month_labels'] = '|'.join(curve.curve_month_labels)
-                
-                # Add prices if requested
-                if include_prices:
-                    # Sequential prices (preferred)
-                    if curve.seq_prices is not None:
-                        for j, price in enumerate(curve.seq_prices):
-                            result_df.loc[timestamp, f'seq_price_M{j+1}'] = price
-                    
-                    # Original calendar month prices
-                    if curve.prices is not None and curve.curve_month_labels is not None:
-                        for j, (label, price) in enumerate(zip(curve.curve_month_labels, curve.prices)):
-                            result_df.loc[timestamp, f'price_{label}'] = price
-                    
-                    # Volumes if available
-                    if curve.volumes is not None and curve.curve_month_labels is not None:
-                        for j, (label, vol) in enumerate(zip(curve.curve_month_labels, curve.volumes)):
-                            if not np.isnan(vol):
-                                result_df.loc[timestamp, f'volume_{label}'] = vol
-                    
-                    # Open interest if available
-                    if curve.open_interest is not None and curve.curve_month_labels is not None:
-                        for j, (label, oi) in enumerate(zip(curve.curve_month_labels, curve.open_interest)):
-                            if not np.isnan(oi):
-                                result_df.loc[timestamp, f'oi_{label}'] = oi
-                    
-                    # Days to expiry if available
-                    if curve.days_to_expiry is not None and curve.curve_month_labels is not None:
-                        for j, (label, dte) in enumerate(zip(curve.curve_month_labels, curve.days_to_expiry)):
-                            result_df.loc[timestamp, f'dte_{label}'] = dte
-        
-        return result_df
-    
-    def calculate_all_features_broadcast(self) -> pd.DataFrame:
-
-        """
-        Vectorized calculation of features across all curves simultaneously
-        Avoids iteration and leverages pandas/numpy broadcast operations
-        """
-        if self.history.empty:
-            return pd.DataFrame()
-        
-        # Check cache first
-        if 'broadcast_features' in self._feature_cache:
-            return self._feature_cache['broadcast_features'].copy()
-        
-        # Extract all price arrays and organize into 3D array
-        max_contracts = 0
-        valid_curves = []
-        timestamps = []
-        
-        for timestamp, curve in self.history.items():
-            if curve is not None:
-                prices = np.array(curve.seq_prices if curve.seq_prices is not None else curve.prices)
-                if len(prices) > 0:
-                    valid_curves.append((timestamp, curve, prices))
-                    max_contracts = max(max_contracts, len(prices))
-                    timestamps.append(timestamp)
-        
-        if not valid_curves:
-            return pd.DataFrame()
-        
-        # Create 3D array: (n_dates, n_contracts, n_features)
-        n_dates = len(valid_curves)
-        price_matrix = np.full((n_dates, max_contracts), np.nan)
-        
-        for i, (timestamp, curve, prices) in enumerate(valid_curves):
-            price_matrix[i, :len(prices)] = prices
-        
-        # Broadcast calculations
-        features_dict = {}
-        
-        # Basic statistics across contracts (axis=1)
-        features_dict['mean_price'] = np.nanmean(price_matrix, axis=1)
-        features_dict['std_price'] = np.nanstd(price_matrix, axis=1)
-        features_dict['min_price'] = np.nanmin(price_matrix, axis=1)
-        features_dict['max_price'] = np.nanmax(price_matrix, axis=1)
-        features_dict['price_range'] = features_dict['max_price'] - features_dict['min_price']
-        
-        # Slope calculations (vectorized)
-        slopes = np.full(n_dates, np.nan)
-        for i in range(n_dates):
-            valid_mask = ~np.isnan(price_matrix[i, :])
-            if np.sum(valid_mask) >= 2:
-                x_vals = np.arange(np.sum(valid_mask))
-                y_vals = price_matrix[i, valid_mask]
-                slopes[i] = np.polyfit(x_vals, y_vals, 1)[0]
-        
-        features_dict['overall_slope'] = slopes
-        
-        # Shape metrics using scipy functions on the matrix
-        skewness = np.full(n_dates, np.nan)
-        kurt = np.full(n_dates, np.nan)
-        
-        for i in range(n_dates):
-            valid_prices = price_matrix[i, ~np.isnan(price_matrix[i, :])]
-            if len(valid_prices) >= 3:
-                skewness[i] = skew(valid_prices)
-                kurt[i] = kurtosis(valid_prices)
-        
-        features_dict['skewness'] = skewness
-        features_dict['kurtosis'] = kurt
-        
-        # Contango/Backwardation ratios
-        contango_ratios = np.full(n_dates, np.nan)
-        for i in range(n_dates):
-            valid_prices = price_matrix[i, ~np.isnan(price_matrix[i, :])]
-            if len(valid_prices) >= 2:
-                diffs = np.diff(valid_prices)
-                contango_ratios[i] = np.sum(diffs > 0) / len(diffs)
-        
-        features_dict['contango_ratio'] = contango_ratios
-        
-        # Create DataFrame
-        features_df = pd.DataFrame(features_dict, index=timestamps)
-        
-        # Cache results
-        self._feature_cache['broadcast_features'] = features_df.copy()
-        
-        return features_df
-    
-    def calculate_rolling_metrics_broadcast(self, 
-                                          window: int = 20, 
-                                          metrics: List[str] = None) -> pd.DataFrame:
-        """
-        Calculate rolling metrics using vectorized operations
-        
-        Parameters:
-        - window: Rolling window size
-        - metrics: List of metrics to calculate ['volatility', 'correlation', 'slope_trend', 'regime_stability']
-        """
-        if metrics is None:
-            metrics = ['volatility', 'slope_trend', 'regime_stability']
-        
-        # Get base features first
-        base_features = self.calculate_all_features_broadcast()
-        if base_features.empty:
-            return pd.DataFrame()
-        
-        cache_key = f'rolling_{window}_{hash(tuple(metrics))}'
-        if cache_key in self._feature_cache:
-            return self._feature_cache[cache_key].copy()
-        
-        rolling_results = {}
-        
-        for metric in metrics:
-            if metric == 'volatility':
-                # Rolling volatility of slopes
-                if 'overall_slope' in base_features.columns:
-                    rolling_results['slope_volatility'] = base_features['overall_slope'].rolling(window).std()
-                    rolling_results['price_volatility'] = base_features['mean_price'].rolling(window).std()
-            
-            elif metric == 'slope_trend':
-                # Trend in slope over rolling window
-                if 'overall_slope' in base_features.columns:
-                    slope_trend = base_features['overall_slope'].rolling(window).apply(
-                        lambda x: np.polyfit(range(len(x)), x, 1)[0] if len(x) == window else np.nan
-                    )
-                    rolling_results['slope_trend'] = slope_trend
-            
-            elif metric == 'regime_stability':
-                # Stability of contango/backwardation regime
-                if 'contango_ratio' in base_features.columns:
-                    regime_std = base_features['contango_ratio'].rolling(window).std()
-                    rolling_results['regime_stability'] = 1 / (1 + regime_std)  # Higher = more stable
-            
-            elif metric == 'correlation':
-                # Rolling correlation between slope and price level
-                if 'overall_slope' in base_features.columns and 'mean_price' in base_features.columns:
-                    rolling_corr = base_features['overall_slope'].rolling(window).corr(
-                        base_features['mean_price'].rolling(window)
-                    )
-                    rolling_results['slope_price_correlation'] = rolling_corr
-        
-        rolling_df = pd.DataFrame(rolling_results, index=base_features.index)
-        
-        # Cache results
-        self._feature_cache[cache_key] = rolling_df.copy()
-        
-        return rolling_df
-    
-    def detect_regime_changes_broadcast(self, 
-                                      threshold: float = 2.0,
-                                      min_regime_length: int = 5) -> pd.DataFrame:
-        """
-        Detect regime changes using vectorized operations on slope data
-        
-        Parameters:
-        - threshold: Z-score threshold for regime change detection
-        - min_regime_length: Minimum length of a regime to be considered valid
-        """
-        cache_key = f'regime_changes_{threshold}_{min_regime_length}'
-        if cache_key in self._feature_cache:
-            return self._feature_cache[cache_key].copy()
-        
-        base_features = self.calculate_all_features_broadcast()
-        if base_features.empty or 'overall_slope' not in base_features.columns:
-            return pd.DataFrame()
-        
-        slopes = base_features['overall_slope'].dropna()
-        if len(slopes) < min_regime_length * 2:
-            return pd.DataFrame()
-        
-        # Calculate rolling statistics
-        rolling_mean = slopes.rolling(20, center=True).mean()
-        rolling_std = slopes.rolling(20, center=True).std()
-        z_scores = (slopes - rolling_mean) / (rolling_std + 1e-10)
-        
-        # Detect regime changes using sign changes and outliers
-        regime_changes = []
-        
-        # Sign-based regime detection
-        contango_regime = (slopes > 0.01).astype(int)  # 1 for contango, 0 for backwardation/flat
-        regime_changes_idx = np.where(np.abs(np.diff(contango_regime)) > 0)[0]
-        
-        for idx in regime_changes_idx:
-            if idx < len(slopes):
-                regime_changes.append({
-                    'date': slopes.index[idx],
-                    'type': 'regime_shift',
-                    'slope': slopes.iloc[idx],
-                    'z_score': z_scores.iloc[idx] if idx < len(z_scores) and pd.notna(z_scores.iloc[idx]) else np.nan,
-                    'from_regime': 'Contango' if contango_regime.iloc[idx-1] == 1 else 'Backwardation',
-                    'to_regime': 'Contango' if contango_regime.iloc[idx] == 1 else 'Backwardation'
-                })
-        
-        # Outlier-based detection
-        outliers = np.abs(z_scores) > threshold
-        for idx in outliers.index[outliers]:
-            regime_changes.append({
-                'date': idx,
-                'type': 'outlier',
-                'slope': slopes[idx],
-                'z_score': z_scores[idx],
-                'from_regime': 'Normal',
-                'to_regime': 'Outlier'
-            })
-        
-        regime_df = pd.DataFrame(regime_changes).sort_values('date') if regime_changes else pd.DataFrame()
-        
-        # Filter by minimum regime length
-        if not regime_df.empty and min_regime_length > 1:
-            filtered_changes = []
-            last_change_date = None
-            
-            for _, row in regime_df.iterrows():
-                if last_change_date is None:
-                    filtered_changes.append(row)
-                    last_change_date = row['date']
-                else:
-                    days_diff = (row['date'] - last_change_date).days
-                    if days_diff >= min_regime_length:
-                        filtered_changes.append(row)
-                        last_change_date = row['date']
-            
-            regime_df = pd.DataFrame(filtered_changes) if filtered_changes else pd.DataFrame()
-        
-        # Cache results
-        self._feature_cache[cache_key] = regime_df.copy() if not regime_df.empty else pd.DataFrame()
-        
-        return regime_df
-    
-    def calculate_correlations_matrix(self, features: List[str] = None) -> pd.DataFrame:
-        """
-        Calculate correlation matrix between different curve features over time
-        Uses vectorized operations for efficiency
-        """
-        if features is None:
-            features = ['mean_price', 'overall_slope', 'std_price', 'contango_ratio', 'skewness']
-        
-        cache_key = f'correlations_{hash(tuple(features))}'
-        if cache_key in self._feature_cache:
-            return self._feature_cache[cache_key].copy()
-        
-        base_features = self.calculate_all_features_broadcast()
-        if base_features.empty:
-            return pd.DataFrame()
-        
-        # Select available features
-        available_features = [f for f in features if f in base_features.columns]
-        if not available_features:
-            return pd.DataFrame()
-        
-        # Calculate correlation matrix
-        feature_data = base_features[available_features]
-        corr_matrix = feature_data.corr()
-        
-        # Cache results
-        self._feature_cache[cache_key] = corr_matrix.copy()
-        
-        return corr_matrix
-    
-    def clear_cache(self):
-        """Clear all cached calculations"""
-        self._feature_cache.clear()
-    
-    def resample_curves(self, 
-                       freq: str = 'W-FRI',
-                       method: str = 'last') -> 'CurveEvolution':
-        """
-        Resample curves to different frequency for analysis
-        
-        Parameters:
-        - freq: Pandas frequency string (e.g., 'W-FRI', 'M', 'Q')
-        - method: Resampling method ('last', 'first', 'mean')
-        
-        Returns:
-        - New CurveEvolution instance with resampled data
-        """
-        if self.history.empty:
-            return CurveEvolution()
-        
-        if method == 'last':
-            resampled_history = self.history.resample(freq).last()
-        elif method == 'first':
-            resampled_history = self.history.resample(freq).first()
-        elif method == 'mean':
-            # For 'mean', we need custom logic since we can't average FuturesCurve objects
-            # Use last for now, but could implement curve averaging in future
-            resampled_history = self.history.resample(freq).last()
-        else:
-            raise ValueError(f"Unsupported method: {method}. Use 'last', 'first', or 'mean'")
-        
-        # Remove NaN entries
-        resampled_history = resampled_history.dropna()
-        
-        return CurveEvolution.from_series(resampled_history)
-    
-    def get_date_range_info(self) -> Dict[str, Any]:
-        """Get information about the date range and data coverage"""
-        if self.history.empty:
-            return {'empty': True}
-        
-        non_null_curves = self.history.dropna()
-        
-        info = {
-            'empty': False,
-            'total_dates': len(self.history),
-            'valid_curves': len(non_null_curves),
-            'missing_curves': len(self.history) - len(non_null_curves),
-            'date_range': {
-                'start': self.history.index.min(),
-                'end': self.history.index.max(),
-                'span_days': (self.history.index.max() - self.history.index.min()).days
-            },
-            'frequency_analysis': {
-                'avg_gap_days': np.mean(np.diff(self.history.index.values) / np.timedelta64(1, 'D')) if len(self.history) > 1 else 0,
-                'max_gap_days': np.max(np.diff(self.history.index.values) / np.timedelta64(1, 'D')) if len(self.history) > 1 else 0,
-                'inferred_freq': pd.infer_freq(self.history.index)
-            }
+        return {
+            'shape_features': shape_features,
+            'structural_metrics': structural_changes,
+            'symbol': getattr(self.sf, 'symbol', None),
+            'analysis_date': datetime.now()
         }
-        
-        return info
-    
-    def validate_data_quality(self) -> Dict[str, Any]:
-        """Validate data quality and identify potential issues"""
-        validation = {
-            'valid': True,
-            'warnings': [],
-            'errors': [],
-            'statistics': {}
-        }
-        
-        if self.history.empty:
-            validation['valid'] = False
-            validation['errors'].append("No data available")
-            return validation
-        
-        # Check for missing curves
-        null_count = self.history.isnull().sum()
-        if null_count > 0:
-            pct_missing = (null_count / len(self.history)) * 100
-            validation['warnings'].append(f"{null_count} missing curves ({pct_missing:.1f}%)")
-        
-        # Check curve consistency
-        contract_counts = []
-        price_ranges = []
-        
-        for date, curve in self.history.items():
-            if curve is not None:
-                prices = curve.seq_prices if curve.seq_prices is not None else curve.prices
-                if prices is not None:
-                    contract_counts.append(len(prices))
-                    price_ranges.append(np.max(prices) - np.min(prices) if len(prices) > 1 else 0)
-        
-        if contract_counts:
-            unique_counts = set(contract_counts)
-            if len(unique_counts) > 1:
-                validation['warnings'].append(f"Inconsistent contract counts: {unique_counts}")
-            
-            validation['statistics'] = {
-                'avg_contracts': np.mean(contract_counts),
-                'avg_price_range': np.mean(price_ranges),
-                'std_price_range': np.std(price_ranges)
-            }
-        
-        # Check for data gaps
-        if len(self.history) > 1:
-            date_diffs = np.diff(self.history.index.values)
-            max_gap = np.max(date_diffs) / np.timedelta64(1, 'D')
-            if max_gap > 7:  # More than a week gap
-                validation['warnings'].append(f"Large data gap detected: {max_gap:.1f} days")
-        
-        return validation
-    
-    def get_pipeline_summary(self) -> str:
-        """Get a summary string describing the pipeline state"""
-        if self.history.empty:
-            return "CurveEvolution: Empty (no curves loaded)"
-        
-        info = self.get_date_range_info()
-        validation = self.validate_data_quality()
-        
-        summary_parts = [
-            f"CurveEvolution Summary:",
-            f"  • {info['valid_curves']:,} curves from {info['date_range']['start'].strftime('%Y-%m-%d')} to {info['date_range']['end'].strftime('%Y-%m-%d')}",
-            f"  • {info['date_range']['span_days']:,} days span, ~{info['frequency_analysis']['avg_gap_days']:.1f} day average frequency"
-        ]
-        
-        if validation['warnings']:
-            summary_parts.append(f"  • Warnings: {'; '.join(validation['warnings'])}")
-        
-        if hasattr(self, '_source_spread_data'):
-            summary_parts.append(f"  • Source: SpreadData pipeline")
-        
-        feature_count = len(self.shape_history.columns) if not self.shape_history.empty else 0
-        cache_count = len(self._feature_cache)
-        summary_parts.append(f"  • Features: {feature_count} calculated, {cache_count} cached")
-        
-        return '\n'.join(summary_parts)
-    
-    def __repr__(self) -> str:
-        """Enhanced repr with pipeline information"""
-        return self.get_pipeline_summary()
-
-
-# Factory functions for common pipeline patterns
-def create_curve_evolution_pipeline(spread_data: 'SpreadData', 
-                                   date_range: Optional[Union[slice, pd.DatetimeIndex]] = None,
-                                   resample_freq: Optional[str] = None) -> CurveEvolution:
-    """
-    Factory function to create a complete CurveEvolution pipeline from SpreadData
-    
-    Parameters:
-    - spread_data: Source SpreadData object
-    - date_range: Optional date range filter
-    - resample_freq: Optional resampling frequency ('W-FRI', 'M', etc.)
-    
-    Returns:
-    - Configured CurveEvolution instance
-    
-    Example:
-    >>> evolution = create_curve_evolution_pipeline(spread_data, 
-    ...                                           date_range=slice('2023-01-01', '2023-12-31'),
-    ...                                           resample_freq='W-FRI')
-    """
-    # Create base evolution
-    evolution = CurveEvolution.from_spread_data(spread_data, date_range)
-    
-    # Apply resampling if requested
-    if resample_freq is not None:
-        evolution = evolution.resample_curves(resample_freq)
-    
-    print(f"\n{evolution.get_pipeline_summary()}")
-    
-    return evolution
 
 
 # Additional advanced features based on mathematical insights
@@ -1291,371 +483,6 @@ def calculate_microstructure_features(spread_data: SpreadData) -> Dict[str, floa
     return features
 
 
-
-class SpreadAnalyzer:
-    """
-    Analyzer for SpreadFeatures - handles spreads, seasonality, and advanced features
-    """
-
-    def __init__(self, spread_features: SpreadData):
-        self.sf = spread_features
-        self.levy_areas = None  # Store as numpy array for consistency
-        self.signatures = None  # Store as numpy array for consistency
-        self.seasonal_cache = {}
-
-    def calculate_levy_areas(self, window: int = 20) -> np.ndarray:
-        """Calculate Lévy areas between contract pairs using sequentialized data"""
-        if not hasattr(self.sf, 'seq_data') or self.sf.seq_data is None:
-            return np.array([])
-        
-        # Work with sequentialized data, not raw curve data
-        if (self.sf.seq_data.seq_prices is None or 
-            self.sf.seq_data.seq_prices.data is None or
-            len(self.sf.seq_data.seq_prices.data.shape) != 2):
-            return np.array([])
-            
-        seq_prices = self.sf.seq_data.seq_prices.data
-        n_times, n_contracts = seq_prices.shape
-        
-        # Calculate Lévy areas between adjacent contracts
-        levy_areas = np.full((n_times, n_contracts - 1), np.nan)
-        
-        for contract_pair in range(n_contracts - 1):
-            front_prices = seq_prices[:, contract_pair]
-            back_prices = seq_prices[:, contract_pair + 1]
-            
-            levy_area = self._compute_levy_area(front_prices, back_prices, window)
-            levy_areas[:, contract_pair] = levy_area
-        
-        self.levy_areas = levy_areas
-        return levy_areas
-
-    def _compute_levy_area(self, X: np.ndarray, Y: np.ndarray, window: int) -> np.ndarray:
-        """Compute rolling Lévy area between two time series"""
-        n = len(X)
-        levy_areas = np.full(n, np.nan)
-
-        for i in range(window, n):
-            x_window = X[i-window:i]
-            y_window = Y[i-window:i]
-
-            if np.any(np.isnan(x_window)) or np.any(np.isnan(y_window)):
-                continue
-
-            area = 0.0
-            for j in range(len(x_window) - 1):
-                area += x_window[j] * (y_window[j+1] - y_window[j])
-                area -= y_window[j] * (x_window[j+1] - x_window[j])
-
-            levy_areas[i] = area / 2.0
-
-        return levy_areas
-
-    def calculate_path_signatures(self, depth: int = 2) -> np.ndarray:
-        """Calculate path signatures up to specified depth using sequentialized data"""
-        if not hasattr(self.sf, 'seq_data') or self.sf.seq_data is None:
-            return np.array([])
-        
-        # Work with sequentialized data directly
-        if (self.sf.seq_data.seq_prices is None or 
-            self.sf.seq_data.seq_prices.data is None or
-            len(self.sf.seq_data.seq_prices.data.shape) != 2):
-            return np.array([])
-            
-        seq_prices = self.sf.seq_data.seq_prices.data
-        n_times, n_contracts = seq_prices.shape
-        
-        if n_contracts < 2:
-            return np.array([])
-        
-        # Calculate signatures using numpy operations
-        signatures_list = []
-        
-        # First-order: increments
-        increments = np.diff(seq_prices, axis=0)  # (n_times-1, n_contracts)
-        signatures_list.append(increments)
-        
-        # Second-order: Lévy areas (if already calculated)
-        if self.levy_areas is not None:
-            # Pad to match dimensions if needed
-            levy_padded = np.pad(self.levy_areas, ((1, 0), (0, 0)), mode='constant', constant_values=np.nan)
-            signatures_list.append(levy_padded[:n_times-1])
-        
-        # Third-order: Triple products (if requested and sufficient contracts)
-        if depth >= 3 and n_contracts >= 3:
-            triple_products = increments[:, :-2] * increments[:, 1:-1] * increments[:, 2:]
-            # Pad to maintain consistent shape
-            padded_triple = np.pad(triple_products, ((0, 0), (0, n_contracts-triple_products.shape[1])), 
-                                 mode='constant', constant_values=np.nan)
-            signatures_list.append(padded_triple)
-        
-        # Combine all signature levels
-        if signatures_list:
-            self.signatures = np.concatenate(signatures_list, axis=1)
-        else:
-            self.signatures = np.array([])
-            
-        return self.signatures
-
-    def calculate_seasonal_statistics(self,
-                                     data_type: str = 'spreads',
-                                     groupby: str = 'month',
-                                     rolling_window: Optional[int] = None) -> pd.DataFrame:
-        """
-        Calculate seasonal statistics with optional rolling window
-
-        Parameters:
-        - data_type: 'spreads', 'returns', 'prices', or 'levy_areas'
-        - groupby: 'month', 'week_of_year', 'week_of_month', 'day_of_week'
-        - rolling_window: If specified, calculate rolling seasonal stats
-        """
-        # Select data source - convert to DataFrame for seasonal analysis
-        if data_type == 'spreads':
-            if hasattr(self.sf, 'seq_data') and self.sf.seq_data and self.sf.seq_data.seq_spreads:
-                data = pd.DataFrame(self.sf.seq_data.seq_spreads.data, index=self.sf.seq_data.timestamps)
-            else:
-                return pd.DataFrame()
-        elif data_type == 'returns':
-            # Use sequentialized price data for returns
-            if hasattr(self.sf, 'seq_data') and self.sf.seq_data and self.sf.seq_data.seq_prices:
-                prices_df = pd.DataFrame(self.sf.seq_data.seq_prices.data, index=self.sf.seq_data.timestamps)
-                data = prices_df.pct_change()
-            else:
-                return pd.DataFrame()
-        elif data_type == 'prices':
-            if hasattr(self.sf, 'seq_data') and self.sf.seq_data and self.sf.seq_data.seq_prices:
-                data = pd.DataFrame(self.sf.seq_data.seq_prices.data, index=self.sf.seq_data.timestamps)
-            else:
-                return pd.DataFrame()
-        elif data_type == 'levy_areas':
-            if self.levy_areas is None or self.levy_areas.size == 0:
-                self.calculate_levy_areas()
-            if self.levy_areas is not None and self.levy_areas.size > 0:
-                data = pd.DataFrame(self.levy_areas, index=self.sf.seq_data.timestamps[:len(self.levy_areas)])
-            else:
-                return pd.DataFrame()
-        else:
-            raise ValueError(f"Unknown data_type: {data_type}")
-
-        if data.empty:
-            return pd.DataFrame()
-
-        # Add time grouping columns
-        data = data.copy()
-        data['year'] = data.index.year
-        data['month'] = data.index.month
-        data['week_of_year'] = data.index.isocalendar().week
-        data['day_of_week'] = data.index.dayofweek
-        data['week_of_month'] = (data.index.day - 1) // 7 + 1
-
-        # Select grouping
-        group_cols = {
-            'month': ['month'],
-            'week_of_year': ['week_of_year'],
-            'week_of_month': ['month', 'week_of_month'],
-            'day_of_week': ['day_of_week']
-        }
-
-        if groupby not in group_cols:
-            raise ValueError(f"Unknown groupby: {groupby}")
-
-        group_by_cols = group_cols[groupby]
-
-        # Calculate statistics
-        if rolling_window is None:
-            stats = self._calculate_static_seasonal_stats(data, group_by_cols)
-        else:
-            stats = self._calculate_rolling_seasonal_stats(data, group_by_cols, rolling_window)
-
-        # Cache results
-        cache_key = f"{data_type}_{groupby}_roll{rolling_window}"
-        self.seasonal_cache[cache_key] = stats
-
-        return stats
-
-    def _calculate_static_seasonal_stats(self, data: pd.DataFrame, group_by_cols: List[str]) -> pd.DataFrame:
-        """Calculate static seasonal statistics"""
-        value_cols = [col for col in data.columns
-                     if col not in ['year', 'month', 'week_of_year', 'day_of_week', 'week_of_month']]
-
-        stats_list = []
-
-        for col in value_cols:
-            if data[col].notna().sum() < 10:
-                continue
-
-            grouped = data.groupby(group_by_cols)[col]
-
-            stats_df = pd.DataFrame({
-                f'{col}_mean': grouped.mean(),
-                f'{col}_median': grouped.median(),
-                f'{col}_high': grouped.max(),
-                f'{col}_low': grouped.min(),
-                f'{col}_std': grouped.std(),
-                f'{col}_25pct': grouped.quantile(0.25),
-                f'{col}_75pct': grouped.quantile(0.75),
-                f'{col}_count': grouped.count()
-            })
-
-            stats_list.append(stats_df)
-
-        if stats_list:
-            return pd.concat(stats_list, axis=1)
-        else:
-            return pd.DataFrame()
-
-    def _calculate_rolling_seasonal_stats(self, data: pd.DataFrame,
-                                         group_by_cols: List[str],
-                                         window: int) -> pd.DataFrame:
-        """Calculate rolling seasonal statistics"""
-        rolling_stats = pd.DataFrame(index=data.index)
-
-        value_cols = [col for col in data.columns
-                     if col not in ['year', 'month', 'week_of_year', 'day_of_week', 'week_of_month']]
-
-        for col in value_cols:
-            if data[col].notna().sum() < window:
-                continue
-
-            for idx in data.index[window:]:
-                hist_data = data.loc[:idx].tail(window * 10)
-
-                current_groups = {g: data.loc[idx, g] for g in group_by_cols}
-
-                mask = pd.Series([True] * len(hist_data), index=hist_data.index)
-                for g, v in current_groups.items():
-                    mask &= (hist_data[g] == v)
-
-                seasonal_data = hist_data.loc[mask, col].tail(window)
-
-                if len(seasonal_data) >= min(5, window // 2):
-                    rolling_stats.loc[idx, f'{col}_roll_mean'] = seasonal_data.mean()
-                    rolling_stats.loc[idx, f'{col}_roll_median'] = seasonal_data.median()
-                    rolling_stats.loc[idx, f'{col}_roll_high'] = seasonal_data.max()
-                    rolling_stats.loc[idx, f'{col}_roll_low'] = seasonal_data.min()
-                    rolling_stats.loc[idx, f'{col}_roll_std'] = seasonal_data.std()
-
-                    if seasonal_data.std() > 0:
-                        current_value = data.loc[idx, col]
-                        z_score = (current_value - seasonal_data.mean()) / seasonal_data.std()
-                        rolling_stats.loc[idx, f'{col}_seasonal_zscore'] = z_score
-
-        return rolling_stats
-
-    def calculate_seasonal_strength(self, data_type: str = 'spreads') -> pd.Series:
-        """Calculate strength of seasonality for each series"""
-        # Convert numpy arrays to DataFrame for seasonal analysis
-        if data_type == 'spreads':
-            if hasattr(self.sf, 'seq_data') and self.sf.seq_data and self.sf.seq_data.seq_spreads:
-                data = pd.DataFrame(self.sf.seq_data.seq_spreads.data, index=self.sf.seq_data.timestamps)
-            else:
-                return pd.Series(dtype=float)
-        elif data_type == 'returns':
-            if hasattr(self.sf, 'seq_data') and self.sf.seq_data and self.sf.seq_data.seq_prices:
-                prices_df = pd.DataFrame(self.sf.seq_data.seq_prices.data, index=self.sf.seq_data.timestamps)
-                data = prices_df.pct_change()
-            else:
-                return pd.Series(dtype=float)
-        else:
-            if hasattr(self.sf, 'seq_data') and self.sf.seq_data and self.sf.seq_data.seq_prices:
-                data = pd.DataFrame(self.sf.seq_data.seq_prices.data, index=self.sf.seq_data.timestamps)
-            else:
-                return pd.Series(dtype=float)
-
-        if data.empty:
-            return pd.Series(dtype=float)
-            
-        strength = {}
-
-        for col in data.columns:
-            series = data[col].dropna()
-
-            if len(series) < 252:
-                continue
-
-            # Autocorrelation at seasonal lags
-            seasonal_lags = [21, 63, 126, 252]
-            acf_values = []
-
-            for lag in seasonal_lags:
-                if len(series) > lag:
-                    acf = series.autocorr(lag)
-                    if not np.isnan(acf):
-                        acf_values.append(abs(acf))
-
-            strength[col] = np.mean(acf_values) if acf_values else 0
-
-        return pd.Series(strength)
-
-    def detect_regime_changes(self, threshold: float = 2.0) -> pd.DataFrame:
-        """Detect regime changes using Lévy areas"""
-        if self.levy_areas is None or self.levy_areas.size == 0:
-            self.calculate_levy_areas()
-
-        if self.levy_areas is None or self.levy_areas.size == 0:
-            return pd.DataFrame()
-
-        # Validate required data structures
-        if not hasattr(self.sf, 'seq_data') or self.sf.seq_data is None:
-            raise ValueError("seq_data is required for regime change detection")
-        
-        if self.sf.seq_data.timestamps is None:
-            raise ValueError("timestamps are required for regime change detection")
-
-        # Convert numpy array to DataFrame for regime analysis with proper column names
-        n_contracts = self.levy_areas.shape[1] if len(self.levy_areas.shape) > 1 else 1
-        column_names = [f'levy_pair_{i}' for i in range(n_contracts)]
-        
-        # Ensure we don't exceed available timestamps
-        n_timestamps = min(len(self.levy_areas), len(self.sf.seq_data.timestamps))
-        levy_df = pd.DataFrame(self.levy_areas[:n_timestamps], 
-                              index=self.sf.seq_data.timestamps[:n_timestamps],
-                              columns=column_names)
-        
-        regime_changes = []
-
-        for col in levy_df.columns:
-            levy_series = levy_df[col].dropna()
-
-            if len(levy_series) < 20:
-                continue
-
-            rolling_mean = levy_series.rolling(20).mean()
-            rolling_std = levy_series.rolling(20).std()
-
-            z_scores = (levy_series - rolling_mean) / (rolling_std + 1e-10)
-
-            sign_changes = np.diff(np.sign(levy_series))
-            sign_change_points = np.where(np.abs(sign_changes) > 0)[0]
-
-            outliers = np.abs(z_scores) > threshold
-
-            # Get contract pair name
-            contract_pair = col.replace('levy_', '') if 'levy_' in col else col
-
-            for idx in levy_series.index[outliers]:
-                regime_changes.append({
-                    'date': idx,
-                    'contract_pair': contract_pair,
-                    'levy_area': levy_series[idx],
-                    'z_score': z_scores[idx] if idx in z_scores.index else np.nan,
-                    'type': 'outlier'
-                })
-
-            for point in sign_change_points:
-                if point < len(levy_series):
-                    idx = levy_series.index[point]
-                    regime_changes.append({
-                        'date': idx,
-                        'contract_pair': contract_pair,
-                        'levy_area': levy_series.iloc[point],
-                        'z_score': z_scores.iloc[point] if point < len(z_scores) else np.nan,
-                        'type': 'sign_change'
-                    })
-
-        return pd.DataFrame(regime_changes)
-
-
 # ====================================================================================
 # JIT-COMPILED UTILITY FUNCTIONS
 # ====================================================================================
@@ -1750,12 +577,13 @@ class CurveEvolutionAnalyzer:
     - Integration with SpreadData.get_seq_curves() pipeline
     """
     
-    def __init__(self, 
+    def __init__(self,
                  curves_data: Optional[Union[pd.Series, SpreadData, List[FuturesCurve]]] = None,
-                 symbol: Optional[str] = None):
+                 symbol: Optional[str] = None,
+                 back_month_years: float = 1.0):
         """
         Initialize CurveEvolutionAnalyzer
-        
+
         Parameters:
         -----------
         curves_data : pd.Series, SpreadData, or List[FuturesCurve]
@@ -1765,22 +593,26 @@ class CurveEvolutionAnalyzer:
             - List of FuturesCurve objects
         symbol : str, optional
             Symbol identifier for the curves
+        back_month_years : float, default 1.0
+            Number of years for back month contracts (1.0 = 1 year, 0.5 = 6 months, etc.)
+            Controls which contracts are considered "back-end" in driver analysis
         """
-        
+
         self.symbol = symbol
+        self.back_month_years = back_month_years
         self.spread_data = None  # Reference to original SpreadData for spot data access
         self.curves = self._process_input_data(curves_data)
-        
+
         # Core analysis components
         self.path_signatures = None
         self.regime_analysis = None
         self.seasonal_patterns = None
-        
+
         # Performance caches
         self._cache = {}
         self._log_price_cache = {}
         self._levy_cache = {}
-        
+
         # Analysis parameters
         self.default_window = 63
         self.regime_threshold = 2.0
@@ -1797,52 +629,41 @@ class CurveEvolutionAnalyzer:
     
     def _process_input_data(self, data) -> Optional[pd.Series]:
         """Process different input data types into standardized pd.Series format"""
-        
+
         if data is None:
             return None
-            
+
         elif isinstance(data, pd.Series):
-            # Handle pandas Series (from SpreadData slicing)
-            # Ensure it has a datetime index if possible
-            if not isinstance(data.index, pd.DatetimeIndex):
-                try:
-                    data = data.copy()
-                    data.index = pd.to_datetime(data.index)
-                except Exception:
-                    pass  # Keep original index if conversion fails
+            # pd.Series already in correct format (from SpreadData.get_seq_curves() or slicing)
             return data
-            
+
         elif hasattr(data, 'get_seq_curves'):
-            # SpreadData object - extract curves and store reference
-            try:
-                self.symbol = getattr(data, 'symbol', self.symbol)
-                self.spread_data = data  # Store reference for spot data access
-                return data.get_seq_curves()
-            except Exception as e:
-                raise ValueError(f"Failed to extract curves from SpreadData: {e}")
-                
+            # SpreadData object - extract curves with proper datetime index
+            self.symbol = getattr(data, 'symbol', self.symbol)
+            self.spread_data = data  # Store reference for spot data access
+            return data.get_seq_curves()  # Already returns pd.Series with DatetimeIndex
+
         elif isinstance(data, list):
-            # List of FuturesCurve objects
+            # List of FuturesCurve objects - use existing timestamps/ref_dates
             if not data:
                 return None
-            
+
             # Validate all are FuturesCurve objects
-            if not all(isinstance(curve, FuturesCurve) for curve in data):
+            if not all(hasattr(curve, '__class__') and 'FuturesCurve' in str(curve.__class__) for curve in data):
                 raise TypeError("All list elements must be FuturesCurve objects")
-            
-            # Create datetime index (use curve timestamps if available)
+
+            # Extract existing timestamps from curves
             dates = []
-            for i, curve in enumerate(data):
+            for curve in data:
                 if hasattr(curve, 'timestamp') and curve.timestamp is not None:
                     dates.append(curve.timestamp)
                 elif hasattr(curve, 'ref_date') and curve.ref_date is not None:
                     dates.append(curve.ref_date)
                 else:
-                    # Fallback to sequential dates
-                    dates.append(pd.Timestamp.now() + pd.Timedelta(days=i))
-            
+                    raise ValueError("FuturesCurve objects must have timestamp or ref_date")
+
             return pd.Series(data, index=pd.DatetimeIndex(dates), name='curves')
-            
+
         else:
             raise TypeError(f"Unsupported data type: {type(data)}")
 
@@ -1901,13 +722,14 @@ class CurveEvolutionAnalyzer:
         return front_month_series.dropna()
     
     @classmethod
-    def from_spread_data(cls, 
-                        spread_data: SpreadData, 
+    def from_spread_data(cls,
+                        spread_data: SpreadData,
                         date_range: Optional[Union[slice, pd.DatetimeIndex]] = None,
-                        step: int = 1) -> 'CurveEvolutionAnalyzer':
+                        step: int = 1,
+                        back_month_years: float = 1.0) -> 'CurveEvolutionAnalyzer':
         """
         Factory method to create analyzer from SpreadData
-        
+
         Parameters:
         -----------
         spread_data : SpreadData
@@ -1916,14 +738,16 @@ class CurveEvolutionAnalyzer:
             Date range for analysis
         step : int
             Sampling step for dates
-            
+        back_month_years : float, default 1.0
+            Number of years for back month contracts (1.0 = 1 year, 0.5 = 6 months, etc.)
+
         Returns:
         --------
         CurveEvolutionAnalyzer
         """
-        
+
         curves = spread_data.get_seq_curves(date_range=date_range, step=step)
-        analyzer = cls(curves, symbol=spread_data.symbol)
+        analyzer = cls(curves, symbol=spread_data.symbol, back_month_years=back_month_years)
         analyzer.spread_data = spread_data  # Store reference for spot data access
         return analyzer
 
@@ -2153,7 +977,171 @@ class CurveEvolutionAnalyzer:
         to detect fundamental drivers of curve evolution
         """
         return _calculate_log_levy_areas_numba(log_prices, window)
-    
+
+
+
+
+
+
+    def pca_deseasonalized(
+            self,
+            constant_maturity: bool = False,
+            n_components: int = 3,
+            standardize: bool = True,
+            drop_na: str = "row"  # {"row","col","none"}
+    ) -> Dict[str, Any]:
+        """
+        Run PCA on deseasonalized log-returns across tenors.
+        - Uses monthly deseasonalization in log space (leverages deseasonalize_monthly).
+        - Returns components, loadings, explained variance, and diagnostics.
+        """
+
+        # (A) Build log price matrix (sequential by default; constant maturity if provided)
+        if constant_maturity and getattr(self, "constant_maturity_data", None) is not None:
+            log_prices = np.log(self.constant_maturity_data.values.astype(float))
+            tenor_labels = list(self.constant_maturity_data.columns)
+            dates = self.constant_maturity_data.index
+        else:
+            # Use the helper you already have: log_prices_matrix(deseasonalize=True)
+            log_prices = self.get_log_prices_matrix(deseasonalize=True, cache=True)  # uses deseasonalize_monthly
+            # labels: attempt from the most recent curve
+            last_curve = self.spread_data.seq_prices.dropna().iloc[-1]
+            tenor_labels = (
+                list(self.spread_data.seq_labels.iloc[-1])
+                if hasattr(last_curve, "seq_labels") and isinstance(last_curve.seq_labels,
+                                                                    dict) and "labels" in last_curve.seq_labels
+                else [f"M{i + 1}" for i in range(log_prices.shape[1])]
+            )
+            dates = self.spread_data.index
+
+        # (B) Time-difference to returns (Δlog)
+        ret = np.diff(log_prices, axis=0)
+        ret_dates = dates[1:]
+
+        # (C) NA handling
+        R = pd.DataFrame(ret, index=ret_dates, columns=tenor_labels)
+        if drop_na == "row":
+            R = R.dropna(axis=0, how="any")
+        elif drop_na == "col":
+            R = R.dropna(axis=1, how="any")
+        else:
+            R = R.fillna(0.0)
+        if R.empty:
+            raise ValueError("No valid returns after NA handling")
+
+        # (D) Column standardization (optional)
+        X = R.values.copy()
+        mu = X.mean(axis=0, keepdims=True)
+        X -= mu
+        if standardize:
+            std = X.std(axis=0, ddof=1, keepdims=True)
+            std[std == 0] = 1.0
+            X /= std
+
+        # (E) PCA via SVD on T x N (time x tenor)
+        U, S, Vt = svd(X, full_matrices=False)
+        # Variance explained
+        sing2 = S ** 2
+        evr = sing2 / sing2.sum()
+        k = min(n_components, Vt.shape[0])
+
+        loadings = Vt[:k, :]  # k x N  (tenor loadings)
+        scores = U[:, :k] * S[:k]  # T x k  (time series of factors)
+
+        out = {
+            "dates": R.index,
+            "tenors": list(R.columns),
+            "loadings": pd.DataFrame(loadings, index=[f"PC{i + 1}" for i in range(k)], columns=R.columns),
+            "scores": pd.DataFrame(scores, index=R.index, columns=[f"PC{i + 1}" for i in range(k)]),
+            "explained_variance_ratio": pd.Series(evr[:k], index=[f"PC{i + 1}" for i in range(k)]),
+            "mean_by_tenor": pd.Series(mu.ravel(), index=R.columns),
+            "std_by_tenor": pd.Series((std if standardize else np.ones_like(mu)).ravel(), index=R.columns),
+            "config": {
+                "constant_maturity": constant_maturity,
+                "standardize": standardize,
+                "deseasonalized": True,
+                "drop_na": drop_na
+            }
+        }
+        return out
+
+    # ---- 2) Cash & Carry / Convenience Yield sheet ----
+    def carry_sheet(
+            self,
+            spot: Optional[pd.Series] = None,  # optional true spot; if None, uses front future as proxy
+            rate: Optional[pd.Series] = None,  # risk-free annualized (e.g., SOFR), daily freq
+            storage_annual: float = 0.0,  # simple flat storage assumption; can be a Series if you prefer
+            use_calendar_next: bool = True  # use F1 and F2 for roll stats
+    ) -> pd.DataFrame:
+        """
+        Build daily carry metrics:
+        - implied_carry_tau: (ln F(T) - ln S) / tau
+        - implied_convenience = r + storage_annual - implied_carry_tau
+        - roll_yield_annualized: ((F2/F1)-1) * 365/days_between
+        """
+        # Extract F1 (and F2 if available)
+        F1, F2, T1, T2, idx = [], [], [], [], []
+        for dt, curve in self.history.items():
+            if curve is None or not hasattr(curve, "prices") or curve.prices is None or len(curve.prices) == 0:
+                continue
+            f1 = float(curve.prices[0]) if not np.isnan(curve.prices[0]) else np.nan
+            f2 = float(curve.prices[1]) if (len(curve.prices) > 1 and not np.isnan(curve.prices[1])) else np.nan
+            # days to expiry if available
+            dte = getattr(curve, "days_to_expiry", None)
+            t1 = float(dte[0]) if (dte is not None and len(dte) > 0 and not np.isnan(dte[0])) else np.nan
+            t2 = float(dte[1]) if (dte is not None and len(dte) > 1 and not np.isnan(dte[1])) else np.nan
+            F1.append(f1);
+            F2.append(f2);
+            T1.append(t1);
+            T2.append(t2);
+            idx.append(dt)
+        df = pd.DataFrame({"F1": F1, "F2": F2, "DTE1": T1, "DTE2": T2}, index=pd.DatetimeIndex(idx)).sort_index()
+
+        # Spot proxy if not provided
+        if spot is None:
+            S = df["F1"].copy()
+        else:
+            S = spot.reindex(df.index).ffill()
+
+        # Rate alignment (annualized, continuously compounded or simple; we’ll treat as simple annual)
+        r = (rate.reindex(df.index).ffill() if isinstance(rate, pd.Series) else pd.Series(0.0, index=df.index))
+
+        # Storage: allow scalar or Series
+        if isinstance(storage_annual, pd.Series):
+            stor = storage_annual.reindex(df.index).ffill()
+        else:
+            stor = pd.Series(storage_annual, index=df.index)
+
+        # Implied carry to a chosen back tenor: prefer F2, else F1 (if you want longer tenors, swap here)
+        target = "F2" if use_calendar_next and df["F2"].notna().any() else "F1"
+        tau_days = np.where(target == "F2", df["DTE2"].values, df["DTE1"].values)
+        tau = pd.Series(np.maximum(tau_days, 1.0), index=df.index) / 365.0  # years, avoid zero
+
+        # Core carry metrics
+        with np.errstate(invalid="ignore", divide="ignore"):
+            implied_carry = (np.log(df[target]) - np.log(S)) / tau  # (r + s - c)
+        implied_convenience = r + stor - implied_carry  # c = r + s - implied
+        df_out = pd.DataFrame({
+            "spot_used": S,
+            "forward_used": df[target],
+            "tau_years": tau,
+            "rate": r,
+            "storage_annual": stor,
+            "implied_carry": implied_carry,
+            "implied_convenience": implied_convenience
+        }, index=df.index)
+
+        # Roll yield (front→next), annualized
+        valid_gap_days = (df["DTE2"] - df["DTE1"]).where((df["DTE2"] > 0) & (df["DTE1"] > 0)).fillna(30.0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            roll_yield_ann = ((df["F2"] / df["F1"]) - 1.0) * (365.0 / valid_gap_days)
+        df_out["roll_yield_annualized"] = roll_yield_ann  # same as your feature, formalized
+
+        # Simple cash-and-carry edge (ignoring fees) → positive suggests carry > (r+storage)
+        df_out["carry_edge_no_fees"] = implied_carry - (r + stor)
+
+        return df_out
+
     def calculate_path_signatures(self,
                                 window: int = None,
                                 max_signature_level: int = 2,
@@ -2296,33 +1284,43 @@ class CurveEvolutionAnalyzer:
     def _detect_curve_drivers(self, log_levy_areas: np.ndarray) -> Dict[str, np.ndarray]:
         """
         Detect essential drivers of curve evolution from log Lévy areas
-        
+
         Focuses on 4 core drivers:
         1. Front-end changes (near-term contract dynamics)
-        2. Back-end changes (long-term contract dynamics) 
+        2. Back-end changes (long-term contract dynamics)
         3. Seasonal deviations (deviations from typical seasonal patterns)
         4. Momentum (rate of change in curve evolution)
+
+        Parameters:
+        -----------
+        log_levy_areas : np.ndarray
+            Log Lévy areas for analysis
         """
         
         drivers = {}
-        
+
         if log_levy_areas.size == 0:
             return drivers
-        
+
         n_contracts = log_levy_areas.shape[1] + 1
-        
+
+        # Calculate target days for back months based on instance parameter
+        target_back_days = self.back_month_years * 365
+
+        # Determine split point based on DTE if available, otherwise use midpoint fallback
+        back_split_index = self._determine_back_month_split(target_back_days, n_contracts)
+
         # 1. Front-End Driver - changes in near-term contracts
-        if n_contracts >= 4:
-            midpoint = n_contracts // 2
-            front_end_levy = np.nanmean(log_levy_areas[:, :midpoint-1], axis=1)
+        if back_split_index > 0:
+            front_end_levy = np.nanmean(log_levy_areas[:, :back_split_index], axis=1)
             drivers['front_end_changes'] = front_end_levy
         else:
             # Fallback for limited contracts
             drivers['front_end_changes'] = np.nanmean(log_levy_areas[:, :1], axis=1)
-        
+
         # 2. Back-End Driver - changes in long-term contracts
-        if n_contracts >= 4:
-            back_end_levy = np.nanmean(log_levy_areas[:, midpoint-1:], axis=1)
+        if back_split_index < n_contracts - 1:
+            back_end_levy = np.nanmean(log_levy_areas[:, back_split_index:], axis=1)
             drivers['back_end_changes'] = back_end_levy
         else:
             # Fallback for limited contracts
@@ -2345,7 +1343,75 @@ class CurveEvolutionAnalyzer:
         drivers['momentum'] = momentum_driver
         
         return drivers
-    
+
+    def _determine_back_month_split(self, target_back_days: float, n_contracts: int) -> int:
+        """
+        Determine the split index between front-end and back-end contracts.
+
+        Parameters:
+        -----------
+        target_back_days : float
+            Target days to expiry for back month contracts
+        n_contracts : int
+            Total number of contracts
+
+        Returns:
+        --------
+        int
+            Index where back-end contracts start (0-based)
+        """
+
+        # Try to use DTE data if available
+        if hasattr(self, 'curves') and self.curves is not None and len(self.curves) > 0:
+            # Use a representative curve to determine split
+            sample_curves = []
+
+            # Handle different curve data types (self.curves should be pd.Series)
+            if isinstance(self.curves, pd.Series):
+                # pd.Series case - iterate over values
+                curve_iterator = self.curves.values
+            else:
+                # Direct iterator for other types (fallback)
+                curve_iterator = self.curves
+
+            for curve in curve_iterator:
+                if curve is not None and hasattr(curve, 'days_to_expiry') and curve.days_to_expiry is not None:
+                    sample_curves.append(curve)
+                if len(sample_curves) >= 5:  # Use up to 5 sample curves
+                    break
+
+            if sample_curves:
+                # Calculate average split index across sample curves
+                split_indices = []
+                for curve in sample_curves:
+                    try:
+                        dte_array = np.array(curve.days_to_expiry)
+                        # Find first contract that meets or exceeds target days
+                        valid_dte = dte_array[~np.isnan(dte_array)]
+                        if len(valid_dte) > 0:
+                            back_mask = valid_dte >= target_back_days
+                            if np.any(back_mask):
+                                split_idx = np.argmax(back_mask)
+                                split_indices.append(split_idx)
+                    except (AttributeError, ValueError):
+                        continue
+
+                if split_indices:
+                    # Use median split index to be robust to outliers
+                    avg_split = int(np.median(split_indices))
+                    # Ensure reasonable bounds
+                    return max(1, min(avg_split, n_contracts - 2))
+
+        # Fallback: use contract position-based logic
+        if n_contracts >= 4:
+            # For monthly contracts, approximate DTE conversion
+            # Assume ~30 days between contracts
+            target_contract_position = max(1, int(target_back_days / 30))
+            return min(target_contract_position, n_contracts - 2)
+        else:
+            # For very limited contracts, use simple midpoint
+            return max(1, n_contracts // 2)
+
     def _calculate_3m_12m_spread_driver(self) -> np.ndarray:
         """
         Calculate 3m-12m spread driver using actual contract expirations
@@ -2680,6 +1746,11 @@ class CurveEvolutionAnalyzer:
             - Identified curve drivers
             - Regime change analysis
             - Driver importance rankings
+
+        Notes:
+        ------
+        Back-end contract definition is controlled by the `back_month_years` parameter
+        set during analyzer initialization (default 1.0 year).
         """
 
         if window is None:
@@ -4454,14 +3525,15 @@ class CurveEvolutionAnalyzer:
         
         return fig
     
-    def create_3d_surface_plot(self, 
+    def create_3d_surface_plot(self,
                               data_type: str = 'spread',
                               title: Optional[str] = None,
                               colorscale: str = 'RdYlBu',
-                              height: int = 800) -> go.Figure:
+                              height: int = 800,
+                              constant_maturity: bool = False) -> go.Figure:
         """
-        Create 3D surface plot with date (x), days-to-expiry (y), and spread/price (z)
-        
+        Create 3D surface plot with date (x), days-to-expiry/tenor (y), and spread/price (z)
+
         Parameters:
         -----------
         data_type : str
@@ -4472,7 +3544,9 @@ class CurveEvolutionAnalyzer:
             Plotly colorscale name
         height : int
             Plot height in pixels
-            
+        constant_maturity : bool, default False
+            Use constant maturity data instead of sequential contracts
+
         Returns:
         --------
         plotly.graph_objects.Figure
@@ -4481,8 +3555,16 @@ class CurveEvolutionAnalyzer:
         
         if self.curves is None or len(self.curves) == 0:
             raise ValueError("No curve data available for 3D surface plot")
-        
-        # Extract data matrices
+
+        # Setup constant maturity if requested
+        if constant_maturity:
+            if self.constant_maturity_data is None:
+                success = self.setup_constant_maturity()
+                if not success:
+                    raise ValueError("Constant maturity setup failed and no existing data available")
+            return self._create_constant_maturity_surface_plot(data_type, title, colorscale, height)
+
+        # Extract data matrices for sequential contracts
         dates = []
         dte_matrix = []
         data_matrix = []
@@ -4565,11 +3647,22 @@ class CurveEvolutionAnalyzer:
                     dte_matrix[i, :n_current] = dte_data[:n_current]
             else:
                 raise ValueError(f"Unsupported data_type: {data_type}")
-        
+
         # Create date arrays for surface plot
         dates_array = np.array(dates)
-        dates_numeric = np.array([d.timestamp() for d in dates_array])
-        
+
+        # Convert to numeric timestamps (handle both pandas Timestamp and numpy datetime64)
+        dates_numeric = []
+        for d in dates_array:
+            if hasattr(d, 'timestamp'):
+                # pandas Timestamp
+                dates_numeric.append(d.timestamp())
+            else:
+                # numpy datetime64 - convert to pandas first
+                pd_date = pd.Timestamp(d)
+                dates_numeric.append(pd_date.timestamp())
+        dates_numeric = np.array(dates_numeric)
+
         # Create meshgrid for surface
         # For surface plots, we need consistent DTE values across all dates
         # Use the median DTE values as the Y-axis
@@ -4647,18 +3740,221 @@ class CurveEvolutionAnalyzer:
             ),
             showlegend=True
         )
-        
+
         # Convert X axis labels to dates for better readability
+        step = max(1, len(dates_array)//10)
+        sample_dates = dates_array[::step]
+
+        # Handle both pandas Timestamp and numpy datetime64 for strftime
+        date_labels = []
+        for d in sample_dates:
+            if hasattr(d, 'strftime'):
+                # pandas Timestamp
+                date_labels.append(d.strftime('%Y-%m-%d'))
+            else:
+                # numpy datetime64 - convert to pandas first
+                pd_date = pd.Timestamp(d)
+                date_labels.append(pd_date.strftime('%Y-%m-%d'))
+
         fig.update_scenes(
             xaxis=dict(
                 tickmode='array',
-                tickvals=dates_numeric[::max(1, len(dates_numeric)//10)],  # Show ~10 tick marks
-                ticktext=[d.strftime('%Y-%m-%d') for d in dates_array[::max(1, len(dates_array)//10)]]
+                tickvals=dates_numeric[::step],  # Show ~10 tick marks
+                ticktext=date_labels
             )
         )
-        
+
         return fig
-    
+
+    def _create_constant_maturity_surface_plot(self,
+                                              data_type: str,
+                                              title: Optional[str],
+                                              colorscale: str,
+                                              height: int) -> go.Figure:
+        """
+        Create 3D surface plot using constant maturity data
+
+        Parameters:
+        -----------
+        data_type : str
+            Type of data to plot: 'spread', 'price', or 'log_price'
+        title : str, optional
+            Custom plot title
+        colorscale : str
+            Plotly colorscale name
+        height : int
+            Plot height in pixels
+
+        Returns:
+        --------
+        plotly.graph_objects.Figure
+            3D surface plot with constant maturity data
+        """
+
+        if self.constant_maturity_data is None:
+            raise ValueError("Constant maturity data not available")
+
+        cm_data = self.constant_maturity_data
+        dates = cm_data.index
+        tenor_columns = cm_data.columns
+
+        # Convert tenor labels to numeric values (years)
+        tenor_values = []
+        for col in tenor_columns:
+            if isinstance(col, str):
+                if col.endswith('M'):
+                    # Monthly tenors (e.g., '1M', '3M', '12M')
+                    months = float(col[:-1])
+                    tenor_values.append(months / 12.0)  # Convert to years
+                elif col.endswith('Y'):
+                    # Yearly tenors (e.g., '1Y', '2Y')
+                    years = float(col[:-1])
+                    tenor_values.append(years)
+                else:
+                    try:
+                        # Numeric tenor (assume years)
+                        tenor_values.append(float(col))
+                    except:
+                        tenor_values.append(len(tenor_values) * 0.25)  # 3-month increments as fallback
+            else:
+                # Numeric tenor (assume years)
+                tenor_values.append(float(col))
+
+        tenor_values = np.array(tenor_values)
+
+        # Prepare data matrices
+        if data_type == 'spread':
+            # Calculate spreads vs front month (shortest tenor)
+            if len(tenor_columns) < 2:
+                raise ValueError("Need at least 2 tenors to calculate spreads")
+
+            # Get front month data (shortest tenor)
+            front_month_data = cm_data.iloc[:, 0].values  # First column (shortest tenor)
+
+            # Calculate spreads vs front month for all other tenors
+            spread_data = cm_data.iloc[:, 1:].values - front_month_data[:, np.newaxis]
+            spread_tenors = tenor_values[1:]  # Exclude front month tenor
+            tenor_days = spread_tenors * 365  # Convert to days for consistency
+
+            Z = spread_data
+            Y_values = tenor_days
+
+        elif data_type == 'price':
+            Z = cm_data.values
+            Y_values = tenor_values * 365  # Convert years to days
+
+        elif data_type == 'log_price':
+            # Handle potential negative or zero values
+            positive_mask = cm_data.values > 0
+            log_data = np.full_like(cm_data.values, np.nan)
+            log_data[positive_mask] = np.log(cm_data.values[positive_mask])
+
+            Z = log_data
+            Y_values = tenor_values * 365  # Convert years to days
+
+        else:
+            raise ValueError(f"Unsupported data_type: {data_type}")
+
+        # Create date arrays for surface plot
+        dates_array = np.array(dates)
+
+        # Convert to numeric timestamps (handle both pandas Timestamp and numpy datetime64)
+        dates_numeric = []
+        for d in dates_array:
+            if hasattr(d, 'timestamp'):
+                # pandas Timestamp
+                dates_numeric.append(d.timestamp())
+            else:
+                # numpy datetime64 - convert to pandas first
+                pd_date = pd.Timestamp(d)
+                dates_numeric.append(pd_date.timestamp())
+        dates_numeric = np.array(dates_numeric)
+
+        # Create meshgrid
+        X, Y = np.meshgrid(dates_numeric, Y_values, indexing='ij')
+
+        # Create surface plot
+        fig = go.Figure()
+
+        fig.add_trace(
+            go.Surface(
+                x=X,
+                y=Y,
+                z=Z,
+                colorscale=colorscale,
+                name=f'{data_type.title()} Surface',
+                hovertemplate='Date: %{x|%Y-%m-%d}<br>Tenor: %{y:.0f} days<br>' +
+                             f'{data_type.title()}: %{{z:.3f}}<extra></extra>',
+                showscale=True,
+                opacity=0.8
+            )
+        )
+
+        # Add contour projection
+        fig.add_trace(
+            go.Contour(
+                x=dates_numeric,
+                y=Y_values,
+                z=Z.T,  # Transpose for contour
+                colorscale=colorscale,
+                showscale=False,
+                opacity=0.3,
+                contours=dict(
+                    showlines=True,
+                    coloring='lines'
+                ),
+                name='Contour Projection',
+                hovertemplate='Date: %{x|%Y-%m-%d}<br>Tenor: %{y:.0f} days<br>' +
+                             f'{data_type.title()}: %{{z:.3f}}<extra></extra>'
+            )
+        )
+
+        # Configure layout
+        data_label = {
+            'spread': 'Spread',
+            'price': 'Price',
+            'log_price': 'Log Price'
+        }[data_type]
+
+        plot_title = title or f'3D {data_label} Surface (Constant Maturity) - {getattr(self, "symbol", "Unknown")}'
+
+        fig.update_layout(
+            title=plot_title,
+            height=height,
+            scene=dict(
+                xaxis_title='Date',
+                yaxis_title='Tenor (Days)',
+                zaxis_title=data_label,
+                camera=dict(eye=dict(x=1.2, y=1.2, z=0.8))
+            ),
+            margin=dict(l=0, r=0, b=0, t=40)
+        )
+
+        # Convert X axis labels to dates for better readability
+        step = max(1, len(dates_array)//10)
+        sample_dates = dates_array[::step]
+
+        # Handle both pandas Timestamp and numpy datetime64 for strftime
+        date_labels = []
+        for d in sample_dates:
+            if hasattr(d, 'strftime'):
+                # pandas Timestamp
+                date_labels.append(d.strftime('%Y-%m-%d'))
+            else:
+                # numpy datetime64 - convert to pandas first
+                pd_date = pd.Timestamp(d)
+                date_labels.append(pd_date.strftime('%Y-%m-%d'))
+
+        fig.update_scenes(
+            xaxis=dict(
+                tickmode='array',
+                tickvals=dates_numeric[::step],  # Show ~10 tick marks
+                ticktext=date_labels
+            )
+        )
+
+        return fig
+
     def get_curve_slopes_broadcast(self) -> pd.DataFrame:
         """
         Broadcasted method to collect slopes from all FuturesCurves in the array
@@ -4845,5 +4141,185 @@ class CurveEvolutionAnalyzer:
         slopes_df = slopes_df.sort_index()
         
         return slopes_df
+
+    # ==================================================================================
+    # SEASONAL ANALYSIS METHODS (Migrated from SpreadAnalyzer)
+    # ==================================================================================
+
+    def calculate_seasonal_statistics_advanced(self,
+                                     data_type: str = 'spreads',
+                                     groupby: str = 'month',
+                                     rolling_window: Optional[int] = None) -> pd.DataFrame:
+        """
+        Calculate seasonal statistics with optional rolling window
+        (Migrated from SpreadAnalyzer for comprehensive seasonal analysis)
+
+        Parameters:
+        - data_type: 'spreads', 'returns', 'prices', or 'levy_areas'
+        - groupby: 'month', 'week_of_year', 'week_of_month', 'day_of_week'
+        - rolling_window: If specified, calculate rolling seasonal stats
+        """
+        # Use direct DataFrame access (simplified from original seq_data patterns)
+        if data_type == 'spreads':
+            if hasattr(self.spread_data, 'seq_spreads') and self.spread_data.seq_spreads is not None:
+                data = self.spread_data.seq_spreads
+            else:
+                return pd.DataFrame()
+        elif data_type == 'returns':
+            if hasattr(self.spread_data, 'seq_prices') and self.spread_data.seq_prices is not None:
+                data = self.spread_data.seq_prices.pct_change()
+            else:
+                return pd.DataFrame()
+        elif data_type == 'prices':
+            if hasattr(self.spread_data, 'seq_prices') and self.spread_data.seq_prices is not None:
+                data = self.spread_data.seq_prices
+            else:
+                return pd.DataFrame()
+        else:
+            raise ValueError(f"Unknown data_type: {data_type}")
+
+        if data.empty:
+            return pd.DataFrame()
+
+        # Add time grouping columns
+        data = data.copy()
+        data['year'] = data.index.year
+        data['month'] = data.index.month
+        data['week_of_year'] = data.index.isocalendar().week
+        data['day_of_week'] = data.index.dayofweek
+        data['week_of_month'] = (data.index.day - 1) // 7 + 1
+
+        # Select grouping
+        group_cols = {
+            'month': ['month'],
+            'week_of_year': ['week_of_year'],
+            'week_of_month': ['month', 'week_of_month'],
+            'day_of_week': ['day_of_week']
+        }
+
+        if groupby not in group_cols:
+            raise ValueError(f"Unknown groupby: {groupby}")
+
+        group_by_cols = group_cols[groupby]
+
+        # Calculate statistics
+        if rolling_window is None:
+            stats = self._calculate_static_seasonal_stats_advanced(data, group_by_cols)
+        else:
+            stats = self._calculate_rolling_seasonal_stats_advanced(data, group_by_cols, rolling_window)
+
+        return stats
+
+    def _calculate_static_seasonal_stats_advanced(self, data: pd.DataFrame, group_by_cols: List[str]) -> pd.DataFrame:
+        """Calculate static seasonal statistics"""
+        value_cols = [col for col in data.columns
+                     if col not in ['year', 'month', 'week_of_year', 'day_of_week', 'week_of_month']]
+
+        stats_list = []
+
+        for col in value_cols:
+            if data[col].notna().sum() < 10:
+                continue
+
+            grouped = data.groupby(group_by_cols)[col]
+
+            stats_df = pd.DataFrame({
+                f'{col}_mean': grouped.mean(),
+                f'{col}_median': grouped.median(),
+                f'{col}_high': grouped.max(),
+                f'{col}_low': grouped.min(),
+                f'{col}_std': grouped.std(),
+                f'{col}_25pct': grouped.quantile(0.25),
+                f'{col}_75pct': grouped.quantile(0.75),
+                f'{col}_count': grouped.count()
+            })
+
+            stats_list.append(stats_df)
+
+        if stats_list:
+            return pd.concat(stats_list, axis=1)
+        else:
+            return pd.DataFrame()
+
+    def _calculate_rolling_seasonal_stats_advanced(self, data: pd.DataFrame,
+                                         group_by_cols: List[str],
+                                         window: int) -> pd.DataFrame:
+        """Calculate rolling seasonal statistics"""
+        rolling_stats = pd.DataFrame(index=data.index)
+
+        value_cols = [col for col in data.columns
+                     if col not in ['year', 'month', 'week_of_year', 'day_of_week', 'week_of_month']]
+
+        for col in value_cols:
+            if data[col].notna().sum() < window:
+                continue
+
+            for idx in data.index[window:]:
+                hist_data = data.loc[:idx].tail(window * 10)
+
+                current_groups = {g: data.loc[idx, g] for g in group_by_cols}
+
+                mask = pd.Series([True] * len(hist_data), index=hist_data.index)
+                for g, v in current_groups.items():
+                    mask &= (hist_data[g] == v)
+
+                seasonal_data = hist_data.loc[mask, col].tail(window)
+
+                if len(seasonal_data) >= min(5, window // 2):
+                    rolling_stats.loc[idx, f'{col}_roll_mean'] = seasonal_data.mean()
+                    rolling_stats.loc[idx, f'{col}_roll_median'] = seasonal_data.median()
+                    rolling_stats.loc[idx, f'{col}_roll_high'] = seasonal_data.max()
+                    rolling_stats.loc[idx, f'{col}_roll_low'] = seasonal_data.min()
+                    rolling_stats.loc[idx, f'{col}_roll_std'] = seasonal_data.std()
+
+                    if seasonal_data.std() > 0:
+                        current_value = data.loc[idx, col]
+                        z_score = (current_value - seasonal_data.mean()) / seasonal_data.std()
+                        rolling_stats.loc[idx, f'{col}_seasonal_zscore'] = z_score
+
+        return rolling_stats
+
+    def calculate_seasonal_strength_advanced(self, data_type: str = 'spreads') -> pd.Series:
+        """Calculate strength of seasonality for each series (migrated from SpreadAnalyzer)"""
+        if data_type == 'spreads':
+            if hasattr(self.spread_data, 'seq_spreads') and self.spread_data.seq_spreads is not None:
+                data = self.spread_data.seq_spreads
+            else:
+                return pd.Series(dtype=float)
+        elif data_type == 'returns':
+            if hasattr(self.spread_data, 'seq_prices') and self.spread_data.seq_prices is not None:
+                data = self.spread_data.seq_prices.pct_change()
+            else:
+                return pd.Series(dtype=float)
+        else:
+            if hasattr(self.spread_data, 'seq_prices') and self.spread_data.seq_prices is not None:
+                data = self.spread_data.seq_prices
+            else:
+                return pd.Series(dtype=float)
+
+        if data.empty:
+            return pd.Series(dtype=float)
+
+        strength = {}
+
+        for col in data.columns:
+            series = data[col].dropna()
+
+            if len(series) < 252:
+                continue
+
+            # Autocorrelation at seasonal lags
+            seasonal_lags = [21, 63, 126, 252]
+            acf_values = []
+
+            for lag in seasonal_lags:
+                if len(series) > lag:
+                    acf = series.autocorr(lag)
+                    if not np.isnan(acf):
+                        acf_values.append(abs(acf))
+
+            strength[col] = np.mean(acf_values) if acf_values else 0
+
+        return pd.Series(strength)
 
 

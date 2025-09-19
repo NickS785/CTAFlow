@@ -393,23 +393,18 @@ class DLYContractManager:
             self.compute_front()
 
         if max_buckets is None:
-            # Increase default to accommodate longer curves (700+ DTE for CL/NG)
-            # Use the actual number of available contracts, up to a reasonable maximum
+            # Use reasonable default for futures curve depth (4 years × 12 months = 48)
+            # Cap at 48 to prevent excessive column creation from long-dated contracts
             available_contracts = self.curve.shape[1] if self.curve is not None else 48
-            max_buckets = min(available_contracts, 120)  # Allow up to 120 sequential contracts
+            max_buckets = min(available_contracts, 48)  # Cap at 48 sequential contracts for reasonable curve depth
 
-        # Allow recently expired contracts (within 30 days) to maintain rolling structure
-        # This prevents the curve from tapering off as contracts expire
-        valid_dte = self.dte.where(self.dte >= -30)
-        dte_arr = valid_dte.values
+        # Improved DTE filtering: For M0, only use active contracts (DTE > 0)
+        # For other positions, allow recently expired for continuity
+        dte_arr = self.dte.values
         px_arr = self.curve.values
         vol_arr = self.curve_volume.values if self.curve_volume is not None else None
         oi_arr = self.curve_oi.values if self.curve_oi is not None else None
         cols = self.curve.columns.to_numpy()
-
-        sort_keys = np.where(np.isnan(dte_arr), np.inf, dte_arr)
-        order = np.argsort(sort_keys, axis=1)
-        valid_counts = np.sum(~np.isnan(dte_arr), axis=1)
 
         rows = dte_arr.shape[0]
         max_buckets = min(max_buckets, dte_arr.shape[1])
@@ -420,17 +415,51 @@ class DLYContractManager:
         seq_vol = np.full((rows, max_buckets), np.nan) if vol_arr is not None else None
         seq_oi_arr = np.full((rows, max_buckets), np.nan) if oi_arr is not None else None
 
-        for i in range(max_buckets):
-            mask = valid_counts > i
-            r_idx = np.where(mask)[0]
-            c_idx = order[r_idx, i]
-            seq_px[r_idx, i] = px_arr[r_idx, c_idx]
-            seq_lb[r_idx, i] = cols[c_idx]
-            seq_te[r_idx, i] = dte_arr[r_idx, c_idx]
-            if seq_vol is not None:
-                seq_vol[r_idx, i] = vol_arr[r_idx, c_idx]
-            if seq_oi_arr is not None:
-                seq_oi_arr[r_idx, i] = oi_arr[r_idx, c_idx]
+        # Process each row (date) individually for better control
+        for row_idx in range(rows):
+            row_dte = dte_arr[row_idx, :]
+            row_px = px_arr[row_idx, :]
+
+            # Find valid contracts for this date
+            # M0: Only active contracts (DTE > 0)
+            # M1+: Recently expired allowed (DTE >= -30)
+            valid_mask = ~np.isnan(row_dte) & ~np.isnan(row_px)
+
+            if np.any(valid_mask):
+                valid_dte = row_dte[valid_mask]
+                valid_px = row_px[valid_mask]
+                valid_cols = cols[valid_mask]
+
+                # Sort by DTE (ascending)
+                sort_order = np.argsort(valid_dte)
+                sorted_dte = valid_dte[sort_order]
+                sorted_px = valid_px[sort_order]
+                sorted_cols = valid_cols[sort_order]
+
+                # Assign to sequential positions with DTE constraints
+                seq_pos = 0
+                for i in range(len(sorted_dte)):
+                    dte_val = sorted_dte[i]
+
+                    # M0: Only active contracts
+                    if seq_pos == 0 and dte_val <= 0:
+                        continue
+
+                    # M1+: Allow recently expired
+                    if seq_pos > 0 and dte_val < -30:
+                        continue
+
+                    if seq_pos < max_buckets:
+                        seq_px[row_idx, seq_pos] = sorted_px[i]
+                        seq_lb[row_idx, seq_pos] = sorted_cols[i]
+                        seq_te[row_idx, seq_pos] = sorted_dte[i]
+                        if seq_vol is not None and vol_arr is not None:
+                            valid_vol = vol_arr[row_idx, :][valid_mask][sort_order]
+                            seq_vol[row_idx, seq_pos] = valid_vol[i]
+                        if seq_oi_arr is not None and oi_arr is not None:
+                            valid_oi = oi_arr[row_idx, :][valid_mask][sort_order]
+                            seq_oi_arr[row_idx, seq_pos] = valid_oi[i]
+                        seq_pos += 1
 
         time_cols = [f"M{i}" for i in range(max_buckets)]
         self.seq_prices = pd.DataFrame(seq_px, index=self.curve.index, columns=time_cols)
