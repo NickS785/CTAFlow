@@ -34,12 +34,22 @@ __email__ = "research@example.com"
 
 # Import main classes for easy access
 try:
+    # Core forecasting classes
     from .forecaster.forecast import CTAForecast, CTALinear, CTALight, CTAXGBoost, CTARForest
+
+    # Primary data processing classes
+    from .data.simple_processor import SimpleDataProcessor
     from .data.data_client import DataClient
+
+    # Feature processing classes
     from .features.feature_engineering import IntradayFeatures
-    from .features.curve_analysis import CurveShapeAnalyzer, CurveEvolution
+    from .features.curve_analysis import CurveShapeAnalyzer, CurveEvolutionAnalyzer
     from .features.signals_processing import COTAnalyzer, TechnicalAnalysis
+
+    # Data container classes
     from .data.contract_handling.curve_manager import FuturesCurveManager, FuturesCurve, SpreadData
+
+    # Configuration
     from .config import *
 except ImportError as e:
     # Handle cases where dependencies might not be available
@@ -50,22 +60,29 @@ except ImportError as e:
 __all__ = [
     # Core forecasting classes
     'CTAForecast',
-    'CTALinear', 
+    'CTALinear',
     'CTALight',
     'CTAXGBoost',
     'CTARForest',
-    
-    # Data processing classes
+
+    # Primary data processing classes
+    'SimpleDataProcessor',
     'DataClient',
+
+    # Feature processing classes
     'COTAnalyzer',
     'TechnicalAnalysis',
-    'FuturesCurveManager',
-
-    # Feature Engineering
     'IntradayFeatures',
+
+    # Analysis classes (Phase 2 consolidated)
     'CurveShapeAnalyzer',
-    'CurveEvolution',
-    
+    'CurveEvolutionAnalyzer',
+
+    # Data container classes
+    'FuturesCurveManager',
+    'FuturesCurve',
+    'SpreadData',
+
     # Utility functions and constants from config
     'MARKET_DATA_PATH',
     'COT_DATA_PATH',

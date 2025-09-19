@@ -756,7 +756,8 @@ class FuturesCurveManager:
         if self.dte is None:
             self.compute_dte_matrix(curve)
 
-        max_cols = curve.shape[1]
+        # Cap sequential columns at reasonable limit to prevent excessive memory usage
+        max_cols = min(curve.shape[1], 48)  # Cap at 48 sequential contracts (4 years)
         mcols = [f"M{i}" for i in range(max_cols)]
         seq_prices = pd.DataFrame(index=curve.index, columns=mcols, dtype="float")
         seq_labels = pd.DataFrame(index=curve.index, columns=mcols, dtype="object")
@@ -2539,44 +2540,21 @@ class SpreadData:
         if self.curve is None or len(self.curve) == 0:
             return None
             
-        if self.seq_data is None or self.seq_data.seq_prices is None:
-            return None
-            
-        # Use sequential data for proper contract ordering
-        if hasattr(self, 'seq_prices') and self.seq_prices is not None:
-            prices = self.seq_prices.values if hasattr(self.seq_prices, 'values') else self.seq_prices
-        elif hasattr(self, 'seq_data') and hasattr(self.seq_data, 'seq_prices') and self.seq_data.seq_prices is not None:
-            prices = self.seq_data.seq_prices.values if hasattr(self.seq_data.seq_prices, 'values') else self.seq_data.seq_prices
-        else:
+        if self.seq_prices is None or len(self.seq_prices) == 0:
             return None
 
-        if prices is None or len(prices) == 0:
-            return None
-            
-        # Convert to numpy array if it's a DataFrame
-        if hasattr(prices, 'values'):
-            prices = prices.values
+        # Use sequential prices DataFrame directly
+        prices = self.seq_prices.values
         
         # Get volume weights if available
         volume_weights = None
-        if (self.seq_data.seq_volume is not None and 
-            self.seq_data.seq_volume.values if hasattr(self.seq_data.seq_volume, 'values') else self.seq_data.seq_volume is not None):
-            volume_weights = self.seq_data.seq_volume.values if hasattr(self.seq_data.seq_volume, 'values') else self.seq_data.seq_volume
-            # Convert to numpy array if it's a DataFrame
-            if hasattr(volume_weights, 'values'):
-                volume_weights = volume_weights.values
+        if hasattr(self, 'seq_volume') and self.seq_volume is not None:
+            volume_weights = self.seq_volume.values
         
-        # Get days-to-expiry weights if available  
+        # Get days-to-expiry weights if available
         dte_weights = None
-        if self.seq_dte is not None:
-            dte_weights = self.seq_dte
-        elif (hasattr(self.seq_data, 'seq_dte') and 
-              self.seq_data.seq_dte is not None):
-            dte_weights = self.seq_data.seq_dte
-            
-        # Convert DTE weights to numpy array if needed
-        if dte_weights is not None and hasattr(dte_weights, 'values'):
-            dte_weights = dte_weights.values
+        if hasattr(self, 'seq_dte') and self.seq_dte is not None:
+            dte_weights = self.seq_dte.values
         
         n_times, n_contracts = prices.shape
         synthetic_spot = np.full(n_times, np.nan)
@@ -2752,11 +2730,6 @@ class SpreadData:
                             if isinstance(self.seq_dte, np.ndarray) and len(self.seq_dte.shape) == 2:
                                 if contract_idx < self.seq_dte.shape[1]:
                                     days_to_expiry = self.seq_dte[:, contract_idx]
-                            elif hasattr(self.seq_data, 'seq_dte') and self.seq_data.seq_dte is not None:
-                                dte_data = self.seq_data.seq_dte
-                                if hasattr(dte_data, 'shape') and len(dte_data.shape) == 2:
-                                    if contract_idx < dte_data.shape[1]:
-                                        days_to_expiry = dte_data[:, contract_idx]
             
             elif len(contract_month) == 1 and contract_month in MONTH_CODE_ORDER:
                 # Specific contract month like F, G, H
@@ -2918,41 +2891,57 @@ class SpreadData:
                 self.convenience_yield = None
 
     def get_sequential_prices(self, dropna: bool = False) -> pd.DataFrame:
-        """Return sequential price data as a DataFrame for utility modules."""
+        """
+        Get sequential prices DataFrame directly (FAST - no curve recreation).
+
+        Returns:
+        --------
+        pd.DataFrame
+            Sequential prices with DatetimeIndex and M0, M1, M2... columns
+
+        Notes:
+        ------
+        This method returns the sequential prices DataFrame directly without
+        recreating FuturesCurve objects, making it much more efficient than
+        get_seq_curves() for simple DataFrame operations.
+        """
         if hasattr(self, 'seq_prices') and self.seq_prices is not None:
             df = self.seq_prices
-        elif hasattr(self, 'seq_data') and hasattr(self.seq_data, 'seq_prices') and self.seq_data.seq_prices is not None:
-            df = self.seq_data.seq_prices
         else:
             raise ValueError("No sequential price data available")
 
         return df.dropna(how='all') if dropna else df
 
+
     def get_sequential_spreads(self, dropna: bool = False) -> Optional[pd.DataFrame]:
+        """
+        Get sequential spreads DataFrame directly (FAST - no curve recreation).
+
+        Returns:
+        --------
+        pd.DataFrame
+            Sequential spreads with DatetimeIndex and M0, M1, M2... columns
+        """
         if hasattr(self, 'seq_spreads') and self.seq_spreads is not None:
             df = self.seq_spreads
-        elif hasattr(self, 'seq_data') and hasattr(self.seq_data, 'seq_spreads') and self.seq_data.seq_spreads is not None:
-            df = self.seq_data.seq_spreads
         else:
             return None
 
         return df.dropna(how='all') if dropna else df
 
+
+
+
     def get_sequential_volume(self, dropna: bool = False) -> Optional[pd.DataFrame]:
         if hasattr(self, 'seq_volume') and self.seq_volume is not None:
             df = self.seq_volume
-        elif hasattr(self, 'seq_data') and hasattr(self.seq_data, 'seq_volume') and self.seq_data.seq_volume is not None:
-            df = self.seq_data.seq_volume
         else:
             return None
-
         return df.dropna(how='all') if dropna else df
 
     def get_sequential_oi(self, dropna: bool = False) -> Optional[pd.DataFrame]:
         if hasattr(self, 'seq_oi') and self.seq_oi is not None:
             df = self.seq_oi
-        elif hasattr(self, 'seq_data') and hasattr(self.seq_data, 'seq_oi') and self.seq_data.seq_oi is not None:
-            df = self.seq_data.seq_oi
         else:
             return None
 
@@ -3659,23 +3648,60 @@ class SpreadData:
         else:
             raise TypeError(f"Invalid date_range type: {type(date_range)}")
         
-        # Generate FuturesCurve objects for selected dates using the working method
+        # BROADCAST: Generate FuturesCurve objects efficiently using vectorized operations
         curves_list = []
         valid_dates = []
 
-        for date in selected_dates:
-            try:
-                # Use the working _create_curve_from_seq_data method directly
-                curve = self._create_curve_from_seq_data(date)
-                if curve is not None:
-                    curves_list.append(curve)
-                    valid_dates.append(date)
-            except Exception as e:
-                # Skip dates with missing/invalid data
-                continue
-        
-        if not curves_list:
+        # Get all date indices at once (vectorized)
+        date_indices = self.seq_prices.index.get_indexer(selected_dates, method='nearest')
+        valid_mask = date_indices != -1
+
+        # Filter to valid dates and indices
+        valid_date_indices = date_indices[valid_mask]
+        valid_selected_dates = selected_dates[valid_mask]
+
+        if len(valid_date_indices) == 0:
             raise ValueError("No valid curves could be generated for the specified date range")
+
+        # BROADCAST: Extract data for all dates at once
+        prices_matrix = self.seq_prices.iloc[valid_date_indices].values  # (n_dates, n_contracts)
+
+        # Get other data if available (broadcast)
+        volumes_matrix = None
+        if hasattr(self, 'seq_volume') and self.seq_volume is not None:
+            volumes_matrix = self.seq_volume.iloc[valid_date_indices].values
+
+        oi_matrix = None
+        if hasattr(self, 'seq_oi') and self.seq_oi is not None:
+            oi_matrix = self.seq_oi.iloc[valid_date_indices].values
+
+        dte_matrix = None
+        if hasattr(self, 'seq_dte') and self.seq_dte is not None:
+            dte_matrix = self.seq_dte.iloc[valid_date_indices].values
+
+        # Generate labels once (broadcast)
+        seq_labels = [f'M{i}' for i in range(prices_matrix.shape[1])]
+
+        # Create FuturesCurve objects for each date (still need loop but with pre-extracted data)
+        for i, date in enumerate(valid_selected_dates):
+            prices = prices_matrix[i]
+            volumes = volumes_matrix[i] if volumes_matrix is not None else None
+            ois = oi_matrix[i] if oi_matrix is not None else None
+            seq_dtes = dte_matrix[i] if dte_matrix is not None else None
+
+            # Create curve with pre-extracted data
+            curve = FuturesCurve(
+                symbol=self.symbol,
+                ref_date=date,
+                seq_prices=prices,
+                seq_labels=seq_labels,
+                seq_volumes=volumes,
+                seq_dte=seq_dtes,
+                sequential=True
+            )
+
+            curves_list.append(curve)
+            valid_dates.append(date)
         
         # Return as pandas Series with datetime index
         return pd.Series(
@@ -4176,27 +4202,110 @@ class SpreadData:
         return result
 
     def load_from_client(self):
+        """
+        Load all available curve data types for this symbol (legacy method).
+
+        For more control over data loading, use the class method load_from_client_filtered().
+        """
+        # Use the class method to get a new instance with all data
+        filtered_data = self.load_from_client_filtered(
+            symbol=self.symbol,
+            start_date=None,
+            end_date=None,
+            curve_types=None
+        )
+
+        # Copy the data from the filtered instance to this instance
+        for attr_name in ['curve', 'volume_curve', 'oi_curve', 'seq_prices', 'seq_volume',
+                         'seq_oi', 'seq_labels', 'seq_spreads', 'seq_dte', 'dte',
+                         'days_to_expiration', 'spot_prices', 'roll_dates']:
+            if hasattr(filtered_data, attr_name):
+                setattr(self, attr_name, getattr(filtered_data, attr_name))
+
+    @classmethod
+    def load_from_client_filtered(
+        cls,
+        symbol: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        curve_types: Optional[Union[str, List[str]]] = None
+    ) -> 'SpreadData':
+        """
+        Class method to create SpreadData instance with filtered data from DataClient.
+
+        Parameters:
+        -----------
+        symbol : str
+            Symbol to load (e.g., 'CL_F', 'NG_F')
+        start_date : str, optional
+            Start date for data filtering (e.g., '2020-01-01')
+        end_date : str, optional
+            End date for data filtering (e.g., '2023-12-31')
+        curve_types : str, list of str, or None
+            Specific curve types to load. If None, loads all available types.
+            Available types: 'curve', 'volume_curve', 'oi_curve', 'seq_curve',
+            'seq_volume', 'seq_oi', 'seq_labels', 'seq_spreads', 'dte', 'seq_dte', 'spot'
+
+        Returns:
+        --------
+        SpreadData
+            New SpreadData instance with filtered data
+
+        Examples:
+        ---------
+        # Load recent NG data with only sequential types
+        ng_data = SpreadData.load_from_client_filtered(
+            'NG_F',
+            start_date='2020-01-01',
+            curve_types=['seq_curve', 'seq_spreads', 'seq_labels', 'seq_dte']
+        )
+
+        # Load CL data for specific year
+        cl_data = SpreadData.load_from_client_filtered(
+            'CL_F',
+            start_date='2023-01-01',
+            end_date='2023-12-31'
+        )
+        """
         cli = DataClient()
-        
-        # Single batch query for all curve data types
-        all_curve_types = [
-            'curve', 'volume_curve', 'oi_curve', 
-            'seq_curve', 'seq_volume', 'seq_oi', 'seq_labels', 'seq_spreads',
-            'dte', 'seq_dte', 'spot'
-        ]
-        curve_data = cli.query_curve_data(self.symbol, curve_types=all_curve_types)
+
+        # Default curve types if none specified
+        if curve_types is None:
+            all_curve_types = [
+                'curve', 'volume_curve', 'oi_curve',
+                'seq_curve', 'seq_volume', 'seq_oi', 'seq_labels', 'seq_spreads',
+                'dte', 'seq_dte', 'spot'
+            ]
+        else:
+            # Ensure curve_types is a list
+            if isinstance(curve_types, str):
+                all_curve_types = [curve_types]
+            else:
+                all_curve_types = list(curve_types)
+
+        # Query data with date filtering
+        curve_data = cli.query_curve_data(
+            symbol,
+            curve_types=all_curve_types,
+            start_date=start_date,
+            end_date=end_date
+        )
+
+        # Create new SpreadData instance
+        spread_data = cls(symbol=symbol)
 
         # Load roll_dates separately (different method)
         try:
-            self.roll_dates = cli.read_roll_dates(self.symbol)
+            spread_data.roll_dates = cli.read_roll_dates(symbol)
         except KeyError:
-            self.roll_dates = None
+            spread_data.roll_dates = None
 
-        # Optimized data extraction with minimal conversions
-        # Extract curve data first to establish index, then process scalar data that may need index intersection
-        self._extract_curve_data(curve_data)
-        self._extract_scalar_data(curve_data)
-        self._extract_sequential_data(curve_data)
+        # Extract data using existing methods
+        spread_data._extract_curve_data(curve_data)
+        spread_data._extract_scalar_data(curve_data)
+        spread_data._extract_sequential_data(curve_data)
+
+        return spread_data
 
     def _extract_scalar_data(self, curve_data):
         """Efficiently extract scalar arrays (dte, seq_dte, spot) from curve_data"""

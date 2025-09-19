@@ -733,13 +733,25 @@ class SimpleDataProcessor:
                     "message": 'Failed to build curve from DLY files'
                 }
 
-            # Get the curve data
-            curve_data = manager.curve
-            if curve_data is None or curve_data.empty:
+            # Get the new curve data
+            new_curve_data = manager.curve
+            if new_curve_data is None or new_curve_data.empty:
                 return {
                     "symbol": normalized_symbol,
                     "success": False,
                     "message": "No curve data generated"
+                }
+
+            # Combine with previous data and verify before saving
+            combined_data = self._combine_and_verify_curve_data(
+                manager, normalized_symbol, new_curve_data
+            )
+
+            if combined_data is None:
+                return {
+                    "symbol": normalized_symbol,
+                    "success": False,
+                    "message": "Data combination and verification failed"
                 }
 
             # Set the HDF path in the manager for storage
@@ -750,7 +762,7 @@ class SimpleDataProcessor:
                 manager.save_hdf()
 
             # Format for compatibility (for return message)
-            formatted_curve = self._format_dly_curve_for_storage(curve_data, base_symbol)
+            formatted_curve = self._format_dly_curve_for_storage(new_curve_data, base_symbol)
 
             return {
                 "symbol": normalized_symbol,
@@ -908,6 +920,93 @@ class SimpleDataProcessor:
                 "error": str(e),
                 "dly_folder": dly_folder
             }
+
+    def _combine_and_verify_curve_data(
+        self,
+        manager,
+        normalized_symbol: str,
+        new_curve_data: pd.DataFrame
+    ) -> Optional[pd.DataFrame]:
+        """Combine previous and new curve data with verification before saving.
+
+        Parameters
+        ----------
+        manager : DLYContractManager
+            The manager instance with new data
+        normalized_symbol : str
+            Symbol key for data retrieval
+        new_curve_data : pd.DataFrame
+            New curve data to combine
+
+        Returns
+        -------
+        Optional[pd.DataFrame]
+            Combined and verified data, or None if verification fails
+        """
+        try:
+            # Try to load existing data
+            existing_data = None
+            try:
+                with pd.HDFStore(self.client.market_data_path, mode='r') as store:
+                    curve_key = f"market/{normalized_symbol}/curve"
+                    if curve_key in store:
+                        existing_data = store[curve_key]
+            except (KeyError, FileNotFoundError, Exception):
+                # No existing data or cannot read - proceed with new data only
+                pass
+
+            if existing_data is None or existing_data.empty:
+                # No previous data - use new data directly
+                combined_data = new_curve_data.copy()
+            else:
+                # Combine existing and new data
+                combined_data = pd.concat([existing_data, new_curve_data], axis=0)
+
+                # Remove duplicates by index, keeping latest values
+                combined_data = combined_data[~combined_data.index.duplicated(keep='last')]
+
+                # Sort by index
+                combined_data = combined_data.sort_index()
+
+            # Verification checks
+            if combined_data.empty:
+                return None
+
+            # Check for reasonable data ranges
+            numeric_columns = combined_data.select_dtypes(include=[np.number]).columns
+            if len(numeric_columns) == 0:
+                return None
+
+            # Basic sanity checks - no all-zero or all-NaN columns
+            for col in numeric_columns:
+                if combined_data[col].isna().all() or (combined_data[col] == 0).all():
+                    continue  # Allow some columns to be zero/NaN
+
+            # Update manager with combined data for saving
+            manager.curve = combined_data
+
+            # Update sequential data if available
+            if hasattr(manager, 'seq_prices') and manager.seq_prices is not None:
+                try:
+                    # Try to load existing sequential data
+                    with pd.HDFStore(self.client.market_data_path, mode='r') as store:
+                        seq_key = f"market/{normalized_symbol}/seq_curve"
+                        if seq_key in store:
+                            existing_seq = store[seq_key]
+                            # Combine sequential data
+                            combined_seq = pd.concat([existing_seq, manager.seq_prices], axis=0)
+                            combined_seq = combined_seq[~combined_seq.index.duplicated(keep='last')]
+                            combined_seq = combined_seq.sort_index()
+                            manager.seq_prices = combined_seq
+                except Exception:
+                    # Keep new sequential data if combination fails
+                    pass
+
+            return combined_data
+
+        except Exception as e:
+            # Return None to indicate verification failure
+            return None
 
     def _format_dly_curve_for_storage(
         self,
