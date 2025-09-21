@@ -3,13 +3,11 @@ from matplotlib import pyplot as plt
 
 import pandas as pd
 import numpy as np
-from CTAFlow.utils import create_tenor_grid, vol_weighted_returns, deseasonalize_monthly
-from sklearn.decomposition import PCA
-from CTAFlow.features import CurveEvolutionAnalyzer
-from CTAFlow.data import SpreadData, DataClient
-from CTAFlow.config import RAW_MARKET_DATA_PATH, DLY_DATA_PATH
-import plotly.io as pio
+from CTAFlow.data.sierra.fast_parse import FastScidReader as FSR
+import asyncio as aio
+from CTAFlow.config import DLY_DATA_PATH
 
-pio.renderers.default = "browser"
+fsr = FSR(str(DLY_DATA_PATH/"ESH25-CME.scid"))
 
-zs = SpreadData("NG")
+with fsr as f:
+    data = f.to_pandas()

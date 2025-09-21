@@ -34,24 +34,40 @@ The package structure follows standard Python conventions with all modules under
 The codebase follows a modular pipeline architecture with four main components:
 
 ### Data Layer (`CTAFlow/data/`)
-- **`data_client.py`**: Main data interface class for HDF5 operations
-- **`retrieval.py`**: Asynchronous data loading from HDF5 stores using `fetch_data_sync()` 
-- **`futures_curve_manager.py`**: Manages futures curve data and contract relationships
-- **`futures_mappings.toml`**: Maps futures ticker symbols to COT commodity codes
+**Primary Data Processing (Post-Phase 3 Simplification):**
+- **`simple_processor.py`**: **PRIMARY DATA PROCESSOR** - Unified data processing pipeline
+  - `SimpleDataProcessor`: Main processor for all data operations using update files approach
+  - COT data refresh via DataClient methods
+  - Market data updates from CSV files with previous data combination and verification
+  - Futures curve processing using DlyContractManager patterns
+- **`data_client.py`**: Core data interface class for HDF5 operations and COT processing
+  - Comprehensive COT methods: `refresh_latest_cot_year()`, `download_cot()`, `query_cot_metrics()`
+  - Market data storage and retrieval with proper data combination
+- **`retrieval.py`**: Asynchronous data loading from HDF5 stores using `fetch_data_sync()`
+
+**Data Management & Classification:**
+- **`contract_handling/dly_contract_manager.py`**: DLY file processing and HDF5 storage blueprint
+  - `DLYContractManager.save_hdf()`: Standard pattern for curve storage
+  - Contract expiry calculations and curve building from DLY files
 - **`ticker_classifier.py`**: Automatic classification of tickers into commodity/financial types
 - **`classifications_reference.py`**: Reference mappings for all supported tickers
+- **`futures_mappings.toml`**: Maps futures ticker symbols to COT commodity codes
+
+**Legacy Processors (Deprecated):**
+- **`data_processor.py`**: Complex threaded processor (use SimpleDataProcessor instead)
+- **`enhanced_curve_processor.py`**: Enhanced curve processing (use SimpleDataProcessor.batch_update_futures_curves instead)
 
 ### Features & Signal Processing (`CTAFlow/features/`) **[PRIMARY PROCESSING LOCATION]**
 **This is where all signal processing and feature engineering is concentrated:**
 - **`signals_processing.py`**: Core technical analysis and COT signal generation
-  - `COTProcessor`: Handles COT data cleaning and positioning metrics
+  - `COTAnalyzer`: Handles COT data cleaning and positioning metrics
   - `TechnicalAnalysis`: Calculates selective technical indicators and volatility normalization
 - **`feature_engineering.py`**: Intraday microstructure features
   - `IntradayFeatures`: Microstructure and intraday feature extraction
-- **`curve_analysis.py`**: Advanced futures curve analysis framework
-  - `CurveShapeAnalyzer`: Curve shape analysis and feature extraction
-  - `CurveEvolution`: Time series evolution tracking using FuturesCurve snapshots
-  - `SpreadAnalyzer`: Spread analysis, seasonality, and Lévy areas
+- **`curve_analysis.py`**: Unified futures curve analysis framework (Post-Phase 2 Consolidation)
+  - `CurveShapeAnalyzer`: Curve shape analysis and feature extraction (includes evolution tracking from former CurveEvolution)
+  - `CurveEvolutionAnalyzer`: Advanced curve evolution analysis (includes seasonal methods from former SpreadAnalyzer)
+  - Unified interface combining path signature analysis, Lévy areas, and regime detection
 
 ### Data Container Classes (`CTAFlow/data/contract_handling/`)
 **Core numpy-based data structures for futures analysis:**
@@ -73,9 +89,92 @@ The codebase follows a modular pipeline architecture with four main components:
 ### Strategy Layer (`CTAFlow/strategy/`)
 - **`strategy.py`**: `RegimeStrategy` class implementing trading strategies using forecasting framework
 
-### Configuration
+### Data Pipeline (`CTAFlow/data/`)
+**Simplified Processing Pipeline (Post-Phase 3):**
+```python
+# Primary workflow using SimpleDataProcessor
+processor = SimpleDataProcessor()
+
+# 1. Update all data types in coordinated fashion
+results = processor.update_all_tickers(
+    dly_folder="path/to/dly/files",
+    selected_cot_features=['positioning', 'flows'],
+    max_workers=4
+)
+
+# 2. Individual market updates using CSV files
+market_result = processor.update_market_from_csv(
+    symbol='CL_F',
+    csv_folder="F:/charts/"
+)
+
+# 3. Futures curve updates with data combination and verification
+curve_result = processor.update_futures_curve_from_dly(
+    symbol='CL_F',
+    dly_folder="path/to/dly/files"
+)
+```
+
+**Key Pipeline Features:**
+- **Update Files Approach**: Uses CSV update files (pattern: `{symbol}-update-*.csv`)
+- **Data Combination**: Combines previous and new data with verification before saving
+- **DlyContractManager Integration**: Uses proven HDF5 storage patterns
+- **COT Integration**: Coordinated COT data refresh using DataClient methods
+- **Error Handling**: Comprehensive error tracking and progress reporting
+
+### Dashboard & Visualization
+**Interactive Analysis Framework:**
+- **Plotly Integration**: Full interactive visualization capabilities
+- **Regime Analysis**: Multi-dimensional regime detection with color-coded visualization
+- **3D Curve Evolution**: Surface plots showing curve evolution over time
+- **PnL Tracking**: Comprehensive spread trading analysis with drawdown visualization
+
+```python
+# Regime change analysis
+from CTAFlow.features.curve_analysis import CurveEvolutionAnalyzer
+
+analyzer = CurveEvolutionAnalyzer.from_spread_data(spread_data)
+regime_fig = analyzer.plot_regime_changes_f0(
+    regime_window=63,
+    regime_threshold=2.0,
+    show_seasonal=True
+)
+
+# Driver analysis visualization
+evolution_fig = analyzer.plot_curve_evolution_analysis(
+    show_drivers=True,
+    show_regimes=True,
+    show_levy_areas=True
+)
+```
+
+### Position Forecaster (`CTAFlow/forecaster/`)
+**Unified Forecasting Interface:**
+- **CTAForecast**: Main forecasting class with selective indicator calculation
+- **Model Classes**: CTALinear, CTALight, CTAXGBoost, CTARForest
+- **Feature Engineering**: Combines COT positioning with technical signals
+- **Weekly Resampling**: Aligned with COT reporting schedule (Friday default)
+
+```python
+# Complete forecasting workflow
+forecaster = CTAFlow.CTAForecast('CL_F')
+
+# Selective indicator calculation for efficiency
+data = forecaster.prepare_data(
+    selected_indicators=['moving_averages', 'rsi', 'atr'],
+    normalize_momentum=True,
+    resample_weekly=True
+)
+
+# Train and evaluate models
+result = forecaster.train_model(model_type='lightgbm', target_type='return')
+print(f"Test Accuracy: {result['test_metrics']['accuracy']:.3f}")
+```
+
+### Utilities & Configuration
 - **`CTAFlow/config.py`**: HDF5 data paths and environment setup
 - **`project_goals.md`**: Detailed research methodology and indicator selection rationale
+- **Package Utilities**: Version info, supported models/indicators, data paths
 
 ## Key Technical Concepts
 
@@ -102,11 +201,20 @@ vol_normalized_returns = raw_returns / (ewm_vol_63d * sqrt(period))
 
 ## Data Flow
 
-1. **Load**: `fetch_market_cot_data()` loads both market and COT data asynchronously
-2. **Process**: `TechnicalAnalysis.calculate_enhanced_indicators()` with selective calculation
-3. **Engineer**: `Forecaster.prepare_forecasting_features()` combines all feature types
-4. **Resample**: Optional weekly resampling (post-calculation or pre-calculation)
-5. **Target**: `create_target_variable()` generates prediction targets
+### Simplified Pipeline (Post-Phase 3)
+1. **Update**: `SimpleDataProcessor.update_all_tickers()` - Coordinated data refresh using update files
+2. **Combine**: Previous and new data combination with verification before saving
+3. **Load**: `fetch_market_cot_data()` loads both market and COT data asynchronously
+4. **Process**: `TechnicalAnalysis.calculate_enhanced_indicators()` with selective calculation
+5. **Engineer**: `Forecaster.prepare_forecasting_features()` combines all feature types
+6. **Resample**: Optional weekly resampling (post-calculation or pre-calculation)
+7. **Target**: `create_target_variable()` generates prediction targets
+
+### Pipeline Integration Points
+- **Data Ingestion**: CSV update files → SimpleDataProcessor → HDF5 storage
+- **COT Processing**: DataClient.refresh_latest_cot_year() → COT metrics calculation
+- **Curve Management**: DLY files → DlyContractManager patterns → Sequentialized curves
+- **Feature Engineering**: Market + COT data → TechnicalAnalysis + COTAnalyzer → ML features
 
 ## Common Usage Patterns
 
@@ -114,6 +222,15 @@ vol_normalized_returns = raw_returns / (ewm_vol_63d * sqrt(period))
 
 ```python
 import CTAFlow
+
+# Primary data processing (Post-Phase 3)
+processor = CTAFlow.SimpleDataProcessor()
+
+# Update all data coordinated refresh
+results = processor.update_all_tickers(
+    dly_folder="path/to/dly/files",
+    selected_cot_features=['positioning', 'flows']
+)
 
 # Main forecasting class (preferred interface)
 forecaster = CTAFlow.CTAForecast('CL_F')
@@ -129,24 +246,28 @@ print(result['test_metrics'])
 ### Direct Model Access
 
 ```python
+# Primary data processing classes (Post-Phase 3)
+processor = CTAFlow.SimpleDataProcessor()
+data_client = CTAFlow.DataClient()
+
 # Access specific model classes
-import CTAFlow.data.contract_handling.curve_manager
-
-import CTAFlow.data.contract_handling.futures
-
 linear_model = CTAFlow.CTALinear('CL_F')
 lightgbm_model = CTAFlow.CTALight('CL_F')
 xgb_model = CTAFlow.CTAXGBoost('CL_F')
 rf_model = CTAFlow.CTARForest('CL_F')
 
-# Access utility classes
-data_client = CTAFlow.DataClient()
-
 # Feature processing classes (from CTAFlow/features/)
-cot_processor = CTAFlow.COTAnalyzer()
+cot_analyzer = CTAFlow.COTAnalyzer()
 tech_analysis = CTAFlow.TechnicalAnalysis()
 intraday_features = CTAFlow.IntradayFeatures('CL_F')
-spread_data = CTAFlow.data.contract_handling.futures_curve_manager.SpreadData('CL_F')
+
+# Analysis classes (Post-Phase 2 Consolidation)
+curve_shape_analyzer = CTAFlow.CurveShapeAnalyzer()
+curve_evolution_analyzer = CTAFlow.CurveEvolutionAnalyzer()
+
+# Data container classes
+spread_data = CTAFlow.SpreadData('CL_F')
+futures_curve_manager = CTAFlow.FuturesCurveManager()
 ```
 
 ### Post-Calculation Resampling
@@ -161,9 +282,47 @@ weekly_features = forecaster.resample_existing_features(day_of_week='Friday')
 Only calculates requested indicator groups to avoid computational waste:
 ```python
 # Only calculates RSI, ATR, and normalized momentum
-tech_features = forecaster.get_technical_features_only(df, 
+tech_features = forecaster.get_technical_features_only(df,
                                                       selected_indicators=['rsi', 'atr'],
                                                       normalize_momentum=True)
+```
+
+### Simplified Data Processing Workflow (Post-Phase 3)
+
+```python
+# Complete data processing pipeline using SimpleDataProcessor
+processor = CTAFlow.SimpleDataProcessor()
+
+# 1. Coordinated data refresh (COT + Market + Curves)
+update_results = processor.update_all_tickers(
+    dly_folder="data/dly/",
+    pattern="CL|NG|ZC",  # Focus on specific tickers
+    selected_cot_features=['positioning', 'flows', 'extremes'],
+    max_workers=4,
+    cot_progress=True
+)
+
+# 2. Individual market data updates using CSV files
+market_update = processor.update_market_from_csv(
+    symbol='CL_F',
+    csv_folder="F:/charts/",
+    resample_rule="1T"
+)
+
+# 3. Futures curve processing with data combination
+curve_update = processor.update_futures_curve_from_dly(
+    symbol='CL_F',
+    dly_folder="data/dly/"
+)
+
+# 4. Batch processing multiple symbols
+batch_results = processor.batch_update_futures_curves(
+    symbols=['CL_F', 'NG_F', 'ZC_F'],
+    dly_folder="data/dly/",
+    max_workers=2
+)
+
+print(f"Updated {update_results['processed_symbols']} symbols successfully")
 ```
 
 ## Data Requirements

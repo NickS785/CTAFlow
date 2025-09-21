@@ -10,6 +10,7 @@ front month (M0) contracts and extract relevant time series data.
 from typing import Dict, List, Optional, Tuple, Union, Set
 from pathlib import Path
 from datetime import datetime, timedelta
+import time
 import pandas as pd
 import numpy as np
 import re
@@ -886,6 +887,446 @@ class IntradayFileManager:
                                f"{total_records:,} records from {date_range} (async)")
 
         return continuous_df
+
+    async def export_continuous_m0_to_parquet(self,
+                                            symbol: str,
+                                            output_path: Union[str, Path],
+                                            start_date: Optional[datetime] = None,
+                                            end_date: Optional[datetime] = None,
+                                            resample_rule: Optional[str] = None,
+                                            volume_bucket_size: Optional[int] = None,
+                                            batch_size: int = 8,
+                                            max_memory_mb: int = 2048,
+                                            single_file: bool = True,
+                                            compression: str = "snappy") -> Dict[str, any]:
+        """
+        Export continuous M0 data to Parquet file(s) with memory-efficient processing.
+
+        Args:
+            symbol: Symbol to process (e.g., 'CL_F')
+            output_path: Output directory or file path
+            start_date: Start date filter
+            end_date: End date filter
+            resample_rule: Optional time-based resampling rule
+            volume_bucket_size: Optional volume bucket aggregation
+            batch_size: Number of files to process concurrently
+            max_memory_mb: Maximum memory usage before writing to disk
+            single_file: If True, attempt to write all data to one file; if False, write per contract
+            compression: Parquet compression algorithm
+
+        Returns:
+            Dictionary with export statistics and file paths
+        """
+        output_path = Path(output_path)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        if self.logger:
+            self.logger.info(f"Starting Parquet export for {symbol} continuous M0 data")
+            self.logger.info(f"Output path: {output_path}, single_file: {single_file}")
+
+        # Get M0 periods
+        m0_periods = self.identify_m0_periods(symbol, start_date, end_date)
+        if not m0_periods:
+            raise ValueError(f"No M0 periods found for {symbol}")
+
+        export_stats = {
+            'symbol': symbol,
+            'start_date': start_date,
+            'end_date': end_date,
+            'single_file': single_file,
+            'compression': compression,
+            'file_paths': [],
+            'total_records': 0,
+            'total_size_mb': 0,
+            'processing_time_seconds': 0,
+            'memory_peak_mb': 0,
+            'contract_periods': len(m0_periods)
+        }
+
+        start_time = time.time()
+
+        if single_file:
+            # Attempt to write all data to a single Parquet file
+            return await self._export_single_parquet_file(
+                symbol, m0_periods, output_path, resample_rule,
+                volume_bucket_size, batch_size, max_memory_mb,
+                compression, export_stats, start_time
+            )
+        else:
+            # Write individual Parquet files per contract period
+            return await self._export_multiple_parquet_files(
+                symbol, m0_periods, output_path, resample_rule,
+                volume_bucket_size, batch_size, compression,
+                export_stats, start_time
+            )
+
+    async def _export_single_parquet_file(self,
+                                        symbol: str,
+                                        m0_periods: List[ContractPeriod],
+                                        output_path: Path,
+                                        resample_rule: Optional[str],
+                                        volume_bucket_size: Optional[int],
+                                        batch_size: int,
+                                        max_memory_mb: int,
+                                        compression: str,
+                                        export_stats: Dict,
+                                        start_time: float) -> Dict[str, any]:
+        """Export all M0 data to a single Parquet file with chunked processing."""
+        import psutil
+        import time
+
+        process = psutil.Process()
+
+        # Determine output file path
+        output_file = output_path / f"{symbol}_continuous_m0.parquet"
+
+        # Initialize Parquet writer for streaming
+        parquet_writer = None
+        schema = None
+
+        try:
+            total_records_written = 0
+            current_memory_mb = 0
+
+            for i, period in enumerate(m0_periods):
+                if self.logger:
+                    self.logger.info(f"Processing period {i+1}/{len(m0_periods)}: "
+                                   f"{period.contract_code} ({period.start_date} to {period.end_date})")
+
+                # Check memory usage
+                current_memory_mb = process.memory_info().rss / (1024 * 1024)
+                export_stats['memory_peak_mb'] = max(export_stats['memory_peak_mb'], current_memory_mb)
+
+                if current_memory_mb > max_memory_mb:
+                    if self.logger:
+                        self.logger.warning(f"Memory usage ({current_memory_mb:.1f}MB) exceeds limit "
+                                          f"({max_memory_mb}MB). Consider using single_file=False")
+
+                # Load data for this period using FastScidReader
+                if not period.file_path or not period.file_path.exists():
+                    if self.logger:
+                        self.logger.warning(f"SCID file not found for {period.contract_code}, skipping")
+                    continue
+
+                try:
+                    with FastScidReader(str(period.file_path)) as reader:
+                        # Use time filtering if period has specific dates
+                        start_ms = int(period.start_date.timestamp() * 1000) if period.start_date else None
+                        end_ms = int(period.end_date.timestamp() * 1000) if period.end_date else None
+
+                        # Get pandas DataFrame
+                        df = reader.to_pandas(start_ms=start_ms, end_ms=end_ms, tz='UTC')
+
+                        if len(df) == 0:
+                            continue
+
+                        # Apply processing
+                        if volume_bucket_size:
+                            df = self._aggregate_volume_buckets(df, volume_bucket_size)
+                        elif resample_rule:
+                            df = self._resample_ohlcv(df, rule=resample_rule)
+
+                        # Add metadata columns
+                        df['contract_code'] = period.contract_code
+                        df['symbol'] = symbol
+
+                        # Convert to PyArrow Table
+                        table = pa.Table.from_pandas(df, preserve_index=True)
+
+                        # Initialize writer with schema from first table
+                        if parquet_writer is None:
+                            schema = table.schema
+                            parquet_writer = pq.ParquetWriter(
+                                output_file,
+                                schema=schema,
+                                compression=compression,
+                                write_statistics=True
+                            )
+
+                        # Write table to Parquet file
+                        parquet_writer.write_table(table)
+                        total_records_written += len(df)
+
+                        if self.logger:
+                            self.logger.info(f"  Wrote {len(df):,} records for {period.contract_code}")
+
+                except Exception as e:
+                    if self.logger:
+                        self.logger.error(f"Error processing {period.contract_code}: {e}")
+                    continue
+
+            # Close writer
+            if parquet_writer:
+                parquet_writer.close()
+
+            # Update export statistics
+            if output_file.exists():
+                export_stats['file_paths'] = [str(output_file)]
+                export_stats['total_records'] = total_records_written
+                export_stats['total_size_mb'] = output_file.stat().st_size / (1024 * 1024)
+                export_stats['processing_time_seconds'] = time.time() - start_time
+
+                if self.logger:
+                    self.logger.info(f"Successfully exported {total_records_written:,} records "
+                                   f"to {output_file.name} ({export_stats['total_size_mb']:.1f}MB)")
+
+            return export_stats
+
+        except Exception as e:
+            # Clean up on error
+            if parquet_writer:
+                parquet_writer.close()
+            if output_file.exists():
+                output_file.unlink()
+            raise RuntimeError(f"Failed to export single Parquet file: {e}")
+
+    async def _export_multiple_parquet_files(self,
+                                           symbol: str,
+                                           m0_periods: List[ContractPeriod],
+                                           output_path: Path,
+                                           resample_rule: Optional[str],
+                                           volume_bucket_size: Optional[int],
+                                           batch_size: int,
+                                           compression: str,
+                                           export_stats: Dict,
+                                           start_time: float) -> Dict[str, any]:
+        """Export M0 data to individual Parquet files per contract period."""
+        import time
+
+        exported_files = []
+        total_records = 0
+        total_size_mb = 0
+
+        # Process in batches for efficiency
+        for i in range(0, len(m0_periods), batch_size):
+            batch = m0_periods[i:i + batch_size]
+
+            if self.logger:
+                self.logger.info(f"Processing batch {i//batch_size + 1}: "
+                               f"contracts {i+1}-{min(i+batch_size, len(m0_periods))}")
+
+            # Process batch concurrently
+            tasks = []
+            for period in batch:
+                task = self._export_single_contract_parquet(
+                    symbol, period, output_path, resample_rule,
+                    volume_bucket_size, compression
+                )
+                tasks.append(task)
+
+            # Wait for batch completion
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Collect results
+            for result in batch_results:
+                if isinstance(result, Exception):
+                    if self.logger:
+                        self.logger.error(f"Batch export error: {result}")
+                    continue
+
+                if result and 'file_path' in result:
+                    exported_files.append(result['file_path'])
+                    total_records += result.get('records', 0)
+                    total_size_mb += result.get('size_mb', 0)
+
+        # Update export statistics
+        export_stats['file_paths'] = exported_files
+        export_stats['total_records'] = total_records
+        export_stats['total_size_mb'] = total_size_mb
+        export_stats['processing_time_seconds'] = time.time() - start_time
+
+        if self.logger:
+            self.logger.info(f"Exported {len(exported_files)} Parquet files with "
+                           f"{total_records:,} total records ({total_size_mb:.1f}MB)")
+
+        return export_stats
+
+    async def _export_single_contract_parquet(self,
+                                            symbol: str,
+                                            period: ContractPeriod,
+                                            output_path: Path,
+                                            resample_rule: Optional[str],
+                                            volume_bucket_size: Optional[int],
+                                            compression: str) -> Dict[str, any]:
+        """Export a single contract period to Parquet file."""
+        if not period.file_path or not period.file_path.exists():
+            return {'error': f"SCID file not found for {period.contract_code}"}
+
+        # Generate output filename
+        date_str = period.start_date.strftime('%Y%m%d')
+        output_file = output_path / f"{symbol}_{period.contract_code}_{date_str}.parquet"
+
+        try:
+            with FastScidReader(str(period.file_path)) as reader:
+                # Use time filtering
+                start_ms = int(period.start_date.timestamp() * 1000) if period.start_date else None
+                end_ms = int(period.end_date.timestamp() * 1000) if period.end_date else None
+
+                # Get DataFrame
+                df = reader.to_pandas(start_ms=start_ms, end_ms=end_ms, tz='UTC')
+
+                if len(df) == 0:
+                    return {'error': f"No data found for {period.contract_code}"}
+
+                # Apply processing
+                if volume_bucket_size:
+                    df = self._aggregate_volume_buckets(df, volume_bucket_size)
+                elif resample_rule:
+                    df = self._resample_ohlcv(df, rule=resample_rule)
+
+                # Add metadata
+                df['contract_code'] = period.contract_code
+                df['symbol'] = symbol
+                df['front_month_start'] = period.start_date
+                df['front_month_end'] = period.end_date
+
+                # Export to Parquet
+                df.to_parquet(
+                    output_file,
+                    compression=compression,
+                    index=True,
+                    engine='pyarrow'
+                )
+
+                file_size_mb = output_file.stat().st_size / (1024 * 1024)
+
+                return {
+                    'file_path': str(output_file),
+                    'contract_code': period.contract_code,
+                    'records': len(df),
+                    'size_mb': file_size_mb,
+                    'date_range': (period.start_date, period.end_date)
+                }
+
+        except Exception as e:
+            return {'error': f"Failed to export {period.contract_code}: {e}"}
+
+    def load_continuous_m0_from_parquet(self,
+                                      parquet_path: Union[str, Path],
+                                      start_date: Optional[datetime] = None,
+                                      end_date: Optional[datetime] = None,
+                                      columns: Optional[List[str]] = None) -> pd.DataFrame:
+        """
+        Load continuous M0 data from Parquet file(s) with optional filtering.
+
+        Args:
+            parquet_path: Path to Parquet file or directory containing Parquet files
+            start_date: Optional start date filter
+            end_date: Optional end date filter
+            columns: Optional list of columns to load
+
+        Returns:
+            DataFrame with continuous M0 data
+        """
+        parquet_path = Path(parquet_path)
+
+        if parquet_path.is_file():
+            # Single Parquet file
+            df = pd.read_parquet(parquet_path, columns=columns, engine='pyarrow')
+        elif parquet_path.is_dir():
+            # Directory with multiple Parquet files
+            parquet_files = list(parquet_path.glob("*.parquet"))
+            if not parquet_files:
+                raise ValueError(f"No Parquet files found in {parquet_path}")
+
+            dfs = []
+            for file_path in sorted(parquet_files):
+                df_chunk = pd.read_parquet(file_path, columns=columns, engine='pyarrow')
+                dfs.append(df_chunk)
+
+            df = pd.concat(dfs, axis=0).sort_index()
+        else:
+            raise ValueError(f"Parquet path not found: {parquet_path}")
+
+        # Apply date filtering if requested
+        if start_date or end_date:
+            if start_date:
+                df = df[df.index >= pd.Timestamp(start_date, tz='UTC')]
+            if end_date:
+                df = df[df.index <= pd.Timestamp(end_date, tz='UTC')]
+
+        # Remove duplicates that might occur at file boundaries
+        df = df[~df.index.duplicated(keep='first')]
+
+        if self.logger:
+            self.logger.info(f"Loaded {len(df):,} records from Parquet: "
+                           f"{df.index[0]} to {df.index[-1]}")
+
+        return df
+
+    def get_parquet_file_info(self, parquet_path: Union[str, Path]) -> Dict[str, any]:
+        """
+        Get metadata information about Parquet file(s).
+
+        Args:
+            parquet_path: Path to Parquet file or directory
+
+        Returns:
+            Dictionary with file information
+        """
+        parquet_path = Path(parquet_path)
+        info = {
+            'path': str(parquet_path),
+            'type': 'unknown',
+            'files': [],
+            'total_size_mb': 0,
+            'total_rows': 0,
+            'schema': None,
+            'date_range': None
+        }
+
+        try:
+            if parquet_path.is_file():
+                # Single file
+                info['type'] = 'single_file'
+                file_info = pq.read_metadata(parquet_path)
+                info['total_rows'] = file_info.num_rows
+                info['total_size_mb'] = parquet_path.stat().st_size / (1024 * 1024)
+                info['schema'] = file_info.schema.to_arrow_schema()
+                info['files'] = [str(parquet_path)]
+
+                # Try to get date range from index
+                df_sample = pd.read_parquet(parquet_path, columns=[], engine='pyarrow')
+                if len(df_sample) > 0:
+                    info['date_range'] = (df_sample.index.min(), df_sample.index.max())
+
+            elif parquet_path.is_dir():
+                # Directory with multiple files
+                info['type'] = 'directory'
+                parquet_files = list(parquet_path.glob("*.parquet"))
+
+                if parquet_files:
+                    total_rows = 0
+                    total_size = 0
+                    min_date = None
+                    max_date = None
+
+                    for file_path in parquet_files:
+                        file_info = pq.read_metadata(file_path)
+                        total_rows += file_info.num_rows
+                        total_size += file_path.stat().st_size
+                        info['files'].append(str(file_path))
+
+                        # Get schema from first file
+                        if info['schema'] is None:
+                            info['schema'] = file_info.schema.to_arrow_schema()
+
+                        # Update date range
+                        df_sample = pd.read_parquet(file_path, columns=[], engine='pyarrow')
+                        if len(df_sample) > 0:
+                            file_min = df_sample.index.min()
+                            file_max = df_sample.index.max()
+                            min_date = min(min_date, file_min) if min_date else file_min
+                            max_date = max(max_date, file_max) if max_date else file_max
+
+                    info['total_rows'] = total_rows
+                    info['total_size_mb'] = total_size / (1024 * 1024)
+                    info['date_range'] = (min_date, max_date) if min_date else None
+
+        except Exception as e:
+            info['error'] = str(e)
+
+        return info
 
     def get_contract_statistics(self, symbol: str) -> Dict[str, any]:
         """Get statistics about available contracts for a symbol."""
