@@ -2848,6 +2848,13 @@ class SpreadData:
             return value
         return None
 
+    def _get_seq_feature(self, attr_name: str):
+        """Return a sequential feature from either the attribute or seq_data namespace."""
+        seq_data = getattr(self, 'seq_data', None)
+        if seq_data is not None and hasattr(seq_data, attr_name):
+            return getattr(seq_data, attr_name)
+        return getattr(self, attr_name, None)
+
     # Removed _create_seq_feature and _feature_to_dataframe methods
     # They were unnecessary complexity - we now store DataFrames directly
 
