@@ -7,7 +7,7 @@ managing intraday SCID files. It integrates with the curve data to identify
 front month (M0) contracts and extract relevant time series data.
 """
 
-from typing import Dict, List, Optional, Tuple, Union, Set
+from typing import Dict, List, Optional, Sequence, Tuple, Union, Set
 from pathlib import Path
 from datetime import datetime, timedelta
 import time
@@ -22,8 +22,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from ...config import DLY_DATA_PATH
-from ...data.sierra.parse_file import read_scid, AsyncScidReader, read_multiple_scid_async
 from ...data.sierra.fast_parse import FastScidReader
+from ...data.sierra.scid_io import PipelineSpec, ReadSpec, WriteSpec, run_pipelines
 from ...data.data_client import DataClient
 from .curve_manager import SpreadData
 
@@ -93,38 +93,72 @@ class IntradayFileManager:
         # Discover SCID files on initialization
         self._discover_scid_files()
 
+    @staticmethod
+    def _ensure_timestamp(value: Optional[Union[datetime, pd.Timestamp]]) -> Optional[pd.Timestamp]:
+        if value is None:
+            return None
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is None:
+            return ts.tz_localize("UTC")
+        return ts.tz_convert("UTC")
+
+    @classmethod
+    def _timestamp_to_epoch_ms(cls, value: Optional[Union[datetime, pd.Timestamp]]) -> Optional[int]:
+        ts = cls._ensure_timestamp(value)
+        if ts is None:
+            return None
+        return int(ts.value // 1_000_000)
+
+    def _load_scid_dataframe(
+        self,
+        file_path: Path,
+        start: Optional[Union[datetime, pd.Timestamp]],
+        end: Optional[Union[datetime, pd.Timestamp]],
+        columns: Optional[Sequence[str]] = None,
+    ) -> pd.DataFrame:
+        start_ms = self._timestamp_to_epoch_ms(start)
+        end_ms = self._timestamp_to_epoch_ms(end)
+        with FastScidReader(str(file_path)) as reader:
+            return reader.to_pandas(start_ms=start_ms, end_ms=end_ms, columns=columns)
+
+    def _collect_scid_files(self, folder: Optional[Path] = None) -> Dict[str, List[Path]]:
+        """Return mapping of symbols to SCID paths using a filename parser."""
+        base = Path(folder) if folder else self.data_path
+        mapping: Dict[str, List[Path]] = {}
+        if not base.exists():
+            return mapping
+
+        pattern = re.compile(r'^([A-Z]{1,3})([FGHJKMNQUVXZ])(\d{2})-([A-Z]+)\.scid$', re.IGNORECASE)
+
+        for entry in base.iterdir():
+            if not entry.is_file() or entry.suffix.lower() != '.scid':
+                continue
+            match = pattern.match(entry.name)
+            if not match:
+                continue
+            base_symbol = match.group(1).upper()
+            full_symbol = f"{base_symbol}_F"
+            mapping.setdefault(full_symbol, []).append(entry)
+
+        for files in mapping.values():
+            files.sort()
+        return mapping
+
     def _discover_scid_files(self) -> None:
-        """Discover and catalog all SCID files in the data directory."""
-        if not self.data_path.exists():
+        """Discover and cache SCID files under ``self.data_path``."""
+        mapping = self._collect_scid_files(self.data_path)
+        if not mapping:
             if self.logger:
-                self.logger.warning(f"Data path does not exist: {self.data_path}")
+                self.logger.warning(f"No SCID files discovered in {self.data_path}")
             return
 
-        scid_pattern = re.compile(r'^([A-Z]{1,3})([FGHJKMNQUVXZ])(\d{2})-([A-Z]+)\.scid$')
-
-        for scid_file in self.data_path.glob("*.scid"):
-            match = scid_pattern.match(scid_file.name)
-            if match:
-                base_symbol = match.group(1)
-                month_code = match.group(2)
-                year_code = match.group(3)
-                exchange = match.group(4)
-
-                # Construct full symbol (e.g., CL_F, ES_F)
-                full_symbol = f"{base_symbol}_F"
-
-                # Store file mapping
-                if full_symbol not in self._scid_files:
-                    self._scid_files[full_symbol] = []
-
-                self._scid_files[full_symbol].append(scid_file)
-
-                if self.logger:
-                    self.logger.debug(f"Discovered SCID file: {scid_file.name} -> {full_symbol}")
+        self._scid_files = mapping
 
         if self.logger:
-            total_files = sum(len(files) for files in self._scid_files.values())
-            self.logger.info(f"Discovered {total_files} SCID files for {len(self._scid_files)} symbols")
+            total_files = sum(len(files) for files in mapping.values())
+            self.logger.info(
+                f"Discovered {total_files} SCID files for {len(mapping)} symbols"
+            )
 
     def get_available_symbols(self) -> List[str]:
         """Get list of symbols with available SCID files."""
@@ -394,10 +428,10 @@ class IntradayFileManager:
                         self.logger.info(processing_info)
 
                     # Read SCID file with date filtering
-                    df = read_scid(
-                        str(period.file_path),
-                        start=pd.Timestamp(period_start, tz='UTC'),
-                        end=pd.Timestamp(period_end, tz='UTC')
+                    df = self._load_scid_dataframe(
+                        period.file_path,
+                        self._ensure_timestamp(period_start),
+                        self._ensure_timestamp(period_end),
                     )
 
                     if len(df) == 0:
@@ -490,7 +524,7 @@ class IntradayFileManager:
             # Create async reading task
             file_read_tasks.append({
                 'period': period,
-                'file_path': str(period.file_path),
+                'file_path': period.file_path,
                 'start_date': period_start,
                 'end_date': period_end,
                 'start_ts': pd.Timestamp(period_start, tz='UTC'),
@@ -500,58 +534,266 @@ class IntradayFileManager:
         if not file_read_tasks:
             return []
 
-        # Read all SCID files asynchronously
         file_paths = [task['file_path'] for task in file_read_tasks]
 
         if self.logger:
             self.logger.info(f"Reading {len(file_paths)} SCID files asynchronously for {symbol}")
 
-        # Use AsyncScidReader for concurrent file reading
-        async with AsyncScidReader(max_workers=min(batch_size * 2, 16)) as async_reader:
-            # Read files in batches
-            file_results = await async_reader.read_multiple_scid(
-                file_paths,
-                batch_size=batch_size,
-                start=file_read_tasks[0]['start_ts'],  # Use overall range
-                end=file_read_tasks[-1]['end_ts']
-            )
+        for idx in range(0, len(file_read_tasks), batch_size):
+            batch = file_read_tasks[idx:idx + batch_size]
+            tasks = [
+                asyncio.to_thread(
+                    self._load_scid_dataframe,
+                    task['file_path'],
+                    task['start_ts'],
+                    task['end_ts'],
+                    None,
+                )
+                for task in batch
+            ]
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Process results and create IntradayData objects
-        for task, (file_path, df) in zip(file_read_tasks, file_results):
-            if len(df) == 0:
-                if self.logger:
-                    self.logger.warning(f"No data in date range for {Path(file_path).name}")
-                continue
+            for task, result in zip(batch, batch_results):
+                file_path = task['file_path']
+                if isinstance(result, Exception):
+                    if self.logger:
+                        self.logger.error(
+                            f"Error loading {file_path.name}: {result}"
+                        )
+                    continue
 
-            period = task['period']
+                df = result
+                if len(df) == 0:
+                    if self.logger:
+                        self.logger.warning(
+                            f"No data in date range for {file_path.name}"
+                        )
+                    continue
 
-            # Apply post-processing
-            if volume_bucket_size:
-                df = self._aggregate_volume_buckets(df, volume_bucket_size)
-            elif resample_rule:
-                df = self._resample_ohlcv(df, rule=resample_rule)
+                period = task['period']
 
-            if len(df) == 0:
-                continue
+                if volume_bucket_size:
+                    df = self._aggregate_volume_buckets(df, volume_bucket_size)
+                elif resample_rule:
+                    df = self._resample_ohlcv(df, rule=resample_rule)
 
-            intraday_data = IntradayData(
-                symbol=symbol,
-                contract_code=period.contract_code,
-                data=df,
-                start_date=task['start_date'],
-                end_date=task['end_date'],
-                total_records=len(df),
-                file_path=period.file_path
-            )
+                if len(df) == 0:
+                    continue
 
-            intraday_data_list.append(intraday_data)
+                intraday_data = IntradayData(
+                    symbol=symbol,
+                    contract_code=period.contract_code,
+                    data=df,
+                    start_date=task['start_date'],
+                    end_date=task['end_date'],
+                    total_records=len(df),
+                    file_path=period.file_path
+                )
 
-        if self.logger:
-            total_records = sum(data.total_records for data in intraday_data_list)
-            self.logger.info(f"Loaded {len(intraday_data_list)} M0 periods with "
-                           f"{total_records:,} total records for {symbol} (async)")
+                intraday_data_list.append(intraday_data)
 
         return intraday_data_list
+
+    def build_pipeline_specs_for_symbol(self,
+                                      symbol: str,
+                                      output_dir: Union[str, Path],
+                                      *,
+                                      start_date: Optional[datetime] = None,
+                                      end_date: Optional[datetime] = None,
+                                      columns: Optional[Sequence[str]] = None,
+                                      include_time: bool = True,
+                                      chunk_records: int = 1_000_000,
+                                      fmt: str = "parquet",
+                                      compression: str = "zstd",
+                                      csv_separator: str = ",",
+                                      csv_shard_rows: Optional[int] = None,
+                                      queue_maxsize: int = 4,
+                                      file_mapping: Optional[Dict[str, List[Path]]] = None) -> List[PipelineSpec]:
+        mapping = file_mapping if file_mapping is not None else self._collect_scid_files()
+        if file_mapping is None:
+            self._scid_files = mapping
+
+        files = mapping.get(symbol, [])
+        if not files:
+            return []
+
+        start_ms = self._timestamp_to_epoch_ms(start_date)
+        end_ms = self._timestamp_to_epoch_ms(end_date)
+        target_dir = Path(output_dir) / symbol
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        specs: List[PipelineSpec] = []
+        for file_path in sorted(files):
+            suffix = ".parquet" if fmt.lower() == "parquet" else ".csv"
+            out_path = target_dir / file_path.with_suffix(suffix).name
+            specs.append(
+                PipelineSpec(
+                    read=ReadSpec(
+                        path=str(file_path),
+                        start_ms=start_ms,
+                        end_ms=end_ms,
+                        columns=tuple(columns) if columns is not None else None,
+                        chunk_records=chunk_records,
+                    ),
+                    write=WriteSpec(
+                        out_path=str(out_path),
+                        format=fmt,
+                        include_time=include_time,
+                        parquet_compression=compression,
+                        csv_separator=csv_separator,
+                        csv_shard_rows=csv_shard_rows,
+                        csv_header=True,
+                    ),
+                    queue_maxsize=queue_maxsize,
+                )
+            )
+        return specs
+
+    async def process_symbol(self,
+                             symbol: str,
+                             output_dir: Union[str, Path],
+                             *,
+                             start_date: Optional[datetime] = None,
+                             end_date: Optional[datetime] = None,
+                             columns: Optional[Sequence[str]] = None,
+                             include_time: bool = True,
+                             chunk_records: int = 1_000_000,
+                             fmt: str = "parquet",
+                             compression: str = "zstd",
+                             csv_separator: str = ",",
+                             csv_shard_rows: Optional[int] = None,
+                             queue_maxsize: int = 4,
+                             max_reader_tasks: int = 2,
+                             max_writer_tasks: int = 2,
+                             file_mapping: Optional[Dict[str, List[Path]]] = None) -> List[Path]:
+        specs = self.build_pipeline_specs_for_symbol(
+            symbol,
+            output_dir,
+            start_date=start_date,
+            end_date=end_date,
+            columns=columns,
+            include_time=include_time,
+            chunk_records=chunk_records,
+            fmt=fmt,
+            compression=compression,
+            csv_separator=csv_separator,
+            csv_shard_rows=csv_shard_rows,
+            queue_maxsize=queue_maxsize,
+            file_mapping=file_mapping,
+        )
+
+        if not specs:
+            if self.logger:
+                self.logger.warning(f"No SCID files found for {symbol}")
+            return []
+
+        await run_pipelines(specs,
+                            max_reader_tasks=max_reader_tasks,
+                            max_writer_tasks=max_writer_tasks)
+        return [Path(spec.write.out_path) for spec in specs]
+
+    async def process_symbols(self,
+                              symbols: Sequence[str],
+                              output_dir: Union[str, Path],
+                              *,
+                              start_date: Optional[datetime] = None,
+                              end_date: Optional[datetime] = None,
+                              columns: Optional[Sequence[str]] = None,
+                              include_time: bool = True,
+                              chunk_records: int = 1_000_000,
+                              fmt: str = "parquet",
+                              compression: str = "zstd",
+                              csv_separator: str = ",",
+                              csv_shard_rows: Optional[int] = None,
+                              queue_maxsize: int = 4,
+                              max_reader_tasks: int = 2,
+                              max_writer_tasks: int = 2,
+                              file_mapping: Optional[Dict[str, List[Path]]] = None) -> Dict[str, List[Path]]:
+        mapping = file_mapping if file_mapping is not None else self._collect_scid_files()
+        if file_mapping is None:
+            self._scid_files = mapping
+        if not mapping:
+            if self.logger:
+                self.logger.warning("No SCID files available for processing")
+            return {}
+
+        specs: List[PipelineSpec] = []
+        outputs: Dict[str, List[Path]] = {}
+
+        for symbol in symbols:
+            symbol_specs = self.build_pipeline_specs_for_symbol(
+                symbol,
+                output_dir,
+                start_date=start_date,
+                end_date=end_date,
+                columns=columns,
+                include_time=include_time,
+                chunk_records=chunk_records,
+                fmt=fmt,
+                compression=compression,
+                csv_separator=csv_separator,
+                csv_shard_rows=csv_shard_rows,
+                queue_maxsize=queue_maxsize,
+                file_mapping=mapping,
+            )
+            if symbol_specs:
+                specs.extend(symbol_specs)
+                outputs[symbol] = [Path(spec.write.out_path) for spec in symbol_specs]
+
+        if not specs:
+            if self.logger:
+                self.logger.warning("No matching SCID files for requested symbols")
+            return {}
+
+        await run_pipelines(specs,
+                            max_reader_tasks=max_reader_tasks,
+                            max_writer_tasks=max_writer_tasks)
+        return outputs
+
+    async def process_all_tickers(self,
+                                 output_dir: Union[str, Path],
+                                 *,
+                                 start_date: Optional[datetime] = None,
+                                 end_date: Optional[datetime] = None,
+                                 columns: Optional[Sequence[str]] = None,
+                                 include_time: bool = True,
+                                 chunk_records: int = 1_000_000,
+                                 compression: str = "zstd",
+                                 fmt: str = "parquet",
+                                 csv_separator: str = ",",
+                                 csv_shard_rows: Optional[int] = None,
+                                 queue_maxsize: int = 4,
+                                 max_reader_tasks: int = 2,
+                                 max_writer_tasks: int = 2) -> Dict[str, List[Path]]:
+        mapping = self._collect_scid_files()
+        self._scid_files = mapping
+        two_letter_symbols = sorted(
+            symbol for symbol in mapping
+            if len(symbol.split('_')[0]) == 2
+        )
+
+        if not two_letter_symbols:
+            if self.logger:
+                self.logger.warning("No two-letter tickers available for processing")
+            return {}
+
+        return await self.process_symbols(
+            two_letter_symbols,
+            output_dir,
+            start_date=start_date,
+            end_date=end_date,
+            columns=columns,
+            include_time=include_time,
+            chunk_records=chunk_records,
+            fmt=fmt,
+            compression=compression,
+            csv_separator=csv_separator,
+            csv_shard_rows=csv_shard_rows,
+            queue_maxsize=queue_maxsize,
+            max_reader_tasks=max_reader_tasks,
+            max_writer_tasks=max_writer_tasks,
+            file_mapping=mapping,
+        )
 
     def _aggregate_volume_buckets(self, df: pd.DataFrame, volume_bucket_size: int) -> pd.DataFrame:
         """

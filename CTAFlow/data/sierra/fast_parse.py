@@ -24,11 +24,13 @@ Dependencies: numpy (required), pandas (optional for to_pandas).
 from __future__ import annotations
 
 import io
-import os
+import logging
 import mmap
+import os
 import struct
 from dataclasses import dataclass
-from typing import Iterator, Literal, Optional, Sequence, Tuple, Dict, Any
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -742,6 +744,9 @@ class FastScidReader:
         stats["records_per_second"] = total_records / export_time if export_time > 0 else 0
 
         return stats
+
+
+# ---------------------------- asynchronous helper -----------------------------
 
 
 # ------------------------------ small CLI helper ------------------------------
