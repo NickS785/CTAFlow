@@ -2622,21 +2622,35 @@ class SpreadData:
                            index=pd.date_range(start='2020-01-01', periods=len(synthetic_spot), freq='D'),
                            name='synthetic_spot')
     
+    @property
+    def spot(self) -> Optional[pd.Series]:
+        """
+        Property to access spot prices as pandas Series.
+
+        Returns real spot prices if available, otherwise synthetic spot prices.
+        This provides a clean interface for accessing spot data.
+
+        Returns:
+        --------
+        Optional[pd.Series]
+            Spot prices with datetime index, or None if no spot data available
+        """
+        return self.get_spot_prices(prefer_real=True)
+
     def get_spot_prices(self, prefer_real: bool = True) -> Optional[pd.Series]:
         """
-        Get spot prices, preferring real over synthetic or vice versa.
-        
+        Get spot prices, preferring real or synthetic.
+
         Parameters:
         -----------
         prefer_real : bool, default True
             If True, returns real spot prices if available, otherwise synthetic.
             If False, returns synthetic spot prices if available, otherwise real.
-            
+
         Returns:
         --------
-        pd.Series or None
-            Best available spot prices as Series with datetime index, 
-            or None if no spot data available.
+        Optional[pd.Series]
+            Spot prices with datetime index, or None if no spot data available
         """
         if prefer_real:
             # Return real spot prices if available (already Series with intersected index)
@@ -4218,7 +4232,7 @@ class SpreadData:
         # Copy the data from the filtered instance to this instance
         for attr_name in ['curve', 'volume_curve', 'oi_curve', 'seq_prices', 'seq_volume',
                          'seq_oi', 'seq_labels', 'seq_spreads', 'seq_dte', 'dte',
-                         'days_to_expiration', 'spot_prices', 'roll_dates']:
+                         'days_to_expiration', 'spot_prices', 'synthetic_spot_prices', 'roll_dates']:
             if hasattr(filtered_data, attr_name):
                 setattr(self, attr_name, getattr(filtered_data, attr_name))
 
@@ -4308,7 +4322,14 @@ class SpreadData:
         return spread_data
 
     def _extract_scalar_data(self, curve_data):
-        """Efficiently extract scalar arrays (dte, seq_dte, spot) from curve_data"""
+        """
+        Efficiently extract scalar arrays (dte, seq_dte, spot) from curve_data.
+
+        Maps HDF5 keys to SpreadData attributes:
+        - 'spot' key → self.spot_prices (pandas Series)
+        - 'dte' key → self.dte (numpy array)
+        - 'seq_dte' key → self.seq_dte (DataFrame/array)
+        """
         # Extract dte data
         if 'dte' in curve_data and curve_data['dte'] is not None:
             dte_data = curve_data['dte']
@@ -4324,6 +4345,7 @@ class SpreadData:
             self.seq_dte = None
 
         # Extract real spot prices as Series with index intersection (keep synthetic separate)
+        # Maps HDF5 '/spot' key to self.spot_prices attribute as pandas Series
         if 'spot' in curve_data and curve_data['spot'] is not None:
             spot_data = curve_data['spot']
             # Convert to Series if not already
@@ -4336,11 +4358,23 @@ class SpreadData:
                 else:
                     spot_series = pd.Series(spot_data.values, index=spot_data.index)
             else:
-                # Raw array case - use self.index if available
+                # Raw array case (numpy array or list) - convert to Series with proper index
                 if hasattr(self, 'index') and self.index is not None:
-                    spot_series = pd.Series(spot_data, index=self.index)
+                    # Ensure array length matches index length
+                    spot_array = np.asarray(spot_data)
+                    if len(spot_array) == len(self.index):
+                        spot_series = pd.Series(spot_array, index=self.index, name='spot')
+                    elif len(spot_array) < len(self.index):
+                        # Truncate index to match array length
+                        spot_series = pd.Series(spot_array, index=self.index[:len(spot_array)], name='spot')
+                    else:
+                        # Truncate array to match index length
+                        spot_series = pd.Series(spot_array[:len(self.index)], index=self.index, name='spot')
                 else:
-                    spot_series = pd.Series(spot_data)
+                    # No index available - create default datetime index
+                    spot_array = np.asarray(spot_data)
+                    default_index = pd.date_range(start='2020-01-01', periods=len(spot_array), freq='D')
+                    spot_series = pd.Series(spot_array, index=default_index, name='spot')
             
             # Intersect with futures index if available
             if hasattr(self, 'index') and self.index is not None and len(spot_series) > 0:
