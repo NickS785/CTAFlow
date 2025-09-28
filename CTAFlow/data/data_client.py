@@ -58,6 +58,12 @@ class DataClient:
 
     All writes sanitize dtypes so numeric-like object columns are coerced to numeric,
     preventing PyTables serialization errors.
+
+    Directories are *not* created automatically when the client is instantiated. Pass
+    ``create_dirs=True`` to ``__init__`` if you want the parent directories for the
+    market/COT stores created up front. Otherwise, write paths call ``_ensure_parent``
+    immediately before persisting data so directories are created only when writes
+    actually occur.
     """
 
     def __init__(
@@ -68,7 +74,7 @@ class DataClient:
         cot_raw_key: str = "cot/raw",
         complevel: int = 9,
         complib: str = "blosc",
-        create_dirs: bool = True,
+        create_dirs: bool = False,
     ) -> None:
         market_path = market_path or MARKET_DATA_PATH
         cot_path = cot_path or COT_DATA_PATH
@@ -1713,11 +1719,12 @@ class DataClient:
                 df, selected_cot_features=selected_cot_features
             )
             
-            with pd.HDFStore(COT_DATA_PATH, "a") as store:
+            self._ensure_parent(self.cot_path)
+            with pd.HDFStore(self.cot_path, "a") as store:
                 # Store raw COT data
                 store.put(storage_path, df, format="table")
                 print(f"Successfully saved {storage_path} with {len(df)} rows")
-                
+
                 # Store calculated metrics
                 metrics_path = f"{storage_path}/metrics"
                 store.put(metrics_path, cot_metrics, format="table")
@@ -2899,6 +2906,7 @@ class DataClient:
             return ticker_results
 
         # Process each ticker
+        self._ensure_parent(self.cot_path)
         with pd.HDFStore(self.cot_path, "a") as store:
             for i, ticker in enumerate(available_tickers):
                 if progress and (i + 1) % 10 == 0:
@@ -2977,6 +2985,7 @@ class DataClient:
         # Determine appropriate raw key based on codes
         raw_key = self._get_raw_key_for_codes(codes_norm)
 
+        self._ensure_parent(self.cot_path)
         with pd.HDFStore(self.cot_path, mode="a") as store:
             if raw_key not in store:
                 raise KeyError(f"Key '{raw_key}' not found in {self.cot_path}")
@@ -3081,7 +3090,8 @@ class DataClient:
 
         # Determine appropriate raw key based on codes
         raw_key = self._get_raw_key_for_codes(codes_norm)
-        
+
+        self._ensure_parent(self.cot_path)
         with pd.HDFStore(self.cot_path, mode="a") as store:
             if raw_key not in store:
                 raise KeyError(f"Key '{raw_key}' not found in {self.cot_path}")
