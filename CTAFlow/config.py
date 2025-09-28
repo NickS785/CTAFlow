@@ -9,7 +9,7 @@ COT_DATA_PATH = Path("F:\\", 'Data', 'cot_data.hd5' )
 RAW_MARKET_DATA_PATH = Path("F:\\", 'charts')  # CSV market data files
 DLY_DATA_PATH = Path("F:\\", 'SierraChart', 'Data')  # DLY futures data files
 MODEL_DATA_PATH = Path("F:\\", "ML", "models")
-
+EXAMPLE_DATA_PATH = Path(__file__).parent / "example_data"
 APP_ROOT = Path(__file__).parent
 with open(APP_ROOT / 'data' / 'futures_mappings.toml') as map:
     FUTURES_MAP = toml.load(map)
