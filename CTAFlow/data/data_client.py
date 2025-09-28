@@ -9,12 +9,21 @@ contain strings like ".", "-" or "—").
 
 from __future__ import annotations
 
-from typing import Optional, Sequence, Union, Dict, Any
+import os
+from pathlib import Path
+from typing import Any, Dict, Optional, Sequence, Union
+
+import pandas as pd
 
 # Optional dependency used by `download_cot`
 # pip install cot_reports
 from CTAFlow.features.signals_processing import COTAnalyzer
-from .ticker_classifier import get_ticker_classifier, get_cot_report_type, get_cot_storage_path, is_financial_ticker
+from .ticker_classifier import (
+    get_cot_report_type,
+    get_cot_storage_path,
+    get_ticker_classifier,
+    is_financial_ticker,
+)
 
 
 try:
@@ -22,7 +31,14 @@ try:
 except Exception:  # pragma: no cover - allows import of module without cot_reports installed
     cot = None
 
-from ..config import *
+from ..config import (
+    COT_DATA_PATH,
+    CODE_TO_TICKER,
+    FUTURES_MAP,
+    MARKET_DATA_PATH,
+    TICKER_TO_CODE,
+    get_cot_code,
+)
 
 
 class DataClient:
@@ -56,7 +72,7 @@ class DataClient:
     ) -> None:
         market_path = market_path or MARKET_DATA_PATH
         cot_path = cot_path or COT_DATA_PATH
-        self.cot_processor = COTAnalyzer()
+        self._cot_processor: Optional[COTAnalyzer] = None
         self.market_path = Path(market_path)
         self.cot_path = Path(cot_path)
         self.cot_raw_key = cot_raw_key
@@ -76,6 +92,11 @@ class DataClient:
     def _ensure_parent(fp: Path) -> None:
         if fp.parent and not fp.parent.exists():
             fp.parent.mkdir(parents=True, exist_ok=True)
+
+    def _get_cot_processor(self) -> COTAnalyzer:
+        if self._cot_processor is None:
+            self._cot_processor = COTAnalyzer()
+        return self._cot_processor
 
     @staticmethod
     def _min_itemsize_for_str_cols(df: pd.DataFrame, base: int = 16) -> Dict[str, int]:
@@ -1686,8 +1707,11 @@ class DataClient:
 
         df = self.query_cot_by_codes(TICKER_TO_CODE[ticker_symbol])
         if len(df) > 0:
-            df = self.cot_processor.load_and_clean_data(df)
-            cot_metrics = self.cot_processor.calculate_enhanced_cot_features(df, selected_cot_features=selected_cot_features)
+            cot_processor = self._get_cot_processor()
+            df = cot_processor.load_and_clean_data(df)
+            cot_metrics = cot_processor.calculate_enhanced_cot_features(
+                df, selected_cot_features=selected_cot_features
+            )
             
             with pd.HDFStore(COT_DATA_PATH, "a") as store:
                 # Store raw COT data
@@ -2892,7 +2916,8 @@ class DataClient:
                         continue
 
                     # Clean and process with COTAnalyzer
-                    ticker_data = self.cot_processor.load_and_clean_data(ticker_data)
+                    cot_processor = self._get_cot_processor()
+                    ticker_data = cot_processor.load_and_clean_data(ticker_data)
 
                     # Set appropriate index if needed
                     if not isinstance(ticker_data.index, pd.DatetimeIndex):
