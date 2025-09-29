@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import pandas as pd
 
@@ -550,17 +550,13 @@ class DataClient:
             COMMODITY_TO_TICKER = {}
         
         # Handle ticker input
+        if isinstance(tickers, str):
+            tickers = [tickers]
+
+        market_keys: Optional[List[str]]
         if tickers is None:
-            # Get all available market data
-            available_keys = self.list_market_data()
-            if daily:
-                market_keys = [key for key in available_keys if key.startswith('market/daily/')]
-            else:
-                market_keys = [key for key in available_keys if key.startswith('market/') and not key.startswith('market/daily/')]
+            market_keys = None  # Determine after opening the store
         else:
-            if isinstance(tickers, str):
-                tickers = [tickers]
-            
             market_keys = []
             for ticker in tickers:
                 # Try to resolve ticker symbol
@@ -597,43 +593,63 @@ class DataClient:
             combined_where = where
         
         # Query data
-        results = {}
-        available_keys = self.list_market_data()
-        
-        for market_key in market_keys:
-            if market_key not in available_keys:
-                print(f"Warning: {market_key} not found in available data")
-                continue
-            if daily:
-                split_key = market_key.split('/')
-                market_key = "".join([split_key[0], '/daily/', split_key[-1]])
-                
-            try:
-                # Read data with filtering
-                df = self.read_market(
-                    market_key,
-                    where=combined_where,
-                    columns=columns
-                )
-                
-                # Apply resampling if requested
-                if resample and len(df) > 0:
-                    df = self._resample_ohlc_data(df, resample)
-                
-                # Extract ticker name for results key
-                if daily:
-                    ticker_name = market_key.replace('market/daily/', '')
-                else:
-                    ticker_name = market_key.replace('market/', '')
-                results[ticker_name] = df
-                
-            except Exception as e:
-                print(f"Error querying {market_key}: {e}")
-                continue
-        
+        results: Dict[str, pd.DataFrame] = {}
+        requested_count = len(market_keys) if market_keys is not None else 0
+
+        if not self.market_path.exists():
+            return pd.DataFrame() if requested_count == 1 or combine_datasets else {}
+
+        try:
+            with pd.HDFStore(self.market_path, "r") as store:
+                if market_keys is None:
+                    available_keys = [
+                        key.lstrip("/")
+                        for key in store.keys()
+                        if key.startswith("/market/")
+                    ]
+                    if daily:
+                        market_keys = [key for key in available_keys if key.startswith("market/daily/")]
+                    else:
+                        market_keys = [
+                            key
+                            for key in available_keys
+                            if key.startswith("market/") and not key.startswith("market/daily/")
+                        ]
+                requested_count = len(market_keys)
+
+                for market_key in market_keys:
+                    if market_key not in store:
+                        print(f"Warning: {market_key} not found in available data")
+                        continue
+
+                    try:
+                        df = store.select(
+                            market_key,
+                            where=combined_where,
+                            columns=columns,
+                        )
+
+                        # Apply resampling if requested
+                        if resample and len(df) > 0:
+                            df = self._resample_ohlc_data(df, resample)
+
+                        # Extract ticker name for results key
+                        if daily:
+                            ticker_name = market_key.replace('market/daily/', '')
+                        else:
+                            ticker_name = market_key.replace('market/', '')
+                        results[ticker_name] = df
+
+                    except Exception as e:
+                        print(f"Error querying {market_key}: {e}")
+                        continue
+        except Exception as e:
+            print(f"Error opening market data store: {e}")
+            return pd.DataFrame() if requested_count == 1 or combine_datasets else {}
+
         # Return results
         if not results:
-            return pd.DataFrame() if len(market_keys) == 1 or combine_datasets else {}
+            return pd.DataFrame() if requested_count == 1 or combine_datasets else {}
         
         if len(results) == 1 and not combine_datasets:
             return list(results.values())[0]
