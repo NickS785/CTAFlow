@@ -995,12 +995,10 @@ class DataClient:
 
         try:
             with pd.HDFStore(self.market_path, "r") as store:
-                store_keys = {k.lstrip("/") for k in store.keys()}
-
                 for curve_type in curve_types_to_query:
                     market_key = f"market/{available_curve_types[curve_type]}"
 
-                    if market_key not in store_keys:
+                    if market_key not in store:
                         print(f"Warning: {market_key} not found in available data")
                         continue
 
@@ -1011,6 +1009,9 @@ class DataClient:
                             columns=columns
                         )
                         results[curve_type] = df
+                    except KeyError:
+                        print(f"Warning: {market_key} not found in available data")
+                        continue
                     except Exception as e:
                         print(f"Error querying {market_key}: {e}")
                         continue
