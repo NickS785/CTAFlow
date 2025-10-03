@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Intraday file management for SCID contract data.
+Intraday file management for SCID contract data using sierrapy.
 
 This module provides the IntradayFileManager class for discovering, parsing, and
-managing intraday SCID files. It integrates with the curve data to identify
-front month (M0) contracts and extract relevant time series data.
+managing intraday SCID files using the sierrapy.parser ScidReader which includes
+built-in front month loading and volume bucketing capabilities.
 """
 
 from typing import Dict, List, Optional, Sequence, Tuple, Union, Set
@@ -18,14 +18,12 @@ import logging
 import asyncio
 from dataclasses import dataclass
 from collections import defaultdict
-import pyarrow as pa
-import pyarrow.parquet as pq
 
-from ...config import DLY_DATA_PATH
-from ...data.sierra.fast_parse import FastScidReader
-from ...data.sierra.scid_io import PipelineSpec, ReadSpec, WriteSpec, run_pipelines
-from ...data.data_client import DataClient
-from .curve_manager import SpreadData
+from sierrapy.parser import ScidReader
+
+from ...config import DLY_DATA_PATH, MARKET_DATA_PATH
+from ..data_client import DataClient
+import h5py
 
 
 @dataclass
@@ -52,29 +50,31 @@ class IntradayData:
 
 class IntradayFileManager:
     """
-    Manager for intraday SCID contract files.
+    Manager for intraday SCID contract files using sierrapy.
 
     This class handles:
     - Discovery of SCID files in DLY_DATA_PATH
     - Parsing contract codes from filenames
     - Integration with curve data to identify M0 periods
-    - Extraction of intraday data for front month contracts
+    - Extraction of intraday data for front month contracts using ScidReader
+    - Automatic front month loading via ScidReader.load_front_month()
+    - Volume bucketing via ScidReader.bucket_volume()
     """
 
     def __init__(self,
                  data_path: Optional[Path] = None,
-                 data_client: Optional[DataClient] = None,
+                 market_data_path: Optional[Path] = None,
                  enable_logging: bool = True):
         """
         Initialize the intraday file manager.
 
         Args:
             data_path: Path to directory containing SCID files (default: DLY_DATA_PATH)
-            data_client: DataClient instance for curve data queries
+            market_data_path: Path to HDF5 market data file (default: MARKET_DATA_PATH)
             enable_logging: Enable logging for debugging
         """
         self.data_path = Path(data_path) if data_path else Path(DLY_DATA_PATH)
-        self.data_client = data_client or DataClient()
+        self.market_data_path = Path(market_data_path) if market_data_path else MARKET_DATA_PATH
         self.enable_logging = enable_logging
 
         # Setup logging
@@ -88,38 +88,12 @@ class IntradayFileManager:
         self._scid_files: Dict[str, List[Path]] = {}
         self._contract_periods: Dict[str, List[ContractPeriod]] = {}
         self._file_cache: Dict[str, IntradayData] = {}
-        self._curve_data_cache: Dict[str, SpreadData] = {}
+
+        # Initialize DataClient for HDF5 operations
+        self.data_client = DataClient(market_path=self.market_data_path)
 
         # Discover SCID files on initialization
         self._discover_scid_files()
-
-    @staticmethod
-    def _ensure_timestamp(value: Optional[Union[datetime, pd.Timestamp]]) -> Optional[pd.Timestamp]:
-        if value is None:
-            return None
-        ts = pd.Timestamp(value)
-        if ts.tzinfo is None:
-            return ts.tz_localize("UTC")
-        return ts.tz_convert("UTC")
-
-    @classmethod
-    def _timestamp_to_epoch_ms(cls, value: Optional[Union[datetime, pd.Timestamp]]) -> Optional[int]:
-        ts = cls._ensure_timestamp(value)
-        if ts is None:
-            return None
-        return int(ts.value // 1_000_000)
-
-    def _load_scid_dataframe(
-        self,
-        file_path: Path,
-        start: Optional[Union[datetime, pd.Timestamp]],
-        end: Optional[Union[datetime, pd.Timestamp]],
-        columns: Optional[Sequence[str]] = None,
-    ) -> pd.DataFrame:
-        start_ms = self._timestamp_to_epoch_ms(start)
-        end_ms = self._timestamp_to_epoch_ms(end)
-        with FastScidReader(str(file_path)) as reader:
-            return reader.to_pandas(start_ms=start_ms, end_ms=end_ms, columns=columns)
 
     def _collect_scid_files(self, folder: Optional[Path] = None) -> Dict[str, List[Path]]:
         """Return mapping of symbols to SCID paths using a filename parser."""
@@ -198,57 +172,86 @@ class IntradayFileManager:
 
         return datetime(year, month, 1)
 
-    def _load_curve_data_bulk(self, symbols: List[str],
-                             start_date: Optional[datetime] = None,
-                             end_date: Optional[datetime] = None) -> Dict[str, SpreadData]:
+    def _load_front_month_data(self, symbol: str) -> Optional[pd.DataFrame]:
         """
-        Load curve data for multiple symbols in a single DataClient operation.
+        Load front month data directly from HDF5 market data.
 
         Args:
-            symbols: List of symbols to load
-            start_date: Start date for analysis
-            end_date: End date for analysis
+            symbol: Trading symbol (e.g., 'CL_F')
 
         Returns:
-            Dictionary mapping symbols to SpreadData objects
+            DataFrame with front month contract codes indexed by date, or None if not found
         """
-        curve_data_map = {}
-
-        # Use DataClient to load all symbols at once
-        for symbol in symbols:
-            try:
-                # Check if we need to query the data client
-                if symbol not in self._curve_data_cache:
-                    spread_data = SpreadData(symbol)
-
-                    # Single call to load curve data
-                    spread_data.load_from_client(
-                        self.data_client,
-                        start_date=start_date,
-                        end_date=end_date
-                    )
-
-                    self._curve_data_cache[symbol] = spread_data
-
+        try:
+            with h5py.File(self.market_data_path, 'r') as f:
+                front_path = f'market/{symbol}/front/table'
+                if front_path not in f:
                     if self.logger:
-                        self.logger.info(f"Loaded curve data for {symbol}")
-                else:
-                    spread_data = self._curve_data_cache[symbol]
+                        self.logger.warning(f"No front month data found for {symbol} in HDF5")
+                    return None
 
-                curve_data_map[symbol] = spread_data
+                front_data = f[front_path][:]
 
-            except Exception as e:
+                # Convert to DataFrame with timezone-naive timestamps
+                timestamps = pd.to_datetime(front_data['index'], utc=True).tz_localize(None)
+                contracts = [code.decode('utf-8') for code in front_data['front']]
+
+                df = pd.DataFrame({
+                    'front_contract': contracts
+                }, index=timestamps)
+
                 if self.logger:
-                    self.logger.error(f"Error loading curve data for {symbol}: {e}")
-                continue
+                    self.logger.info(f"Loaded {len(df)} front month records for {symbol}")
 
-        return curve_data_map
+                return df
+
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Error loading front month data for {symbol}: {e}")
+            return None
+
+    def _load_expiry_data(self, symbol: str) -> Optional[Dict[str, datetime]]:
+        """
+        Load contract expiry dates from HDF5 market data.
+
+        Args:
+            symbol: Trading symbol (e.g., 'CL_F')
+
+        Returns:
+            Dictionary mapping contract codes to expiry dates, or None if not found
+        """
+        try:
+            with h5py.File(self.market_data_path, 'r') as f:
+                expiry_path = f'market/{symbol}/expiry/table'
+                if expiry_path not in f:
+                    if self.logger:
+                        self.logger.warning(f"No expiry data found for {symbol} in HDF5")
+                    return None
+
+                expiry_data = f[expiry_path][:]
+
+                # Convert to dictionary with timezone-naive dates
+                expiry_dict = {}
+                for row in expiry_data:
+                    contract_code = row['index'].decode('utf-8')
+                    expiry_timestamp = pd.to_datetime(row['expiry_date'], utc=True).tz_localize(None)
+                    expiry_dict[contract_code] = expiry_timestamp.to_pydatetime()
+
+                if self.logger:
+                    self.logger.info(f"Loaded expiry data for {len(expiry_dict)} contracts for {symbol}")
+
+                return expiry_dict
+
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Error loading expiry data for {symbol}: {e}")
+            return None
 
     def identify_m0_periods(self, symbol: str,
                            start_date: Optional[datetime] = None,
                            end_date: Optional[datetime] = None) -> List[ContractPeriod]:
         """
-        Identify periods when each contract was the front month (M0).
+        Identify periods when each contract was the front month (M0) using simplified approach.
 
         Args:
             symbol: Trading symbol (e.g., 'CL_F')
@@ -262,76 +265,24 @@ class IntradayFileManager:
         if cache_key in self._contract_periods:
             return self._contract_periods[cache_key]
 
-        # Load curve data efficiently
-        curve_data_map = self._load_curve_data_bulk([symbol], start_date, end_date)
+        # Try to load front month data from HDF5 first
+        front_df = self._load_front_month_data(symbol)
 
-        if symbol not in curve_data_map:
-            if self.logger:
-                self.logger.warning(f"No curve data available for {symbol}")
-            return []
-
-        spread_data = curve_data_map[symbol]
-
-        if spread_data.seq_data is None or spread_data.seq_data.seq_labels is None:
-            if self.logger:
-                self.logger.warning(f"No sequential data available for {symbol}")
-            return []
-
-        # Extract M0 contract information from seq_labels
-        contract_periods = []
-        seq_labels = spread_data.seq_data.seq_labels
-        dates = spread_data.index
-
-        if len(dates) == 0 or seq_labels.shape[0] == 0:
-            return []
-
-        # Track when each contract becomes/stops being M0
-        current_m0 = None
-        m0_start_date = None
-
-        for i, date in enumerate(dates):
-            if i < seq_labels.shape[0] and seq_labels.shape[1] > 0:
-                # Get M0 contract label for this date
-                m0_contract = seq_labels[i, 0]  # First column is M0
-
-                if m0_contract != current_m0:
-                    # M0 contract changed
-                    if current_m0 is not None and m0_start_date is not None:
-                        # Close previous M0 period
-                        contract_periods.append(ContractPeriod(
-                            contract_code=current_m0,
-                            symbol=symbol,
-                            start_date=m0_start_date,
-                            end_date=date - timedelta(days=1)
-                        ))
-
-                    # Start new M0 period
-                    current_m0 = m0_contract
-                    m0_start_date = date
-
-        # Close final M0 period
-        if current_m0 is not None and m0_start_date is not None:
-            contract_periods.append(ContractPeriod(
-                contract_code=current_m0,
-                symbol=symbol,
-                start_date=m0_start_date,
-                end_date=dates[-1]
-            ))
+        if front_df is not None:
+            # Use HDF5 front month data
+            contract_periods = self._extract_periods_from_front_data(
+                front_df, symbol, start_date, end_date
+            )
+        else:
+            # Fallback: Calculate periods from available SCID files and expiry dates
+            contract_periods = self._calculate_periods_from_expiry(
+                symbol, start_date, end_date
+            )
 
         # Match contract periods with SCID files
         scid_files = self.get_scid_files_for_symbol(symbol)
         for period in contract_periods:
-            for scid_file in scid_files:
-                parsed = self._parse_contract_from_filename(scid_file)
-                if parsed:
-                    base_symbol, month_code, year_code, exchange = parsed
-                    contract_date = self._convert_month_year_to_date(month_code, year_code)
-
-                    # Match by contract expiry month/year
-                    if (contract_date.year == period.start_date.year and
-                        contract_date.month == period.start_date.month):
-                        period.file_path = scid_file
-                        break
+            period.file_path = self._find_matching_scid_file(period.contract_code, scid_files)
 
         self._contract_periods[cache_key] = contract_periods
 
@@ -340,35 +291,215 @@ class IntradayFileManager:
 
         return contract_periods
 
-    def identify_m0_periods_bulk(self, symbols: List[str],
-                                start_date: Optional[datetime] = None,
-                                end_date: Optional[datetime] = None) -> Dict[str, List[ContractPeriod]]:
+    def _extract_periods_from_front_data(self, front_df: pd.DataFrame, symbol: str,
+                                       start_date: Optional[datetime] = None,
+                                       end_date: Optional[datetime] = None) -> List[ContractPeriod]:
+        """Extract contract periods from front month DataFrame."""
+        # Apply date filtering
+        if start_date:
+            start_ts = pd.Timestamp(start_date)
+            front_df = front_df[front_df.index >= start_ts]
+        if end_date:
+            end_ts = pd.Timestamp(end_date)
+            front_df = front_df[front_df.index <= end_ts]
+
+        if len(front_df) == 0:
+            return []
+
+        contract_periods = []
+        current_contract = None
+        period_start = None
+
+        for date, row in front_df.iterrows():
+            contract_code = row['front_contract']
+
+            if contract_code != current_contract:
+                # Contract changed
+                if current_contract is not None and period_start is not None:
+                    # Close previous period
+                    contract_periods.append(ContractPeriod(
+                        contract_code=current_contract,
+                        symbol=symbol,
+                        start_date=period_start.to_pydatetime(),
+                        end_date=(date - timedelta(days=1)).to_pydatetime()
+                    ))
+
+                # Start new period
+                current_contract = contract_code
+                period_start = date
+
+        # Close final period
+        if current_contract is not None and period_start is not None:
+            contract_periods.append(ContractPeriod(
+                contract_code=current_contract,
+                symbol=symbol,
+                start_date=period_start.to_pydatetime(),
+                end_date=front_df.index[-1].to_pydatetime()
+            ))
+
+        return contract_periods
+
+    def _calculate_periods_from_expiry(self, symbol: str,
+                                     start_date: Optional[datetime] = None,
+                                     end_date: Optional[datetime] = None) -> List[ContractPeriod]:
         """
-        Identify M0 periods for multiple symbols efficiently.
-
-        Args:
-            symbols: List of symbols to analyze
-            start_date: Start date for analysis
-            end_date: End date for analysis
-
-        Returns:
-            Dictionary mapping symbols to their M0 periods
+        Fallback method: Calculate M0 periods from expiry dates with 30 DTE rolling.
         """
-        # Load all curve data in a single operation
-        curve_data_map = self._load_curve_data_bulk(symbols, start_date, end_date)
+        expiry_dict = self._load_expiry_data(symbol)
+        scid_files = self.get_scid_files_for_symbol(symbol)
 
-        all_periods = {}
+        if not expiry_dict or not scid_files:
+            if self.logger:
+                self.logger.warning(f"No expiry data or SCID files available for {symbol}")
+            return []
 
-        for symbol in symbols:
-            if symbol not in curve_data_map:
-                all_periods[symbol] = []
+        # Parse available contracts from SCID files
+        available_contracts = []
+        for scid_file in scid_files:
+            parsed = self._parse_contract_from_filename(scid_file)
+            if parsed:
+                base_symbol, month_code, year_code, exchange = parsed
+                contract_code = f"{month_code}{year_code}"
+                if contract_code in expiry_dict:
+                    available_contracts.append({
+                        'code': contract_code,
+                        'expiry': expiry_dict[contract_code],
+                        'file_path': scid_file
+                    })
+
+        if not available_contracts:
+            return []
+
+        # Sort by expiry date
+        available_contracts.sort(key=lambda x: x['expiry'])
+
+        contract_periods = []
+
+        for i, contract in enumerate(available_contracts):
+            expiry_date = contract['expiry']
+
+            # Calculate when this contract becomes front month (30 DTE before expiry)
+            roll_date = expiry_date - timedelta(days=30)
+
+            # Determine period start (either roll date or when previous contract expires)
+            if i == 0:
+                # First contract starts from earliest available date
+                period_start = start_date or (expiry_date - timedelta(days=90))
+            else:
+                # Start when previous contract rolled
+                prev_expiry = available_contracts[i-1]['expiry']
+                period_start = prev_expiry - timedelta(days=30)
+
+            # Period ends at roll date (30 DTE)
+            period_end = roll_date
+
+            # Apply date filtering
+            if start_date and period_end < start_date:
+                continue
+            if end_date and period_start > end_date:
                 continue
 
-            # Use the already loaded curve data
-            periods = self.identify_m0_periods(symbol, start_date, end_date)
-            all_periods[symbol] = periods
+            # Adjust boundaries
+            if start_date and period_start < start_date:
+                period_start = start_date
+            if end_date and period_end > end_date:
+                period_end = end_date
 
-        return all_periods
+            contract_periods.append(ContractPeriod(
+                contract_code=contract['code'],
+                symbol=symbol,
+                start_date=period_start,
+                end_date=period_end,
+                file_path=contract['file_path']
+            ))
+
+        return contract_periods
+
+    def _find_matching_scid_file(self, contract_code: str, scid_files: List[Path]) -> Optional[Path]:
+        """Find SCID file matching the contract code."""
+        for scid_file in scid_files:
+            parsed = self._parse_contract_from_filename(scid_file)
+            if parsed:
+                base_symbol, month_code, year_code, exchange = parsed
+                file_contract_code = f"{month_code}{year_code}"
+                if file_contract_code == contract_code:
+                    return scid_file
+        return None
+
+    def load_front_month_continuous(self,
+                                   symbol: str,
+                                   start_date: Optional[datetime] = None,
+                                   end_date: Optional[datetime] = None,
+                                   volume_bucket_size: Optional[int] = None,
+                                   resample_rule: Optional[str] = None) -> pd.DataFrame:
+        """
+        Load continuous front month data using ScidReader.load_front_month().
+
+        This method leverages sierrapy's built-in front month loading capability
+        which automatically stitches together front month contracts.
+
+        Args:
+            symbol: Trading symbol (e.g., 'CL_F')
+            start_date: Start date filter
+            end_date: End date filter
+            volume_bucket_size: Optional volume bucket size for bucketing
+            resample_rule: Optional time-based resampling rule (e.g., '1T', '5T', '1H')
+
+        Returns:
+            Continuous DataFrame with front month intraday data
+        """
+        scid_files = self.get_scid_files_for_symbol(symbol)
+
+        if not scid_files:
+            if self.logger:
+                self.logger.warning(f"No SCID files found for {symbol}")
+            return pd.DataFrame()
+
+        if self.logger:
+            self.logger.info(f"Loading continuous front month data for {symbol} using ScidReader")
+
+        # Use ScidReader to load front month data across all files
+        try:
+            # Convert file paths to strings
+            file_paths = [str(f) for f in scid_files]
+
+            # Use ScidReader's load_front_month method
+            reader = ScidReader(file_paths)
+
+            # Load front month data
+            df = reader.load_front_month(
+                start_date=start_date,
+                end_date=end_date
+            )
+
+            if len(df) == 0:
+                if self.logger:
+                    self.logger.warning(f"No front month data loaded for {symbol}")
+                return pd.DataFrame()
+
+            # Apply volume bucketing if requested
+            if volume_bucket_size:
+                if self.logger:
+                    self.logger.info(f"Bucketing data by volume: {volume_bucket_size} contracts per bucket")
+                df = reader.bucket_volume(df, bucket_size=volume_bucket_size)
+
+            # Apply time-based resampling if requested (and not using volume buckets)
+            elif resample_rule:
+                if self.logger:
+                    self.logger.info(f"Resampling data to {resample_rule}")
+                df = self._resample_ohlcv(df, rule=resample_rule)
+
+            if self.logger:
+                total_records = len(df)
+                date_range = f"{df.index[0]} to {df.index[-1]}"
+                self.logger.info(f"Loaded {total_records:,} records from {date_range}")
+
+            return df
+
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Error loading front month data for {symbol}: {e}")
+            return pd.DataFrame()
 
     def load_m0_intraday_data(self, symbol: str,
                              start_date: Optional[datetime] = None,
@@ -376,7 +507,7 @@ class IntradayFileManager:
                              resample_rule: Optional[str] = None,
                              volume_bucket_size: Optional[int] = None) -> List[IntradayData]:
         """
-        Load intraday data for all M0 periods of a symbol.
+        Load intraday data for all M0 periods of a symbol using ScidReader.
 
         Args:
             symbol: Trading symbol (e.g., 'CL_F')
@@ -388,6 +519,12 @@ class IntradayFileManager:
         Returns:
             List of IntradayData objects for each M0 period
         """
+        # Convert to timezone-naive datetime if needed
+        if start_date and hasattr(start_date, 'tzinfo') and start_date.tzinfo is not None:
+            start_date = start_date.replace(tzinfo=None)
+        if end_date and hasattr(end_date, 'tzinfo') and end_date.tzinfo is not None:
+            end_date = end_date.replace(tzinfo=None)
+
         m0_periods = self.identify_m0_periods(symbol, start_date, end_date)
         intraday_data_list = []
 
@@ -413,50 +550,44 @@ class IntradayFileManager:
                 period_end = end_date
 
             try:
-                # Load SCID data
-                cache_key = f"{symbol}_{period.contract_code}_{period_start}_{period_end}_{resample_rule}_{volume_bucket_size}"
-
-                if cache_key in self._file_cache:
-                    intraday_data = self._file_cache[cache_key]
-                else:
-                    if self.logger:
-                        processing_info = f"Loading SCID data: {period.file_path.name} from {period_start} to {period_end}"
-                        if volume_bucket_size:
-                            processing_info += f" (volume buckets: {volume_bucket_size})"
-                        elif resample_rule:
-                            processing_info += f" (resample: {resample_rule})"
-                        self.logger.info(processing_info)
-
-                    # Read SCID file with date filtering
-                    df = self._load_scid_dataframe(
-                        period.file_path,
-                        self._ensure_timestamp(period_start),
-                        self._ensure_timestamp(period_end),
-                    )
-
-                    if len(df) == 0:
-                        if self.logger:
-                            self.logger.warning(f"No data in date range for {period.file_path.name}")
-                        continue
-
-                    # Apply volume bucket aggregation (takes priority over time resampling)
+                if self.logger:
+                    processing_info = f"Loading SCID data: {period.file_path.name} from {period_start} to {period_end}"
                     if volume_bucket_size:
-                        df = self._aggregate_volume_buckets(df, volume_bucket_size)
-                    # Optional time-based resampling
+                        processing_info += f" (volume buckets: {volume_bucket_size})"
                     elif resample_rule:
-                        df = self._resample_ohlcv(df, rule=resample_rule)
+                        processing_info += f" (resample: {resample_rule})"
+                    self.logger.info(processing_info)
 
-                    intraday_data = IntradayData(
-                        symbol=symbol,
-                        contract_code=period.contract_code,
-                        data=df,
-                        start_date=period_start,
-                        end_date=period_end,
-                        total_records=len(df),
-                        file_path=period.file_path
-                    )
+                # Read SCID file using ScidReader
+                reader = ScidReader(str(period.file_path))
 
-                    self._file_cache[cache_key] = intraday_data
+                # Load data with date filtering
+                df = reader.read(
+                    start_date=period_start,
+                    end_date=period_end
+                )
+
+                if len(df) == 0:
+                    if self.logger:
+                        self.logger.warning(f"No data in date range for {period.file_path.name}")
+                    continue
+
+                # Apply volume bucket aggregation (takes priority over time resampling)
+                if volume_bucket_size:
+                    df = reader.bucket_volume(df, bucket_size=volume_bucket_size)
+                # Optional time-based resampling
+                elif resample_rule:
+                    df = self._resample_ohlcv(df, rule=resample_rule)
+
+                intraday_data = IntradayData(
+                    symbol=symbol,
+                    contract_code=period.contract_code,
+                    data=df,
+                    start_date=period_start,
+                    end_date=period_end,
+                    total_records=len(df),
+                    file_path=period.file_path
+                )
 
                 intraday_data_list.append(intraday_data)
 
@@ -472,459 +603,27 @@ class IntradayFileManager:
 
         return intraday_data_list
 
-    async def load_m0_intraday_data_async(self, symbol: str,
-                                         start_date: Optional[datetime] = None,
-                                         end_date: Optional[datetime] = None,
-                                         resample_rule: Optional[str] = None,
-                                         volume_bucket_size: Optional[int] = None,
-                                         batch_size: int = 5) -> List[IntradayData]:
-        """
-        Asynchronously load intraday data for all M0 periods of a symbol.
-
-        Args:
-            symbol: Trading symbol (e.g., 'CL_F')
-            start_date: Start date filter
-            end_date: End date filter
-            resample_rule: Optional time-based resampling rule
-            volume_bucket_size: Optional volume bucket size for aggregation
-            batch_size: Number of SCID files to process concurrently
-
-        Returns:
-            List of IntradayData objects for each M0 period
-        """
-        m0_periods = self.identify_m0_periods(symbol, start_date, end_date)
-        intraday_data_list = []
-
-        # Filter periods with valid file paths
-        valid_periods = [p for p in m0_periods if p.file_path is not None]
-
-        if not valid_periods:
-            if self.logger:
-                self.logger.warning(f"No valid SCID files found for {symbol}")
-            return []
-
-        # Prepare file reading tasks
-        file_read_tasks = []
-        for period in valid_periods:
-            # Apply date filtering
-            period_start = period.start_date
-            period_end = period.end_date
-
-            if start_date and period_end < start_date:
-                continue
-            if end_date and period_start > end_date:
-                continue
-
-            # Adjust period boundaries based on filters
-            if start_date and period_start < start_date:
-                period_start = start_date
-            if end_date and period_end > end_date:
-                period_end = end_date
-
-            # Create async reading task
-            file_read_tasks.append({
-                'period': period,
-                'file_path': period.file_path,
-                'start_date': period_start,
-                'end_date': period_end,
-                'start_ts': pd.Timestamp(period_start, tz='UTC'),
-                'end_ts': pd.Timestamp(period_end, tz='UTC')
-            })
-
-        if not file_read_tasks:
-            return []
-
-        file_paths = [task['file_path'] for task in file_read_tasks]
-
-        if self.logger:
-            self.logger.info(f"Reading {len(file_paths)} SCID files asynchronously for {symbol}")
-
-        for idx in range(0, len(file_read_tasks), batch_size):
-            batch = file_read_tasks[idx:idx + batch_size]
-            tasks = [
-                asyncio.to_thread(
-                    self._load_scid_dataframe,
-                    task['file_path'],
-                    task['start_ts'],
-                    task['end_ts'],
-                    None,
-                )
-                for task in batch
-            ]
-            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            for task, result in zip(batch, batch_results):
-                file_path = task['file_path']
-                if isinstance(result, Exception):
-                    if self.logger:
-                        self.logger.error(
-                            f"Error loading {file_path.name}: {result}"
-                        )
-                    continue
-
-                df = result
-                if len(df) == 0:
-                    if self.logger:
-                        self.logger.warning(
-                            f"No data in date range for {file_path.name}"
-                        )
-                    continue
-
-                period = task['period']
-
-                if volume_bucket_size:
-                    df = self._aggregate_volume_buckets(df, volume_bucket_size)
-                elif resample_rule:
-                    df = self._resample_ohlcv(df, rule=resample_rule)
-
-                if len(df) == 0:
-                    continue
-
-                intraday_data = IntradayData(
-                    symbol=symbol,
-                    contract_code=period.contract_code,
-                    data=df,
-                    start_date=task['start_date'],
-                    end_date=task['end_date'],
-                    total_records=len(df),
-                    file_path=period.file_path
-                )
-
-                intraday_data_list.append(intraday_data)
-
-        return intraday_data_list
-
-    def build_pipeline_specs_for_symbol(self,
-                                      symbol: str,
-                                      output_dir: Union[str, Path],
-                                      *,
-                                      start_date: Optional[datetime] = None,
-                                      end_date: Optional[datetime] = None,
-                                      columns: Optional[Sequence[str]] = None,
-                                      include_time: bool = True,
-                                      chunk_records: int = 1_000_000,
-                                      fmt: str = "parquet",
-                                      compression: str = "zstd",
-                                      csv_separator: str = ",",
-                                      csv_shard_rows: Optional[int] = None,
-                                      queue_maxsize: int = 4,
-                                      file_mapping: Optional[Dict[str, List[Path]]] = None) -> List[PipelineSpec]:
-        mapping = file_mapping if file_mapping is not None else self._collect_scid_files()
-        if file_mapping is None:
-            self._scid_files = mapping
-
-        files = mapping.get(symbol, [])
-        if not files:
-            return []
-
-        start_ms = self._timestamp_to_epoch_ms(start_date)
-        end_ms = self._timestamp_to_epoch_ms(end_date)
-        target_dir = Path(output_dir) / symbol
-        target_dir.mkdir(parents=True, exist_ok=True)
-
-        specs: List[PipelineSpec] = []
-        for file_path in sorted(files):
-            suffix = ".parquet" if fmt.lower() == "parquet" else ".csv"
-            out_path = target_dir / file_path.with_suffix(suffix).name
-            specs.append(
-                PipelineSpec(
-                    read=ReadSpec(
-                        path=str(file_path),
-                        start_ms=start_ms,
-                        end_ms=end_ms,
-                        columns=tuple(columns) if columns is not None else None,
-                        chunk_records=chunk_records,
-                    ),
-                    write=WriteSpec(
-                        out_path=str(out_path),
-                        format=fmt,
-                        include_time=include_time,
-                        parquet_compression=compression,
-                        csv_separator=csv_separator,
-                        csv_shard_rows=csv_shard_rows,
-                        csv_header=True,
-                    ),
-                    queue_maxsize=queue_maxsize,
-                )
-            )
-        return specs
-
-    async def process_symbol(self,
-                             symbol: str,
-                             output_dir: Union[str, Path],
-                             *,
-                             start_date: Optional[datetime] = None,
-                             end_date: Optional[datetime] = None,
-                             columns: Optional[Sequence[str]] = None,
-                             include_time: bool = True,
-                             chunk_records: int = 1_000_000,
-                             fmt: str = "parquet",
-                             compression: str = "zstd",
-                             csv_separator: str = ",",
-                             csv_shard_rows: Optional[int] = None,
-                             queue_maxsize: int = 4,
-                             max_reader_tasks: int = 2,
-                             max_writer_tasks: int = 2,
-                             file_mapping: Optional[Dict[str, List[Path]]] = None) -> List[Path]:
-        specs = self.build_pipeline_specs_for_symbol(
-            symbol,
-            output_dir,
-            start_date=start_date,
-            end_date=end_date,
-            columns=columns,
-            include_time=include_time,
-            chunk_records=chunk_records,
-            fmt=fmt,
-            compression=compression,
-            csv_separator=csv_separator,
-            csv_shard_rows=csv_shard_rows,
-            queue_maxsize=queue_maxsize,
-            file_mapping=file_mapping,
-        )
-
-        if not specs:
-            if self.logger:
-                self.logger.warning(f"No SCID files found for {symbol}")
-            return []
-
-        await run_pipelines(specs,
-                            max_reader_tasks=max_reader_tasks,
-                            max_writer_tasks=max_writer_tasks)
-        return [Path(spec.write.out_path) for spec in specs]
-
-    async def process_symbols(self,
-                              symbols: Sequence[str],
-                              output_dir: Union[str, Path],
-                              *,
-                              start_date: Optional[datetime] = None,
-                              end_date: Optional[datetime] = None,
-                              columns: Optional[Sequence[str]] = None,
-                              include_time: bool = True,
-                              chunk_records: int = 1_000_000,
-                              fmt: str = "parquet",
-                              compression: str = "zstd",
-                              csv_separator: str = ",",
-                              csv_shard_rows: Optional[int] = None,
-                              queue_maxsize: int = 4,
-                              max_reader_tasks: int = 2,
-                              max_writer_tasks: int = 2,
-                              file_mapping: Optional[Dict[str, List[Path]]] = None) -> Dict[str, List[Path]]:
-        mapping = file_mapping if file_mapping is not None else self._collect_scid_files()
-        if file_mapping is None:
-            self._scid_files = mapping
-        if not mapping:
-            if self.logger:
-                self.logger.warning("No SCID files available for processing")
-            return {}
-
-        specs: List[PipelineSpec] = []
-        outputs: Dict[str, List[Path]] = {}
-
-        for symbol in symbols:
-            symbol_specs = self.build_pipeline_specs_for_symbol(
-                symbol,
-                output_dir,
-                start_date=start_date,
-                end_date=end_date,
-                columns=columns,
-                include_time=include_time,
-                chunk_records=chunk_records,
-                fmt=fmt,
-                compression=compression,
-                csv_separator=csv_separator,
-                csv_shard_rows=csv_shard_rows,
-                queue_maxsize=queue_maxsize,
-                file_mapping=mapping,
-            )
-            if symbol_specs:
-                specs.extend(symbol_specs)
-                outputs[symbol] = [Path(spec.write.out_path) for spec in symbol_specs]
-
-        if not specs:
-            if self.logger:
-                self.logger.warning("No matching SCID files for requested symbols")
-            return {}
-
-        await run_pipelines(specs,
-                            max_reader_tasks=max_reader_tasks,
-                            max_writer_tasks=max_writer_tasks)
-        return outputs
-
-    async def process_all_tickers(self,
-                                 output_dir: Union[str, Path],
-                                 *,
-                                 start_date: Optional[datetime] = None,
-                                 end_date: Optional[datetime] = None,
-                                 columns: Optional[Sequence[str]] = None,
-                                 include_time: bool = True,
-                                 chunk_records: int = 1_000_000,
-                                 compression: str = "zstd",
-                                 fmt: str = "parquet",
-                                 csv_separator: str = ",",
-                                 csv_shard_rows: Optional[int] = None,
-                                 queue_maxsize: int = 4,
-                                 max_reader_tasks: int = 2,
-                                 max_writer_tasks: int = 2) -> Dict[str, List[Path]]:
-        mapping = self._collect_scid_files()
-        self._scid_files = mapping
-        two_letter_symbols = sorted(
-            symbol for symbol in mapping
-            if len(symbol.split('_')[0]) == 2
-        )
-
-        if not two_letter_symbols:
-            if self.logger:
-                self.logger.warning("No two-letter tickers available for processing")
-            return {}
-
-        return await self.process_symbols(
-            two_letter_symbols,
-            output_dir,
-            start_date=start_date,
-            end_date=end_date,
-            columns=columns,
-            include_time=include_time,
-            chunk_records=chunk_records,
-            fmt=fmt,
-            compression=compression,
-            csv_separator=csv_separator,
-            csv_shard_rows=csv_shard_rows,
-            queue_maxsize=queue_maxsize,
-            max_reader_tasks=max_reader_tasks,
-            max_writer_tasks=max_writer_tasks,
-            file_mapping=mapping,
-        )
-
-    def _aggregate_volume_buckets(self, df: pd.DataFrame, volume_bucket_size: int) -> pd.DataFrame:
-        """
-        Aggregate tick data into volume buckets.
-
-        Args:
-            df: Input DataFrame with tick data
-            volume_bucket_size: Target volume per bucket
-
-        Returns:
-            DataFrame aggregated by volume buckets
-        """
-        if len(df) == 0 or 'TotalVolume' not in df.columns:
-            return df
-
-        aggregated_data = []
-        current_bucket = {
-            'start_time': None,
-            'end_time': None,
-            'open': None,
-            'high': float('-inf'),
-            'low': float('inf'),
-            'close': None,
-            'volume': 0,
-            'num_trades': 0,
-            'bid_volume': 0,
-            'ask_volume': 0,
-            'tick_count': 0
-        }
-
-        for timestamp, row in df.iterrows():
-            # Initialize bucket if first tick
-            if current_bucket['start_time'] is None:
-                current_bucket['start_time'] = timestamp
-                current_bucket['open'] = row['Close']
-                current_bucket['high'] = row['High']
-                current_bucket['low'] = row['Low']
-
-            # Update bucket with current tick
-            current_bucket['end_time'] = timestamp
-            current_bucket['close'] = row['Close']
-            current_bucket['high'] = max(current_bucket['high'], row['High'])
-            current_bucket['low'] = min(current_bucket['low'], row['Low'])
-            current_bucket['volume'] += row.get('TotalVolume', 0)
-            current_bucket['num_trades'] += row.get('NumTrades', 0)
-            current_bucket['bid_volume'] += row.get('BidVolume', 0)
-            current_bucket['ask_volume'] += row.get('AskVolume', 0)
-            current_bucket['tick_count'] += 1
-
-            # Check if bucket is complete
-            if current_bucket['volume'] >= volume_bucket_size:
-                # Create aggregated record
-                bucket_record = {
-                    'Open': current_bucket['open'],
-                    'High': current_bucket['high'],
-                    'Low': current_bucket['low'],
-                    'Close': current_bucket['close'],
-                    'TotalVolume': current_bucket['volume'],
-                    'NumTrades': current_bucket['num_trades'],
-                    'BidVolume': current_bucket['bid_volume'],
-                    'AskVolume': current_bucket['ask_volume'],
-                    'TickCount': current_bucket['tick_count'],
-                    'BucketDuration': (current_bucket['end_time'] - current_bucket['start_time']).total_seconds()
-                }
-
-                # Use end_time as the timestamp for the bucket
-                aggregated_data.append((current_bucket['end_time'], bucket_record))
-
-                # Reset bucket
-                current_bucket = {
-                    'start_time': None,
-                    'end_time': None,
-                    'open': None,
-                    'high': float('-inf'),
-                    'low': float('inf'),
-                    'close': None,
-                    'volume': 0,
-                    'num_trades': 0,
-                    'bid_volume': 0,
-                    'ask_volume': 0,
-                    'tick_count': 0
-                }
-
-        # Handle remaining partial bucket
-        if current_bucket['start_time'] is not None and current_bucket['volume'] > 0:
-            bucket_record = {
-                'Open': current_bucket['open'],
-                'High': current_bucket['high'],
-                'Low': current_bucket['low'],
-                'Close': current_bucket['close'],
-                'TotalVolume': current_bucket['volume'],
-                'NumTrades': current_bucket['num_trades'],
-                'BidVolume': current_bucket['bid_volume'],
-                'AskVolume': current_bucket['ask_volume'],
-                'TickCount': current_bucket['tick_count'],
-                'BucketDuration': (current_bucket['end_time'] - current_bucket['start_time']).total_seconds()
-            }
-            aggregated_data.append((current_bucket['end_time'], bucket_record))
-
-        if not aggregated_data:
-            return pd.DataFrame()
-
-        # Convert to DataFrame
-        timestamps, records = zip(*aggregated_data)
-        result_df = pd.DataFrame(records, index=pd.DatetimeIndex(timestamps, name='DateTime'))
-
-        return result_df
-
     def _resample_ohlcv(self, df: pd.DataFrame, rule: str = "1T") -> pd.DataFrame:
         """
-        Resample a tick/second stream into OHLCV using pandas (UTC index required).
+        Resample a tick/second stream into OHLCV using pandas.
 
         Args:
             df: Input DataFrame with tick data
             rule: Resampling rule (e.g., "1T" for 1 minute)
 
         Returns:
-            Resampled OHLCV DataFrame
+            Resampled OHLCV DataFrame (timezone-naive)
         """
-        if df.index.tz is None:
-            df = df.tz_localize("UTC")
+        # Ensure timezone-naive index for consistent processing
+        if df.index.tz is not None:
+            df = df.tz_localize(None)
 
         resampled = df.resample(rule).agg({
             'Open': 'first',
             'High': 'max',
             'Low': 'min',
             'Close': 'last',
-            'TotalVolume': 'sum',
-            'NumTrades': 'sum',
-            'BidVolume': 'sum',
-            'AskVolume': 'sum'
+            'Volume': 'sum',
         }).dropna()
 
         return resampled
@@ -951,7 +650,9 @@ class IntradayFileManager:
         Returns:
             Continuous DataFrame with M0 intraday data
         """
-        intraday_data_list = self.load_m0_intraday_data(symbol, start_date, end_date)
+        intraday_data_list = self.load_m0_intraday_data(
+            symbol, start_date, end_date, resample_rule, volume_bucket_size
+        )
 
         if not intraday_data_list:
             return pd.DataFrame()
@@ -963,19 +664,6 @@ class IntradayFileManager:
         for i, intraday_data in enumerate(intraday_data_list):
             df = intraday_data.data.copy()
 
-            # Apply volume bucket aggregation if requested
-            if volume_bucket_size is not None:
-                if self.logger:
-                    self.logger.info(f"Aggregating {intraday_data.contract_code} into "
-                                   f"{volume_bucket_size} volume buckets")
-                df = self._aggregate_volume_buckets(df, volume_bucket_size)
-
-            # Apply time-based resampling if requested (and not using volume buckets)
-            elif resample_rule is not None:
-                if self.logger:
-                    self.logger.info(f"Resampling {intraday_data.contract_code} to {resample_rule}")
-                df = self._resample_ohlcv(df, rule=resample_rule)
-
             if len(df) == 0:
                 continue
 
@@ -1024,7 +712,7 @@ class IntradayFileManager:
             date_range = f"{continuous_df.index[0]} to {continuous_df.index[-1]}"
 
             if volume_bucket_size:
-                avg_volume_per_bucket = continuous_df['TotalVolume'].mean()
+                avg_volume_per_bucket = continuous_df.get('Volume', continuous_df.get('TotalVolume', pd.Series())).mean()
                 self.logger.info(f"Created continuous M0 dataset for {symbol}: "
                                f"{total_records:,} volume buckets ({volume_bucket_size} target volume) "
                                f"from {date_range}, avg volume/bucket: {avg_volume_per_bucket:.0f}")
@@ -1033,542 +721,6 @@ class IntradayFileManager:
                                f"{total_records:,} records from {date_range}")
 
         return continuous_df
-
-    async def get_continuous_m0_data_async(self, symbol: str,
-                                          start_date: Optional[datetime] = None,
-                                          end_date: Optional[datetime] = None,
-                                          resample_rule: Optional[str] = None,
-                                          volume_bucket_size: Optional[int] = None,
-                                          remove_gaps: bool = True,
-                                          add_roll_markers: bool = True,
-                                          batch_size: int = 5) -> pd.DataFrame:
-        """
-        Asynchronously get continuous M0 intraday data by concatenating all M0 periods.
-
-        Args:
-            symbol: Trading symbol (e.g., 'CL_F')
-            start_date: Start date filter
-            end_date: End date filter
-            resample_rule: Optional time-based resampling rule (e.g., '1T', '5T', '1H')
-            volume_bucket_size: Optional volume bucket size for volume-based aggregation
-            remove_gaps: Remove time gaps between contracts
-            add_roll_markers: Add markers to identify contract roll dates
-            batch_size: Number of SCID files to process concurrently
-
-        Returns:
-            Continuous DataFrame with M0 intraday data
-        """
-        intraday_data_list = await self.load_m0_intraday_data_async(
-            symbol, start_date, end_date, resample_rule, volume_bucket_size, batch_size
-        )
-
-        if not intraday_data_list:
-            return pd.DataFrame()
-
-        # Process each M0 period (already processed async)
-        dataframes = []
-        roll_dates = []
-
-        for i, intraday_data in enumerate(intraday_data_list):
-            df = intraday_data.data.copy()
-
-            if len(df) == 0:
-                continue
-
-            # Add contract metadata
-            df['contract_code'] = intraday_data.contract_code
-            df['contract_start'] = intraday_data.start_date
-            df['contract_end'] = intraday_data.end_date
-
-            # Add roll marker (True for last day of contract)
-            if add_roll_markers:
-                last_day = df.index[-1].date()
-                df['is_roll_day'] = df.index.date == last_day
-                if i < len(intraday_data_list) - 1:  # Not the last contract
-                    roll_dates.append(df.index[-1])
-
-            dataframes.append(df)
-
-        if not dataframes:
-            return pd.DataFrame()
-
-        # Concatenate all M0 periods
-        continuous_df = pd.concat(dataframes, axis=0).sort_index()
-
-        # Remove duplicate timestamps at roll boundaries
-        continuous_df = continuous_df[~continuous_df.index.duplicated(keep='first')]
-
-        # Optionally remove gaps between contracts
-        if remove_gaps and len(roll_dates) > 0:
-            # Calculate time gaps and optionally fill or mark them
-            for roll_date in roll_dates:
-                next_idx = continuous_df.index.get_indexer([roll_date], method='bfill')[0] + 1
-                if next_idx < len(continuous_df):
-                    gap_duration = (continuous_df.index[next_idx] - roll_date).total_seconds()
-                    if gap_duration > 86400:  # Gap > 1 day
-                        if self.logger:
-                            self.logger.info(f"Gap detected at roll date {roll_date}: "
-                                           f"{gap_duration/3600:.1f} hours")
-
-        # Add summary statistics
-        if add_roll_markers and len(roll_dates) > 0:
-            continuous_df.attrs['roll_dates'] = roll_dates
-            continuous_df.attrs['num_contracts'] = len(intraday_data_list)
-
-        if self.logger:
-            total_records = len(continuous_df)
-            date_range = f"{continuous_df.index[0]} to {continuous_df.index[-1]}"
-
-            if volume_bucket_size:
-                avg_volume_per_bucket = continuous_df['TotalVolume'].mean()
-                self.logger.info(f"Created continuous M0 dataset for {symbol}: "
-                               f"{total_records:,} volume buckets ({volume_bucket_size} target volume) "
-                               f"from {date_range}, avg volume/bucket: {avg_volume_per_bucket:.0f} (async)")
-            else:
-                self.logger.info(f"Created continuous M0 dataset for {symbol}: "
-                               f"{total_records:,} records from {date_range} (async)")
-
-        return continuous_df
-
-    async def export_continuous_m0_to_parquet(self,
-                                            symbol: str,
-                                            output_path: Union[str, Path],
-                                            start_date: Optional[datetime] = None,
-                                            end_date: Optional[datetime] = None,
-                                            resample_rule: Optional[str] = None,
-                                            volume_bucket_size: Optional[int] = None,
-                                            batch_size: int = 8,
-                                            max_memory_mb: int = 2048,
-                                            single_file: bool = True,
-                                            compression: str = "snappy") -> Dict[str, any]:
-        """
-        Export continuous M0 data to Parquet file(s) with memory-efficient processing.
-
-        Args:
-            symbol: Symbol to process (e.g., 'CL_F')
-            output_path: Output directory or file path
-            start_date: Start date filter
-            end_date: End date filter
-            resample_rule: Optional time-based resampling rule
-            volume_bucket_size: Optional volume bucket aggregation
-            batch_size: Number of files to process concurrently
-            max_memory_mb: Maximum memory usage before writing to disk
-            single_file: If True, attempt to write all data to one file; if False, write per contract
-            compression: Parquet compression algorithm
-
-        Returns:
-            Dictionary with export statistics and file paths
-        """
-        output_path = Path(output_path)
-        output_path.mkdir(parents=True, exist_ok=True)
-
-        if self.logger:
-            self.logger.info(f"Starting Parquet export for {symbol} continuous M0 data")
-            self.logger.info(f"Output path: {output_path}, single_file: {single_file}")
-
-        # Get M0 periods
-        m0_periods = self.identify_m0_periods(symbol, start_date, end_date)
-        if not m0_periods:
-            raise ValueError(f"No M0 periods found for {symbol}")
-
-        export_stats = {
-            'symbol': symbol,
-            'start_date': start_date,
-            'end_date': end_date,
-            'single_file': single_file,
-            'compression': compression,
-            'file_paths': [],
-            'total_records': 0,
-            'total_size_mb': 0,
-            'processing_time_seconds': 0,
-            'memory_peak_mb': 0,
-            'contract_periods': len(m0_periods)
-        }
-
-        start_time = time.time()
-
-        if single_file:
-            # Attempt to write all data to a single Parquet file
-            return await self._export_single_parquet_file(
-                symbol, m0_periods, output_path, resample_rule,
-                volume_bucket_size, batch_size, max_memory_mb,
-                compression, export_stats, start_time
-            )
-        else:
-            # Write individual Parquet files per contract period
-            return await self._export_multiple_parquet_files(
-                symbol, m0_periods, output_path, resample_rule,
-                volume_bucket_size, batch_size, compression,
-                export_stats, start_time
-            )
-
-    async def _export_single_parquet_file(self,
-                                        symbol: str,
-                                        m0_periods: List[ContractPeriod],
-                                        output_path: Path,
-                                        resample_rule: Optional[str],
-                                        volume_bucket_size: Optional[int],
-                                        batch_size: int,
-                                        max_memory_mb: int,
-                                        compression: str,
-                                        export_stats: Dict,
-                                        start_time: float) -> Dict[str, any]:
-        """Export all M0 data to a single Parquet file with chunked processing."""
-        import psutil
-        import time
-
-        process = psutil.Process()
-
-        # Determine output file path
-        output_file = output_path / f"{symbol}_continuous_m0.parquet"
-
-        # Initialize Parquet writer for streaming
-        parquet_writer = None
-        schema = None
-
-        try:
-            total_records_written = 0
-            current_memory_mb = 0
-
-            for i, period in enumerate(m0_periods):
-                if self.logger:
-                    self.logger.info(f"Processing period {i+1}/{len(m0_periods)}: "
-                                   f"{period.contract_code} ({period.start_date} to {period.end_date})")
-
-                # Check memory usage
-                current_memory_mb = process.memory_info().rss / (1024 * 1024)
-                export_stats['memory_peak_mb'] = max(export_stats['memory_peak_mb'], current_memory_mb)
-
-                if current_memory_mb > max_memory_mb:
-                    if self.logger:
-                        self.logger.warning(f"Memory usage ({current_memory_mb:.1f}MB) exceeds limit "
-                                          f"({max_memory_mb}MB). Consider using single_file=False")
-
-                # Load data for this period using FastScidReader
-                if not period.file_path or not period.file_path.exists():
-                    if self.logger:
-                        self.logger.warning(f"SCID file not found for {period.contract_code}, skipping")
-                    continue
-
-                try:
-                    with FastScidReader(str(period.file_path)) as reader:
-                        # Use time filtering if period has specific dates
-                        start_ms = int(period.start_date.timestamp() * 1000) if period.start_date else None
-                        end_ms = int(period.end_date.timestamp() * 1000) if period.end_date else None
-
-                        # Get pandas DataFrame
-                        df = reader.to_pandas(start_ms=start_ms, end_ms=end_ms, tz='UTC')
-
-                        if len(df) == 0:
-                            continue
-
-                        # Apply processing
-                        if volume_bucket_size:
-                            df = self._aggregate_volume_buckets(df, volume_bucket_size)
-                        elif resample_rule:
-                            df = self._resample_ohlcv(df, rule=resample_rule)
-
-                        # Add metadata columns
-                        df['contract_code'] = period.contract_code
-                        df['symbol'] = symbol
-
-                        # Convert to PyArrow Table
-                        table = pa.Table.from_pandas(df, preserve_index=True)
-
-                        # Initialize writer with schema from first table
-                        if parquet_writer is None:
-                            schema = table.schema
-                            parquet_writer = pq.ParquetWriter(
-                                output_file,
-                                schema=schema,
-                                compression=compression,
-                                write_statistics=True
-                            )
-
-                        # Write table to Parquet file
-                        parquet_writer.write_table(table)
-                        total_records_written += len(df)
-
-                        if self.logger:
-                            self.logger.info(f"  Wrote {len(df):,} records for {period.contract_code}")
-
-                except Exception as e:
-                    if self.logger:
-                        self.logger.error(f"Error processing {period.contract_code}: {e}")
-                    continue
-
-            # Close writer
-            if parquet_writer:
-                parquet_writer.close()
-
-            # Update export statistics
-            if output_file.exists():
-                export_stats['file_paths'] = [str(output_file)]
-                export_stats['total_records'] = total_records_written
-                export_stats['total_size_mb'] = output_file.stat().st_size / (1024 * 1024)
-                export_stats['processing_time_seconds'] = time.time() - start_time
-
-                if self.logger:
-                    self.logger.info(f"Successfully exported {total_records_written:,} records "
-                                   f"to {output_file.name} ({export_stats['total_size_mb']:.1f}MB)")
-
-            return export_stats
-
-        except Exception as e:
-            # Clean up on error
-            if parquet_writer:
-                parquet_writer.close()
-            if output_file.exists():
-                output_file.unlink()
-            raise RuntimeError(f"Failed to export single Parquet file: {e}")
-
-    async def _export_multiple_parquet_files(self,
-                                           symbol: str,
-                                           m0_periods: List[ContractPeriod],
-                                           output_path: Path,
-                                           resample_rule: Optional[str],
-                                           volume_bucket_size: Optional[int],
-                                           batch_size: int,
-                                           compression: str,
-                                           export_stats: Dict,
-                                           start_time: float) -> Dict[str, any]:
-        """Export M0 data to individual Parquet files per contract period."""
-        import time
-
-        exported_files = []
-        total_records = 0
-        total_size_mb = 0
-
-        # Process in batches for efficiency
-        for i in range(0, len(m0_periods), batch_size):
-            batch = m0_periods[i:i + batch_size]
-
-            if self.logger:
-                self.logger.info(f"Processing batch {i//batch_size + 1}: "
-                               f"contracts {i+1}-{min(i+batch_size, len(m0_periods))}")
-
-            # Process batch concurrently
-            tasks = []
-            for period in batch:
-                task = self._export_single_contract_parquet(
-                    symbol, period, output_path, resample_rule,
-                    volume_bucket_size, compression
-                )
-                tasks.append(task)
-
-            # Wait for batch completion
-            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Collect results
-            for result in batch_results:
-                if isinstance(result, Exception):
-                    if self.logger:
-                        self.logger.error(f"Batch export error: {result}")
-                    continue
-
-                if result and 'file_path' in result:
-                    exported_files.append(result['file_path'])
-                    total_records += result.get('records', 0)
-                    total_size_mb += result.get('size_mb', 0)
-
-        # Update export statistics
-        export_stats['file_paths'] = exported_files
-        export_stats['total_records'] = total_records
-        export_stats['total_size_mb'] = total_size_mb
-        export_stats['processing_time_seconds'] = time.time() - start_time
-
-        if self.logger:
-            self.logger.info(f"Exported {len(exported_files)} Parquet files with "
-                           f"{total_records:,} total records ({total_size_mb:.1f}MB)")
-
-        return export_stats
-
-    async def _export_single_contract_parquet(self,
-                                            symbol: str,
-                                            period: ContractPeriod,
-                                            output_path: Path,
-                                            resample_rule: Optional[str],
-                                            volume_bucket_size: Optional[int],
-                                            compression: str) -> Dict[str, any]:
-        """Export a single contract period to Parquet file."""
-        if not period.file_path or not period.file_path.exists():
-            return {'error': f"SCID file not found for {period.contract_code}"}
-
-        # Generate output filename
-        date_str = period.start_date.strftime('%Y%m%d')
-        output_file = output_path / f"{symbol}_{period.contract_code}_{date_str}.parquet"
-
-        try:
-            with FastScidReader(str(period.file_path)) as reader:
-                # Use time filtering
-                start_ms = int(period.start_date.timestamp() * 1000) if period.start_date else None
-                end_ms = int(period.end_date.timestamp() * 1000) if period.end_date else None
-
-                # Get DataFrame
-                df = reader.to_pandas(start_ms=start_ms, end_ms=end_ms, tz='UTC')
-
-                if len(df) == 0:
-                    return {'error': f"No data found for {period.contract_code}"}
-
-                # Apply processing
-                if volume_bucket_size:
-                    df = self._aggregate_volume_buckets(df, volume_bucket_size)
-                elif resample_rule:
-                    df = self._resample_ohlcv(df, rule=resample_rule)
-
-                # Add metadata
-                df['contract_code'] = period.contract_code
-                df['symbol'] = symbol
-                df['front_month_start'] = period.start_date
-                df['front_month_end'] = period.end_date
-
-                # Export to Parquet
-                df.to_parquet(
-                    output_file,
-                    compression=compression,
-                    index=True,
-                    engine='pyarrow'
-                )
-
-                file_size_mb = output_file.stat().st_size / (1024 * 1024)
-
-                return {
-                    'file_path': str(output_file),
-                    'contract_code': period.contract_code,
-                    'records': len(df),
-                    'size_mb': file_size_mb,
-                    'date_range': (period.start_date, period.end_date)
-                }
-
-        except Exception as e:
-            return {'error': f"Failed to export {period.contract_code}: {e}"}
-
-    def load_continuous_m0_from_parquet(self,
-                                      parquet_path: Union[str, Path],
-                                      start_date: Optional[datetime] = None,
-                                      end_date: Optional[datetime] = None,
-                                      columns: Optional[List[str]] = None) -> pd.DataFrame:
-        """
-        Load continuous M0 data from Parquet file(s) with optional filtering.
-
-        Args:
-            parquet_path: Path to Parquet file or directory containing Parquet files
-            start_date: Optional start date filter
-            end_date: Optional end date filter
-            columns: Optional list of columns to load
-
-        Returns:
-            DataFrame with continuous M0 data
-        """
-        parquet_path = Path(parquet_path)
-
-        if parquet_path.is_file():
-            # Single Parquet file
-            df = pd.read_parquet(parquet_path, columns=columns, engine='pyarrow')
-        elif parquet_path.is_dir():
-            # Directory with multiple Parquet files
-            parquet_files = list(parquet_path.glob("*.parquet"))
-            if not parquet_files:
-                raise ValueError(f"No Parquet files found in {parquet_path}")
-
-            dfs = []
-            for file_path in sorted(parquet_files):
-                df_chunk = pd.read_parquet(file_path, columns=columns, engine='pyarrow')
-                dfs.append(df_chunk)
-
-            df = pd.concat(dfs, axis=0).sort_index()
-        else:
-            raise ValueError(f"Parquet path not found: {parquet_path}")
-
-        # Apply date filtering if requested
-        if start_date or end_date:
-            if start_date:
-                df = df[df.index >= pd.Timestamp(start_date, tz='UTC')]
-            if end_date:
-                df = df[df.index <= pd.Timestamp(end_date, tz='UTC')]
-
-        # Remove duplicates that might occur at file boundaries
-        df = df[~df.index.duplicated(keep='first')]
-
-        if self.logger:
-            self.logger.info(f"Loaded {len(df):,} records from Parquet: "
-                           f"{df.index[0]} to {df.index[-1]}")
-
-        return df
-
-    def get_parquet_file_info(self, parquet_path: Union[str, Path]) -> Dict[str, any]:
-        """
-        Get metadata information about Parquet file(s).
-
-        Args:
-            parquet_path: Path to Parquet file or directory
-
-        Returns:
-            Dictionary with file information
-        """
-        parquet_path = Path(parquet_path)
-        info = {
-            'path': str(parquet_path),
-            'type': 'unknown',
-            'files': [],
-            'total_size_mb': 0,
-            'total_rows': 0,
-            'schema': None,
-            'date_range': None
-        }
-
-        try:
-            if parquet_path.is_file():
-                # Single file
-                info['type'] = 'single_file'
-                file_info = pq.read_metadata(parquet_path)
-                info['total_rows'] = file_info.num_rows
-                info['total_size_mb'] = parquet_path.stat().st_size / (1024 * 1024)
-                info['schema'] = file_info.schema.to_arrow_schema()
-                info['files'] = [str(parquet_path)]
-
-                # Try to get date range from index
-                df_sample = pd.read_parquet(parquet_path, columns=[], engine='pyarrow')
-                if len(df_sample) > 0:
-                    info['date_range'] = (df_sample.index.min(), df_sample.index.max())
-
-            elif parquet_path.is_dir():
-                # Directory with multiple files
-                info['type'] = 'directory'
-                parquet_files = list(parquet_path.glob("*.parquet"))
-
-                if parquet_files:
-                    total_rows = 0
-                    total_size = 0
-                    min_date = None
-                    max_date = None
-
-                    for file_path in parquet_files:
-                        file_info = pq.read_metadata(file_path)
-                        total_rows += file_info.num_rows
-                        total_size += file_path.stat().st_size
-                        info['files'].append(str(file_path))
-
-                        # Get schema from first file
-                        if info['schema'] is None:
-                            info['schema'] = file_info.schema.to_arrow_schema()
-
-                        # Update date range
-                        df_sample = pd.read_parquet(file_path, columns=[], engine='pyarrow')
-                        if len(df_sample) > 0:
-                            file_min = df_sample.index.min()
-                            file_max = df_sample.index.max()
-                            min_date = min(min_date, file_min) if min_date else file_min
-                            max_date = max(max_date, file_max) if max_date else file_max
-
-                    info['total_rows'] = total_rows
-                    info['total_size_mb'] = total_size / (1024 * 1024)
-                    info['date_range'] = (min_date, max_date) if min_date else None
-
-        except Exception as e:
-            info['error'] = str(e)
-
-        return info
 
     def get_contract_statistics(self, symbol: str) -> Dict[str, any]:
         """Get statistics about available contracts for a symbol."""
@@ -1607,7 +759,6 @@ class IntradayFileManager:
         """Clear internal caches."""
         self._file_cache.clear()
         self._contract_periods.clear()
-        self._curve_data_cache.clear()
 
         if self.logger:
             self.logger.info("Cleared internal caches")
@@ -1640,24 +791,19 @@ class IntradayFileManager:
             }
 
             try:
-                with FastScidReader(str(scid_file)) as reader:
-                    file_result['records'] = len(reader)
-                    file_result['variant'] = reader.schema.variant
-                    file_result['scale'] = getattr(reader, 'scale', 1.0)  # FastScidReader doesn't have scale
+                reader = ScidReader(str(scid_file))
+                df = reader.read()
 
-                    if len(reader) > 0:
-                        # Get first and last timestamps using FastScidReader's efficient API
-                        times_ms = reader.times_epoch_ms()
-                        first_ts = pd.to_datetime(times_ms[0], unit='ms', utc=True).to_pydatetime()
-                        last_ts = pd.to_datetime(times_ms[-1], unit='ms', utc=True).to_pydatetime()
+                file_result['records'] = len(df)
 
-                        file_result['date_range'] = {
-                            'start': first_ts,
-                            'end': last_ts
-                        }
+                if len(df) > 0:
+                    file_result['date_range'] = {
+                        'start': df.index[0],
+                        'end': df.index[-1]
+                    }
 
-                    file_result['valid'] = True
-                    validation_results['valid_files'] += 1
+                file_result['valid'] = True
+                validation_results['valid_files'] += 1
 
             except Exception as e:
                 file_result['error'] = str(e)
@@ -1667,167 +813,210 @@ class IntradayFileManager:
 
         return validation_results
 
-    def analyze_volume_patterns(self, symbol: str,
-                               start_date: Optional[datetime] = None,
-                               end_date: Optional[datetime] = None,
-                               bucket_sizes: List[int] = None) -> Dict[str, any]:
+    def write_intraday_to_hdf5(self,
+                              symbol: str,
+                              start_date: Optional[datetime] = None,
+                              end_date: Optional[datetime] = None,
+                              timeframe: Optional[str] = None,
+                              volume_bucket_size: Optional[int] = None,
+                              replace: bool = True) -> Dict[str, any]:
         """
-        Analyze volume patterns for different bucket sizes.
+        Write intraday data to HDF5 in DataClient format: market/{ticker}/{timeframe or bucket_size}
+
+        Args:
+            symbol: Trading symbol (e.g., 'CL_F')
+            start_date: Start date filter
+            end_date: End date filter
+            timeframe: Optional time-based resampling rule (e.g., '1T', '5T', '1H')
+                      If provided, will write to market/{symbol}/{timeframe}
+            volume_bucket_size: Optional volume bucket size for aggregation
+                               If provided, will write to market/{symbol}/vol_{bucket_size}
+            replace: If True, replace existing data; if False, append
+
+        Returns:
+            Dictionary with write statistics
+
+        Examples:
+            # Write 1-minute bars
+            manager.write_intraday_to_hdf5('CL_F', timeframe='1T')
+            # -> market/CL_F/1T
+
+            # Write 500-contract volume buckets
+            manager.write_intraday_to_hdf5('CL_F', volume_bucket_size=500)
+            # -> market/CL_F/vol_500
+
+            # Write raw tick data (no timeframe/bucket)
+            manager.write_intraday_to_hdf5('CL_F')
+            # -> market/CL_F
+        """
+        if self.logger:
+            self.logger.info(f"Writing intraday data for {symbol} to HDF5")
+
+        # Load continuous M0 data
+        df = self.get_continuous_m0_data(
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            resample_rule=timeframe,
+            volume_bucket_size=volume_bucket_size,
+            remove_gaps=True,
+            add_roll_markers=True
+        )
+
+        if df.empty:
+            if self.logger:
+                self.logger.warning(f"No data loaded for {symbol}")
+            return {
+                'symbol': symbol,
+                'records_written': 0,
+                'success': False,
+                'error': 'No data loaded'
+            }
+
+        # Construct HDF5 key based on format: market/{ticker}/{optional timeframe/bucket}
+        key = f"market/{symbol}"
+
+        if volume_bucket_size:
+            key += f"/vol_{volume_bucket_size}"
+        elif timeframe:
+            key += f"/{timeframe}"
+
+        try:
+            # Write using DataClient's write_market method
+            self.data_client.write_market(
+                df=df,
+                key=key,
+                replace=replace
+            )
+
+            stats = {
+                'symbol': symbol,
+                'key': key,
+                'records_written': len(df),
+                'date_range': {
+                    'start': df.index[0],
+                    'end': df.index[-1]
+                },
+                'timeframe': timeframe,
+                'volume_bucket_size': volume_bucket_size,
+                'success': True
+            }
+
+            if self.logger:
+                self.logger.info(
+                    f"Successfully wrote {len(df):,} records to {key} "
+                    f"({df.index[0]} to {df.index[-1]})"
+                )
+
+            return stats
+
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Error writing data to HDF5: {e}")
+
+            return {
+                'symbol': symbol,
+                'key': key,
+                'records_written': 0,
+                'success': False,
+                'error': str(e)
+            }
+
+    def batch_write_intraday_to_hdf5(self,
+                                    symbols: List[str],
+                                    start_date: Optional[datetime] = None,
+                                    end_date: Optional[datetime] = None,
+                                    timeframe: Optional[str] = None,
+                                    volume_bucket_size: Optional[int] = None,
+                                    replace: bool = True) -> Dict[str, Dict[str, any]]:
+        """
+        Write intraday data for multiple symbols to HDF5.
+
+        Args:
+            symbols: List of trading symbols
+            start_date: Start date filter
+            end_date: End date filter
+            timeframe: Optional time-based resampling rule
+            volume_bucket_size: Optional volume bucket size
+            replace: If True, replace existing data; if False, append
+
+        Returns:
+            Dictionary mapping symbols to their write statistics
+        """
+        results = {}
+
+        for symbol in symbols:
+            if self.logger:
+                self.logger.info(f"Processing {symbol}...")
+
+            result = self.write_intraday_to_hdf5(
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date,
+                timeframe=timeframe,
+                volume_bucket_size=volume_bucket_size,
+                replace=replace
+            )
+
+            results[symbol] = result
+
+        # Summary statistics
+        total_records = sum(r.get('records_written', 0) for r in results.values())
+        successful = sum(1 for r in results.values() if r.get('success', False))
+
+        if self.logger:
+            self.logger.info(
+                f"Batch write complete: {successful}/{len(symbols)} symbols successful, "
+                f"{total_records:,} total records written"
+            )
+
+        return results
+
+    def write_multiple_timeframes(self,
+                                 symbol: str,
+                                 timeframes: List[str],
+                                 start_date: Optional[datetime] = None,
+                                 end_date: Optional[datetime] = None,
+                                 replace: bool = True) -> Dict[str, Dict[str, any]]:
+        """
+        Write the same symbol data at multiple timeframes.
 
         Args:
             symbol: Trading symbol
-            start_date: Start date for analysis
-            end_date: End date for analysis
-            bucket_sizes: List of volume bucket sizes to analyze
+            timeframes: List of timeframe strings (e.g., ['1T', '5T', '15T', '1H'])
+            start_date: Start date filter
+            end_date: End date filter
+            replace: If True, replace existing data; if False, append
 
         Returns:
-            Dictionary with volume pattern analysis
+            Dictionary mapping timeframes to their write statistics
+
+        Example:
+            results = manager.write_multiple_timeframes(
+                'CL_F',
+                timeframes=['1T', '5T', '15T', '1H', '1D']
+            )
+            # Writes to:
+            # market/CL_F/1T
+            # market/CL_F/5T
+            # market/CL_F/15T
+            # market/CL_F/1H
+            # market/CL_F/1D
         """
-        if bucket_sizes is None:
-            bucket_sizes = [100, 500, 1000, 2000, 5000]
+        results = {}
 
-        analysis = {
-            'symbol': symbol,
-            'date_range': {'start': start_date, 'end': end_date},
-            'bucket_analysis': {},
-            'recommendations': {}
-        }
+        for timeframe in timeframes:
+            if self.logger:
+                self.logger.info(f"Writing {symbol} at {timeframe} timeframe...")
 
-        # Load raw tick data first
-        raw_data = self.get_continuous_m0_data(symbol, start_date, end_date)
+            result = self.write_intraday_to_hdf5(
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date,
+                timeframe=timeframe,
+                replace=replace
+            )
 
-        if len(raw_data) == 0:
-            return analysis
+            results[timeframe] = result
 
-        total_volume = raw_data['TotalVolume'].sum()
-        total_ticks = len(raw_data)
-        avg_volume_per_tick = total_volume / total_ticks if total_ticks > 0 else 0
-
-        analysis['raw_statistics'] = {
-            'total_ticks': total_ticks,
-            'total_volume': total_volume,
-            'avg_volume_per_tick': avg_volume_per_tick,
-            'volume_std': raw_data['TotalVolume'].std(),
-            'max_volume_tick': raw_data['TotalVolume'].max(),
-            'min_volume_tick': raw_data['TotalVolume'].min()
-        }
-
-        # Analyze each bucket size
-        for bucket_size in bucket_sizes:
-            try:
-                bucketed_data = self._aggregate_volume_buckets(raw_data, bucket_size)
-
-                if len(bucketed_data) == 0:
-                    continue
-
-                bucket_stats = {
-                    'bucket_size': bucket_size,
-                    'total_buckets': len(bucketed_data),
-                    'avg_volume_per_bucket': bucketed_data['TotalVolume'].mean(),
-                    'volume_std': bucketed_data['TotalVolume'].std(),
-                    'avg_ticks_per_bucket': bucketed_data['TickCount'].mean(),
-                    'avg_duration_seconds': bucketed_data['BucketDuration'].mean(),
-                    'min_duration': bucketed_data['BucketDuration'].min(),
-                    'max_duration': bucketed_data['BucketDuration'].max(),
-                    'coverage_ratio': len(bucketed_data) * bucket_size / total_volume
-                }
-
-                # Calculate efficiency metrics
-                bucket_stats['compression_ratio'] = total_ticks / len(bucketed_data) if len(bucketed_data) > 0 else 0
-                bucket_stats['time_efficiency'] = bucket_stats['avg_duration_seconds'] / 60  # minutes per bucket
-
-                analysis['bucket_analysis'][bucket_size] = bucket_stats
-
-            except Exception as e:
-                if self.logger:
-                    self.logger.warning(f"Error analyzing bucket size {bucket_size}: {e}")
-
-        # Generate recommendations
-        if analysis['bucket_analysis']:
-            # Find optimal bucket size based on balance of compression and time efficiency
-            best_bucket = None
-            best_score = 0
-
-            for bucket_size, stats in analysis['bucket_analysis'].items():
-                # Score based on compression ratio and reasonable time per bucket (5-60 minutes)
-                compression_score = min(stats['compression_ratio'] / 100, 1.0)  # Normalize to max 100:1
-                time_score = 1.0 if 5 <= stats['time_efficiency'] <= 60 else 0.5
-
-                combined_score = compression_score * 0.7 + time_score * 0.3
-
-                if combined_score > best_score:
-                    best_score = combined_score
-                    best_bucket = bucket_size
-
-            analysis['recommendations'] = {
-                'optimal_bucket_size': best_bucket,
-                'optimal_score': best_score,
-                'small_bucket_sizes': [size for size in bucket_sizes if size < avg_volume_per_tick * 5],
-                'large_bucket_sizes': [size for size in bucket_sizes if size > avg_volume_per_tick * 50],
-                'suggested_range': {
-                    'min': int(avg_volume_per_tick * 2),
-                    'max': int(avg_volume_per_tick * 20),
-                    'optimal': int(avg_volume_per_tick * 10)
-                }
-            }
-
-        return analysis
-
-    def get_volume_bucket_summary(self, symbol: str,
-                                 volume_bucket_size: int,
-                                 start_date: Optional[datetime] = None,
-                                 end_date: Optional[datetime] = None) -> Dict[str, any]:
-        """
-        Get summary statistics for a specific volume bucket configuration.
-        """
-        bucketed_data = self.get_continuous_m0_data(
-            symbol, start_date, end_date, volume_bucket_size=volume_bucket_size
-        )
-
-        if len(bucketed_data) == 0:
-            return {'error': 'No data available'}
-
-        summary = {
-            'symbol': symbol,
-            'bucket_size': volume_bucket_size,
-            'total_buckets': len(bucketed_data),
-            'date_range': {
-                'start': bucketed_data.index[0],
-                'end': bucketed_data.index[-1],
-                'duration_days': (bucketed_data.index[-1] - bucketed_data.index[0]).days
-            },
-            'volume_statistics': {
-                'total_volume': bucketed_data['TotalVolume'].sum(),
-                'avg_volume_per_bucket': bucketed_data['TotalVolume'].mean(),
-                'volume_std': bucketed_data['TotalVolume'].std(),
-                'min_volume': bucketed_data['TotalVolume'].min(),
-                'max_volume': bucketed_data['TotalVolume'].max()
-            },
-            'timing_statistics': {
-                'avg_duration_minutes': bucketed_data['BucketDuration'].mean() / 60,
-                'min_duration_seconds': bucketed_data['BucketDuration'].min(),
-                'max_duration_seconds': bucketed_data['BucketDuration'].max(),
-                'std_duration_minutes': bucketed_data['BucketDuration'].std() / 60
-            },
-            'tick_statistics': {
-                'avg_ticks_per_bucket': bucketed_data['TickCount'].mean(),
-                'min_ticks_per_bucket': bucketed_data['TickCount'].min(),
-                'max_ticks_per_bucket': bucketed_data['TickCount'].max(),
-                'total_ticks': bucketed_data['TickCount'].sum()
-            },
-            'price_statistics': {
-                'avg_bucket_range': (bucketed_data['High'] - bucketed_data['Low']).mean(),
-                'max_bucket_range': (bucketed_data['High'] - bucketed_data['Low']).max(),
-                'avg_price_move': abs(bucketed_data['Close'] - bucketed_data['Open']).mean()
-            }
-        }
-
-        # Add contract roll information if available
-        if 'contract_code' in bucketed_data.columns:
-            unique_contracts = bucketed_data['contract_code'].nunique()
-            summary['contract_information'] = {
-                'unique_contracts': unique_contracts,
-                'buckets_per_contract': len(bucketed_data) / unique_contracts if unique_contracts > 0 else 0
-            }
-
-        return summary
+        return results

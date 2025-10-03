@@ -2484,15 +2484,19 @@ class SpreadData:
         self.contracts = {}
         self._slopes_cache = {}
 
-        # Set up timestamps
+        # Set up timestamps/index - ensure we have an index
         if self.index is not None:
             self.timestamps = self.index
         elif self.timestamps is not None:
             self.index = self.timestamps
-
-        # Load data if needed
-        if (self.curve is None or len(self.curve) == 0) and self.symbol:
-            self.load_from_client()
+        else:
+            # Try to infer index from data
+            if hasattr(self, 'seq_prices') and isinstance(self.seq_prices, pd.DataFrame):
+                self.index = self.seq_prices.index
+                self.timestamps = self.index
+            elif hasattr(self, 'curve') and isinstance(self.curve, pd.DataFrame):
+                self.index = self.curve.index
+                self.timestamps = self.index
 
         # Convert DataFrames to numpy arrays
         self._convert_to_arrays()
@@ -4239,9 +4243,22 @@ class SpreadData:
         # Copy the data from the filtered instance to this instance
         for attr_name in ['curve', 'volume_curve', 'oi_curve', 'seq_prices', 'seq_volume',
                          'seq_oi', 'seq_labels', 'seq_spreads', 'seq_dte', 'dte',
-                         'days_to_expiration', 'spot_prices', 'synthetic_spot_prices', 'roll_dates']:
+                         'days_to_expiration', 'spot_prices', 'synthetic_spot_prices', 'roll_dates',
+                         'index', 'timestamps']:
             if hasattr(filtered_data, attr_name):
                 setattr(self, attr_name, getattr(filtered_data, attr_name))
+
+        # Ensure index is set (fallback to seq_prices index if available)
+        if self.index is None and hasattr(self, 'seq_prices') and isinstance(self.seq_prices, pd.DataFrame):
+            self.index = self.seq_prices.index
+        elif self.index is None and hasattr(self, 'curve') and isinstance(self.curve, pd.DataFrame):
+            self.index = self.curve.index
+
+        # Ensure timestamps matches index
+        if self.index is not None and self.timestamps is None:
+            self.timestamps = self.index
+
+        return self
 
     @classmethod
     def load_from_client_filtered(
@@ -4304,7 +4321,11 @@ class SpreadData:
             else:
                 all_curve_types = list(curve_types)
 
-        # Query data with date filtering
+        # Add roll_dates to curve types if not already included
+        if 'roll_dates' not in all_curve_types:
+            all_curve_types.append('roll_dates')
+
+        # Query all data in single HDF5 transaction (including roll_dates)
         curve_data = cli.query_curve_data(
             symbol,
             curve_types=all_curve_types,
@@ -4315,10 +4336,10 @@ class SpreadData:
         # Create new SpreadData instance
         spread_data = cls(symbol=symbol)
 
-        # Load roll_dates separately (different method)
-        try:
-            spread_data.roll_dates = cli.read_roll_dates(symbol)
-        except KeyError:
+        # Extract roll_dates from unified query result
+        if isinstance(curve_data, dict) and 'roll_dates' in curve_data:
+            spread_data.roll_dates = curve_data['roll_dates']
+        else:
             spread_data.roll_dates = None
 
         # Extract data using existing methods
@@ -4456,10 +4477,10 @@ class SpreadData:
             if curve_key in curve_data and isinstance(curve_data[curve_key], pd.DataFrame):
                 setattr(self, attr_name, curve_data[curve_key])
         
-        # Handle other DataFrame types
+        # Handle other DataFrame types (skip 'spot' and 'roll_dates' - handled separately)
         for k, val in curve_data.items():
             if (isinstance(val, pd.DataFrame) and
-                k not in {'curve', 'seq_curve', 'seq_prices', 'seq_spreads', 'seq_oi', 'seq_volume', 'seq_labels', 'seq_dte'}):
+                k not in {'curve', 'seq_curve', 'seq_prices', 'seq_spreads', 'seq_oi', 'seq_volume', 'seq_labels', 'seq_dte', 'spot', 'roll_dates'}):
                 setattr(self, k, val.values if hasattr(val, 'values') else val)
 
     def to_dataframe(
