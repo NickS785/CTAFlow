@@ -10,10 +10,11 @@ import warnings
 from datetime import datetime
 from scipy import stats
 from scipy.stats import skew, kurtosis
+import plotly.io as pio
 from numpy.linalg import svd
 from ..data.contract_handling.curve_manager import FuturesCurve, SpreadData, SpreadFeature
 from ..utils.seasonal import deseasonalize_monthly
-
+pio.renderers.default = "browser"
 # Import data client and utilities if available
 try:
     from ..data.data_client import DataClient
@@ -491,67 +492,70 @@ def calculate_microstructure_features(spread_data: SpreadData) -> Dict[str, floa
 def _calculate_log_levy_areas_numba(log_prices: np.ndarray, window: int) -> np.ndarray:
     """
     JIT-optimized Lévy area calculation on log prices
-    
+
     Computes Lévy areas between consecutive contract months using log prices
     to detect fundamental drivers of curve evolution.
-    
-    Fixed scaling issue: Uses increments-only formula to avoid large outliers
-    from mixing absolute log price levels with increments.
+
+    Proper formula: A = 0.5 * sum(X_mid * dY - Y_mid * dX)
+    where X_mid = (X[i] + X[i-1])/2 and dY = Y[i] - Y[i-1]
+
+    Interpretation: A > 0 => front contract leads (drives) the back contract
+                    A < 0 => back contract leads (drives) the front contract
     """
-    
+
     n_dates, n_contracts = log_prices.shape
     levy_areas = np.full((n_dates, n_contracts - 1), np.nan)
-    
+
     for contract_pair in prange(n_contracts - 1):
         front_log = log_prices[:, contract_pair]
         back_log = log_prices[:, contract_pair + 1]
-        
+
         for i in range(window, n_dates):
             # Extract windows
             front_window = front_log[i-window:i]
             back_window = back_log[i-window:i]
-            
+
             # Check for valid data
             has_nan_front = False
             has_nan_back = False
-            
+
             for j in range(len(front_window)):
                 if np.isnan(front_window[j]):
                     has_nan_front = True
                     break
-                    
+
             for j in range(len(back_window)):
                 if np.isnan(back_window[j]):
                     has_nan_back = True
                     break
-            
+
             if has_nan_front or has_nan_back:
                 continue
-            
-            # Calculate increments first
-            front_increments = np.empty(len(front_window) - 1)
-            back_increments = np.empty(len(back_window) - 1)
-            
-            for k in range(len(front_window) - 1):
-                front_increments[k] = front_window[k + 1] - front_window[k]
-                back_increments[k] = back_window[k + 1] - back_window[k]
-            
-            # Corrected Lévy area formula using increments only
-            # This avoids the scaling issue by not mixing absolute levels with increments
+
+            # Calculate Lévy area using proper midpoint formula
+            # A = 0.5 * sum(X_mid * dY - Y_mid * dX)
             area = 0.0
-            cumulative_front = 0.0
-            cumulative_back = 0.0
-            
-            for k in range(len(front_increments)):
-                # Build cumulative sums of increments (relative to window start)
-                cumulative_front += front_increments[k]
-                cumulative_back += back_increments[k]
-                
-                # Lévy area using cumulative increments instead of absolute levels
-                area += cumulative_front * back_increments[k] - cumulative_back * front_increments[k]
-            
+
+            for k in range(1, len(front_window)):
+                # Current and previous values
+                front_curr = front_window[k]
+                front_prev = front_window[k - 1]
+                back_curr = back_window[k]
+                back_prev = back_window[k - 1]
+
+                # Increments
+                dX = front_curr - front_prev
+                dY = back_curr - back_prev
+
+                # Midpoints
+                X_mid = (front_curr + front_prev) * 0.5
+                Y_mid = (back_curr + back_prev) * 0.5
+
+                # Lévy area increment
+                area += X_mid * dY - Y_mid * dX
+
             levy_areas[i, contract_pair] = 0.5 * area
-    
+
     return levy_areas
 
 
@@ -1144,86 +1148,137 @@ class CurveEvolutionAnalyzer:
 
     def calculate_path_signatures(self,
                                 window: int = None,
-                                max_signature_level: int = 2,
                                 constant_maturity: bool = False) -> Dict[str, Any]:
         """
-        Calculate comprehensive path signatures for curve evolution analysis
+        Calculate Lévy areas focusing on front vs back month leadership
 
         Parameters:
         -----------
         window : int
             Rolling window for calculations
-        max_signature_level : int
-            Maximum level of path signature to compute
         constant_maturity : bool, default False
             Use constant maturity tenors instead of sequential contracts
 
         Returns:
         --------
         Dict[str, Any]
-            Complete path signature analysis results with:
-            - levy_areas: Standard Lévy areas
-            - log_levy_areas: Log price Lévy areas (key innovation)
-            - path_variations: Path complexity measures
-            - signature_levels: Multi-level signatures
-            - curve_drivers: Identified drivers
-            - regime_changes: Regime change detection
+            Lévy area analysis results with:
+            - front_levy_area: Aggregated front-end Lévy area (who leads front months)
+            - back_levy_area: Aggregated back-end Lévy area (who leads back months)
+            - front_back_leadership: Overall front vs back leadership signal
+            - regime_changes: Regime change detection based on leadership shifts
         """
-        
+
         if window is None:
             window = self.default_window
-        
-        cache_key = f'path_signatures_{window}_{max_signature_level}_cm_{constant_maturity}'
+
+        cache_key = f'levy_leadership_{window}_cm_{constant_maturity}'
         if cache_key in self._cache:
             return self._cache[cache_key]
 
         # Get log prices matrix - either constant maturity or sequential
         if constant_maturity and self.constant_maturity_data is not None:
-            # Use constant maturity data
             log_prices = np.log(self.constant_maturity_data.values)
         else:
-            # Use sequential contract data
             log_prices = self.get_log_prices_matrix()
-        
-        # Calculate log price Lévy areas (primary driver detection)
-        log_levy_areas = self._calculate_log_levy_areas_jit(log_prices, window)
-        
-        # Calculate standard Lévy areas for comparison
-        prices = np.exp(log_prices)  # Convert back to price level
-        levy_areas = self._calculate_log_levy_areas_jit(prices, window)
-        
-        # Path variation analysis
-        path_variations = self._calculate_path_variations(log_prices, window)
-        
-        # Higher-order signature terms
-        signature_levels = self._calculate_signature_levels(
-            log_prices, window, max_signature_level
-        )
-        
-        # Detect curve drivers from log Lévy areas
-        curve_drivers = self._detect_curve_drivers(log_levy_areas)
-        
-        # Regime change detection
-        regime_changes = self._detect_regime_changes_from_levy(log_levy_areas)
-        
+
+        # Calculate front-end and back-end leadership using Lévy areas
+        leadership_results = self._calculate_front_back_leadership(log_prices, window)
+
+        # Detect regime changes from leadership shifts
+        regime_changes = self._detect_regime_changes_from_levy(leadership_results['front_back_leadership'])
+
         # Create result dictionary
         path_sig = {
-            'levy_areas': levy_areas,
-            'log_levy_areas': log_levy_areas,
-            'path_variations': path_variations,
-            'signature_levels': signature_levels,
-            'curve_drivers': curve_drivers,
-            'regime_changes': regime_changes
+            'front_levy_area': leadership_results['front_levy_area'],
+            'back_levy_area': leadership_results['back_levy_area'],
+            'front_back_leadership': leadership_results['front_back_leadership'],
+            'regime_changes': regime_changes,
+            'front_leader_pct': leadership_results['front_leader_pct'],
+            'back_leader_pct': leadership_results['back_leader_pct']
         }
-        
+
         # Cache results
         self._cache[cache_key] = path_sig
         self.path_signatures = path_sig
-        
+
         return path_sig
-    
-    def _calculate_path_variations(self, 
-                                  log_prices: np.ndarray, 
+
+    def _calculate_front_back_leadership(self, log_prices: np.ndarray, window: int) -> Dict[str, np.ndarray]:
+        """
+        Calculate front vs back month leadership using Lévy areas.
+
+        For each pair of consecutive contracts, calculates Lévy area to determine
+        which contract leads. Then aggregates into front-end and back-end zones.
+
+        Interpretation:
+        - Positive Lévy area: Front contract of the pair leads
+        - Negative Lévy area: Back contract of the pair leads
+
+        Parameters:
+        -----------
+        log_prices : np.ndarray
+            Matrix of log prices (n_dates, n_contracts)
+        window : int
+            Rolling window size
+
+        Returns:
+        --------
+        Dict[str, np.ndarray]
+            - front_levy_area: Average Lévy area for front-end pairs
+            - back_levy_area: Average Lévy area for back-end pairs
+            - front_back_leadership: Difference (front - back) showing overall leadership
+            - front_leader_pct: Percentage of time front leads back
+            - back_leader_pct: Percentage of time back leads front
+        """
+        n_dates = log_prices.shape[0]
+
+        # Calculate Lévy areas between consecutive contracts
+        all_levy_areas = self._calculate_log_levy_areas_jit(log_prices, window)
+
+        # Determine split between front and back
+        n_contract_pairs = all_levy_areas.shape[1]
+        back_split_index = self._determine_back_month_split(
+            self.back_month_years * 365,
+            n_contract_pairs + 1  # +1 because pairs is n_contracts - 1
+        )
+
+        # Aggregate front-end Lévy areas (average across front pairs)
+        if back_split_index > 0:
+            front_levy_area = np.nanmean(all_levy_areas[:, :back_split_index], axis=1)
+        else:
+            front_levy_area = np.full(n_dates, np.nan)
+
+        # Aggregate back-end Lévy areas (average across back pairs)
+        if back_split_index < n_contract_pairs:
+            back_levy_area = np.nanmean(all_levy_areas[:, back_split_index:], axis=1)
+        else:
+            back_levy_area = np.full(n_dates, np.nan)
+
+        # Overall front vs back leadership signal
+        # Positive: front-end leading overall curve
+        # Negative: back-end leading overall curve
+        front_back_leadership = front_levy_area - back_levy_area
+
+        # Calculate percentage of time each side leads
+        valid_mask = ~np.isnan(front_back_leadership)
+        if np.sum(valid_mask) > 0:
+            front_leader_pct = np.sum(front_back_leadership[valid_mask] > 0) / np.sum(valid_mask)
+            back_leader_pct = np.sum(front_back_leadership[valid_mask] < 0) / np.sum(valid_mask)
+        else:
+            front_leader_pct = 0.0
+            back_leader_pct = 0.0
+
+        return {
+            'front_levy_area': front_levy_area,
+            'back_levy_area': back_levy_area,
+            'front_back_leadership': front_back_leadership,
+            'front_leader_pct': front_leader_pct,
+            'back_leader_pct': back_leader_pct
+        }
+
+    def _calculate_path_variations(self,
+                                  log_prices: np.ndarray,
                                   window: int) -> np.ndarray:
         """Calculate path variation (total variation of the path)"""
         
@@ -1667,69 +1722,78 @@ class CurveEvolutionAnalyzer:
         
         return seasonal_driver
     
-    def _detect_regime_changes_from_levy(self, log_levy_areas: np.ndarray) -> np.ndarray:
+    def _detect_regime_changes_from_levy(self, leadership_signal: np.ndarray, confirmation_days: int = 3) -> np.ndarray:
         """
-        Detect regime changes using log price Lévy areas
-        
-        Regime changes are identified as significant shifts in the distribution
-        of Lévy areas, indicating fundamental changes in curve evolution dynamics
+        Detect regime changes with time-based confirmation period.
+
+        Regime changes occur when the leadership signal changes sign (crosses zero) and
+        maintains the new sign for a confirmation period (default 2-3 days).
+
+        Parameters:
+        -----------
+        leadership_signal : np.ndarray
+            1D array of front_back_leadership values (positive = front leads, negative = back leads)
+        confirmation_days : int, default 3
+            Number of consecutive days the new regime must persist to confirm the change
+
+        Returns:
+        --------
+        np.ndarray
+            Indices where confirmed regime changes occur
         """
-        
-        if log_levy_areas.size == 0:
+
+        if leadership_signal.size == 0:
             return np.array([])
-        
-        n_dates = log_levy_areas.shape[0]
-        regime_changes = np.zeros(n_dates)
-        
-        # Use rolling statistics to detect regime shifts
-        window = min(30, n_dates // 4)
-        if window < 10:
-            return regime_changes
-        
-        # Calculate rolling mean and std of Lévy area magnitudes
-        levy_magnitudes = np.sqrt(np.nansum(log_levy_areas**2, axis=1))
-        
-        for i in range(window, n_dates - window):
-            # Current window statistics
-            current_window = levy_magnitudes[i:i+window]
-            current_mean = np.nanmean(current_window)
-            current_std = np.nanstd(current_window)
-            
-            # Past window statistics
-            past_window = levy_magnitudes[i-window:i]
-            past_mean = np.nanmean(past_window)
-            past_std = np.nanstd(past_window)
-            
-            # Detect significant shifts
-            if not (np.isnan(current_mean) or np.isnan(past_mean) or 
-                   np.isnan(current_std) or np.isnan(past_std)):
-                
-                # Test for mean shift
-                if past_std > 0:
-                    z_score_mean = abs(current_mean - past_mean) / past_std
-                    if z_score_mean > self.regime_threshold:
-                        regime_changes[i] = 1
-                
-                # Test for volatility shift
-                if past_std > 0 and current_std > 0:
-                    vol_ratio = max(current_std / past_std, past_std / current_std)
-                    if vol_ratio > 1.5:  # 50% volatility change
-                        regime_changes[i] = max(regime_changes[i], 0.5)
-        
-        # Smooth regime changes
-        smoothed_changes = np.convolve(
-            regime_changes, 
-            np.ones(self.min_regime_length) / self.min_regime_length, 
-            mode='same'
-        )
-        
-        return (smoothed_changes > 0.3).astype(float)
+
+        # Remove NaN values for sign detection
+        valid_mask = ~np.isnan(leadership_signal)
+        if np.sum(valid_mask) < confirmation_days:
+            return np.array([])
+
+        # Get sign of leadership signal
+        sign_signal = np.sign(leadership_signal)
+
+        # Detect potential regime changes (zero crossings)
+        sign_changes = np.diff(sign_signal)
+        potential_changes = np.where(np.abs(sign_changes) > 0)[0] + 1
+
+        # Confirm regime changes by checking if new regime persists
+        confirmed_changes = []
+
+        for change_idx in potential_changes:
+            # Check if we have enough data after the change
+            if change_idx + confirmation_days > len(sign_signal):
+                continue
+
+            # Get the new regime sign
+            new_regime_sign = sign_signal[change_idx]
+
+            # Skip if new regime is neutral (zero)
+            if new_regime_sign == 0:
+                continue
+
+            # Check if the new sign persists for confirmation_days
+            confirmation_window = sign_signal[change_idx:change_idx + confirmation_days]
+
+            # Regime is confirmed if all values in confirmation window have same sign as new regime
+            # (allowing for zeros which are treated as continuation)
+            confirmed = np.all((confirmation_window == new_regime_sign) | (confirmation_window == 0))
+
+            if confirmed:
+                confirmed_changes.append(change_idx)
+
+        # Create regime change array
+        regime_changes = np.zeros(len(leadership_signal), dtype=int)
+        if len(confirmed_changes) > 0:
+            regime_changes[confirmed_changes] = 1
+
+        return regime_changes
     
     def analyze_curve_evolution_drivers(self,
                                        window: int = None,
                                        constant_maturity: bool = False) -> Dict[str, Any]:
         """
-        Comprehensive analysis of curve evolution drivers
+        Analyze front vs back month leadership dynamics
 
         Parameters:
         -----------
@@ -1741,11 +1805,12 @@ class CurveEvolutionAnalyzer:
         Returns:
         --------
         Dict[str, Any]
-            Complete analysis results including:
-            - Path signatures and Lévy areas
-            - Identified curve drivers
-            - Regime change analysis
-            - Driver importance rankings
+            Leadership analysis results including:
+            - front_levy_area: Front-end leadership signal
+            - back_levy_area: Back-end leadership signal
+            - front_back_leadership: Overall front vs back leadership
+            - regime_changes: Detected leadership regime changes
+            - leadership_statistics: Summary statistics
 
         Notes:
         ------
@@ -1763,33 +1828,90 @@ class CurveEvolutionAnalyzer:
                 warnings.warn("Constant maturity setup failed, falling back to sequential contracts")
                 constant_maturity = False
 
-        # Calculate path signatures
-        path_sig = self.calculate_path_signatures(window, constant_maturity=constant_maturity)
-        
-        # Analyze driver importance
-        driver_importance = self._analyze_driver_importance(path_sig['curve_drivers'])
-        
-        # Cross-correlation analysis between drivers
-        driver_correlations = self._calculate_driver_correlations(path_sig['curve_drivers'])
-        
+        # Calculate Lévy area leadership
+        levy_results = self.calculate_path_signatures(window, constant_maturity=constant_maturity)
+
         # Regime transition analysis
-        regime_analysis = self._analyze_regime_transitions(path_sig['regime_changes'])
-        
+        regime_analysis = self._analyze_regime_transitions(levy_results['regime_changes'])
+
+        # Calculate leadership statistics
+        leadership_stats = self._analyze_leadership_statistics(levy_results)
+
         return {
-            'path_signatures': path_sig,
-            'driver_importance': driver_importance,
-            'driver_correlations': driver_correlations,
+            'front_levy_area': levy_results['front_levy_area'],
+            'back_levy_area': levy_results['back_levy_area'],
+            'front_back_leadership': levy_results['front_back_leadership'],
+            'regime_changes': levy_results['regime_changes'],
             'regime_analysis': regime_analysis,
+            'leadership_statistics': leadership_stats,
             'summary_statistics': {
                 'n_curves': len(self.curves) if self.curves is not None else 0,
                 'date_range': (self.curves.index.min(), self.curves.index.max()) if self.curves is not None else None,
-                'n_regime_changes': np.sum(path_sig['regime_changes']) if path_sig['regime_changes'].size > 0 else 0,
-                'primary_driver': max(driver_importance.items(), key=lambda x: x[1])[0] if driver_importance else None
+                'n_regime_changes': int(np.sum(levy_results['regime_changes'])) if levy_results['regime_changes'].size > 0 else 0,
+                'front_leader_pct': levy_results['front_leader_pct'],
+                'back_leader_pct': levy_results['back_leader_pct'],
+                'current_leader': 'front' if levy_results['front_back_leadership'][-1] > 0 else 'back' if levy_results['front_back_leadership'][-1] < 0 else 'neutral'
             }
         }
-    
+
+    def _analyze_leadership_statistics(self, levy_results: Dict[str, np.ndarray]) -> Dict[str, float]:
+        """
+        Calculate detailed leadership statistics
+
+        Parameters:
+        -----------
+        levy_results : Dict[str, np.ndarray]
+            Results from calculate_path_signatures
+
+        Returns:
+        --------
+        Dict[str, float]
+            Leadership statistics
+        """
+        stats = {}
+
+        front_levy = levy_results['front_levy_area']
+        back_levy = levy_results['back_levy_area']
+        leadership = levy_results['front_back_leadership']
+
+        # Remove NaN values for statistics
+        valid_mask = ~np.isnan(leadership)
+        if np.sum(valid_mask) > 0:
+            leadership_valid = leadership[valid_mask]
+
+            # Basic statistics
+            stats['mean_leadership'] = float(np.mean(leadership_valid))
+            stats['std_leadership'] = float(np.std(leadership_valid))
+            stats['median_leadership'] = float(np.median(leadership_valid))
+
+            # Leadership strength
+            stats['avg_front_strength'] = float(np.mean(front_levy[~np.isnan(front_levy)]))
+            stats['avg_back_strength'] = float(np.mean(back_levy[~np.isnan(back_levy)]))
+
+            # Persistence (autocorrelation at lag 1)
+            if len(leadership_valid) > 1:
+                stats['leadership_persistence'] = float(np.corrcoef(leadership_valid[:-1], leadership_valid[1:])[0, 1])
+            else:
+                stats['leadership_persistence'] = 0.0
+
+            # Volatility of leadership
+            stats['leadership_volatility'] = float(np.std(np.diff(leadership_valid)))
+
+        else:
+            stats = {
+                'mean_leadership': 0.0,
+                'std_leadership': 0.0,
+                'median_leadership': 0.0,
+                'avg_front_strength': 0.0,
+                'avg_back_strength': 0.0,
+                'leadership_persistence': 0.0,
+                'leadership_volatility': 0.0
+            }
+
+        return stats
+
     def _analyze_driver_importance(self, drivers: Dict[str, np.ndarray]) -> Dict[str, float]:
-        """Analyze the importance of each curve driver"""
+        """Analyze the importance of each curve driver (legacy method - deprecated)"""
         
         importance = {}
         
@@ -2264,6 +2386,7 @@ class CurveEvolutionAnalyzer:
                                      show_seasonal_analysis: bool = True,
                                      show_3m_12m_spread: bool = True,
                                      constant_maturity: bool = False,
+                                     regime_confirmation_days: int = 3,
                                      height: int = 1200) -> go.Figure:
         """
         Focused visualization showing front month, back/front spread, drivers, seasonal analysis, and 3m-12m spread
@@ -2278,6 +2401,8 @@ class CurveEvolutionAnalyzer:
             Show 3m-12m spread as separate bottom chart
         constant_maturity : bool, default False
             Use constant maturity tenors instead of sequential contracts for analysis
+        regime_confirmation_days : int, default 3
+            Number of consecutive days required to confirm a regime change (2-3 day confirmation period)
         height : int
             Plot height
 
@@ -2301,7 +2426,7 @@ class CurveEvolutionAnalyzer:
         # Create subplot titles
         subplot_titles = ['Front Month, Synthetic Spot & Spot Prices', 'Back/Front Spread']
         if show_drivers:
-            subplot_titles.append('Curve Drivers (4 Core)')
+            subplot_titles.append('Front vs Back Leadership (Lévy Areas)')
         if show_seasonal_analysis:
             subplot_titles.append('Seasonal Deviations')
         if show_3m_12m_spread:
@@ -2323,18 +2448,18 @@ class CurveEvolutionAnalyzer:
             dates = pd.date_range(start='2023-01-01', periods=100, freq='D')
         
         current_row = 1
-        
+
         # 1. Front month price
-        self._add_front_month_plot(fig, current_row, dates, constant_maturity=constant_maturity)
+        self._add_front_month_plot(fig, current_row, dates, constant_maturity=constant_maturity, confirmation_days=regime_confirmation_days)
         current_row += 1
         
         # 2. Back/Front spread
         self._add_back_front_spread_plot(fig, current_row, dates, constant_maturity=constant_maturity)
         current_row += 1
         
-        # 3. Curve drivers
-        if show_drivers and 'curve_drivers' in self.path_signatures:
-            self._add_drivers_plot(fig, current_row, dates)
+        # 3. Leadership analysis (replaces old curve drivers)
+        if show_drivers:
+            self._add_leadership_analysis_plot(fig, current_row, dates, confirmation_days=regime_confirmation_days)
             current_row += 1
         
         # 4. Seasonal analysis
@@ -2393,47 +2518,82 @@ class CurveEvolutionAnalyzer:
                         row=row, col=1
                     )
     
-    def _add_drivers_plot(self, fig, row, dates):
-        """Add curve drivers plot - shows 3 core curve drivers (excluding seasonal_deviations)"""
-        
-        drivers = self.path_signatures['curve_drivers']
-        
-        # Exclude seasonal_deviations from drivers plot (it goes to seasonal analysis)
-        filtered_drivers = {k: v for k, v in drivers.items() if k != 'seasonal_deviations'}
-        
-        # Plot 3 core curve drivers (sorted by importance)
-        driver_importance = self._analyze_driver_importance(filtered_drivers)
-        core_drivers = sorted(driver_importance.items(), 
-                           key=lambda x: x[1], reverse=True)  # Show core drivers only
-        
-        # Color palette for 3 core drivers
-        colors = ['blue', 'red', 'green']
-        
-        for i, (driver_name, importance) in enumerate(core_drivers):
-            if driver_name in drivers and drivers[driver_name].size > 0:
-                driver_values = drivers[driver_name]
-                valid_mask = ~np.isnan(driver_values)
-                
-                if np.sum(valid_mask) > 0:
-                    # Ensure we align dates and driver values correctly
-                    aligned_length = min(len(dates), len(driver_values))
-                    aligned_dates = dates[:aligned_length]
-                    aligned_driver_values = driver_values[:aligned_length]
-                    aligned_valid_mask = valid_mask[:aligned_length]
+    def _add_leadership_analysis_plot(self, fig, row, dates, confirmation_days: int = 3):
+        """Add front vs back leadership analysis plot"""
 
-                    valid_dates = aligned_dates[aligned_valid_mask]
-                    valid_values = aligned_driver_values[aligned_valid_mask]
-                    
-                    fig.add_trace(
-                        go.Scatter(
-                            x=valid_dates,
-                            y=valid_values,
-                            mode='lines',
-                            name=f'{driver_name} ({importance:.3f})',
-                            line=dict(color=colors[i % len(colors)])
-                        ),
-                        row=row, col=1
-                    )
+        # Get leadership data from path_signatures
+        front_levy = self.path_signatures['front_levy_area']
+        back_levy = self.path_signatures['back_levy_area']
+        leadership = self.path_signatures['front_back_leadership']
+
+        # Recalculate regime changes with the specified confirmation period
+        regime_changes = self._detect_regime_changes_from_levy(leadership, confirmation_days=confirmation_days)
+
+        # Align dates with data
+        aligned_length = min(len(dates), len(leadership))
+        plot_dates = dates[:aligned_length]
+
+        # Plot front-end Lévy area
+        valid_front = ~np.isnan(front_levy[:aligned_length])
+        if np.sum(valid_front) > 0:
+            fig.add_trace(
+                go.Scatter(
+                    x=plot_dates[valid_front],
+                    y=front_levy[:aligned_length][valid_front],
+                    mode='lines',
+                    name='Front-End Leadership',
+                    line=dict(color='blue', width=2)
+                ),
+                row=row, col=1
+            )
+
+        # Plot back-end Lévy area
+        valid_back = ~np.isnan(back_levy[:aligned_length])
+        if np.sum(valid_back) > 0:
+            fig.add_trace(
+                go.Scatter(
+                    x=plot_dates[valid_back],
+                    y=back_levy[:aligned_length][valid_back],
+                    mode='lines',
+                    name='Back-End Leadership',
+                    line=dict(color='red', width=2)
+                ),
+                row=row, col=1
+            )
+
+        # Plot overall leadership signal
+        valid_leadership = ~np.isnan(leadership[:aligned_length])
+        if np.sum(valid_leadership) > 0:
+            fig.add_trace(
+                go.Scatter(
+                    x=plot_dates[valid_leadership],
+                    y=leadership[:aligned_length][valid_leadership],
+                    mode='lines',
+                    name='Front-Back Difference',
+                    line=dict(color='green', width=3, dash='dash')
+                ),
+                row=row, col=1
+            )
+
+        # Add zero line (regime boundary)
+        fig.add_hline(y=0, line_dash="dot", line_color="gray", row=row, col=1,
+                     annotation_text=f"{confirmation_days}-day confirmation",
+                     annotation_position="top right")
+
+        # Highlight regime changes if available
+        if regime_changes.size > 0 and len(regime_changes) >= aligned_length:
+            regime_points = np.where(regime_changes[:aligned_length] > 0)[0]
+            if len(regime_points) > 0:
+                fig.add_trace(
+                    go.Scatter(
+                        x=plot_dates[regime_points],
+                        y=leadership[:aligned_length][regime_points],
+                        mode='markers',
+                        name='Regime Changes',
+                        marker=dict(color='purple', size=10, symbol='x')
+                    ),
+                    row=row, col=1
+                )
     
     def _add_regime_plot(self, fig, row, dates):
         """Add regime changes plot"""
@@ -2490,8 +2650,11 @@ class CurveEvolutionAnalyzer:
                     row=row, col=1
                 )
     
-    def _add_front_month_plot(self, fig, row, dates, constant_maturity=False):
+    def _add_front_month_plot(self, fig, row, dates, constant_maturity=False, confirmation_days=3):
         """Add front month (F0) price plot with synthetic spot and spot data using broadcasting"""
+
+        valid_dates = None
+        front_month_prices = None
 
         if constant_maturity and hasattr(self, 'constant_maturity_data') and self.constant_maturity_data is not None:
             # Use constant maturity data for front month plot
@@ -2524,7 +2687,6 @@ class CurveEvolutionAnalyzer:
                     ),
                     row=row, col=1
                 )
-                return
 
         if self.curves is not None:
             # Use broadcast method to extract F0 prices
@@ -2603,7 +2765,7 @@ class CurveEvolutionAnalyzer:
                     x_numeric = np.arange(len(front_month_prices))
                     coeffs = np.polyfit(x_numeric, front_month_prices, 1)
                     trend_line = coeffs[0] * x_numeric + coeffs[1]
-                    
+
                     fig.add_trace(
                         go.Scatter(
                             x=valid_dates,
@@ -2615,9 +2777,42 @@ class CurveEvolutionAnalyzer:
                         ),
                         row=row, col=1
                     )
-                
-                # Update y-axis label for this subplot
-                fig.update_yaxes(title_text="Price", row=row, col=1)
+
+        # Add regime change markers if path_signatures available and we have price data
+        if (valid_dates is not None and front_month_prices is not None and
+            self.path_signatures is not None and 'front_back_leadership' in self.path_signatures):
+
+            leadership = self.path_signatures['front_back_leadership']
+            regime_changes = self._detect_regime_changes_from_levy(leadership, confirmation_days=confirmation_days)
+
+            # Align regime changes with front month prices
+            aligned_length = min(len(valid_dates), len(regime_changes))
+            regime_points = np.where(regime_changes[:aligned_length] > 0)[0]
+
+            if len(regime_points) > 0:
+                # Get prices at regime change points
+                regime_dates = valid_dates[regime_points]
+                regime_prices = front_month_prices[regime_points]
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=regime_dates,
+                        y=regime_prices,
+                        mode='markers',
+                        name='Regime Changes (Price)',
+                        marker=dict(
+                            color='purple',
+                            size=12,
+                            symbol='star',
+                            line=dict(color='white', width=1)
+                        ),
+                        hovertemplate='Regime Change<br>Date: %{x}<br>Price: %{y:.2f}<extra></extra>'
+                    ),
+                    row=row, col=1
+                )
+
+        # Update y-axis label for this subplot
+        fig.update_yaxes(title_text="Price", row=row, col=1)
 
     def _select_contract_by_dte(self,
                                  curve: FuturesCurve,

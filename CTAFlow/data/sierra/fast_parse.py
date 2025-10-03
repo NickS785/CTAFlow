@@ -396,9 +396,12 @@ class FastScidReader:
         sl = self.slice_by_time(start_ms=start_ms, end_ms=end_ms)
         v = self.view[sl]
         t = self.times_epoch_ms()[sl]
-        idx = pd.to_datetime(t, unit="ms", utc=True)
+
+        # Create timezone-naive datetime index by default to avoid timezone conflicts
         if tz:
-            idx = idx.tz_convert(tz)
+            idx = pd.to_datetime(t, unit="ms", utc=True).tz_convert(tz)
+        else:
+            idx = pd.to_datetime(t, unit="ms")
 
         # Force copies to avoid holding references to memory-mapped buffer
         data_dict = {}
