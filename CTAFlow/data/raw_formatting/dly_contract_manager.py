@@ -712,21 +712,44 @@ class DLYContractManager:
                 continue
 
             store_key = f"market/{self.ticker}/{key}"
-            try:
-                existing_df = self.client.read_market(store_key)
-            except KeyError:
-                existing_df = pd.DataFrame()
+            sorted_frame = sort_curve_columns(frame.sort_index())
+            append_result = self.client.append_market_continuous(sorted_frame, store_key)
 
-            merged = merge_frames(existing_df, frame)
-            if merged.empty:
+            if append_result["mode"] == "schema_mismatch":
+                try:
+                    existing_df = self.client.read_market(store_key)
+                except KeyError:
+                    existing_df = pd.DataFrame()
+
+                merged = merge_frames(existing_df, sorted_frame)
+                if merged.empty:
+                    results["skipped"].append(key)
+                    continue
+
+                self.client.write_market(merged, store_key, replace=True)
+                results["updated"][key] = {
+                    "total_rows": len(merged),
+                    "delta_rows": len(merged) - len(existing_df),
+                    "mode": "replace",
+                    "extra_columns": append_result.get("extra_columns", []),
+                }
+                continue
+
+            if append_result["mode"] == "noop":
                 results["skipped"].append(key)
                 continue
 
-            self.client.write_market(merged, store_key, replace=True)
             results["updated"][key] = {
-                "total_rows": len(merged),
-                "delta_rows": len(merged) - len(existing_df),
+                "total_rows": append_result.get("total_rows"),
+                "delta_rows": append_result.get("delta_rows"),
+                "mode": append_result.get("mode"),
+                "rows_written": append_result.get("rows_written"),
             }
+
+            if append_result.get("missing_columns"):
+                results["updated"][key]["missing_columns"] = append_result["missing_columns"]
+            if append_result.get("removed_rows"):
+                results["updated"][key]["removed_rows"] = append_result["removed_rows"]
 
         return results
     @classmethod
