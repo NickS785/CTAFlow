@@ -125,7 +125,7 @@ async def fetch_market_cot_data(ticker_symbol: str,daily=True, resample=False, r
         pd.DataFrame: concatenated market and cot_data
     """
     try:
-        # Get the COT commodity name from ticker mapping
+        # Get the COT symbol name from ticker mapping
         if ticker_symbol not in mapping['tickers']:
             raise ValueError(f"Ticker {ticker_symbol} not found in futures mappings")
 

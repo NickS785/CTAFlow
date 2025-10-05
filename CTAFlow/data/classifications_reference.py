@@ -121,7 +121,7 @@ def get_all_classifications() -> dict:
 
 
 def get_commodities_by_category() -> dict:
-    """Group commodity tickers by category."""
+    """Group symbol tickers by category."""
     categories = {}
     for ticker, info in COMMODITY_TICKERS.items():
         category = info['category']

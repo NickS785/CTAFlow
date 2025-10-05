@@ -11,7 +11,7 @@ from typing import Dict, Any, Optional, List, Tuple, Set, Sequence
 import numpy as np
 import pandas as pd
 
-from .contract_handling.dly_contract_manager import DLYContractManager, DLYFolderUpdater
+from .raw_formatting.dly_contract_manager import DLYContractManager, DLYFolderUpdater
 from CTAFlow.config import RAW_MARKET_DATA_PATH
 
 
