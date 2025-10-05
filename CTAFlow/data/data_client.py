@@ -319,6 +319,166 @@ class DataClient:
         with pd.HDFStore(self.market_path, "a") as store:
             (store.put if replace else store.append)(key, df2, **fmt)
 
+    def append_market_continuous(
+        self,
+        df: pd.DataFrame,
+        key: str,
+        *,
+        data_columns: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        """Append ``df`` to ``key`` while preserving existing schema ordering."""
+
+        if df is None or df.empty:
+            return {
+                "mode": "noop",
+                "rows_written": 0,
+                "total_rows": self._get_market_rowcount(key),
+                "delta_rows": 0,
+                "schema_changed": False,
+                "extra_columns": [],
+                "missing_columns": [],
+                "removed_rows": 0,
+            }
+
+        df_sorted = df.sort_index()
+        df_sorted = df_sorted[~df_sorted.index.duplicated(keep="last")]
+
+        if not self.market_key_exists(key):
+            self.write_market(df_sorted, key, replace=True, data_columns=data_columns)
+            total_rows = self._get_market_rowcount(key)
+            return {
+                "mode": "replace",
+                "rows_written": len(df_sorted),
+                "total_rows": total_rows,
+                "delta_rows": len(df_sorted),
+                "schema_changed": False,
+                "extra_columns": [],
+                "missing_columns": [],
+                "removed_rows": 0,
+            }
+
+        tail = self.get_market_tail(key, nrows=1)
+        last_ts = tail.index[-1] if not tail.empty else None
+
+        append_df: Optional[pd.DataFrame] = None
+        existing_columns: Optional[List[str]] = None
+        missing_columns: List[str] = []
+        extra_columns: List[str] = []
+        removed_rows = 0
+        prior_rows = 0
+
+        with pd.HDFStore(self.market_path, "a") as store:
+            try:
+                storer = store.get_storer(key)
+            except (KeyError, ValueError):
+                storer = None
+
+            if storer is None or storer.nrows == 0:
+                append_df = df_sorted
+                existing_columns = list(df_sorted.columns)
+            else:
+                prior_rows = storer.nrows
+                existing_columns = self._extract_market_columns(store, key, storer)
+                if existing_columns is None:
+                    append_df = df_sorted
+                    existing_columns = list(df_sorted.columns)
+                else:
+                    extra_columns = [c for c in df_sorted.columns if c not in existing_columns]
+                    if extra_columns:
+                        return {
+                            "mode": "schema_mismatch",
+                            "rows_written": 0,
+                            "total_rows": prior_rows,
+                            "delta_rows": 0,
+                            "schema_changed": True,
+                            "extra_columns": extra_columns,
+                            "missing_columns": [],
+                            "removed_rows": 0,
+                        }
+
+                    missing_columns = [c for c in existing_columns if c not in df_sorted.columns]
+                    append_df = df_sorted
+                    if last_ts is not None:
+                        overlap_mask = append_df.index <= last_ts
+                        if overlap_mask.any():
+                            overlap_start = append_df.index[overlap_mask].min()
+                            try:
+                                store.remove(key, where=f'index >= "{overlap_start.isoformat()}"')
+                            except Exception:
+                                overlap_start = None
+                            else:
+                                storer = store.get_storer(key)
+                                current_rows = storer.nrows if storer is not None else 0
+                                removed_rows = prior_rows - current_rows
+                            if overlap_start is not None:
+                                append_df = append_df.loc[append_df.index >= overlap_start]
+                            else:
+                                append_df = append_df.loc[append_df.index > last_ts]
+                        else:
+                            append_df = append_df.loc[append_df.index > last_ts]
+
+        if append_df is None or append_df.empty:
+            total_rows = self._get_market_rowcount(key)
+            return {
+                "mode": "noop",
+                "rows_written": 0,
+                "total_rows": total_rows,
+                "delta_rows": 0,
+                "schema_changed": False,
+                "extra_columns": extra_columns,
+                "missing_columns": missing_columns,
+                "removed_rows": removed_rows,
+            }
+
+        if existing_columns is not None:
+            append_df = append_df.reindex(columns=existing_columns)
+
+        self.write_market(append_df, key, replace=False, data_columns=data_columns)
+
+        total_rows = self._get_market_rowcount(key)
+        delta_rows = len(append_df) - removed_rows
+        mode = "append_with_revisions" if removed_rows else "append"
+
+        return {
+            "mode": mode,
+            "rows_written": len(append_df),
+            "total_rows": total_rows,
+            "delta_rows": delta_rows,
+            "schema_changed": False,
+            "extra_columns": extra_columns,
+            "missing_columns": missing_columns,
+            "removed_rows": removed_rows,
+        }
+
+    def _get_market_rowcount(self, key: str) -> int:
+        if not self.market_path.exists():
+            return 0
+        try:
+            with pd.HDFStore(self.market_path, "r") as store:
+                storer = store.get_storer(key)
+                if storer is None:
+                    return 0
+                return storer.nrows
+        except (KeyError, OSError, FileNotFoundError):
+            return 0
+
+    @staticmethod
+    def _extract_market_columns(
+        store: pd.HDFStore, key: str, storer: Any
+    ) -> Optional[List[str]]:
+        try:
+            sample = store.select(key, stop=0)
+            if hasattr(sample, "columns") and len(sample.columns) > 0:
+                return list(sample.columns)
+        except Exception:
+            pass
+
+        try:
+            colnames = list(getattr(storer.table, "colnames", []))
+            return [c for c in colnames if c not in {"index", "level_0"}]
+        except Exception:
+            return None
+
     # ------------------------------------------------------------------
     # Market metadata helpers
     # ------------------------------------------------------------------
