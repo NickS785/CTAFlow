@@ -20,9 +20,9 @@ import numpy as np
 
 from ..config import RAW_MARKET_DATA_PATH, MARKET_DATA_PATH, TICKER_TO_CODE
 from .data_client import DataClient
-from CTAFlow.data.contract_handling.curve_manager import FuturesCurveManager
-from CTAFlow.data.contract_handling.roll_date_manager import create_enhanced_curve_manager_with_roll_tracking
-from CTAFlow.data.contract_handling.dly_contract_manager import (
+from CTAFlow.data.raw_formatting.spread_manager import FuturesCurveManager
+from CTAFlow.data.raw_formatting.roll_date_manager import create_enhanced_curve_manager_with_roll_tracking
+from CTAFlow.data.raw_formatting.dly_contract_manager import (
     DLYContractManager,
     discover_tickers,
     parse_contract_filename,

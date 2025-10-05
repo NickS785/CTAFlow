@@ -591,6 +591,15 @@ class DLYContractManager:
     ) -> Dict[str, Any]:
         """Update existing HDF5 curve datasets with the latest .dly data."""
 
+        # Check existing data structure to preserve column count
+        existing_max_buckets = None
+        try:
+            existing_seq = self.client.read_market(f"market/{self.ticker}/seq_curve")
+            if existing_seq is not None and not existing_seq.empty:
+                existing_max_buckets = existing_seq.shape[1]
+        except KeyError:
+            pass  # No existing data, will use default
+
         if file_paths:
             parsed_pairs: List[Tuple[ContractInfo, str]] = []
             for fp in file_paths:
@@ -611,7 +620,8 @@ class DLYContractManager:
         self.build_dte()
         self.build_expiry_series()
         self.compute_front()
-        self.sequentialize()
+        # Use existing column count to preserve data structure
+        self.sequentialize(max_buckets=existing_max_buckets)
 
         spreads = self.spreads_vs_front()
 
@@ -803,18 +813,18 @@ class DLYFolderUpdater:
             with self._progress_lock:
                 print(f"[THREAD] Starting {ticker}")
 
-            # Create manager and process - UPDATED TO USE NEW CONSTRUCTOR SYNTAX
+            # Create manager and process
             if hdf_path:
                 # Shared HDF file - will be saved later in thread-safe manner
                 mgr = DLYContractManager(ticker, self.folder)
                 mgr.run(save=False)
             elif per_ticker_hdf_tpl:
-                # Per-ticker HDF file
+                # Per-ticker HDF file - pass the formatted path to constructor
                 path = per_ticker_hdf_tpl.format(ticker=ticker)
-                mgr = DLYContractManager(ticker, self.folder)
+                mgr = DLYContractManager(ticker, self.folder, hdf_path=path)
                 mgr.run(save=True)
             else:
-                # No saving
+                # No saving - defaults to MARKET_DATA_PATH but save=False
                 mgr = DLYContractManager(ticker, self.folder)
                 mgr.run(save=False)
 

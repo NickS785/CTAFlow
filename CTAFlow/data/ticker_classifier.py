@@ -27,7 +27,7 @@ class ReportType(Enum):
 
 class TickerCategory(Enum):
     """Ticker categories for COT classification"""
-    COMMODITY = "commodity"
+    COMMODITY = "symbol"
     FINANCIAL = "financial"
 
 
@@ -92,11 +92,11 @@ class TickerClassifier:
         
         # Process ALL tickers in the mappings
         for ticker_symbol in TICKER_TO_CODE.keys():
-            # Get commodity name and COT code
+            # Get symbol name and COT code
             commodity_name = FUTURES_MAP['tickers'][ticker_symbol]
             cot_code = TICKER_TO_CODE[ticker_symbol]
             
-            # Classify as commodity or financial based on knowledge
+            # Classify as symbol or financial based on knowledge
             category = self._classify_ticker(commodity_name)
             report_type = ReportType.TFF if category == TickerCategory.FINANCIAL else ReportType.DISAGGREGATED
             
@@ -118,14 +118,14 @@ class TickerClassifier:
         return ticker_objects
     
     def _classify_ticker(self, commodity_name: str) -> TickerCategory:
-        """Classify ticker as commodity or financial based on commodity name"""
+        """Classify ticker as symbol or financial based on symbol name"""
         if commodity_name in self.FINANCIAL_CATEGORIES:
             return TickerCategory.FINANCIAL
         else:
             return TickerCategory.COMMODITY
     
     def get_commodities(self) -> List[TickerInfo]:
-        """Get all commodity tickers"""
+        """Get all symbol tickers"""
         return [ticker for ticker in self.ticker_objects.values() 
                 if ticker.category == TickerCategory.COMMODITY]
     

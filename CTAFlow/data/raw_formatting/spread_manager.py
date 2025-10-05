@@ -1249,7 +1249,7 @@ class ExpiryTracker:
         if inferred_year is not None:
             year = inferred_year
 
-        # Default expiry rules (can be customized per commodity)
+        # Default expiry rules (can be customized per symbol)
         expiry_rules = {
             'CL': {'day': 25, 'offset': -3},  # Crude: 3 business days before 25th
             'NG': {'day': -3, 'offset': 0},  # Natural Gas: 3 business days before last
@@ -1258,7 +1258,7 @@ class ExpiryTracker:
             'W': {'day': 15, 'offset': -1},  # Wheat
         }
 
-        # Extract commodity code from symbol
+        # Extract symbol code from symbol
         commodity = ''.join([c for c in self.symbol if c.isalpha()])[:2]
 
         if commodity in expiry_rules:
@@ -5044,6 +5044,8 @@ class CrossSpreadLeg:
         return {contract: self.weight_for_contract(contract) for contract in contracts}
 
 
+
+
 @dataclass
 class CrossProductSpreadData:
     """Cross-asset spread container supporting multi-leg weighted combinations."""
@@ -5057,7 +5059,7 @@ class CrossProductSpreadData:
     hedge_contract_ratios: Optional[Dict[str, float]] = None
     additional_legs: Optional[Sequence[Union[CrossSpreadLeg, Tuple['SpreadData', float], Dict[str, Any]]]] = None
 
-    seq_spreads: SpreadFeature = field(init=False)
+    seq_spreads: pd.DataFrame = field(init=False)
     spread_dataframe: pd.DataFrame = field(init=False)
     index: pd.DatetimeIndex = field(init=False)
     columns: List[str] = field(init=False)

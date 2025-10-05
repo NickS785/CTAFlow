@@ -250,7 +250,7 @@ class DataClient:
         """
         text_indicators = [
             "market", "exchange", "name", "description", "symbol", "ticker",
-            "commodity", "contract", "group", "subgroup", "category", "type",
+            "symbol", "contract", "group", "subgroup", "category", "type",
             "region", "location", "currency", "unit"
         ]
         col_lower = col_name.lower()
@@ -483,7 +483,7 @@ class DataClient:
         -----------
         tickers : str, sequence of str, or None
             Ticker symbol(s) to query. If None, returns all available data.
-            Can use ticker symbols (e.g., 'ZC_F', 'CL_F') or commodity names (e.g., 'CORN', 'CRUDE_OIL').
+            Can use ticker symbols (e.g., 'ZC_F', 'CL_F') or symbol names (e.g., 'CORN', 'CRUDE_OIL').
             
         start_date : str, optional
             Start date filter in 'YYYY-MM-DD' format
@@ -529,7 +529,7 @@ class DataClient:
         # Combine multiple tickers into single DataFrame
         >>> df = client.query_market_data(['ZC_F', 'CL_F'], combine_datasets=True)
         
-        # Query by commodity name
+        # Query by symbol name
         >>> df = client.query_market_data('CORN', start_date='2024-06-01')
         
         # Advanced filtering
@@ -541,14 +541,6 @@ class DataClient:
         # Query multiple tickers with daily data
         >>> daily_data = client.query_market_data(['ZC_F', 'CL_F'], daily=True, columns=['Open', 'High', 'Low', 'Last'])
         """
-        try:
-            from ..config import get_ticker_symbol, COMMODITY_TO_TICKER
-        except ImportError:
-            # Fallback if config functions are not available
-            def get_ticker_symbol(ticker):
-                return ticker
-            COMMODITY_TO_TICKER = {}
-        
         # Handle ticker input
         if isinstance(tickers, str):
             tickers = [tickers]
@@ -559,23 +551,19 @@ class DataClient:
         else:
             market_keys = []
             for ticker in tickers:
-                # Try to resolve ticker symbol
-                try:
-                    resolved_ticker = get_ticker_symbol(ticker.upper())
+                # Ensure ticker has _F suffix (all market symbols end with _F)
+                ticker_upper = ticker.upper()
+                if not ticker_upper.endswith('_F'):
+                    ticker_upper = f"{ticker_upper}_F"
+
+                # Build market key
+                if ticker.startswith('market/'):
+                    market_keys.append(ticker)
+                else:
                     if daily:
-                        market_key = f"market/daily/{resolved_ticker}"
+                        market_keys.append(f"market/daily/{ticker_upper}")
                     else:
-                        market_key = f"market/{resolved_ticker}"
-                    market_keys.append(market_key)
-                except (KeyError, ValueError):
-                    # Try as direct market key
-                    if ticker.startswith('market/'):
-                        market_keys.append(ticker)
-                    else:
-                        if daily:
-                            market_keys.append(f"market/daily/{ticker}")
-                        else:
-                            market_keys.append(f"market/{ticker}")
+                        market_keys.append(f"market/{ticker_upper}")
         
         # Build where clause for date filtering
         date_conditions = []
@@ -828,7 +816,7 @@ class DataClient:
         Query pre-calculated COT metrics for a specific ticker with filtering options.
         
         Automatically determines the correct storage path based on whether ticker
-        is a financial future (stored in cot/tff/) or commodity (stored in cot/).
+        is a financial future (stored in cot/tff/) or symbol (stored in cot/).
         
         Parameters:
         -----------
@@ -947,8 +935,8 @@ class DataClient:
         # Define available curve types and their market keys
         available_curve_types = {
             "curve": f"{symbol_key}/curve",
-            "volume_curve": f"{symbol_key}/volume_curve",
-            "oi_curve": f"{symbol_key}/oi_curve",
+            "volume_curve": f"{symbol_key}/curve_volume",
+            "oi_curve": f"{symbol_key}/curve_oi",
             "front": f"{symbol_key}/front",
             "dte": f"{symbol_key}/dte",
             "seq_curve": f"{symbol_key}/seq_curve",
@@ -1078,8 +1066,8 @@ class DataClient:
         # Look for curve-related keys
         curve_patterns = {
             'curve': '/curve',
-            'volume_curve': '/volume_curve',
-            'oi_curve': '/oi_curve',
+            'volume_curve': '/curve_volume',
+            'oi_curve': '/curve_oi',
             'front': '/front',
             'dte': '/dte',
             'seq_curve': '/seq_curve',
@@ -1128,10 +1116,10 @@ class DataClient:
         
         curve_types = {
             "curve": f"{symbol_key}/curve",
-            "volume_curve": f"{symbol_key}/volume_curve",
-            "oi_curve": f"{symbol_key}/oi_curve",
+            "volume_curve": f"{symbol_key}/curve_volume",
+            "oi_curve": f"{symbol_key}/curve_oi",
             "front": f"{symbol_key}/front",
-            "dte": f"{symbol_key}/dte", 
+            "dte": f"{symbol_key}/dte",
             "seq_curve": f"{symbol_key}/seq_curve",
             "seq_volume": f"{symbol_key}/seq_volume",
             "seq_oi": f"{symbol_key}/seq_oi",
@@ -1718,7 +1706,7 @@ class DataClient:
         """
         Write COT metrics for a ticker using appropriate report type and storage path.
         
-        Automatically determines if ticker is a financial future (uses TFF) or commodity (uses disaggregated),
+        Automatically determines if ticker is a financial future (uses TFF) or symbol (uses disaggregated),
         and stores data in the appropriate HDF5 path (cot/tff/ for financials, cot/ for commodities).
         """
         if selected_cot_features is None:
@@ -2462,7 +2450,7 @@ class DataClient:
         **kwargs
     ) -> pd.DataFrame:
         """
-        Query COT data using commodity names (e.g., 'CORN', 'CRUDE_OIL').
+        Query COT data using symbol names (e.g., 'CORN', 'CRUDE_OIL').
         
         Parameters:
         -----------
@@ -2486,7 +2474,7 @@ class DataClient:
                 code = get_cot_code(commodity.upper())
                 codes.append(code)
             except KeyError:
-                raise KeyError(f"No COT code mapping found for commodity '{commodity}'. "
+                raise KeyError(f"No COT code mapping found for symbol '{commodity}'. "
                               f"Available commodities: {list(FUTURES_MAP['COT']['codes'].keys())}")
         
         return self.query_cot_by_codes(codes, **kwargs)
@@ -2498,19 +2486,19 @@ class DataClient:
         Returns:
         --------
         pd.DataFrame
-            DataFrame with ticker, commodity, and COT code mappings
+            DataFrame with ticker, symbol, and COT code mappings
         """
         instruments = []
         for ticker, commodity in FUTURES_MAP['tickers'].items():
             code = FUTURES_MAP['COT']['codes'][commodity]
             instruments.append({
                 'ticker': ticker,
-                'commodity': commodity,
+                'symbol': commodity,
                 'cot_code': code,
                 'category': self._get_instrument_category(commodity)
             })
         
-        return pd.DataFrame(instruments).sort_values(['category', 'commodity'])
+        return pd.DataFrame(instruments).sort_values(['category', 'symbol'])
     
     @staticmethod
     def _get_instrument_category(commodity: str) -> str:
@@ -2605,7 +2593,7 @@ class DataClient:
         Download COT data for a specific ticker using the appropriate report type.
         
         Automatically determines if the ticker is a financial future (uses TFF) or 
-        commodity (uses disaggregated), and downloads the appropriate COT report.
+        symbol (uses disaggregated), and downloads the appropriate COT report.
         
         Parameters:
         -----------
@@ -2705,7 +2693,7 @@ class DataClient:
                 replace=replace
             )
             
-            # Filter for each commodity ticker
+            # Filter for each symbol ticker
             for ticker in commodity_tickers:
                 try:
                     cot_code = TICKER_TO_CODE[ticker]
