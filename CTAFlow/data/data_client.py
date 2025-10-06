@@ -10,6 +10,7 @@ contain strings like ".", "-" or "—").
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
@@ -34,10 +35,19 @@ except Exception:  # pragma: no cover - allows import of module without cot_repo
 from ..config import (
     COT_DATA_PATH,
     CODE_TO_TICKER,
+    DLY_DATA_PATH,
     FUTURES_MAP,
     MARKET_DATA_PATH,
     TICKER_TO_CODE,
     get_cot_code,
+)
+from .update_management import (
+    COT_REFRESH_EVENT,
+    WEEKLY_MARKET_UPDATE_EVENT,
+    get_update_metadata_store,
+    get_weekly_update_scheduler,
+    summarize_cot_refresh,
+    summarize_update_summary,
 )
 
 
@@ -65,6 +75,9 @@ class DataClient:
     immediately before persisting data so directories are created only when writes
     actually occur.
     """
+
+    _weekly_update_lock = threading.Lock()
+    _weekly_update_checked = False
 
     def __init__(
         self,
@@ -103,6 +116,44 @@ class DataClient:
         if self._cot_processor is None:
             self._cot_processor = COTAnalyzer()
         return self._cot_processor
+
+    def _ensure_weekly_updates(self) -> None:
+        """Run the weekly market data update if it is due."""
+
+        cls = type(self)
+        with cls._weekly_update_lock:
+            if cls._weekly_update_checked:
+                return
+            cls._weekly_update_checked = True
+
+        scheduler = get_weekly_update_scheduler()
+        if not scheduler.is_due():
+            return
+
+        attempt_details = {"trigger": "query_market_data"}
+        scheduler.mark_attempt(attempt_details)
+
+        try:
+            from .data_processor import SimpleDataProcessor
+        except Exception as exc:  # pragma: no cover - defensive
+            scheduler.mark_failure(f"import_error: {exc}", details=attempt_details)
+            print(f"[WeeklyUpdate] Unable to import SimpleDataProcessor: {exc}")
+            return
+
+        try:
+            processor = SimpleDataProcessor(self)
+            summary = processor.update_all_tickers(
+                dly_folder=str(DLY_DATA_PATH),
+                cot_progress=False,
+                record_metadata=True,
+                metadata_event=WEEKLY_MARKET_UPDATE_EVENT,
+            )
+        except Exception as exc:  # pragma: no cover - runtime safeguard
+            scheduler.mark_failure(str(exc), details=attempt_details)
+            print(f"[WeeklyUpdate] update_all_tickers failed: {exc}")
+            return
+
+        scheduler.mark_success(summarize_update_summary(summary))
 
     @staticmethod
     def _min_itemsize_for_str_cols(df: pd.DataFrame, base: int = 16) -> Dict[str, int]:
@@ -462,6 +513,11 @@ class DataClient:
         except (KeyError, OSError, FileNotFoundError):
             return 0
 
+    def get_market_rowcount(self, key: str) -> int:
+        """Public wrapper returning the rowcount for ``key``."""
+
+        return self._get_market_rowcount(key)
+
     @staticmethod
     def _extract_market_columns(
         store: pd.HDFStore, key: str, storer: Any
@@ -701,6 +757,9 @@ class DataClient:
         # Query multiple tickers with daily data
         >>> daily_data = client.query_market_data(['ZC_F', 'CL_F'], daily=True, columns=['Open', 'High', 'Low', 'Last'])
         """
+
+        self._ensure_weekly_updates()
+
         # Handle ticker input
         if isinstance(tickers, str):
             tickers = [tickers]
@@ -2920,112 +2979,126 @@ class DataClient:
             Results including combined data and ticker-specific results
         """
 
-        self._ensure_parent(self.cot_path)
-        raw_key = self._get_raw_key_for_report_type(report_type)
-
-        existing = pd.DataFrame()
-        if self.cot_path.exists():
-            with pd.HDFStore(self.cot_path, "r") as store:
-                if raw_key in store:
-                    existing = store.select(raw_key)
-
-        date_col: Optional[str] = None
-        target_year = int(pd.Timestamp.today().year)
-
-        if not existing.empty:
-            try:
-                date_col = self._find_report_date_column(existing)
-                existing_dates = pd.to_datetime(existing[date_col], errors="coerce")
-                valid_dates = existing_dates.dropna()
-                if not valid_dates.empty:
-                    target_year = int(valid_dates.max().year)
-            except Exception:
-                date_col = None
-
-        if progress:
-            print(f"Downloading latest COT data for year {target_year} using {report_type}...")
-
-        new_data = self.download_cot(
-            report_type=report_type,
-            years=target_year,
-            write_raw=False,
-            replace=False,
-        )
-
-        if new_data.empty:
-            raise ValueError(
-                f"No COT data returned for year {target_year} using report type '{report_type}'."
-            )
-
-        if date_col is None or date_col not in new_data.columns:
-            date_col = self._find_report_date_column(new_data)
-
-        column_order = list(existing.columns) if not existing.empty else []
-        for col in new_data.columns:
-            if col not in column_order:
-                column_order.append(col)
-
-        historical = existing
-        if not existing.empty and date_col in existing.columns:
-            existing_dates = pd.to_datetime(existing[date_col], errors="coerce")
-            year_series = existing_dates.dt.year
-            keep_mask = (year_series != target_year) | year_series.isna()
-            historical = existing.loc[keep_mask]
-
-        historical = historical.reindex(columns=column_order)
-        new_aligned = new_data.reindex(columns=column_order)
-        combined = pd.concat([historical, new_aligned], ignore_index=True, sort=False)
+        metadata_store = get_update_metadata_store()
+        attempt_details = {"report_type": report_type}
+        metadata_store.record_attempt(COT_REFRESH_EVENT, details=attempt_details)
 
         try:
-            code_col = self._find_code_col(combined)
-        except KeyError:
-            code_col = None
+            self._ensure_parent(self.cot_path)
+            raw_key = self._get_raw_key_for_report_type(report_type)
 
-        if date_col in combined.columns:
-            combined["_sort_date"] = pd.to_datetime(combined[date_col], errors="coerce")
-            sort_cols = ["_sort_date"]
-            if code_col and code_col in combined.columns:
-                sort_cols.insert(0, code_col)
-            combined = combined.sort_values(by=sort_cols, kind="mergesort")
-            dedup_subset = [code_col, "_sort_date"] if code_col and code_col in combined.columns else ["_sort_date"]
-            combined = combined.drop_duplicates(subset=dedup_subset, keep="last")
-            if "_sort_date" in combined.columns:
-                combined = combined.drop(columns="_sort_date")
+            existing = pd.DataFrame()
+            if self.cot_path.exists():
+                with pd.HDFStore(self.cot_path, "r") as store:
+                    if raw_key in store:
+                        existing = store.select(raw_key)
 
-        combined = self._sanitize_for_hdf(combined)
+            date_col: Optional[str] = None
+            target_year = int(pd.Timestamp.today().year)
 
-        data_columns: Union[bool, Sequence[str]] = True
-        if code_col and code_col in combined.columns:
-            data_columns = [code_col]
+            if not existing.empty:
+                try:
+                    date_col = self._find_report_date_column(existing)
+                    existing_dates = pd.to_datetime(existing[date_col], errors="coerce")
+                    valid_dates = existing_dates.dropna()
+                    if not valid_dates.empty:
+                        target_year = int(valid_dates.max().year)
+                except Exception:
+                    date_col = None
 
-        min_itemsize = self._min_itemsize_for_str_cols(combined)
-        fmt: Dict[str, Any] = dict(
-            format="table",
-            data_columns=data_columns,
-            complib=self.complib,
-            complevel=self.complevel,
-            min_itemsize=min_itemsize or None,
-        )
+            if progress:
+                print(f"Downloading latest COT data for year {target_year} using {report_type}...")
 
-        # Write combined data to main raw key
-        with pd.HDFStore(self.cot_path, "a") as store:
-            store.put(raw_key, combined, **fmt)
-
-        if progress:
-            print(f"Updated {raw_key} with {len(combined)} rows")
-
-        results = {
-            'combined_data': combined,
-            'raw_key': raw_key,
-            'ticker_results': {},
-            'total_rows': len(combined)
-        }
-
-        # Write individual ticker keys if requested
-        if write_ticker_keys and code_col:
-            results['ticker_results'] = self._write_ticker_cot_keys(
-                combined, code_col, progress=progress
+            new_data = self.download_cot(
+                report_type=report_type,
+                years=target_year,
+                write_raw=False,
+                replace=False,
             )
+
+            if new_data.empty:
+                raise ValueError(
+                    f"No COT data returned for year {target_year} using report type '{report_type}'."
+                )
+
+            if date_col is None or date_col not in new_data.columns:
+                date_col = self._find_report_date_column(new_data)
+
+            column_order = list(existing.columns) if not existing.empty else []
+            for col in new_data.columns:
+                if col not in column_order:
+                    column_order.append(col)
+
+            historical = existing
+            if not existing.empty and date_col in existing.columns:
+                existing_dates = pd.to_datetime(existing[date_col], errors="coerce")
+                year_series = existing_dates.dt.year
+                keep_mask = (year_series != target_year) | year_series.isna()
+                historical = existing.loc[keep_mask]
+
+            historical = historical.reindex(columns=column_order)
+            new_aligned = new_data.reindex(columns=column_order)
+            combined = pd.concat([historical, new_aligned], ignore_index=True, sort=False)
+
+            try:
+                code_col = self._find_code_col(combined)
+            except KeyError:
+                code_col = None
+
+            if date_col in combined.columns:
+                combined["_sort_date"] = pd.to_datetime(combined[date_col], errors="coerce")
+                sort_cols = ["_sort_date"]
+                if code_col and code_col in combined.columns:
+                    sort_cols.insert(0, code_col)
+                combined = combined.sort_values(by=sort_cols, kind="mergesort")
+                dedup_subset = [code_col, "_sort_date"] if code_col and code_col in combined.columns else ["_sort_date"]
+                combined = combined.drop_duplicates(subset=dedup_subset, keep="last")
+                if "_sort_date" in combined.columns:
+                    combined = combined.drop(columns="_sort_date")
+
+            combined = self._sanitize_for_hdf(combined)
+
+            data_columns: Union[bool, Sequence[str]] = True
+            if code_col and code_col in combined.columns:
+                data_columns = [code_col]
+
+            min_itemsize = self._min_itemsize_for_str_cols(combined)
+            fmt: Dict[str, Any] = dict(
+                format="table",
+                data_columns=data_columns,
+                complib=self.complib,
+                complevel=self.complevel,
+                min_itemsize=min_itemsize or None,
+            )
+
+            # Write combined data to main raw key
+            with pd.HDFStore(self.cot_path, "a") as store:
+                store.put(raw_key, combined, **fmt)
+
+            if progress:
+                print(f"Updated {raw_key} with {len(combined)} rows")
+
+            results = {
+                'combined_data': combined,
+                'raw_key': raw_key,
+                'ticker_results': {},
+                'total_rows': len(combined)
+            }
+
+            # Write individual ticker keys if requested
+            if write_ticker_keys and code_col:
+                results['ticker_results'] = self._write_ticker_cot_keys(
+                    combined, code_col, progress=progress
+                )
+
+        except Exception as exc:
+            metadata_store.record_failure(COT_REFRESH_EVENT, str(exc), details=attempt_details)
+            raise
+
+        metadata_store.record_success(
+            COT_REFRESH_EVENT,
+            summarize_cot_refresh(results, report_type),
+        )
 
         return results
 
