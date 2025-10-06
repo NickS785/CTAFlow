@@ -23,6 +23,12 @@ from sierrapy.parser import ScidReader
 
 from ...config import DLY_DATA_PATH, MARKET_DATA_PATH
 from ..data_client import DataClient
+from ..update_management import (
+    INTRADAY_UPDATE_EVENT,
+    get_update_metadata_store,
+    prepare_dataframe_for_append,
+    summarize_append_result,
+)
 import h5py
 
 
@@ -819,7 +825,7 @@ class IntradayFileManager:
                               end_date: Optional[datetime] = None,
                               timeframe: Optional[str] = None,
                               volume_bucket_size: Optional[int] = None,
-                              replace: bool = True) -> Dict[str, any]:
+                              replace: bool = False) -> Dict[str, any]:
         """
         Write intraday data to HDF5 in DataClient format: market/{ticker}/{timeframe or bucket_size}
 
@@ -863,56 +869,143 @@ class IntradayFileManager:
             add_roll_markers=True
         )
 
-        if df.empty:
-            if self.logger:
-                self.logger.warning(f"No data loaded for {symbol}")
-            return {
-                'symbol': symbol,
-                'records_written': 0,
-                'success': False,
-                'error': 'No data loaded'
-            }
-
-        # Construct HDF5 key based on format: market/{ticker}/{optional timeframe/bucket}
+        metadata_store = get_update_metadata_store()
         key = f"market/{symbol}"
-
         if volume_bucket_size:
             key += f"/vol_{volume_bucket_size}"
         elif timeframe:
             key += f"/{timeframe}"
 
-        try:
-            # Write using DataClient's write_market method
-            self.data_client.write_market(
-                df=df,
-                key=key,
-                replace=replace
+        event_details = {
+            "symbol": symbol,
+            "key": key,
+            "timeframe": timeframe,
+            "volume_bucket_size": volume_bucket_size,
+        }
+
+        if df.empty:
+            if self.logger:
+                self.logger.warning(f"No data loaded for {symbol}")
+            metadata_store.record_success(
+                INTRADAY_UPDATE_EVENT,
+                {**event_details, "mode": "noop", "rows_written": 0},
             )
+            return {
+                'symbol': symbol,
+                'key': key,
+                'records_written': 0,
+                'success': False,
+                'error': 'No data loaded'
+            }
+
+        metadata_store.record_attempt(INTRADAY_UPDATE_EVENT, details=event_details)
+
+        try:
+            if replace:
+                prepared = df.sort_index()
+                prepared = prepared[~prepared.index.duplicated(keep="last")]
+                self.data_client.write_market(prepared, key, replace=True)
+                stats = {
+                    'symbol': symbol,
+                    'key': key,
+                    'records_written': len(prepared),
+                    'mode': 'replace',
+                    'date_range': {
+                        'start': prepared.index[0],
+                        'end': prepared.index[-1]
+                    },
+                    'timeframe': timeframe,
+                    'volume_bucket_size': volume_bucket_size,
+                    'success': True
+                }
+                metadata_store.record_success(INTRADAY_UPDATE_EVENT, stats)
+                return stats
+
+            prepared, require_replace = prepare_dataframe_for_append(
+                self.data_client,
+                key,
+                df,
+                allow_schema_expansion=False,
+            )
+
+            if prepared.empty and self.data_client.market_key_exists(key):
+                stats = {
+                    'symbol': symbol,
+                    'key': key,
+                    'records_written': 0,
+                    'mode': 'noop',
+                    'timeframe': timeframe,
+                    'volume_bucket_size': volume_bucket_size,
+                    'success': True
+                }
+                metadata_store.record_success(INTRADAY_UPDATE_EVENT, stats)
+                return stats
+
+            if require_replace:
+                previous_rows = self.data_client.get_market_rowcount(key)
+                self.data_client.write_market(prepared, key, replace=True)
+                total_rows = len(prepared)
+                stats = {
+                    'symbol': symbol,
+                    'key': key,
+                    'records_written': total_rows,
+                    'mode': 'schema_replace',
+                    'delta_rows': total_rows - previous_rows,
+                    'date_range': {
+                        'start': prepared.index[0],
+                        'end': prepared.index[-1]
+                    },
+                    'timeframe': timeframe,
+                    'volume_bucket_size': volume_bucket_size,
+                    'success': True
+                }
+                metadata_store.record_success(INTRADAY_UPDATE_EVENT, stats)
+                if self.logger:
+                    self.logger.info(
+                        f"Rewrote {key} with schema expansion; rows={total_rows:,}"
+                    )
+                return stats
+
+            append_result = self.data_client.append_market_continuous(prepared, key)
 
             stats = {
                 'symbol': symbol,
                 'key': key,
-                'records_written': len(df),
+                'records_written': append_result.get('rows_written', 0),
+                'mode': append_result.get('mode'),
                 'date_range': {
-                    'start': df.index[0],
-                    'end': df.index[-1]
-                },
+                    'start': prepared.index[0],
+                    'end': prepared.index[-1]
+                } if not prepared.empty else None,
                 'timeframe': timeframe,
                 'volume_bucket_size': volume_bucket_size,
-                'success': True
+                'success': append_result.get('mode') != 'schema_mismatch'
             }
 
+            if append_result.get('mode') == 'schema_mismatch':
+                raise ValueError(f"Schema mismatch when appending to {key}: {append_result}")
+
+            metadata_store.record_success(
+                INTRADAY_UPDATE_EVENT,
+                {**event_details, **summarize_append_result(append_result)},
+            )
+
             if self.logger:
-                self.logger.info(
-                    f"Successfully wrote {len(df):,} records to {key} "
-                    f"({df.index[0]} to {df.index[-1]})"
-                )
+                rows = append_result.get('rows_written', 0)
+                if rows:
+                    self.logger.info(
+                        f"Appended {rows:,} records to {key} ({prepared.index[0]} to {prepared.index[-1]})"
+                    )
+                else:
+                    self.logger.info(f"No new intraday rows appended to {key}")
 
             return stats
 
         except Exception as e:
             if self.logger:
                 self.logger.error(f"Error writing data to HDF5: {e}")
+
+            metadata_store.record_failure(INTRADAY_UPDATE_EVENT, str(e), details=event_details)
 
             return {
                 'symbol': symbol,
@@ -928,7 +1021,7 @@ class IntradayFileManager:
                                     end_date: Optional[datetime] = None,
                                     timeframe: Optional[str] = None,
                                     volume_bucket_size: Optional[int] = None,
-                                    replace: bool = True) -> Dict[str, Dict[str, any]]:
+                                    replace: bool = False) -> Dict[str, Dict[str, any]]:
         """
         Write intraday data for multiple symbols to HDF5.
 
@@ -977,7 +1070,7 @@ class IntradayFileManager:
                                  timeframes: List[str],
                                  start_date: Optional[datetime] = None,
                                  end_date: Optional[datetime] = None,
-                                 replace: bool = True) -> Dict[str, Dict[str, any]]:
+                                 replace: bool = False) -> Dict[str, Dict[str, any]]:
         """
         Write the same symbol data at multiple timeframes.
 
