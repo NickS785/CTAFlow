@@ -7,6 +7,12 @@ import concurrent.futures
 from dataclasses import dataclass
 from pathlib import Path
 from ..data_client import DataClient
+from ..update_management import (
+    DLY_UPDATE_EVENT,
+    get_update_metadata_store,
+    prepare_dataframe_for_append,
+    summarize_dly_update,
+)
 from typing import Any, Dict, List, Optional, Tuple, Sequence
 
 import numpy as np
@@ -713,7 +719,31 @@ class DLYContractManager:
 
             store_key = f"market/{self.ticker}/{key}"
             sorted_frame = sort_curve_columns(frame.sort_index())
-            append_result = self.client.append_market_continuous(sorted_frame, store_key)
+            prepared_frame, require_replace = prepare_dataframe_for_append(
+                self.client,
+                store_key,
+                sorted_frame,
+                allow_schema_expansion=True,
+                sort_columns=True,
+            )
+
+            if prepared_frame.empty and self.client.market_key_exists(store_key):
+                results["skipped"].append(key)
+                continue
+
+            if require_replace:
+                previous_rows = self.client.get_market_rowcount(store_key)
+                self.client.write_market(prepared_frame, store_key, replace=True)
+                total_rows = len(prepared_frame)
+                results["updated"][key] = {
+                    "total_rows": total_rows,
+                    "delta_rows": total_rows - previous_rows,
+                    "mode": "schema_replace",
+                    "rows_written": total_rows,
+                }
+                continue
+
+            append_result = self.client.append_market_continuous(prepared_frame, store_key)
 
             if append_result["mode"] == "schema_mismatch":
                 try:
@@ -721,15 +751,16 @@ class DLYContractManager:
                 except KeyError:
                     existing_df = pd.DataFrame()
 
-                merged = merge_frames(existing_df, sorted_frame)
+                merged = merge_frames(existing_df, prepared_frame)
                 if merged.empty:
                     results["skipped"].append(key)
                     continue
 
+                previous_rows = len(existing_df)
                 self.client.write_market(merged, store_key, replace=True)
                 results["updated"][key] = {
                     "total_rows": len(merged),
-                    "delta_rows": len(merged) - len(existing_df),
+                    "delta_rows": len(merged) - previous_rows,
                     "mode": "replace",
                     "extra_columns": append_result.get("extra_columns", []),
                 }
@@ -811,7 +842,20 @@ class DLYFolderUpdater:
     ) -> Dict[str, Any]:
         base_ticker = ticker[:-2] if ticker.upper().endswith("_F") else ticker
         manager = DLYContractManager(base_ticker, self.folder, yy_pivot=self.yy_pivot)
-        return manager.update_existing_keys(existing_curve_keys, file_paths=file_paths)
+        metadata_store = get_update_metadata_store()
+        event_details = {"ticker": base_ticker}
+        metadata_store.record_attempt(DLY_UPDATE_EVENT, details=event_details)
+        try:
+            result = manager.update_existing_keys(existing_curve_keys, file_paths=file_paths)
+        except Exception as exc:
+            metadata_store.record_failure(DLY_UPDATE_EVENT, str(exc), details=event_details)
+            raise
+
+        metadata_store.record_success(
+            DLY_UPDATE_EVENT,
+            summarize_dly_update(result, base_ticker),
+        )
+        return result
 
     def _process_single_ticker_worker(self, ticker: str, hdf_path: Optional[str],
                                     per_ticker_hdf_tpl: Optional[str],
