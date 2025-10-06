@@ -12,6 +12,12 @@ import numpy as np
 import pandas as pd
 
 from .raw_formatting.dly_contract_manager import DLYContractManager, DLYFolderUpdater
+from .update_management import (
+    WEEKLY_MARKET_UPDATE_EVENT,
+    get_update_metadata_store,
+    prepare_dataframe_for_append,
+    summarize_update_summary,
+)
 from CTAFlow.config import RAW_MARKET_DATA_PATH
 
 
@@ -161,11 +167,15 @@ class SimpleDataProcessor:
         raw_data_path: Optional[str] = None,
         market_resample_rule: str = "1T",
         cot_progress: bool = False,
+        record_metadata: bool = True,
+        metadata_event: str = WEEKLY_MARKET_UPDATE_EVENT,
     ) -> Dict[str, Any]:
         """Update COT metrics, market data and curve datasets for all tracked tickers."""
 
         if max_workers <= 0:
             raise ValueError("max_workers must be positive")
+
+        metadata_store = get_update_metadata_store() if record_metadata else None
 
         # COT updates using DataClient's refresh_latest_cot_year (multi-threaded operation)
         # Run first before updating the rest as requested
@@ -247,6 +257,11 @@ class SimpleDataProcessor:
 
         if not update_jobs:
             summary["message"] = "No eligible tickers found for update"
+            if metadata_store:
+                metadata_store.record_success(
+                    metadata_event,
+                    summarize_update_summary(summary),
+                )
             return summary
 
         # Run market updates sequentially to minimize memory pressure
@@ -306,6 +321,12 @@ class SimpleDataProcessor:
 
         if summary["skipped"]:
             summary["skipped"] = sorted(set(summary["skipped"]))
+
+        if metadata_store:
+            metadata_store.record_success(
+                metadata_event,
+                summarize_update_summary(summary),
+            )
 
         return summary
 
@@ -494,32 +515,51 @@ class SimpleDataProcessor:
         resampled["ticker_prefix"] = resampled["ticker_prefix"].astype(str)
         resampled["ticker_symbol"] = resampled["ticker_symbol"].astype(str)
 
-        # Combine with existing data and overwrite
         with self._hdf_lock:
-            # Get all existing data for this symbol
-            try:
-                existing_data = self.client.get_market_data(normalized_symbol)
-                if not existing_data.empty:
-                    # Combine existing and new data
-                    combined_data = pd.concat([existing_data, resampled], axis=0, ignore_index=False)
-                    # Remove duplicates, keeping the latest
-                    combined_data = combined_data[~combined_data.index.duplicated(keep="last")]
-                    combined_data = combined_data.sort_index()
-                else:
-                    combined_data = resampled
-            except:
-                # If no existing data, just use the new data
-                combined_data = resampled
+            prepared, require_replace = prepare_dataframe_for_append(
+                self.client,
+                tail_key,
+                resampled,
+                allow_schema_expansion=False,
+            )
 
-            # Overwrite with combined data
-            self.client.write_market(combined_data, tail_key, replace=True)
+            if prepared.empty and self.client.market_key_exists(tail_key):
+                return {
+                    "symbol": normalized_symbol,
+                    "csv_files": processed_files,
+                    "appended_rows": 0,
+                    "resample_rule": resample_rule,
+                    "last_timestamp": str(last_timestamp) if last_timestamp is not None else None,
+                    "mode": "noop",
+                    "message": "No new rows after alignment",
+                }
+
+            if require_replace:
+                previous_rows = self.client.get_market_rowcount(tail_key)
+                self.client.write_market(prepared, tail_key, replace=True)
+                append_summary: Dict[str, Any] = {
+                    "mode": "schema_replace",
+                    "rows_written": len(prepared),
+                    "total_rows": len(prepared),
+                    "delta_rows": len(prepared) - previous_rows,
+                }
+            else:
+                append_result = self.client.append_market_continuous(prepared, tail_key)
+                if append_result.get("mode") == "schema_mismatch":
+                    raise ValueError(f"Schema mismatch when appending market data for {normalized_symbol}: {append_result}")
+                append_summary = append_result
+
+        appended_rows = append_summary.get("delta_rows")
+        if appended_rows is None:
+            appended_rows = append_summary.get("rows_written", len(prepared))
 
         return {
             "symbol": normalized_symbol,
             "csv_files": processed_files,
-            "appended_rows": len(resampled),
+            "appended_rows": appended_rows,
             "resample_rule": resample_rule,
-            "last_timestamp": str(resampled.index.max()) if not resampled.empty else None,
+            "last_timestamp": str(prepared.index.max()) if not prepared.empty else None,
+            "mode": append_summary.get("mode"),
         }
 
     def _read_csv_file(self, csv_path: Path) -> pd.DataFrame:
