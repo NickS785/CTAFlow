@@ -13,7 +13,6 @@ This module contains classes and functions for:
 
 # Core data processing classes
 from .data_client import DataClient
-from .simple_processor import SimpleDataProcessor
 from .raw_formatting import *
 from .retrieval import fetch_market_cot_data, fetch_data_sync, convert_cot_date_to_datetime
 from .ticker_classifier import TickerClassifier
@@ -41,8 +40,9 @@ except ImportError:
 
 __all__ = [
     # Primary data processing classes
-    'SimpleDataProcessor',
+    'DataProcessor',
     'DataClient',
+
 
     # Core data classes
     'FuturesCurveManager',
@@ -50,11 +50,9 @@ __all__ = [
     'SpreadData',
     'SpreadReturns',
     'FuturesCurve',
-    'RollDateManager',
-    'create_enhanced_curve_manager_with_roll_tracking',
     'IntradaySpreadEngine',
     'CrossSpreadLeg',
-
+    "SyntheticSymbol",
     # Legacy classes (deprecated)
     'DataProcessor',
     'process_all_futures_curves',
