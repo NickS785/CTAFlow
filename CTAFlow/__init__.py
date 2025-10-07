@@ -38,7 +38,7 @@ try:
     from .forecaster.forecast import CTAForecast, CTALinear, CTALight, CTAXGBoost, CTARForest
 
     # Primary data processing classes
-    from .data.simple_processor import SimpleDataProcessor
+    from .data.data_processor import DataProcessor
     from .data.data_client import DataClient
 
     # Feature processing classes
@@ -66,7 +66,7 @@ __all__ = [
     'CTARForest',
 
     # Primary data processing classes
-    'SimpleDataProcessor',
+    'DataProcessor',
     'DataClient',
 
     # Feature processing classes

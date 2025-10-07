@@ -21,7 +21,7 @@ from .update_management import (
 from CTAFlow.config import RAW_MARKET_DATA_PATH
 
 
-class SimpleDataProcessor:
+class DataProcessor:
     """Simplified data processor that only handles CSV files.
 
     IMPORTANT: /spot data protection safeguards are implemented:

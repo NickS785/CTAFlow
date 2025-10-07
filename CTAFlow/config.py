@@ -5,6 +5,7 @@ import toml
 import os
 
 MARKET_DATA_PATH = Path("F:\\", 'Data', 'market_data.hd5')
+DATA_DIR = Path("F:\\Data ")
 COT_DATA_PATH = Path("F:\\", 'Data', 'cot_data.hd5' )
 RAW_MARKET_DATA_PATH = Path("F:\\", 'charts')  # CSV market data files
 DLY_DATA_PATH = Path("F:\\", 'SierraChart', 'Data')  # DLY futures data files

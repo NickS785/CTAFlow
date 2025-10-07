@@ -5,7 +5,7 @@ from .spread_manager import (
 )
 from .intraday_manager import IntradayFileManager, IntradayData, ContractPeriod
 from .dly_contract_manager import DLYContractManager, DLYFolderUpdater
-from .synthetic import CrossProductEngine, CrossSpreadLeg, IntradayLeg, IntradaySpreadEngine
+from .synthetic import CrossProductEngine, CrossSpreadLeg, IntradayLeg, IntradaySpreadEngine, SyntheticSymbol
 
 __all__ = [
     "CrossProductEngine",
@@ -13,6 +13,7 @@ __all__ = [
     "IntradayLeg",
     "IntradaySpreadEngine",
     "SpreadData",
+    "SyntheticSymbol",
     "IntradayFileManager",
     "IntradayData",
     "ContractPeriod",

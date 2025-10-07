@@ -14,11 +14,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union, Any, Sequence
 from datetime import datetime
+from CTAFlow.config import DLY_DATA_PATH
 
 import numpy as np
 import pandas as pd
 from ...data import DataClient
 from .spread_manager import SpreadData, FuturesCurve
+from sierrapy.parser import ScidReader
 
 try:
     from ...utils.unit_conversions import (
@@ -27,46 +29,46 @@ try:
         gallons_to_barrels,
         bushels_to_metric_tons
     )
+
     HAS_CONVERSIONS = True
 except ImportError:
     GALLONS_PER_BARREL = 42.0
     HAS_CONVERSIONS = False
 
-
 # CME contract specifications - maps symbol to (unit, commodity_name)
 CME_CONTRACT_SPECS = {
     # Energy - NYMEX
-    'CL': ('$/bbl', 'crude_oil'),      # WTI Crude Oil
-    'HO': ('$/gal', 'heating_oil'),    # Heating Oil
-    'RB': ('$/gal', 'gasoline'),       # RBOB Gasoline
+    'CL': ('$/bbl', 'crude_oil'),  # WTI Crude Oil
+    'HO': ('$/gal', 'heating_oil'),  # Heating Oil
+    'RB': ('$/gal', 'gasoline'),  # RBOB Gasoline
     'NG': ('$/mmbtu', 'natural_gas'),  # Natural Gas
-    'BZ': ('$/bbl', 'brent_crude'),    # Brent Crude
+    'BZ': ('$/bbl', 'brent_crude'),  # Brent Crude
 
     # Grains - CBOT
-    'ZC': ('cents/bu', 'corn'),        # Corn
-    'ZS': ('cents/bu', 'soybean'),     # Soybeans
-    'ZW': ('cents/bu', 'wheat'),       # Wheat
-    'ZM': ('$/ton', 'soybean_meal'),   # Soybean Meal
-    'ZL': ('cents/lb', 'soybean_oil'), # Soybean Oil
-    'ZO': ('cents/bu', 'oat'),         # Oats
+    'ZC': ('cents/bu', 'corn'),  # Corn
+    'ZS': ('cents/bu', 'soybean'),  # Soybeans
+    'ZW': ('cents/bu', 'wheat'),  # Wheat
+    'ZM': ('$/ton', 'soybean_meal'),  # Soybean Meal
+    'ZL': ('cents/lb', 'soybean_oil'),  # Soybean Oil
+    'ZO': ('cents/bu', 'oat'),  # Oats
 
     # Softs
-    'KC': ('cents/lb', 'coffee'),      # Coffee
-    'SB': ('cents/lb', 'sugar'),       # Sugar
-    'CC': ('$/mt', 'cocoa'),           # Cocoa
-    'CT': ('cents/lb', 'cotton'),      # Cotton
+    'KC': ('cents/lb', 'coffee'),  # Coffee
+    'SB': ('cents/lb', 'sugar'),  # Sugar
+    'CC': ('$/mt', 'cocoa'),  # Cocoa
+    'CT': ('cents/lb', 'cotton'),  # Cotton
 
     # Livestock
-    'LE': ('cents/lb', 'live_cattle'), # Live Cattle
-    'GF': ('cents/lb', 'feeder_cattle'), # Feeder Cattle
-    'HE': ('cents/lb', 'lean_hogs'),   # Lean Hogs
+    'LE': ('cents/lb', 'live_cattle'),  # Live Cattle
+    'GF': ('cents/lb', 'feeder_cattle'),  # Feeder Cattle
+    'HE': ('cents/lb', 'lean_hogs'),  # Lean Hogs
 
     # Metals - COMEX
-    'GC': ('$/oz', 'gold'),            # Gold
-    'SI': ('$/oz', 'silver'),          # Silver
-    'HG': ('cents/lb', 'copper'),      # Copper
-    'PL': ('$/oz', 'platinum'),        # Platinum
-    'PA': ('$/oz', 'palladium'),       # Palladium
+    'GC': ('$/oz', 'gold'),  # Gold
+    'SI': ('$/oz', 'silver'),  # Silver
+    'HG': ('cents/lb', 'copper'),  # Copper
+    'PL': ('$/oz', 'platinum'),  # Platinum
+    'PA': ('$/oz', 'palladium'),  # Palladium
 }
 
 
@@ -103,20 +105,20 @@ def detect_contract_unit(symbol: str) -> tuple[str, str]:
 
 # Unit hierarchy for determining reference unit (largest/most standard first)
 UNIT_HIERARCHY = [
-    '$/bbl',      # Barrels (energy - most common reference)
-    '$/mt',       # Metric tons (large bulk)
-    '$/ton',      # Short tons (bulk)
-    '$/mmbtu',    # Natural gas (energy equivalent)
-    '$/bu',       # Bushels (agricultural)
-    '$/oz',       # Ounces (precious metals)
-    '$/kg',       # Kilograms
-    '$/lb',       # Pounds
-    '$/gal',      # Gallons (refined products)
-    'cents/bu',   # Cents per bushel (smaller denomination)
-    'cents/lb',   # Cents per pound (smaller denomination)
+    '$/bbl',  # Barrels (energy - most common reference)
+    '$/mt',  # Metric tons (large bulk)
+    '$/ton',  # Short tons (bulk)
+    '$/mmbtu',  # Natural gas (energy equivalent)
+    '$/bu',  # Bushels (agricultural)
+    '$/oz',  # Ounces (precious metals)
+    '$/kg',  # Kilograms
+    '$/lb',  # Pounds
+    '$/gal',  # Gallons (refined products)
+    'cents/bu',  # Cents per bushel (smaller denomination)
+    'cents/lb',  # Cents per pound (smaller denomination)
     'cents/gal',  # Cents per gallon (smaller denomination)
     'cents/bbl',  # Cents per barrel (smaller denomination)
-    '$/unit',     # Generic fallback
+    '$/unit',  # Generic fallback
 ]
 
 
@@ -250,13 +252,13 @@ def dte_to_months(dte_value: Optional[float]) -> Optional[float]:
 
 
 def align_tenors(
-    seq_labels_A: Sequence[str],
-    seq_dte_A: Sequence[float],
-    seq_labels_B: Sequence[str],
-    seq_dte_B: Sequence[float],
-    method: str = "index",
-    k: int = 0,
-    target_months: Optional[float] = None
+        seq_labels_A: Sequence[str],
+        seq_dte_A: Sequence[float],
+        seq_labels_B: Sequence[str],
+        seq_dte_B: Sequence[float],
+        method: str = "index",
+        k: int = 0,
+        target_months: Optional[float] = None
 ) -> Tuple[Optional[str], Optional[str]]:
     """
     Returns (contractA, contractB) for the chosen tenor.
@@ -423,12 +425,12 @@ class CrossSpreadLeg:
 
     @classmethod
     def load_from_dclient(
-        cls,
-        symbol: str,
-        base_weight: float = 1.0,
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
-        **kwargs
+            cls,
+            symbol: str,
+            base_weight: float = 1.0,
+            start_date: Optional[str] = None,
+            end_date: Optional[str] = None,
+            **kwargs
     ) -> 'CrossSpreadLeg':
         """
         Load CrossSpreadLeg from DataClient with auto-detected units.
@@ -473,6 +475,7 @@ class CrossSpreadLeg:
             **kwargs
         )
 
+
 @dataclass
 class CrossProductSpreadData:
     """
@@ -516,13 +519,13 @@ class CrossProductEngine:
     """
 
     def __init__(
-        self,
-        base: Optional[SpreadData] = None,
-        hedge: Optional[SpreadData] = None,
-        base_leg: Optional[CrossSpreadLeg] = None,
-        hedge_leg: Optional[CrossSpreadLeg] = None,
-        legs: Optional[List[CrossSpreadLeg]] = None,
-        reference_unit: Optional[str] = None
+            self,
+            base: Optional[SpreadData] = None,
+            hedge: Optional[SpreadData] = None,
+            base_leg: Optional[CrossSpreadLeg] = None,
+            hedge_leg: Optional[CrossSpreadLeg] = None,
+            legs: Optional[List[CrossSpreadLeg]] = None,
+            reference_unit: Optional[str] = None
     ):
         """
         Initialize CrossProductEngine with flexible leg configuration.
@@ -583,11 +586,19 @@ class CrossProductEngine:
         # Cache for tenor alignments (now supports N legs)
         self._alignment_cache: Dict[str, Dict[datetime, List[str]]] = {}
 
+        # Set price attribute to k=0 (front month) spread series
+        self.price = None
+        try:
+            self.price = self.build_cps_series(method="index", k=0)
+        except Exception:
+            # If building k=0 fails, leave price as None
+            pass
+
     @classmethod
     def from_legs(
-        cls,
-        legs: List[CrossSpreadLeg],
-        reference_unit: Optional[str] = None
+            cls,
+            legs: List[CrossSpreadLeg],
+            reference_unit: Optional[str] = None
     ) -> 'CrossProductEngine':
         """
         Create CrossProductEngine from a list of legs (cleaner multi-leg construction).
@@ -623,10 +634,10 @@ class CrossProductEngine:
         return cls(legs=legs, reference_unit=reference_unit)
 
     def cross_value_on_date(
-        self,
-        date: datetime,
-        label_map: Dict[str, str],
-        prices_by_symbol: Dict[str, Dict[str, float]]
+            self,
+            date: datetime,
+            label_map: Dict[str, str],
+            prices_by_symbol: Dict[str, Dict[str, float]]
     ) -> float:
         """
         Calculate cross-product value at a specific date with automatic unit conversion.
@@ -672,11 +683,11 @@ class CrossProductEngine:
         return v
 
     def build_cps_series(
-        self,
-        method: str = "index",
-        k: int = 0,
-        target_months: Optional[float] = None,
-        align_index: str = "intersection"
+            self,
+            method: str = "index",
+            k: int = 0,
+            target_months: Optional[float] = None,
+            align_index: str = "intersection"
     ) -> pd.Series:
         """
         Build cross-product spread time series for chosen tenor rule.
@@ -721,7 +732,7 @@ class CrossProductEngine:
         else:
             raise ValueError(f"Unknown align_index: {align_index}")
 
-        out = pd.Series(index=idx, dtype=float, name=f"CPS_{method}_{k if method=='index' else target_months}")
+        out = pd.Series(index=idx, dtype=float, name=f"CPS_{method}_{k if method == 'index' else target_months}")
 
         # Build cache key for this tenor rule
         cache_key = f"{method}_{k}_{target_months}"
@@ -766,7 +777,8 @@ class CrossProductEngine:
                     else:
                         # Align subsequent legs to first leg's tenor
                         first_labels = list(leg_data[0].seq_labels.loc[t]) if t in leg_data[0].seq_labels.index else []
-                        first_dte = list(leg_data[0].seq_dte.loc[t]) if leg_data[0].seq_dte is not None and t in leg_data[0].seq_dte.index else []
+                        first_dte = list(leg_data[0].seq_dte.loc[t]) if leg_data[0].seq_dte is not None and t in \
+                                                                        leg_data[0].seq_dte.index else []
 
                         c1, c2 = align_tenors(
                             first_labels, first_dte, labels, dte,
@@ -809,10 +821,10 @@ class CrossProductEngine:
         return out.dropna()
 
     def build_cps_calendar(
-        self,
-        near_rule: Dict[str, Any],
-        far_rule: Dict[str, Any],
-        align_index: str = "intersection"
+            self,
+            near_rule: Dict[str, Any],
+            far_rule: Dict[str, Any],
+            align_index: str = "intersection"
     ) -> pd.Series:
         """
         Build calendar of CPS: (CPS near) - (CPS far).
@@ -850,15 +862,15 @@ class CrossProductEngine:
 
         calendar = (cps_near - cps_far).dropna()
         calendar.name = f"CPS_CAL_{near_rule.get('k', near_rule.get('target_months'))}_" \
-                       f"{far_rule.get('k', far_rule.get('target_months'))}"
+                        f"{far_rule.get('k', far_rule.get('target_months'))}"
 
         return calendar
 
     def build_cps_family(
-        self,
-        k_values: Optional[List[int]] = None,
-        month_targets: Optional[List[float]] = None,
-        align_index: str = "intersection"
+            self,
+            k_values: Optional[List[int]] = None,
+            month_targets: Optional[List[float]] = None,
+            align_index: str = "intersection"
     ) -> Dict[str, pd.Series]:
         """
         Build family of CPS for multiple tenors.
@@ -902,11 +914,11 @@ class CrossProductEngine:
         return results
 
     def get_alignment_diagnostics(
-        self,
-        method: str = "index",
-        k: int = 0,
-        target_months: Optional[float] = None,
-        n_samples: int = 10
+            self,
+            method: str = "index",
+            k: int = 0,
+            target_months: Optional[float] = None,
+            n_samples: int = 10
     ) -> pd.DataFrame:
         """
         Get diagnostic report showing contract alignments across all legs per date.
@@ -963,13 +975,105 @@ class CrossProductEngine:
         """Clear the tenor alignment cache."""
         self._alignment_cache.clear()
 
+    def get_leg_weights(self) -> Dict[str, float]:
+        """
+        Return the base weight for each leg.
+
+        Returns:
+        --------
+        Dict[str, float]
+            Maps leg symbol to its base weight
+        """
+        weights = {}
+        for i, leg in enumerate(self.legs):
+            sym = getattr(leg.data, 'symbol', f'LEG{i}')
+            weights[sym] = leg.base_weight
+        return weights
+
+    def get_leg_contributions(
+            self,
+            method: str = "index",
+            k: int = 0,
+            target_months: Optional[float] = None
+    ) -> Dict[str, pd.Series]:
+        """
+        Calculate the price contribution of each leg to the cross-product spread.
+
+        Parameters:
+        -----------
+        method : str
+            "index" for M{k} alignment, "months" for months-to-expiry
+        k : int
+            Sequential index when method="index"
+        target_months : float, optional
+            Target months to expiry when method="months"
+
+        Returns:
+        --------
+        Dict[str, pd.Series]
+            Maps leg symbol to its contribution series (weighted prices in reference unit)
+        """
+        # Build the main CPS series to populate cache
+        cps_series = self.build_cps_series(method=method, k=k, target_months=target_months)
+
+        # Build individual contributions for each leg
+        contributions = {}
+
+        for i, leg in enumerate(self.legs):
+            sym = getattr(leg.data, 'symbol', f'LEG{i}')
+            leg_values = []
+
+            for t in cps_series.index:
+                # Get the aligned contract for this leg at this date
+                cache_key = f"{method}_{k}_{target_months}"
+                if cache_key in self._alignment_cache and t in self._alignment_cache[cache_key]:
+                    contract_labels = self._alignment_cache[cache_key][t]
+                    if i < len(contract_labels):
+                        contract_label = contract_labels[i]
+                    else:
+                        leg_values.append(np.nan)
+                        continue
+                else:
+                    leg_values.append(np.nan)
+                    continue
+
+                # Get the price for this contract
+                if t not in leg.data.seq_prices.index or t not in leg.data.seq_labels.index:
+                    leg_values.append(np.nan)
+                    continue
+
+                labels = list(leg.data.seq_labels.loc[t])
+                prices_row = list(leg.data.seq_prices.loc[t])
+
+                if contract_label not in labels:
+                    leg_values.append(np.nan)
+                    continue
+
+                price_idx = labels.index(contract_label)
+                if price_idx >= len(prices_row):
+                    leg_values.append(np.nan)
+                    continue
+
+                price = prices_row[price_idx]
+
+                # Apply weight and unit conversion
+                weight = leg.weight_for_contract(contract_label, date=t)
+                price_converted = leg.convert_price_to_unit(price, self.reference_unit)
+                contribution = weight * price_converted
+
+                leg_values.append(contribution)
+
+            contributions[sym] = pd.Series(leg_values, index=cps_series.index, name=f"{sym}_contribution")
+
+        return contributions
+
 
 def create_simple_cps(
-    base_symbol: str,
-    hedge_symbol: str,
-    base_weight: float = 1.0,
-    hedge_weight: float = -1.0,
-    k: int = 0
+        base_symbol: str,
+        hedge_symbol: str,
+        base_weight: float = 1.0,
+        hedge_weight: float = -1.0,
+        k: int = 0
 ) -> pd.Series:
     """
     Convenience function to create simple front-month CPS.
@@ -1085,14 +1189,28 @@ class IntradayLeg:
         return w
 
     @classmethod
+    def load_from_scid(cls, symbol,
+                       path: str = None,
+                       base_weight: float = 1.0,
+                       start_date: Optional[str] = None,
+                       end_date: Optional[str] = None,
+                       resample_rule='5min',
+                       **kwargs):
+        if not path:
+            path = str(DLY_DATA_PATH)
+        rdr = ScidReader(path)
+        data = rdr.load_front_month_series(ticker=symbol, start=start_date, end=end_date, resample_rule=resample_rule)
+        return cls(symbol, data, base_weight)
+
+    @classmethod
     def load_from_dclient(
-        cls,
-        symbol: str,
-        base_weight: float = 1.0,
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
-        daily: bool = False,
-        **kwargs
+            cls,
+            symbol: str,
+            base_weight: float = 1.0,
+            start_date: Optional[str] = None,
+            end_date: Optional[str] = None,
+            daily: bool = False,
+            **kwargs
     ) -> 'IntradayLeg':
         """
         Load IntradayLeg from DataClient market data.
@@ -1122,7 +1240,7 @@ class IntradayLeg:
         client = DataClient()
 
         # Query market data
-        market_data = client.query_market(
+        market_data = client.query_market_data(
             tickers=[symbol],
             start_date=start_date,
             end_date=end_date,
@@ -1173,9 +1291,9 @@ class IntradaySpreadEngine:
     """
 
     def __init__(
-        self,
-        legs: List[IntradayLeg],
-        reference_unit: Optional[str] = None
+            self,
+            legs: List[IntradayLeg],
+            reference_unit: Optional[str] = None
     ):
         """
         Initialize IntradaySpreadEngine with flexible leg configuration.
@@ -1201,9 +1319,9 @@ class IntradaySpreadEngine:
 
     @classmethod
     def from_legs(
-        cls,
-        legs: List[IntradayLeg],
-        reference_unit: Optional[str] = None
+            cls,
+            legs: List[IntradayLeg],
+            reference_unit: Optional[str] = None
     ) -> 'IntradaySpreadEngine':
         """
         Create IntradaySpreadEngine from a list of legs.
@@ -1236,9 +1354,9 @@ class IntradaySpreadEngine:
         return cls(legs=legs, reference_unit=reference_unit)
 
     def spread_value_on_date(
-        self,
-        date: datetime,
-        prices_by_symbol: Dict[str, float]
+            self,
+            date: datetime,
+            prices_by_symbol: Dict[str, float]
     ) -> float:
         """
         Calculate spread value at a specific date with automatic unit conversion.
@@ -1253,18 +1371,18 @@ class IntradaySpreadEngine:
         Returns:
         --------
         float
-            Spread value in reference unit
+            Spread value in reference unit (NaN if ANY leg has invalid price)
         """
         v = 0.0
 
         for leg in self.legs:
             if leg.symbol not in prices_by_symbol:
-                continue
+                return np.nan
 
             p = prices_by_symbol[leg.symbol]
 
             if not np.isfinite(p):
-                continue
+                return np.nan
 
             # Get effective weight
             w = leg.get_effective_weight(date=date)
@@ -1276,65 +1394,124 @@ class IntradaySpreadEngine:
         return v
 
     def build_spread_series(
-        self,
-        align_index: str = "intersection"
-    ) -> pd.Series:
+            self,
+            align_index: str = "intersection",
+            return_ohlc: bool = False
+    ) -> Union[pd.Series, pd.DataFrame]:
         """
-        Build intraday spread time series using Close prices.
+        Build intraday spread time series using synchronized OHLC or Close prices.
+        Uses DataFrame broadcasting with intersected indices for efficient computation.
 
         Parameters:
         -----------
         align_index : str
             "intersection", "union", "left", or "right" for timestamp alignment
+        return_ohlc : bool
+            If True, returns DataFrame with OHLC columns calculated from leg OHLC data
+            If False, returns Series with Close prices only (default)
 
         Returns:
         --------
-        pd.Series
-            Spread values indexed by datetime
+        pd.Series or pd.DataFrame
+            If return_ohlc=False: pd.Series of spread close prices
+            If return_ohlc=True: pd.DataFrame with Open, High, Low, Close columns
         """
-        # Align timestamps across all legs
-        indices = [leg.data.index for leg in self.legs]
+        # Check if all legs have OHLC data
+        has_ohlc = all(
+            all(col in leg.data.columns for col in ['Open', 'High', 'Low', 'Close'])
+            for leg in self.legs
+        )
 
-        if align_index == "intersection":
-            idx = indices[0]
-            for ts_idx in indices[1:]:
-                idx = idx.intersection(ts_idx)
-        elif align_index == "union":
-            idx = indices[0]
-            for ts_idx in indices[1:]:
-                idx = idx.union(ts_idx)
-        elif align_index == "left":
-            idx = indices[0]
-        elif align_index == "right":
-            idx = indices[-1]
-        else:
-            raise ValueError(f"Unknown align_index: {align_index}")
+        if return_ohlc and not has_ohlc:
+            raise ValueError("Cannot return OHLC: one or more legs missing OHLC columns")
 
-        # Build spread series
-        spread_values = []
-
-        for t in idx:
-            # Collect close prices for all legs at this timestamp
-            prices_by_symbol = {}
-
+        # Build DataFrames for each leg with proper index alignment
+        if return_ohlc:
+            # Create OHLC DataFrames for each leg
+            leg_ohlc_dfs = []
             for leg in self.legs:
-                if t not in leg.data.index:
-                    prices_by_symbol[leg.symbol] = np.nan
-                else:
-                    prices_by_symbol[leg.symbol] = leg.data.loc[t, 'Close']
+                df = leg.data[['Open', 'High', 'Low', 'Close']].copy()
 
-            # Calculate spread value
-            v = self.spread_value_on_date(t, prices_by_symbol)
-            spread_values.append(v)
+                # Apply weight and unit conversion
+                weight = leg.get_effective_weight()
 
-        # Create series
-        symbols_str = "_".join([leg.symbol.replace('_F', '') for leg in self.legs])
-        weights_str = "_".join([f"{leg.base_weight:+.1f}".replace('.', 'p') for leg in self.legs])
-        series_name = f"Spread_{symbols_str}_{weights_str}"
+                # Convert prices to reference unit
+                for col in ['Open', 'High', 'Low', 'Close']:
+                    df[col] = df[col].apply(lambda p: leg.convert_price_to_unit(p, self.reference_unit) if np.isfinite(p) else np.nan)
 
-        result = pd.Series(spread_values, index=idx, name=series_name, dtype=float)
+                # Apply weight
+                df = df * weight
+                df.columns = pd.MultiIndex.from_product([[leg.symbol], df.columns])
+                leg_ohlc_dfs.append(df)
 
-        return result.dropna()
+            # Combine all leg DataFrames
+            combined_df = pd.concat(leg_ohlc_dfs, axis=1)
+
+            # Align index based on method
+            if align_index == "intersection":
+                combined_df = combined_df.dropna()
+            elif align_index == "union":
+                pass  # Keep all timestamps with NaNs
+            elif align_index == "left":
+                combined_df = combined_df.loc[leg_ohlc_dfs[0].index]
+            elif align_index == "right":
+                combined_df = combined_df.loc[leg_ohlc_dfs[-1].index]
+            else:
+                raise ValueError(f"Unknown align_index: {align_index}")
+
+            # Broadcast sum across all legs for each OHLC column
+            result_df = pd.DataFrame(index=combined_df.index)
+            for ohlc_col in ['Open', 'High', 'Low', 'Close']:
+                # Sum across all legs for this OHLC column
+                col_sum = combined_df.xs(ohlc_col, level=1, axis=1).sum(axis=1)
+                result_df[ohlc_col] = col_sum
+
+            symbols_str = "_".join([leg.symbol.replace('_F', '') for leg in self.legs])
+            result_df.columns.name = f"Spread_{symbols_str}"
+
+            return result_df.dropna()
+
+        else:
+            # Close-only series using DataFrame broadcasting
+            close_dfs = []
+            for leg in self.legs:
+                # Get Close prices
+                close_series = leg.data['Close'].copy()
+
+                # Apply weight and unit conversion
+                weight = leg.get_effective_weight()
+
+                # Convert to reference unit and apply weight
+                close_series = close_series.apply(
+                    lambda p: weight * leg.convert_price_to_unit(p, self.reference_unit) if np.isfinite(p) else np.nan
+                )
+                close_series.name = leg.symbol
+                close_dfs.append(close_series)
+
+            # Combine into DataFrame
+            combined_df = pd.concat(close_dfs, axis=1)
+
+            # Align index based on method
+            if align_index == "intersection":
+                combined_df = combined_df.dropna()
+            elif align_index == "union":
+                pass  # Keep all timestamps with NaNs
+            elif align_index == "left":
+                combined_df = combined_df.loc[close_dfs[0].index]
+            elif align_index == "right":
+                combined_df = combined_df.loc[close_dfs[-1].index]
+            else:
+                raise ValueError(f"Unknown align_index: {align_index}")
+
+            # Broadcast sum across all legs
+            spread_series = combined_df.sum(axis=1)
+
+            # Name the series
+            symbols_str = "_".join([leg.symbol.replace('_F', '') for leg in self.legs])
+            weights_str = "_".join([f"{leg.base_weight:+.1f}".replace('.', 'p') for leg in self.legs])
+            spread_series.name = f"Spread_{symbols_str}_{weights_str}"
+
+            return spread_series.dropna()
 
     def get_diagnostics(self, n_samples: int = 10) -> pd.DataFrame:
         """
@@ -1379,3 +1556,203 @@ class IntradaySpreadEngine:
             records.append(record)
 
         return pd.DataFrame(records)
+
+
+@dataclass
+class SyntheticSymbol:
+    legs: List[CrossSpreadLeg]
+    type: str = "product"
+    ticker: str = "CS"
+    full_name: str = "Custom Spread"
+    intraday: bool = False
+
+    def __post_init__(self):
+        if self.intraday:
+            self.data_engine = IntradaySpreadEngine(legs=self.legs)
+        else:
+            self.data_engine = CrossProductEngine.from_legs(legs=self.legs)
+
+        # Generate individual leg price data
+        self.legs_df = self._generate_legs_data()
+
+        # Calculate combined spread price
+        self.price = self._calculate_legs_price()
+
+    def _generate_legs_data(self) -> pd.DataFrame:
+        """
+        Generate price data (OHLC if available, Close otherwise) for each leg.
+
+        Returns:
+        --------
+        pd.DataFrame
+            Multi-column DataFrame with legs as level 0 columns and OHLC/Close as level 1
+            Index is datetime timestamps
+        """
+        if self.intraday:
+            return self._generate_intraday_legs_data()
+        else:
+            return self._generate_daily_legs_data()
+
+    def _generate_intraday_legs_data(self) -> pd.DataFrame:
+        """Generate granular OHLC data for intraday legs with full market data."""
+        leg_data_dict = {}
+
+        for leg in self.legs:
+            symbol = leg.symbol
+            df = leg.data
+
+            # Check if OHLC columns are all valid
+            required_ohlc = ['Open', 'High', 'Low', 'Close']
+            has_valid_ohlc = all(
+                col in df.columns and df[col].notna().sum() > 0
+                for col in required_ohlc
+            )
+
+            if has_valid_ohlc:
+                # Use full OHLC data
+                leg_data_dict[(symbol, 'Open')] = df['Open']
+                leg_data_dict[(symbol, 'High')] = df['High']
+                leg_data_dict[(symbol, 'Low')] = df['Low']
+                leg_data_dict[(symbol, 'Close')] = df['Close']
+
+                # Add volume if available
+                if 'Volume' in df.columns:
+                    leg_data_dict[(symbol, 'Volume')] = df['Volume']
+                if 'BidVolume' in df.columns and 'AskVolume' in df.columns:
+                    leg_data_dict[(symbol, 'BidVolume')] = df['BidVolume']
+                    leg_data_dict[(symbol, 'AskVolume')] = df['AskVolume']
+            else:
+                # Fallback to Close only
+                if 'Close' in df.columns:
+                    leg_data_dict[(symbol, 'Close')] = df['Close']
+
+        # Create MultiIndex DataFrame
+        result = pd.DataFrame(leg_data_dict)
+        result.columns = pd.MultiIndex.from_tuples(result.columns, names=['symbol', 'field'])
+
+        return result
+
+    def _generate_daily_legs_data(self) -> pd.DataFrame:
+        """Generate price data for daily/sequentialized legs (CrossProductEngine)."""
+        leg_data_dict = {}
+
+        for leg in self.legs:
+            symbol = getattr(leg.data, 'symbol', leg.symbol) if hasattr(leg, 'symbol') else f'LEG_{id(leg)}'
+
+            # For CrossSpreadLeg, use seq_prices for M0 (front month)
+            if hasattr(leg.data, 'seq_prices') and leg.data.seq_prices is not None:
+                seq_prices = leg.data.seq_prices
+                seq_labels = leg.data.seq_labels
+
+                # Extract M0 (front month) prices
+                m0_prices = []
+                timestamps = []
+
+                for ts in seq_prices.index:
+                    if ts in seq_labels.index:
+                        labels = list(seq_labels.loc[ts])
+                        prices = list(seq_prices.loc[ts])
+
+                        # Get M0 (first contract)
+                        if len(prices) > 0 and len(labels) > 0:
+                            m0_price = prices[0]
+                            if np.isfinite(m0_price):
+                                m0_prices.append(m0_price)
+                                timestamps.append(ts)
+
+                if m0_prices:
+                    # Create series for M0 prices
+                    price_series = pd.Series(m0_prices, index=timestamps, name=symbol)
+                    leg_data_dict[(symbol, 'Close')] = price_series
+
+        # Create MultiIndex DataFrame
+        if leg_data_dict:
+            result = pd.DataFrame(leg_data_dict)
+            result.columns = pd.MultiIndex.from_tuples(result.columns, names=['symbol', 'field'])
+        else:
+            # Empty DataFrame with proper structure
+            result = pd.DataFrame()
+
+        return result
+
+    def _calculate_legs_price(
+        self,
+        columns: str = "close",
+        resample_rule: Optional[str] = None,
+        spread_rules: Optional[Dict[str, Any]] = None,
+        resample_kwargs: Optional[Dict[str, Any]] = None
+    ) -> Union[pd.Series, pd.DataFrame]:
+        """
+        Calculate spread price from legs with optional resampling.
+
+        Parameters:
+        -----------
+        columns : str
+            "close" for last price only (default)
+            "ohlc" for full OHLC resampled data
+        resample_rule : str, optional
+            Pandas resample rule (e.g., "5min", "1H", "1D")
+            If None, returns raw spread series without resampling
+        spread_rules : Dict[str, Any], optional
+            Rules for calendar spread construction (only for CrossProductEngine)
+        resample_kwargs : Dict[str, Any], optional
+            Additional kwargs passed to pandas resample
+
+        Returns:
+        --------
+        pd.Series or pd.DataFrame
+            If columns="close": Returns pd.Series of spread prices
+            If columns="ohlc": Returns pd.DataFrame with OHLC columns
+        """
+        if self.intraday:
+            # Intraday engine with OHLC support
+            return_ohlc = columns.lower() == "ohlc"
+
+            # Build spread series (OHLC or Close)
+            spread_data = self.data_engine.build_spread_series(return_ohlc=return_ohlc)
+
+            # No resampling requested - return raw data
+            if resample_rule is None:
+                return spread_data
+
+            # Set default resample kwargs if not provided
+            if resample_kwargs is None:
+                resample_kwargs = {}
+
+            # Resample based on data type
+            if return_ohlc:
+                # OHLC DataFrame - resample each column appropriately
+                resampler = spread_data.resample(resample_rule, **resample_kwargs)
+                result = pd.DataFrame({
+                    'Open': resampler['Open'].first(),
+                    'High': resampler['High'].max(),
+                    'Low': resampler['Low'].min(),
+                    'Close': resampler['Close'].last()
+                })
+                return result.dropna()
+            else:
+                # Close series - resample with last value
+                return spread_data.resample(resample_rule, **resample_kwargs).last()
+
+        else:
+            # Cross-product engine uses sequentialized contracts
+            if "calendar" in self.type.lower():
+                if isinstance(self.data_engine, CrossProductEngine):
+                    if spread_rules is None:
+                        spread_rules = {"k_values": [0, 3, 6, 11], "month_targets": [1, 4, 6, 12]}
+                    self.seq_curve = self.data_engine.build_cps_family(**spread_rules)
+
+            # Build front month spread series
+            spread_series = self.data_engine.build_cps_series(method="index", k=0)
+
+            # No resampling requested - return raw series
+            if resample_rule is None:
+                return spread_series
+
+            # Set default resample kwargs if not provided
+            if resample_kwargs is None:
+                resample_kwargs = {}
+
+
+
+                return spread_series.resample(resample_rule, **resample_kwargs).last()
