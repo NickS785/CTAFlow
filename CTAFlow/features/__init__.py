@@ -16,8 +16,7 @@ This module contains classes and functions for:
 # Feature engineering classes
 from .feature_engineering import IntradayFeatures
 from .curve_analysis import SpreadData, FuturesCurve, CurveShapeAnalyzer, CurveEvolutionAnalyzer
-
-# Signal processing and technical analysis classes
+from .seasonal_anamoly import intraday_autocorr_between_times, intraday_lag_autocorr, last_year_predicts_this_year, abnormal_months, prewindow_feature, prewindow_predicts_month
 from .signals_processing import COTAnalyzer, TechnicalAnalysis
 SpreadFeatures = SpreadData
 
@@ -28,7 +27,6 @@ __all__ = [
     'FuturesCurve',
     'CurveShapeAnalyzer',
     'CurveEvolutionAnalyzer',
-    
     # Signal processing classes
     'COTAnalyzer',
     'TechnicalAnalysis',

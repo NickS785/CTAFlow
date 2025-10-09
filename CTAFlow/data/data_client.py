@@ -32,6 +32,13 @@ try:
 except Exception:  # pragma: no cover - allows import of module without cot_reports installed
     cot = None
 
+try:
+    from arcticdb import Arctic
+    HAS_ARCTICDB = True
+except ImportError:
+    HAS_ARCTICDB = False
+    Arctic = None
+
 from ..config import (
     COT_DATA_PATH,
     CODE_TO_TICKER,
@@ -40,6 +47,10 @@ from ..config import (
     MARKET_DATA_PATH,
     TICKER_TO_CODE,
     get_cot_code,
+    DAILY_ADB_PATH,
+    CURVE_ADB_PATH,
+    COT_ADB_PATH,
+    INTRADAY_ADB_PATH,
 )
 from .update_management import (
     COT_REFRESH_EVENT,
@@ -53,27 +64,34 @@ from .update_management import (
 
 class DataClient:
     """
-    Manage two HDF5 stores (market + COT).
+    Manage data stores using ArcticDB (primary) or HDF5 (legacy).
 
-    Market store
-    ------------
-    - Arbitrary schema (caller-defined)
-    - Enforces sorted, duplicate-free DatetimeIndex on write
+    Storage Backends
+    ----------------
+    - **ArcticDB (default)**: High-performance columnar storage with versioning
+      - Daily market data: lmdb://F:/Data/daily
+      - Forward curves: lmdb://F:/Data/curves
+      - COT data: lmdb://F:/Data/cot
+      - Intraday data: lmdb://F:/Data/intraday
 
-    COT store
-    ---------
-    - Raw table at `cot_raw_key`
-    - Filter by contract codes and store combined result under a *single* key
-    - Optional per-code slices method (for convenience)
+    - **HDF5 (legacy)**: For backward compatibility
+      - market_data.hd5
+      - cot_data.hd5
 
-    All writes sanitize dtypes so numeric-like object columns are coerced to numeric,
-    preventing PyTables serialization errors.
-
-    Directories are *not* created automatically when the client is instantiated. Pass
-    ``create_dirs=True`` to ``__init__`` if you want the parent directories for the
-    market/COT stores created up front. Otherwise, write paths call ``_ensure_parent``
-    immediately before persisting data so directories are created only when writes
-    actually occur.
+    Parameters
+    ----------
+    use_arctic : bool
+        If True (default), uses ArcticDB for storage. If False, uses HDF5.
+    daily_uri : str, optional
+        Arctic URI for daily market data (default: DAILY_ADB_PATH)
+    curve_uri : str, optional
+        Arctic URI for forward curve data (default: CURVE_ADB_PATH)
+    cot_uri : str, optional
+        Arctic URI for COT data (default: COT_ADB_PATH)
+    market_path : str or Path, optional
+        HDF5 path for market data (legacy, used when use_arctic=False)
+    cot_path : str or Path, optional
+        HDF5 path for COT data (legacy, used when use_arctic=False)
     """
 
     _weekly_update_lock = threading.Lock()
@@ -82,27 +100,75 @@ class DataClient:
     def __init__(
         self,
         *,
-        market_path: Union[str, os.PathLike]  = None,
+        use_arctic: bool = True,
+        daily_uri: Optional[str] = None,
+        curve_uri: Optional[str] = None,
+        cot_uri: Optional[str] = None,
+        market_path: Union[str, os.PathLike] = None,
         cot_path: Union[str, os.PathLike] = None,
         cot_raw_key: str = "cot/raw",
         complevel: int = 9,
         complib: str = "blosc",
         create_dirs: bool = False,
     ) -> None:
-        market_path = market_path or MARKET_DATA_PATH
-        cot_path = cot_path or COT_DATA_PATH
         self._cot_processor: Optional[COTAnalyzer] = None
-        self.market_path = Path(market_path)
-        self.cot_path = Path(cot_path)
+        self.use_arctic = use_arctic and HAS_ARCTICDB
+
+        if self.use_arctic:
+            # ArcticDB mode (primary)
+            self.daily_uri = daily_uri or DAILY_ADB_PATH
+            self.curve_uri = curve_uri or CURVE_ADB_PATH
+            self.cot_uri = cot_uri or COT_ADB_PATH
+
+            # Import singleton pattern for Arctic instances
+            from .raw_formatting.intraday_manager import get_arctic_instance
+
+            # Create Arctic connections using singleton pattern
+            self.daily_arctic = get_arctic_instance(self.daily_uri)
+            self.curve_arctic = get_arctic_instance(self.curve_uri)
+            self.cot_arctic = get_arctic_instance(self.cot_uri)
+
+            # Get or create libraries
+            if self.daily_arctic and "default" not in self.daily_arctic.list_libraries():
+                self.daily_arctic.create_library("default")
+            if self.curve_arctic and "default" not in self.curve_arctic.list_libraries():
+                self.curve_arctic.create_library("default")
+            if self.cot_arctic and "default" not in self.cot_arctic.list_libraries():
+                self.cot_arctic.create_library("default")
+
+            # Store library references
+            self.daily_lib = self.daily_arctic["default"] if self.daily_arctic else None
+            self.curve_lib = self.curve_arctic["default"] if self.curve_arctic else None
+            self.cot_lib = self.cot_arctic["default"] if self.cot_arctic else None
+
+            # Set legacy paths to None
+            self.market_path = None
+            self.cot_path = None
+        else:
+            # HDF5 mode (legacy)
+            market_path = market_path or MARKET_DATA_PATH
+            cot_path = cot_path or COT_DATA_PATH
+            self.market_path = Path(market_path)
+            self.cot_path = Path(cot_path)
+
+            # Arctic attributes set to None
+            self.daily_arctic = None
+            self.curve_arctic = None
+            self.cot_arctic = None
+            self.daily_lib = None
+            self.curve_lib = None
+            self.cot_lib = None
+
+            if create_dirs:
+                for p in {self.market_path.parent, self.cot_path.parent}:
+                    if p and not p.exists():
+                        p.mkdir(parents=True, exist_ok=True)
+
+        # Common attributes
         self.cot_raw_key = cot_raw_key
         self.complevel = complevel
         self.complib = complib
-        self.market_data_path = self.market_path
-
-        if create_dirs:
-            for p in {self.market_path.parent, self.cot_path.parent}:
-                if p and not p.exists():
-                    p.mkdir(parents=True, exist_ok=True)
+        self.market_data_path = self.market_path  # For backward compatibility
 
     # ---------------------------------------------------------------------
     # Helpers
@@ -355,20 +421,62 @@ class DataClient:
         *,
         replace: bool = True,
         data_columns: Optional[Sequence[str]] = None,
+        daily: bool = False,
     ) -> None:
-        self._ensure_parent(self.market_path)
-        df2 = self._sanitize_for_hdf(df)  # sanitize before writing
+        """
+        Write market data to storage.
 
-        min_itemsize = self._min_itemsize_for_str_cols(df2)
-        fmt: Dict[str, Any] = dict(
-            format="table",
-            data_columns=data_columns or True,
-            complib=self.complib,
-            complevel=self.complevel,
-            min_itemsize=min_itemsize or None,
-        )
-        with pd.HDFStore(self.market_path, "a") as store:
-            (store.put if replace else store.append)(key, df2, **fmt)
+        Parameters:
+        -----------
+        df : pd.DataFrame
+            Data to write
+        key : str
+            Symbol/key for the data (e.g., 'CL_F', 'NG_F')
+        replace : bool
+            If True, replace existing data. If False, append.
+        data_columns : Sequence[str], optional
+            Columns to index (HDF5 only)
+        daily : bool
+            If True, writes to daily library. If False, writes to curves library.
+            Only relevant when use_arctic=True.
+        """
+        if self.use_arctic:
+            # Arctic mode
+            lib = self.daily_lib if daily else self.curve_lib
+
+            if lib is None:
+                raise ValueError(f"Arctic library not available ({'daily' if daily else 'curves'})")
+
+            # Ensure DataFrame has datetime index
+            if not isinstance(df.index, pd.DatetimeIndex):
+                df = df.copy()
+                df.index = pd.to_datetime(df.index)
+
+            # Sort and deduplicate
+            df = df.sort_index()
+            df = df[~df.index.duplicated(keep='last')]
+
+            # Write to Arctic
+            if replace or key not in lib.list_symbols():
+                lib.write(key, df)
+            else:
+                # Append mode - use update
+                lib.update(key, df)
+        else:
+            # HDF5 mode (legacy)
+            self._ensure_parent(self.market_path)
+            df2 = self._sanitize_for_hdf(df)  # sanitize before writing
+
+            min_itemsize = self._min_itemsize_for_str_cols(df2)
+            fmt: Dict[str, Any] = dict(
+                format="table",
+                data_columns=data_columns or True,
+                complib=self.complib,
+                complevel=self.complevel,
+                min_itemsize=min_itemsize or None,
+            )
+            with pd.HDFStore(self.market_path, "a") as store:
+                (store.put if replace else store.append)(key, df2, **fmt)
 
     def append_market_continuous(
         self,
@@ -591,11 +699,60 @@ class DataClient:
         columns: Optional[Sequence[str]] = None,
         start: Optional[int] = None,
         stop: Optional[int] = None,
+        daily: bool = False,
     ) -> pd.DataFrame:
-        with pd.HDFStore(self.market_path, "r") as store:
-            if key not in store:
-                raise KeyError(f"Key '{key}' not found in {self.market_path}")
-            return store.select(key, where=where, columns=columns, start=start, stop=stop)
+        """
+        Read market data from storage.
+
+        Parameters:
+        -----------
+        key : str
+            Symbol/key for the data (e.g., 'CL_F', 'NG_F')
+        where : str, optional
+            Query filter (HDF5 only)
+        columns : Sequence[str], optional
+            Columns to read
+        start : int, optional
+            Row index to start reading from
+        stop : int, optional
+            Row index to stop reading at
+        daily : bool
+            If True, reads from daily library. If False, reads from curves library.
+            Only relevant when use_arctic=True.
+
+        Returns:
+        --------
+        pd.DataFrame
+            Market data
+        """
+        if self.use_arctic:
+            # Arctic mode
+            lib = self.daily_lib if daily else self.curve_lib
+
+            if lib is None:
+                raise ValueError(f"Arctic library not available ({'daily' if daily else 'curves'})")
+
+            if key not in lib.list_symbols():
+                raise KeyError(f"Symbol '{key}' not found in Arctic library")
+
+            # Read from Arctic
+            df = lib.read(key).data
+
+            # Apply column filter if specified
+            if columns:
+                df = df[list(columns)]
+
+            # Apply row slicing if specified
+            if start is not None or stop is not None:
+                df = df.iloc[start:stop]
+
+            return df
+        else:
+            # HDF5 mode (legacy)
+            with pd.HDFStore(self.market_path, "r") as store:
+                if key not in store:
+                    raise KeyError(f"Key '{key}' not found in {self.market_path}")
+                return store.select(key, where=where, columns=columns, start=start, stop=stop)
     
     def list_market_data(self) -> List[str]:
         """
@@ -679,7 +836,7 @@ class DataClient:
                 'date_range': None
             }
     
-    def query_market_data(
+    def Gquery_market_data(
         self,
         tickers: Optional[Union[str, Sequence[str]]] = None,
         *,

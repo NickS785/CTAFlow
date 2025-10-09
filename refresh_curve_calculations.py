@@ -32,7 +32,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent))
 
 from CTAFlow.data.data_client import DataClient
-from CTAFlow.data.contract_handling.dly_contract_manager import DLYContractManager, DLYFolderUpdater
+from CTAFlow.data.raw_formatting.dly_contract_manager import DLYContractManager, DLYFolderUpdater
 from CTAFlow.config import DLY_DATA_PATH, MARKET_DATA_PATH
 
 # Global HDF5 lock for thread-safe operations

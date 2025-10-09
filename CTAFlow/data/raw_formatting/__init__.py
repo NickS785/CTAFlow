@@ -3,7 +3,12 @@ from .spread_manager import (
     SpreadData,
     SpreadReturns,
 )
-from .intraday_manager import IntradayFileManager, IntradayData, ContractPeriod
+from .intraday_manager import (
+    IntradayFileManager,
+    get_arctic_instance,
+    clear_arctic_cache,
+    get_cached_arctic_uris,
+)
 from .dly_contract_manager import DLYContractManager, DLYFolderUpdater
 from .synthetic import CrossProductEngine, CrossSpreadLeg, IntradayLeg, IntradaySpreadEngine, SyntheticSymbol
 
@@ -15,8 +20,11 @@ __all__ = [
     "SpreadData",
     "SyntheticSymbol",
     "IntradayFileManager",
-    "IntradayData",
-    "ContractPeriod",
+    "get_arctic_instance",
+    "clear_arctic_cache",
+    "get_cached_arctic_uris",
     "DLYContractManager",
-    "DLYFolderUpdater"
+    "DLYFolderUpdater",
+    "Contract",
+    "SpreadReturns"
 ]

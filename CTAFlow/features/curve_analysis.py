@@ -12,13 +12,13 @@ from scipy import stats
 from scipy.stats import skew, kurtosis
 import plotly.io as pio
 from numpy.linalg import svd
-from ..data.contract_handling.curve_manager import FuturesCurve, SpreadData, SpreadFeature
+from ..data.raw_formatting.spread_manager import FuturesCurve, SpreadData, SpreadFeature
 from ..utils.seasonal import deseasonalize_monthly
 pio.renderers.default = "browser"
 # Import data client and utilities if available
 try:
     from ..data.data_client import DataClient
-    from CTAFlow.data.contract_handling.curve_manager import MONTH_CODE_MAP, _is_empty
+    from CTAFlow.data.raw_formatting.spread_manager import MONTH_CODE_MAP, _is_empty
 except ImportError:
     # Fallback definitions for standalone use
     MONTH_CODE_MAP = {
@@ -786,7 +786,7 @@ class CurveEvolutionAnalyzer:
 
         try:
             # Import necessary functions
-            from ..data.contract_handling.dly_contract_manager import calculate_contract_expiry
+            from ..data.raw_formatting.dly_contract_manager import calculate_contract_expiry
             import pandas as pd
             import numpy as np
             import re

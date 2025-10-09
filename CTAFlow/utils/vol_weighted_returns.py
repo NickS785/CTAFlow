@@ -46,6 +46,8 @@ def ewma_volatility(
             ).std()
     return result
 
+def log_returns(series: pd.Series) -> pd.Series:
+    return np.log(series).diff()
 
 def vol_weighted_returns(
     returns: Union[pd.Series, pd.DataFrame],

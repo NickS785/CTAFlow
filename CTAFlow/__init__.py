@@ -47,7 +47,7 @@ try:
     from .features.signals_processing import COTAnalyzer, TechnicalAnalysis
 
     # Data container classes
-    from .data.contract_handling.curve_manager import FuturesCurveManager, FuturesCurve, SpreadData
+    from .data.raw_formatting.spread_manager import FuturesCurveManager, FuturesCurve, SpreadData
 
     # Configuration
     from .config import *
