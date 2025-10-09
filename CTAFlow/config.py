@@ -4,9 +4,21 @@ import pandas as pd
 import toml
 import os
 
+
+intraday_db_path = "lmdb:\\F:\\data\\intraday"
+
+# ArcticDB URIs (primary data storage)
+INTRADAY_ADB_PATH = "lmdb://F:/Data/intraday"  # ArcticDB URI for intraday data
+DAILY_ADB_PATH = "lmdb://F:/Data/daily"  # ArcticDB URI for daily market data
+CURVE_ADB_PATH = "lmdb://F:/Data/curves"  # ArcticDB URI for forward curve data
+COT_ADB_PATH = "lmdb://F:/Data/cot"  # ArcticDB URI for COT data
+
+# Legacy HDF5 paths (deprecated - use Arctic instead)
 MARKET_DATA_PATH = Path("F:\\", 'Data', 'market_data.hd5')
+COT_DATA_PATH = Path("F:\\", 'Data', 'cot_data.hd5')
+
+# File system paths
 DATA_DIR = Path("F:\\Data ")
-COT_DATA_PATH = Path("F:\\", 'Data', 'cot_data.hd5' )
 RAW_MARKET_DATA_PATH = Path("F:\\", 'charts')  # CSV market data files
 DLY_DATA_PATH = Path("F:\\", 'SierraChart', 'Data')  # DLY futures data files
 MODEL_DATA_PATH = Path("F:\\", "ML", "models")

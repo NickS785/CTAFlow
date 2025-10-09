@@ -1560,14 +1560,30 @@ class IntradaySpreadEngine:
 
 @dataclass
 class SyntheticSymbol:
-    legs: List[CrossSpreadLeg]
+    legs: List[Union[CrossSpreadLeg, IntradayLeg]]
     type: str = "product"
     ticker: str = "CS"
     full_name: str = "Custom Spread"
     intraday: bool = False
 
     def __post_init__(self):
-        if self.intraday:
+        # Auto-detect intraday mode if not explicitly set
+        if not self.intraday:
+            # Check if any leg is IntradayLeg type
+            self.intraday = any(isinstance(leg, IntradayLeg) for leg in self.legs)
+
+        # Validate legs are compatible
+        has_intraday = any(isinstance(leg, IntradayLeg) for leg in self.legs)
+        has_cross = any(isinstance(leg, CrossSpreadLeg) for leg in self.legs)
+
+        if has_intraday and has_cross:
+            raise ValueError(
+                "Cannot mix IntradayLeg and CrossSpreadLeg in same SyntheticSymbol. "
+                "All legs must be the same type."
+            )
+
+        # Create appropriate engine
+        if self.intraday or isinstance(self.legs[0], IntradayLeg):
             self.data_engine = IntradaySpreadEngine(legs=self.legs)
         else:
             self.data_engine = CrossProductEngine.from_legs(legs=self.legs)
@@ -1637,7 +1653,13 @@ class SyntheticSymbol:
         leg_data_dict = {}
 
         for leg in self.legs:
-            symbol = getattr(leg.data, 'symbol', leg.symbol) if hasattr(leg, 'symbol') else f'LEG_{id(leg)}'
+            # Get symbol - handle both CrossSpreadLeg and IntradayLeg
+            if hasattr(leg, 'symbol'):
+                symbol = leg.symbol
+            elif hasattr(leg.data, 'symbol'):
+                symbol = leg.data.symbol
+            else:
+                symbol = f'LEG_{id(leg)}'
 
             # For CrossSpreadLeg, use seq_prices for M0 (front month)
             if hasattr(leg.data, 'seq_prices') and leg.data.seq_prices is not None:
@@ -1664,6 +1686,10 @@ class SyntheticSymbol:
                     # Create series for M0 prices
                     price_series = pd.Series(m0_prices, index=timestamps, name=symbol)
                     leg_data_dict[(symbol, 'Close')] = price_series
+            # Handle IntradayLeg that might have been used with CrossProductEngine
+            elif hasattr(leg, 'data') and isinstance(leg.data, pd.DataFrame):
+                if 'Close' in leg.data.columns:
+                    leg_data_dict[(symbol, 'Close')] = leg.data['Close']
 
         # Create MultiIndex DataFrame
         if leg_data_dict:
