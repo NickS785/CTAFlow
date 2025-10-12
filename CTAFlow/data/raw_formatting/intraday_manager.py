@@ -111,6 +111,7 @@ class GapInfo:
     contracts_affected: List[str]
 
 
+
 class IntradayFileManager:
     """
     Optimized manager for intraday SCID contract files using sierrapy.
@@ -872,33 +873,18 @@ class IntradayFileManager:
             }
 
         try:
-            # Convert paths to strings
-            file_paths = [str(f) for f in scid_files]
-
-            # Convert datetime to milliseconds for AsyncScidReader
-            start_ms = int(start.timestamp() * 1000) if start else None
-            end_ms = int(end.timestamp() * 1000) if end else None
-
             # Create AsyncScidReader instance with data directory
             async_reader = AsyncScidReader(self.data_path)
 
-            # Load SCID files - returns Dict[str, pd.DataFrame]
-            result_dict = await async_reader.load_scid_files(
-                file_paths,
-                start_ms=start_ms,
-                end_ms=end_ms,
+            # Load front month series directly - this handles contract rolls automatically
+            df = await async_reader.load_front_month_series(
+                ticker=symbol,
+                start=start,
+                end=end,
                 resample_rule=timeframe,
-                volume_per_bar=volume_bucket_size
+                volume_per_bar=volume_bucket_size,
+                include_metadata=False  # We don't need metadata for writing to Arctic
             )
-
-            # Combine all dataframes from the result dict
-            if not result_dict:
-                df = pd.DataFrame()
-            else:
-                # Concatenate all dataframes
-                df = pd.concat(result_dict.values(), ignore_index=False)
-                df = df.sort_index()
-                df = df[~df.index.duplicated(keep='last')]
 
             if df.empty:
                 if self.logger:

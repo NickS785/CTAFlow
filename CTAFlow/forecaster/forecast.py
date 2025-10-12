@@ -1373,7 +1373,7 @@ class CTALight:
             X_train, X_val = X_clean[train_idx], X_clean[val_idx]
             y_train, y_val = y_clean[train_idx], y_clean[val_idx]
             
-            # Create datasets
+            # Create ticker_sets
             train_data = lgb.Dataset(X_train, label=y_train, feature_name=feature_names)
             val_data = lgb.Dataset(X_val, label=y_val, reference=train_data, feature_name=feature_names)
             
@@ -1540,7 +1540,7 @@ class CTALight:
                 X_train, X_val = X_clean[train_idx], X_clean[val_idx]
                 y_train, y_val = y_clean[train_idx], y_clean[val_idx]
                 
-                # Create datasets
+                # Create ticker_sets
                 train_data = lgb.Dataset(X_train, label=y_train, feature_name=feature_names)
                 val_data = lgb.Dataset(X_val, label=y_val, reference=train_data, feature_name=feature_names)
                 

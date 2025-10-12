@@ -24,25 +24,17 @@ from .classifications_reference import (
     get_all_classifications
 )
 from .raw_formatting.synthetic import CrossProductEngine, IntradaySpreadEngine , CrossSpreadLeg, IntradayLeg
-# Legacy data processing utilities (deprecated - use SimpleDataProcessor instead)
+# Data processing utilities
 try:
-    from .data_processor import DataProcessor, process_all_futures_curves
-    import warnings
-    warnings.warn(
-        "DataProcessor is deprecated. Use SimpleDataProcessor instead for better performance and simplicity.",
-        DeprecationWarning,
-        stacklevel=2
-    )
+    from .data_processor import DataProcessor
 except ImportError:
     # Handle case where DataProcessor might not be available
     DataProcessor = None
-    process_all_futures_curves = None
 
 __all__ = [
     # Primary data processing classes
     'DataProcessor',
     'DataClient',
-
 
     # Core data classes
     'FuturesCurveManager',
@@ -53,9 +45,6 @@ __all__ = [
     'IntradaySpreadEngine',
     'CrossSpreadLeg',
     "SyntheticSymbol",
-    # Legacy classes (deprecated)
-    'DataProcessor',
-    'process_all_futures_curves',
 
     # Data retrieval functions
     'fetch_market_cot_data',

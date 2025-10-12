@@ -48,6 +48,7 @@ try:
 
     # Data container classes
     from .data.raw_formatting.spread_manager import FuturesCurveManager, FuturesCurve, SpreadData
+    from .screeners import ScreenParams, HistoricalScreener
 
     # Configuration
     from .config import *
@@ -82,6 +83,10 @@ __all__ = [
     'FuturesCurveManager',
     'FuturesCurve',
     'SpreadData',
+
+    # Screener classes
+    'ScreenParams',
+    'HistoricalScreener',
 
     # Utility functions and constants from config
     'MARKET_DATA_PATH',

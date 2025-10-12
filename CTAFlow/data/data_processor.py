@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from .raw_formatting.dly_contract_manager import DLYContractManager, DLYFolderUpdater
+from .raw_formatting.intraday_manager import IntradayFileManager
 from .update_management import (
     WEEKLY_MARKET_UPDATE_EVENT,
     get_update_metadata_store,
@@ -170,7 +171,7 @@ class DataProcessor:
         record_metadata: bool = True,
         metadata_event: str = WEEKLY_MARKET_UPDATE_EVENT,
     ) -> Dict[str, Any]:
-        """Update COT metrics, market data and curve datasets for all tracked tickers."""
+        """Update COT metrics, market data and curve ticker_sets for all tracked tickers."""
 
         if max_workers <= 0:
             raise ValueError("max_workers must be positive")
@@ -635,7 +636,7 @@ class DataProcessor:
                             column_mapping[col] = 'last'
                         elif col_lower in ['volume', 'v', 'vol']:
                             column_mapping[col] = 'volume'
-                        elif col_lower in ['num_trades', 'trades', 'numberoftrades', 'number_of_trades', '#oftrades']:
+                        elif col_lower in ['num_trades', 'trades', 'numberoftrades', 'number_of_trades', '#oftrades', '#of trades']:
                             column_mapping[col] = 'num_trades'
                         elif col_lower in ['bid_volume', 'bidvolume', 'bid_vol', 'bvol']:
                             column_mapping[col] = 'bidvolume'
@@ -687,8 +688,12 @@ class DataProcessor:
         float_cols = ["Open", "High", "Low", "Last"]
         int_cols = ["Volume", "NumberOfTrades", "BidVolume", "AskVolume"]
 
-        working[float_cols] = working[float_cols].astype(float)
-        working[int_cols] = working[int_cols].astype(float)
+        # Convert to numeric first, coercing errors to NaN
+        for col in float_cols:
+            working[col] = pd.to_numeric(working[col], errors='coerce').fillna(0.0)
+
+        for col in int_cols:
+            working[col] = pd.to_numeric(working[col], errors='coerce').fillna(0.0)
 
         # Return only the standard columns in consistent order
         return working[float_cols + int_cols]
@@ -713,6 +718,294 @@ class DataProcessor:
 
         combined.index.name = "datetime"
         return combined.dropna(subset=["Open", "High", "Low", "Last"], how="all")
+
+    # =================================================================
+    # Intraday Market Data Processing via IntradayFileManager
+    # =================================================================
+
+    def update_intraday_from_scid(
+        self,
+        symbol: str,
+        *,
+        scid_folder: Optional[str] = None,
+        timeframe: Optional[str] = None,
+        start: Optional[pd.Timestamp] = None,
+        end: Optional[pd.Timestamp] = None,
+        replace: bool = False
+    ) -> Dict[str, Any]:
+        """Update intraday market data from SCID files to market/{symbol}/{timeframe}.
+
+        This method uses IntradayFileManager to load front month data from SCID files
+        and writes it to HDF5 in timeframe-specific sub-keys (e.g., market/CL_F/5min).
+
+        Parameters
+        ----------
+        symbol : str
+            Market symbol (with or without _F suffix)
+        scid_folder : str, optional
+            Folder containing SCID files (default: DLY_DATA_PATH from config)
+        timeframe : str, optional
+            Resampling timeframe (e.g., '1T', '5T', '15T', '1H', '4H')
+            If None, uses raw tick data
+        start : pd.Timestamp, optional
+            Start date for data loading
+        end : pd.Timestamp, optional
+            End date for data loading
+        replace : bool, default False
+            If True, replace existing data; if False, append new data
+
+        Returns
+        -------
+        Dict[str, Any]
+            Summary with records_written, key, success status
+
+        Examples
+        --------
+        >>> processor = DataProcessor(client)
+        >>> # Update 5-minute bars
+        >>> result = processor.update_intraday_from_scid('CL_F', timeframe='5min')
+        >>> # Update hourly bars from specific date
+        >>> result = processor.update_intraday_from_scid(
+        ...     'NG_F',
+        ...     timeframe='1h',
+        ...     start=pd.Timestamp('2024-01-01')
+        ... )
+        """
+        if not symbol:
+            raise ValueError("symbol must be provided")
+
+        normalized_symbol = symbol.upper()
+        if not normalized_symbol.endswith("_F"):
+            normalized_symbol = f"{normalized_symbol}_F"
+
+        # Initialize IntradayFileManager
+        try:
+            from CTAFlow.config import DLY_DATA_PATH
+            data_path = Path(scid_folder) if scid_folder else DLY_DATA_PATH
+
+            intraday_mgr = IntradayFileManager(
+                data_path=data_path,
+                market_data_path=self.client.market_data_path,
+                enable_logging=True
+            )
+
+            # Convert pandas Timestamp to datetime if needed
+            start_dt = start.to_pydatetime() if start is not None else None
+            end_dt = end.to_pydatetime() if end is not None else None
+
+            # Use IntradayFileManager's write_to_hdf5 method
+            # This handles all the heavy lifting: loading SCID, resampling, gap detection
+            result = intraday_mgr.write_to_hdf5(
+                symbol=normalized_symbol,
+                start=start_dt,
+                end=end_dt,
+                timeframe=timeframe,
+                replace=replace
+            )
+
+            return result
+
+        except Exception as e:
+            return {
+                'symbol': normalized_symbol,
+                'success': False,
+                'error': f"Error updating intraday data: {e}",
+                'records_written': 0
+            }
+
+    def update_multiple_timeframes(
+        self,
+        symbol: str,
+        timeframes: List[str],
+        *,
+        scid_folder: Optional[str] = None,
+        start: Optional[pd.Timestamp] = None,
+        end: Optional[pd.Timestamp] = None,
+        replace: bool = False
+    ) -> Dict[str, Dict[str, Any]]:
+        """Update the same symbol at multiple timeframes using SCID files.
+
+        This efficiently processes one symbol to multiple timeframe sub-keys:
+        - market/{symbol}/1min
+        - market/{symbol}/5min
+        - market/{symbol}/15min
+        - market/{symbol}/1h
+        etc.
+
+        Parameters
+        ----------
+        symbol : str
+            Market symbol
+        timeframes : List[str]
+            List of timeframe strings (e.g., ['1T', '5T', '15T', '1H'])
+        scid_folder : str, optional
+            Folder containing SCID files
+        start : pd.Timestamp, optional
+            Start date for data loading
+        end : pd.Timestamp, optional
+            End date for data loading
+        replace : bool, default False
+            If True, replace existing data
+
+        Returns
+        -------
+        Dict[str, Dict[str, Any]]
+            Dictionary mapping timeframes to their update results
+
+        Examples
+        --------
+        >>> processor = DataProcessor(client)
+        >>> # Update CL_F at 1min, 5min, 15min, and 1h timeframes
+        >>> results = processor.update_multiple_timeframes(
+        ...     'CL_F',
+        ...     timeframes=['1T', '5T', '15T', '1H']
+        ... )
+        >>> for tf, result in results.items():
+        ...     print(f"{tf}: {result['records_written']} records")
+        """
+        if not symbol:
+            raise ValueError("symbol must be provided")
+
+        if not timeframes:
+            raise ValueError("timeframes list must be provided")
+
+        normalized_symbol = symbol.upper()
+        if not normalized_symbol.endswith("_F"):
+            normalized_symbol = f"{normalized_symbol}_F"
+
+        results = {}
+        for timeframe in timeframes:
+            print(f"[{normalized_symbol}] Processing timeframe: {timeframe}")
+
+            result = self.update_intraday_from_scid(
+                symbol=normalized_symbol,
+                scid_folder=scid_folder,
+                timeframe=timeframe,
+                start=start,
+                end=end,
+                replace=replace
+            )
+
+            results[timeframe] = result
+
+            # Log result
+            if result.get('success'):
+                records = result.get('records_written', 0)
+                print(f"[{normalized_symbol}/{timeframe}] Success: {records:,} records")
+            else:
+                error = result.get('error', 'Unknown error')
+                print(f"[{normalized_symbol}/{timeframe}] Failed: {error}")
+
+        # Summary
+        total_records = sum(r.get('records_written', 0) for r in results.values())
+        successful = sum(1 for r in results.values() if r.get('success', False))
+
+        print(f"\n[{normalized_symbol}] Complete: {successful}/{len(timeframes)} timeframes, {total_records:,} total records")
+
+        return results
+
+    def batch_update_intraday(
+        self,
+        symbols: List[str],
+        timeframes: List[str],
+        *,
+        scid_folder: Optional[str] = None,
+        start: Optional[pd.Timestamp] = None,
+        end: Optional[pd.Timestamp] = None,
+        replace: bool = False
+    ) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        """Batch update multiple symbols at multiple timeframes from SCID files.
+
+        This is the most comprehensive intraday update method, processing:
+        - Multiple symbols
+        - Multiple timeframes per symbol
+        - Writing to market/{symbol}/{timeframe} sub-keys
+
+        Parameters
+        ----------
+        symbols : List[str]
+            List of symbols to process
+        timeframes : List[str]
+            List of timeframes to create for each symbol
+        scid_folder : str, optional
+            Folder containing SCID files
+        start : pd.Timestamp, optional
+            Start date for data loading
+        end : pd.Timestamp, optional
+            End date for data loading
+        replace : bool, default False
+            If True, replace existing data
+
+        Returns
+        -------
+        Dict[str, Dict[str, Dict[str, Any]]]
+            Nested dictionary: {symbol: {timeframe: result}}
+
+        Examples
+        --------
+        >>> processor = DataProcessor(client)
+        >>> # Update multiple commodities at standard timeframes
+        >>> results = processor.batch_update_intraday(
+        ...     symbols=['CL_F', 'NG_F', 'ZC_F'],
+        ...     timeframes=['1T', '5T', '15T', '1H'],
+        ...     start=pd.Timestamp('2024-01-01')
+        ... )
+        >>> # Check results
+        >>> for symbol, tf_results in results.items():
+        ...     for tf, result in tf_results.items():
+        ...         if result['success']:
+        ...             print(f"{symbol}/{tf}: {result['records_written']} records")
+        """
+        if not symbols:
+            raise ValueError("symbols list must be provided")
+
+        if not timeframes:
+            raise ValueError("timeframes list must be provided")
+
+        print(f"\n[BATCH UPDATE] Processing {len(symbols)} symbols × {len(timeframes)} timeframes")
+        print(f"[BATCH UPDATE] Total operations: {len(symbols) * len(timeframes)}")
+
+        all_results = {}
+
+        for symbol in symbols:
+            print(f"\n{'='*60}")
+            print(f"Processing symbol: {symbol}")
+            print(f"{'='*60}")
+
+            symbol_results = self.update_multiple_timeframes(
+                symbol=symbol,
+                timeframes=timeframes,
+                scid_folder=scid_folder,
+                start=start,
+                end=end,
+                replace=replace
+            )
+
+            all_results[symbol] = symbol_results
+
+        # Final summary
+        print(f"\n{'='*60}")
+        print(f"BATCH UPDATE COMPLETE")
+        print(f"{'='*60}")
+
+        total_records = 0
+        successful_ops = 0
+        total_ops = 0
+
+        for symbol, tf_results in all_results.items():
+            for timeframe, result in tf_results.items():
+                total_ops += 1
+                if result.get('success'):
+                    successful_ops += 1
+                    total_records += result.get('records_written', 0)
+
+        print(f"Symbols processed: {len(symbols)}")
+        print(f"Timeframes per symbol: {len(timeframes)}")
+        print(f"Successful operations: {successful_ops}/{total_ops}")
+        print(f"Total records written: {total_records:,}")
+        print(f"Success rate: {successful_ops/total_ops*100:.1f}%")
+
+        return all_results
 
     # =================================================================
     # FuturesCurve Processing Methods using DLY Contract Managers

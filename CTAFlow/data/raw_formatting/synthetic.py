@@ -179,6 +179,15 @@ UNIT_CONVERSIONS = {
     ('cents/lb', '$/lb'): 0.01,
     ('$/lb', 'cents/lb'): 100.0,
 
+    # Weight conversions (lb to ton)
+    # 1 short ton = 2000 lbs
+    ('cents/lb', '$/ton'): 0.01 * 2000.0,  # cents/lb to $/ton: (cents/lb) * 0.01 * 2000 lbs/ton
+    ('$/ton', 'cents/lb'): 1.0 / (0.01 * 2000.0),  # $/ton to cents/lb
+    ('$/lb', '$/ton'): 2000.0,  # $/lb to $/ton
+    ('$/ton', '$/lb'): 1.0 / 2000.0,  # $/ton to $/lb
+    ('cents/lb', 'cents/ton'): 2000.0,  # cents/lb to cents/ton
+    ('cents/ton', 'cents/lb'): 1.0 / 2000.0,  # cents/ton to cents/lb
+
     # Metals (troy oz conversions if needed)
     ('$/oz', '$/kg'): 32.1507,  # troy oz to kg
     ('$/kg', '$/oz'): 1.0 / 32.1507,
@@ -193,6 +202,7 @@ UNIT_CONVERSIONS = {
     ('cents/bu', 'cents/bu'): 1.0,
     ('$/ton', '$/ton'): 1.0,
     ('$/mmbtu', '$/mmbtu'): 1.0,
+    ('$/lb', '$/lb'): 1.0,
 }
 
 
@@ -1594,6 +1604,130 @@ class SyntheticSymbol:
         # Calculate combined spread price
         self.price = self._calculate_legs_price()
 
+    @classmethod
+    def from_weights_dict(
+            cls,
+            weights: Dict[str, float],
+            path: Optional[str] = None,
+            start_date: Optional[str] = None,
+            end_date: Optional[str] = None,
+            resample_rule: str = '5min',
+            ticker: Optional[str] = None,
+            full_name: Optional[str] = None,
+            spread_type: str = "product",
+            reference_unit: Optional[str] = None,
+            **kwargs
+    ) -> 'SyntheticSymbol':
+        """
+        Create SyntheticSymbol from a dictionary mapping tickers to hedge ratios.
+        Loads data from SCID files using IntradayLeg.load_from_scid().
+
+        Parameters:
+        -----------
+        weights : Dict[str, float]
+            Dictionary mapping ticker symbols to weights/hedge ratios
+            Example: {'CL_F': 1.0, 'HO_F': -2.0, 'RB_F': -1.0}
+        path : str, optional
+            Path to SCID files directory (defaults to DLY_DATA_PATH if None)
+        start_date : str, optional
+            Start date for data filtering (ISO format: 'YYYY-MM-DD')
+        end_date : str, optional
+            End date for data filtering (ISO format: 'YYYY-MM-DD')
+        resample_rule : str
+            Resampling rule for tick data (default: '5min')
+            Examples: '1T' (1-minute), '5T' (5-minute), '1H' (hourly)
+        ticker : str, optional
+            Custom ticker symbol for the spread (auto-generated if None)
+        full_name : str, optional
+            Custom full name for the spread (auto-generated if None)
+        spread_type : str
+            Type of spread: 'product', 'calendar', etc. (default: 'product')
+        reference_unit : str, optional
+            Common unit to convert all prices to (auto-detects if None)
+        **kwargs
+            Additional arguments passed to IntradayLeg.load_from_scid()
+
+        Returns:
+        --------
+        SyntheticSymbol
+            Initialized synthetic symbol with loaded legs
+
+        Examples:
+        ---------
+        # 3-2-1 crack spread from weights dict
+        >>> weights = {'CL_F': 3.0, 'HO_F': -2.0, 'RB_F': -1.0}
+        >>> crack_spread = SyntheticSymbol.from_weights_dict(
+        ...     weights,
+        ...     path='/path/to/scid/files',
+        ...     start_date='2020-01-01',
+        ...     resample_rule='1T',
+        ...     ticker='CRACK_321',
+        ...     full_name='3-2-1 Crack Spread'
+        ... )
+
+        # Simple 2-leg corn-soybean spread
+        >>> weights = {'ZC_F': 1.0, 'ZS_F': -1.0}
+        >>> grain_spread = SyntheticSymbol.from_weights_dict(
+        ...     weights,
+        ...     start_date='2020-01-01',
+        ...     ticker='ZC_ZS',
+        ...     full_name='Corn-Soybean Spread'
+        ... )
+
+        # Gold-silver ratio spread with 15-minute bars
+        >>> weights = {'GC_F': 1.0, 'SI_F': -1.0}
+        >>> metal_spread = SyntheticSymbol.from_weights_dict(
+        ...     weights,
+        ...     resample_rule='15T',
+        ...     ticker='GC_SI_RATIO'
+        ... )
+        """
+        if not weights or len(weights) < 2:
+            raise ValueError("Must provide at least 2 tickers with weights")
+
+        # Load legs using IntradayLeg.load_from_scid()
+        legs = []
+        symbols = []
+
+        for symbol, weight in weights.items():
+            symbols.append(symbol)
+
+            # Load IntradayLeg from SCID files
+            leg = IntradayLeg.load_from_scid(
+                symbol=symbol,
+                path=path,
+                base_weight=weight,
+                start_date=start_date,
+                end_date=end_date,
+                resample_rule=resample_rule,
+                **kwargs
+            )
+
+            legs.append(leg)
+
+        # Auto-generate ticker if not provided
+        if ticker is None:
+            # Create ticker from symbols: CL_HO_RB or CL_HO depending on length
+            symbol_codes = [s.replace('_F', '') for s in symbols]
+            ticker = '_'.join(symbol_codes)
+            if len(ticker) > 15:  # Limit ticker length
+                ticker = ticker[:15]
+
+        # Auto-generate full name if not provided
+        if full_name is None:
+            # Create descriptive name showing weights
+            leg_strs = [f"{w:+.1f}*{s.replace('_F', '')}" for s, w in weights.items()]
+            full_name = ' '.join(leg_strs) + ' Spread'
+
+        # Create and return SyntheticSymbol
+        return cls(
+            legs=legs,
+            type=spread_type,
+            ticker=ticker,
+            full_name=full_name,
+            intraday=True  # Always True since we're loading from SCID files
+        )
+
     def _generate_legs_data(self) -> pd.DataFrame:
         """
         Generate price data (OHLC if available, Close otherwise) for each leg.
@@ -1715,7 +1849,7 @@ class SyntheticSymbol:
         -----------
         columns : str
             "close" for last price only (default)
-            "ohlc" for full OHLC resampled data
+            "ohlc" for full OHLC resampled data (only valid for intraday mode)
         resample_rule : str, optional
             Pandas resample rule (e.g., "5min", "1H", "1D")
             If None, returns raw spread series without resampling
@@ -1728,10 +1862,16 @@ class SyntheticSymbol:
         --------
         pd.Series or pd.DataFrame
             If columns="close": Returns pd.Series of spread prices
-            If columns="ohlc": Returns pd.DataFrame with OHLC columns
+            If columns="ohlc" and intraday=True: Returns pd.DataFrame with OHLC columns
+            If columns="ohlc" and intraday=False: Raises ValueError (cannot create OHLC from daily data)
+
+        Raises:
+        -------
+        ValueError
+            If OHLC is requested for non-intraday data (only Close prices available)
         """
         if self.intraday:
-            # Intraday engine with OHLC support
+            # Intraday engine with OHLC support - has actual tick/bar data
             return_ohlc = columns.lower() == "ohlc"
 
             # Build spread series (OHLC or Close)
@@ -1761,14 +1901,23 @@ class SyntheticSymbol:
                 return spread_data.resample(resample_rule, **resample_kwargs).last()
 
         else:
-            # Cross-product engine uses sequentialized contracts
+            # Cross-product engine uses sequentialized contracts (daily/Close only)
+            # Cannot create valid OHLC from daily Close prices
+            if columns.lower() == "ohlc":
+                raise ValueError(
+                    "OHLC data cannot be calculated for non-intraday spreads. "
+                    "Daily/CrossProductEngine mode only provides Close prices from sequentialized contracts. "
+                    "Use columns='close' or set intraday=True with IntradayLeg data."
+                )
+
+            # Handle calendar spreads
             if "calendar" in self.type.lower():
                 if isinstance(self.data_engine, CrossProductEngine):
                     if spread_rules is None:
                         spread_rules = {"k_values": [0, 3, 6, 11], "month_targets": [1, 4, 6, 12]}
                     self.seq_curve = self.data_engine.build_cps_family(**spread_rules)
 
-            # Build front month spread series
+            # Build front month spread series (Close only)
             spread_series = self.data_engine.build_cps_series(method="index", k=0)
 
             # No resampling requested - return raw series
@@ -1779,6 +1928,4 @@ class SyntheticSymbol:
             if resample_kwargs is None:
                 resample_kwargs = {}
 
-
-
-                return spread_series.resample(resample_rule, **resample_kwargs).last()
+            return spread_series.resample(resample_rule, **resample_kwargs).last()

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from ..data import IntradayFileManager, DataClient, SyntheticSymbol
 from ..config import DLY_DATA_PATH, INTRADAY_ADB_PATH
 from scipy import stats
+from pathlib import Path
 
 
 @dataclass
@@ -53,6 +54,15 @@ class ScreenParams:
     dayofweek_screen : bool
         Whether to analyze day-of-week patterns (default: True)
 
+    # Tick data parameters (for volume analysis)
+    use_tick_data : bool
+        If True, loads tick data from .scid files for high-precision volume analysis (default: False)
+    scid_folder : Optional[Union[str, Path]]
+        Path to folder containing .scid files (required if use_tick_data=True)
+    tick_aggregation_window : str
+        Time window for aggregating tick data (default: '1T' for 1-minute)
+        Examples: '30S' (30-sec), '1T' (1-min), '5T' (5-min)
+
     Examples
     --------
     # Momentum screen for winter months
@@ -71,6 +81,17 @@ class ScreenParams:
     ...     season='spring',
     ...     target_times=["09:30", "14:00"],
     ...     dayofweek_screen=True
+    ... )
+
+    # Seasonality screen with tick data (1-minute resolution)
+    >>> tick_seasonality = ScreenParams(
+    ...     screen_type='seasonality',
+    ...     name='winter_tick_volume',
+    ...     season='winter',
+    ...     target_times=["09:30", "14:00"],
+    ...     use_tick_data=True,
+    ...     scid_folder='/path/to/scid/files',
+    ...     tick_aggregation_window='1T'
     ... )
 
     # Custom months momentum screen
@@ -101,6 +122,11 @@ class ScreenParams:
     period_length: Optional[Union[int, timedelta]] = None
     dayofweek_screen: bool = True
 
+    # Tick data parameters
+    use_tick_data: bool = False
+    scid_folder: Optional[Union[str, Path]] = None
+    tick_aggregation_window: str = '1T'
+
     def __post_init__(self):
         """Validate parameters and auto-generate name if not provided."""
         # Validate screen_type
@@ -118,15 +144,20 @@ class ScreenParams:
             if self.target_times is None:
                 raise ValueError("Seasonality screens require target_times")
 
+        # Validate tick data parameters
+        if self.use_tick_data and self.scid_folder is None:
+            raise ValueError("scid_folder must be provided when use_tick_data=True")
+
         # Auto-generate name if not provided
         if self.name is None:
+            tick_suffix = "_tick" if self.use_tick_data else ""
             if self.season:
-                self.name = f"{self.season}_{self.screen_type}"
+                self.name = f"{self.season}_{self.screen_type}{tick_suffix}"
             elif self.months:
                 month_str = "_".join(map(str, self.months))
-                self.name = f"months_{month_str}_{self.screen_type}"
+                self.name = f"months_{month_str}_{self.screen_type}{tick_suffix}"
             else:
-                self.name = f"all_{self.screen_type}"
+                self.name = f"all_{self.screen_type}{tick_suffix}"
 
 
 class HistoricalScreener:
@@ -154,6 +185,58 @@ class HistoricalScreener:
             for ticker, data in ticker_data.items()
         }
 
+        # Tick data cache: stores loaded tick data to avoid redundant loading
+        # Structure: {(scid_folder, tick_aggregation_window): {ticker: DataFrame}}
+        # This allows reuse across multiple screens with the same tick data config
+        self._tick_data_cache: Dict[Tuple[str, str], Dict[str, pd.DataFrame]] = {}
+
+    def clear_tick_data_cache(self, scid_folder: Optional[str] = None, tick_aggregation_window: Optional[str] = None):
+        """
+        Clear the tick data cache.
+
+        Parameters
+        ----------
+        scid_folder : Optional[str]
+            If provided, only clear cache for this specific scid_folder.
+            If None, clears all cached tick data.
+        tick_aggregation_window : Optional[str]
+            If provided along with scid_folder, only clear cache for this specific configuration.
+            Ignored if scid_folder is None.
+
+        Examples
+        --------
+        >>> # Clear all cached tick data
+        >>> screener.clear_tick_data_cache()
+        >>>
+        >>> # Clear cache for specific folder
+        >>> screener.clear_tick_data_cache(scid_folder='/path/to/scid')
+        >>>
+        >>> # Clear cache for specific configuration
+        >>> screener.clear_tick_data_cache(scid_folder='/path/to/scid', tick_aggregation_window='1T')
+        """
+        if scid_folder is None:
+            # Clear all cache
+            cleared_count = len(self._tick_data_cache)
+            self._tick_data_cache.clear()
+            print(f"[Tick Data Cache] Cleared all {cleared_count} cached configurations")
+        else:
+            # Clear specific configuration(s)
+            resolved_path = str(Path(scid_folder).resolve())
+
+            if tick_aggregation_window is not None:
+                # Clear specific configuration
+                cache_key = (resolved_path, tick_aggregation_window)
+                if cache_key in self._tick_data_cache:
+                    del self._tick_data_cache[cache_key]
+                    print(f"[Tick Data Cache] Cleared cache for {scid_folder} at {tick_aggregation_window}")
+                else:
+                    print(f"[Tick Data Cache] No cache found for {scid_folder} at {tick_aggregation_window}")
+            else:
+                # Clear all configurations for this folder
+                keys_to_remove = [key for key in self._tick_data_cache.keys() if key[0] == resolved_path]
+                for key in keys_to_remove:
+                    del self._tick_data_cache[key]
+                print(f"[Tick Data Cache] Cleared {len(keys_to_remove)} cached configurations for {scid_folder}")
 
     def intraday_momentum_screen(
         self,
@@ -344,7 +427,10 @@ class HistoricalScreener:
         period_length: Optional[Union[int, timedelta]] = None,
         dayofweek_screen: bool = True,
         months: Optional[List[int]] = None,
-        season: Optional[str] = None
+        season: Optional[str] = None,
+        use_tick_data: bool = False,
+        scid_folder: Optional[Union[str, Path]] = None,
+        tick_aggregation_window: str = '1T'
     ) -> Dict[str, Dict[str, any]]:
         """
         Screen for seasonality patterns in intraday data.
@@ -355,6 +441,7 @@ class HistoricalScreener:
         - Lag autocorrelations at specific times
         - Volatility seasonality
         - Month-specific and seasonal patterns
+        - Bid/ask volume seasonality (automatic when data available)
 
         Parameters:
         -----------
@@ -375,6 +462,14 @@ class HistoricalScreener:
             - spring: Mar, Apr, May (3, 4, 5)
             - summer: Jun, Jul, Aug (6, 7, 8)
             - fall: Sep, Oct, Nov (9, 10, 11)
+        use_tick_data : bool
+            If True, loads tick data from .scid files for higher precision
+            volume analysis (default: False, uses existing data)
+        scid_folder : Optional[Union[str, Path]]
+            Path to folder containing .scid files (required if use_tick_data=True)
+        tick_aggregation_window : str
+            Time window for aggregating tick data (default: '1T' for 1-minute)
+            Examples: '30S' (30-sec), '1T' (1-min), '5T' (5-min)
 
         Returns:
         --------
@@ -383,38 +478,97 @@ class HistoricalScreener:
 
         Examples:
         ---------
-        # Test specific times for next-day predictability
+        # Standard analysis with 5-minute candle data
         results = screener.st_seasonality_screen(
             target_times=["09:30", "14:00"],
             dayofweek_screen=True
         )
 
-        # Test 30-minute windows
+        # High-precision tick data analysis (1-minute aggregation)
         results = screener.st_seasonality_screen(
-            target_times=["09:30", "13:00"],
-            period_length=timedelta(minutes=30),
-            dayofweek_screen=True
+            target_times=["09:30", "14:00"],
+            use_tick_data=True,
+            scid_folder='/path/to/scid/files',
+            tick_aggregation_window='1T'
         )
 
-        # Analyze only winter months
+        # Ultra-high resolution tick analysis (30-second aggregation)
+        results = screener.st_seasonality_screen(
+            target_times=["09:30", "10:00", "14:00"],
+            use_tick_data=True,
+            scid_folder='/path/to/scid/files',
+            tick_aggregation_window='30S',
+            season='winter'
+        )
+
+        # Analyze only winter months with standard data
         results = screener.st_seasonality_screen(
             target_times=["10:00"],
             season='winter',
             dayofweek_screen=True
         )
-
-        # Analyze specific months (Q1)
-        results = screener.st_seasonality_screen(
-            target_times=["14:00"],
-            months=[1, 2, 3],
-            dayofweek_screen=True
-        )
         """
+        # Validate tick data parameters
+        if use_tick_data and scid_folder is None:
+            raise ValueError("scid_folder must be provided when use_tick_data=True")
+
         # Convert times to time objects
         converted_times = self._convert_times(target_times)
 
         # Determine which months to analyze
         selected_months = self._parse_season_months(months, season)
+
+        # Load all tick data upfront for efficiency if requested
+        # Use class-level cache to avoid redundant loading across multiple screens
+        tick_data_cache = {}
+        if use_tick_data:
+            # Create cache key from scid_folder path and aggregation window
+            cache_key = (str(Path(scid_folder).resolve()), tick_aggregation_window)
+
+            # Check if we already have this tick data loaded
+            if cache_key in self._tick_data_cache:
+                print(f"[Tick Data] Using cached tick data for {len(self._tick_data_cache[cache_key])} tickers "
+                      f"at {tick_aggregation_window} resolution")
+                tick_data_cache = self._tick_data_cache[cache_key]
+            else:
+                # Load tick data fresh
+                print(f"[Tick Data] Loading tick data for {len(self.tickers)} tickers at {tick_aggregation_window} resolution...")
+                manager = IntradayFileManager(data_path=Path(scid_folder))
+
+                for ticker in self.tickers:
+                    is_synthetic = self.synthetic_tickers.get(ticker, False)
+                    if is_synthetic:
+                        continue  # Skip synthetic tickers for tick data
+
+                    try:
+                        # Ensure _F suffix is present for IntradayFileManager compatibility
+                        # E.g., 'CL' -> 'CL_F', 'CL_F' -> 'CL_F' (already has suffix)
+                        symbol_with_f = ticker if ticker.endswith('_F') else f"{ticker}_F"
+
+                        df, gaps = manager.load_front_month_series(
+                            symbol=symbol_with_f,
+                            resample_rule=tick_aggregation_window,
+                            detect_gaps=True
+                        )
+
+                        if not df.empty:
+                            tick_data_cache[ticker] = df
+                            gap_info = ""
+                            if gaps:
+                                gap_summary = manager.get_gap_summary(gaps)
+                                gap_info = f", {gap_summary['total_gaps']} gaps detected"
+                            print(f"[Tick Data] {ticker}: {len(df):,} bars{gap_info}")
+                        else:
+                            print(f"[Warning] {ticker}: No tick data loaded, will use existing data")
+
+                    except Exception as e:
+                        print(f"[Warning] {ticker}: Failed to load tick data ({e}), will use existing data")
+
+                print(f"[Tick Data] Successfully loaded tick data for {len(tick_data_cache)}/{len(self.tickers)} tickers")
+
+                # Store in cache for reuse
+                self._tick_data_cache[cache_key] = tick_data_cache
+                print(f"[Tick Data] Cached for future screens with same configuration")
 
         results = {}
 
@@ -422,7 +576,10 @@ class HistoricalScreener:
             # Get data for this ticker
             is_synthetic = self.synthetic_tickers.get(ticker, False)
 
-            if is_synthetic:
+            # Use tick data cache if available, otherwise fall back to existing data
+            if use_tick_data and ticker in tick_data_cache:
+                data = tick_data_cache[ticker]
+            elif is_synthetic:
                 synthetic_obj = self.data[ticker]
                 data = synthetic_obj.price if hasattr(synthetic_obj, 'price') else synthetic_obj.data_engine.build_spread_series(return_ohlc=True)
             else:
@@ -476,6 +633,47 @@ class HistoricalScreener:
             if selected_months is not None:
                 month_analysis = self._analyze_by_month(data, price_col, is_synthetic, selected_months)
                 ticker_results['month_breakdown'] = month_analysis
+
+            # Bid/Ask volume analysis if data available
+            # For synthetic symbols, calculate feasible spread volume based on limiting leg
+            volume_data_available = False
+            volume_data = data
+
+            if is_synthetic:
+                synthetic_obj = self.data[ticker]
+                if hasattr(synthetic_obj, 'legs_df') and not synthetic_obj.legs_df.empty:
+                    # Check if legs_df has volume columns
+                    legs_df = synthetic_obj.legs_df
+                    # Check for volume columns at level 1 (field level) of MultiIndex
+                    if isinstance(legs_df.columns, pd.MultiIndex):
+                        # Check if BidVolume and AskVolume are available
+                        has_bid_ask = ('BidVolume' in legs_df.columns.get_level_values(1) and
+                                      'AskVolume' in legs_df.columns.get_level_values(1))
+                        has_volume = 'Volume' in legs_df.columns.get_level_values(1)
+
+                        volume_data_available = has_bid_ask or has_volume
+
+                        if volume_data_available:
+                            # Calculate feasible spread volume based on limiting leg
+                            volume_data = self._calculate_synthetic_spread_volume(
+                                synthetic_obj,
+                                legs_df,
+                                has_bid_ask
+                            )
+                            # Add Close price from spread for correlation analysis
+                            if 'Close' in data.columns:
+                                volume_data['Close'] = data['Close']
+            else:
+                volume_data_available = any(col in data.columns for col in ['BidVolume', 'AskVolume', 'Volume'])
+
+            if volume_data_available:
+                volume_analysis = self._analyze_volume_seasonality(
+                    data=volume_data,
+                    selected_months=selected_months,
+                    dayofweek_screen=dayofweek_screen,
+                    target_times=converted_times
+                )
+                ticker_results['volume_seasonality'] = volume_analysis
 
             # Rank strongest patterns
             strongest = self._rank_seasonal_strength(ticker_results)
@@ -694,7 +892,10 @@ class HistoricalScreener:
                 period_length=params.period_length,
                 dayofweek_screen=params.dayofweek_screen,
                 months=params.months,
-                season=params.season
+                season=params.season,
+                use_tick_data=params.use_tick_data,
+                scid_folder=params.scid_folder,
+                tick_aggregation_window=params.tick_aggregation_window
             )
 
         else:
@@ -1983,6 +2184,744 @@ class HistoricalScreener:
 
         return patterns
 
+    def _load_tick_data_from_scid(
+        self,
+        ticker: str,
+        scid_folder: Union[str, Path],
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        aggregation_window: str = '1T'
+    ) -> pd.DataFrame:
+        """
+        Load tick data from .scid files for a ticker and aggregate to specified window.
+
+        This method provides tick-level precision for volume analysis by loading
+        raw tick data from Sierra Chart .scid files and aggregating it to the
+        specified time window (e.g., '1T' for 1-minute bars).
+
+        Parameters
+        ----------
+        ticker : str
+            Trading symbol (e.g., 'CL_F', 'NG_F')
+        scid_folder : Union[str, Path]
+            Path to folder containing .scid files
+        start : Optional[datetime]
+            Start date/time for data filtering
+        end : Optional[datetime]
+            End date/time for data filtering
+        aggregation_window : str
+            Pandas resample rule for aggregation (default: '1T' for 1-minute)
+            Examples: '1T' (1-min), '30S' (30-sec), '5T' (5-min), '15T' (15-min)
+
+        Returns
+        -------
+        pd.DataFrame
+            Aggregated OHLCV data with BidVolume and AskVolume columns
+            Index: DatetimeIndex (UTC)
+            Columns: Open, High, Low, Close, NumTrades, TotalVolume, BidVolume, AskVolume
+
+        Notes
+        -----
+        - Uses IntradayFileManager for efficient .scid file loading
+        - Automatically detects and processes front month contracts
+        - Tick-level data provides true order flow precision
+        - Aggregation preserves bid/ask volume for microstructure analysis
+
+        Examples
+        --------
+        >>> # Load 1-minute aggregated tick data
+        >>> tick_data = screener._load_tick_data_from_scid(
+        ...     'CL_F',
+        ...     scid_folder='/path/to/scid/files',
+        ...     aggregation_window='1T'
+        ... )
+        >>>
+        >>> # Load 30-second bars for high-resolution analysis
+        >>> tick_data = screener._load_tick_data_from_scid(
+        ...     'CL_F',
+        ...     scid_folder='/path/to/scid/files',
+        ...     start=datetime(2024, 1, 1),
+        ...     end=datetime(2024, 12, 31),
+        ...     aggregation_window='30S'
+        ... )
+        """
+        scid_path = Path(scid_folder)
+        if not scid_path.exists():
+            raise FileNotFoundError(f"SCID folder not found: {scid_folder}")
+
+        # Check if we already have this data cached
+        cache_key = (str(scid_path.resolve()), aggregation_window)
+        if cache_key in self._tick_data_cache and ticker in self._tick_data_cache[cache_key]:
+            print(f"[Tick Data] Using cached data for {ticker} at {aggregation_window} resolution")
+            return self._tick_data_cache[cache_key][ticker]
+
+        # Initialize IntradayFileManager to discover and load .scid files
+        manager = IntradayFileManager(data_path=scid_path)
+
+        # Ensure _F suffix is present for IntradayFileManager compatibility
+        # E.g., 'CL' -> 'CL_F', 'CL_F' -> 'CL_F' (already has suffix)
+        symbol_with_f = ticker if ticker.endswith('_F') else f"{ticker}_F"
+
+        # Load front month series with specified time range
+        df, gaps = manager.load_front_month_series(
+            symbol=symbol_with_f,
+            start=start,
+            end=end,
+            resample_rule=aggregation_window,
+            detect_gaps=True
+        )
+
+        if df.empty:
+            raise ValueError(f"No tick data loaded for {ticker} from {scid_folder}")
+
+        # Log gap information if available
+        if gaps:
+            gap_summary = manager.get_gap_summary(gaps)
+            print(f"[Tick Data] {ticker}: Detected {gap_summary['total_gaps']} gaps, "
+                  f"{gap_summary.get('data_missing_count', 0)} missing data periods")
+
+        # Save to cache before returning
+        if cache_key not in self._tick_data_cache:
+            self._tick_data_cache[cache_key] = {}
+        self._tick_data_cache[cache_key][ticker] = df
+        print(f"[Tick Data] Cached {ticker} data for future use")
+
+        return df
+
+    def _aggregate_tick_data(
+        self,
+        tick_data: pd.DataFrame,
+        aggregation_window: str = '1T'
+    ) -> pd.DataFrame:
+        """
+        Aggregate tick data to specified time window while preserving bid/ask volumes.
+
+        Parameters
+        ----------
+        tick_data : pd.DataFrame
+            Raw or pre-aggregated tick data with OHLCV + BidVolume/AskVolume
+        aggregation_window : str
+            Pandas resample rule (e.g., '1T', '5T', '15T', '1H')
+
+        Returns
+        -------
+        pd.DataFrame
+            Aggregated data with proper OHLCV and volume calculations
+
+        Notes
+        -----
+        - Open: First value in window
+        - High: Maximum value in window
+        - Low: Minimum value in window
+        - Close: Last value in window
+        - NumTrades: Sum of trades in window
+        - TotalVolume: Sum of total volume
+        - BidVolume: Sum of bid-side volume
+        - AskVolume: Sum of ask-side volume
+        """
+        if tick_data.empty:
+            return tick_data
+
+        # Ensure datetime index is UTC
+        if tick_data.index.tz is None:
+            tick_data = tick_data.tz_localize('UTC')
+        elif str(tick_data.index.tz) != 'UTC':
+            tick_data = tick_data.tz_convert('UTC')
+
+        # Resample OHLC
+        agg_dict = {
+            'Open': 'first',
+            'High': 'max',
+            'Low': 'min',
+            'Close': 'last'
+        }
+
+        # Add volume fields if present
+        if 'NumTrades' in tick_data.columns:
+            agg_dict['NumTrades'] = 'sum'
+        if 'TotalVolume' in tick_data.columns:
+            agg_dict['TotalVolume'] = 'sum'
+        if 'Volume' in tick_data.columns:
+            agg_dict['Volume'] = 'sum'
+        if 'BidVolume' in tick_data.columns:
+            agg_dict['BidVolume'] = 'sum'
+        if 'AskVolume' in tick_data.columns:
+            agg_dict['AskVolume'] = 'sum'
+
+        # Perform resampling
+        resampled = tick_data.resample(aggregation_window).agg(agg_dict)
+
+        # Drop rows with all NaN (no data in that window)
+        resampled = resampled.dropna(how='all')
+
+        # Forward fill OHLC prices (common in sparse tick data)
+        price_cols = ['Open', 'High', 'Low', 'Close']
+        existing_price_cols = [c for c in price_cols if c in resampled.columns]
+        if existing_price_cols:
+            resampled[existing_price_cols] = resampled[existing_price_cols].fillna(method='ffill')
+
+        # Fill volume columns with 0 (no trades = zero volume)
+        volume_cols = ['NumTrades', 'TotalVolume', 'Volume', 'BidVolume', 'AskVolume']
+        existing_volume_cols = [c for c in volume_cols if c in resampled.columns]
+        if existing_volume_cols:
+            resampled[existing_volume_cols] = resampled[existing_volume_cols].fillna(0)
+
+        return resampled
+
+    def _calculate_synthetic_spread_volume(
+        self,
+        synthetic_obj: SyntheticSymbol,
+        legs_df: pd.DataFrame,
+        has_bid_ask: bool
+    ) -> pd.DataFrame:
+        """
+        Calculate feasible spread volume based on limiting leg and hedge ratios.
+
+        For a spread like CL - 2*HO - RB:
+        - Positive ratio (CL): need to BUY at Ask, so use AskVolume
+        - Negative ratio (HO, RB): need to SELL at Bid, so use BidVolume
+        - Feasible spread volume = min(AskVolume_CL, BidVolume_HO/2, BidVolume_RB)
+
+        Parameters
+        ----------
+        synthetic_obj : SyntheticSymbol
+            Synthetic spread object with legs
+        legs_df : pd.DataFrame
+            MultiIndex DataFrame with leg data
+        has_bid_ask : bool
+            Whether BidVolume/AskVolume columns are available
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with BidVolume, AskVolume, Volume columns representing
+            feasible spread volume (limited by constraining leg)
+        """
+        volume_data = pd.DataFrame(index=legs_df.index)
+
+        if has_bid_ask:
+            # Calculate feasible spread volume based on leg constraints
+            # For buying the spread: need to buy long legs (use Ask) and sell short legs (use Bid)
+            # For selling the spread: need to sell long legs (use Bid) and buy short legs (use Ask)
+
+            # Get legs and their weights
+            legs = synthetic_obj.legs
+
+            # Track available volume for buying and selling the spread
+            buy_spread_limits = []  # Limits for buying the spread (going long)
+            sell_spread_limits = []  # Limits for selling the spread (going short)
+
+            for leg in legs:
+                symbol = leg.symbol
+                weight = leg.base_weight
+
+                # Get volume columns for this leg
+                bid_col = (symbol, 'BidVolume')
+                ask_col = (symbol, 'AskVolume')
+
+                if bid_col not in legs_df.columns or ask_col not in legs_df.columns:
+                    continue
+
+                bid_vol = legs_df[bid_col]
+                ask_vol = legs_df[ask_col]
+
+                # Absolute weight determines the ratio
+                abs_weight = abs(weight)
+
+                if weight > 0:
+                    # Long leg (buying this leg when buying spread)
+                    # To BUY spread: need to BUY this leg at Ask -> limited by AskVolume
+                    buy_spread_limits.append(ask_vol / abs_weight)
+                    # To SELL spread: need to SELL this leg at Bid -> limited by BidVolume
+                    sell_spread_limits.append(bid_vol / abs_weight)
+                else:
+                    # Short leg (selling this leg when buying spread)
+                    # To BUY spread: need to SELL this leg at Bid -> limited by BidVolume
+                    buy_spread_limits.append(bid_vol / abs_weight)
+                    # To SELL spread: need to BUY this leg at Ask -> limited by AskVolume
+                    sell_spread_limits.append(ask_vol / abs_weight)
+
+            # Feasible volume for buying spread = minimum across all leg constraints
+            if buy_spread_limits:
+                buy_spread_volume = pd.concat(buy_spread_limits, axis=1).min(axis=1)
+            else:
+                buy_spread_volume = pd.Series(0, index=legs_df.index)
+
+            # Feasible volume for selling spread = minimum across all leg constraints
+            if sell_spread_limits:
+                sell_spread_volume = pd.concat(sell_spread_limits, axis=1).min(axis=1)
+            else:
+                sell_spread_volume = pd.Series(0, index=legs_df.index)
+
+            # Store as BidVolume (sell spread) and AskVolume (buy spread)
+            volume_data['BidVolume'] = sell_spread_volume
+            volume_data['AskVolume'] = buy_spread_volume
+            # Total volume = sum of both directions
+            volume_data['Volume'] = sell_spread_volume + buy_spread_volume
+
+        elif 'Volume' in legs_df.columns.get_level_values(1):
+            # If only total volume available, calculate limiting volume
+            leg_volumes = []
+            legs = synthetic_obj.legs
+
+            for leg in legs:
+                symbol = leg.symbol
+                weight = leg.base_weight
+                vol_col = (symbol, 'Volume')
+
+                if vol_col in legs_df.columns:
+                    leg_vol = legs_df[vol_col]
+                    abs_weight = abs(weight)
+                    # Adjust volume by ratio
+                    leg_volumes.append(leg_vol / abs_weight)
+
+            # Limiting volume = minimum across all legs
+            if leg_volumes:
+                volume_data['Volume'] = pd.concat(leg_volumes, axis=1).min(axis=1)
+            else:
+                volume_data['Volume'] = pd.Series(0, index=legs_df.index)
+
+        return volume_data
+
+    def _analyze_volume_seasonality(
+        self,
+        data: pd.DataFrame,
+        selected_months: Optional[List[int]],
+        dayofweek_screen: bool,
+        target_times: List[time]
+    ) -> Dict[str, any]:
+        """
+        Comprehensive seasonality analysis for bid/ask volume and order flow.
+
+        Analyzes:
+        - Day-of-week volume patterns
+        - Time-of-day volume patterns
+        - Bid/Ask imbalance seasonality
+        - Order flow toxicity indicators
+        - Volume-weighted price impact
+
+        Parameters
+        ----------
+        data : pd.DataFrame
+            Market data with BidVolume, AskVolume, Volume columns
+        selected_months : Optional[List[int]]
+            Months to analyze (for monthly breakdown)
+        dayofweek_screen : bool
+            Whether to perform day-of-week analysis
+        target_times : List[time]
+            Times to analyze for intraday patterns
+
+        Returns
+        -------
+        Dict[str, any]
+            Comprehensive volume seasonality metrics
+        """
+        volume_results = {
+            'has_bid_ask': 'BidVolume' in data.columns and 'AskVolume' in data.columns,
+            'has_volume': 'Volume' in data.columns
+        }
+
+        # Day-of-week volume patterns
+        if dayofweek_screen:
+            dow_volume = self._analyze_volume_by_dayofweek(data)
+            volume_results['dayofweek_volume'] = dow_volume
+
+        # Time-of-day volume patterns
+        if target_times:
+            tod_volume = self._analyze_volume_by_timeofday(data, target_times)
+            volume_results['timeofday_volume'] = tod_volume
+
+        # Bid/Ask imbalance analysis
+        if volume_results['has_bid_ask']:
+            imbalance_analysis = self._analyze_bidask_imbalance(data)
+            volume_results['bidask_imbalance'] = imbalance_analysis
+
+            # Order flow toxicity
+            toxicity_analysis = self._analyze_order_flow_toxicity(data)
+            volume_results['order_flow_toxicity'] = toxicity_analysis
+
+        # Monthly volume patterns if filtering applied
+        if selected_months is not None and volume_results['has_volume']:
+            monthly_volume = self._analyze_volume_by_month(data, selected_months)
+            volume_results['monthly_breakdown'] = monthly_volume
+
+        return volume_results
+
+    def _analyze_volume_by_dayofweek(
+        self,
+        data: pd.DataFrame
+    ) -> Dict[str, Dict[str, float]]:
+        """
+        Analyze volume patterns by day of week.
+
+        Returns
+        -------
+        Dict with volume statistics for each weekday
+        """
+        weekday_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+        results = {}
+
+        # Add weekday column
+        df = data.copy()
+        df['weekday'] = df.index.dayofweek
+
+        for dow in range(5):
+            day_data = df[df['weekday'] == dow]
+            if len(day_data) < 2:
+                continue
+
+            day_name = weekday_names[dow]
+            day_stats = {
+                'n': len(day_data)
+            }
+
+            # Total volume statistics
+            if 'Volume' in data.columns:
+                vol = day_data['Volume']
+                day_stats['volume_mean'] = float(vol.mean())
+                day_stats['volume_std'] = float(vol.std())
+                day_stats['volume_median'] = float(vol.median())
+                day_stats['volume_total'] = float(vol.sum())
+
+            # Bid volume statistics
+            if 'BidVolume' in data.columns:
+                bid_vol = day_data['BidVolume']
+                day_stats['bid_volume_mean'] = float(bid_vol.mean())
+                day_stats['bid_volume_std'] = float(bid_vol.std())
+                day_stats['bid_volume_total'] = float(bid_vol.sum())
+
+            # Ask volume statistics
+            if 'AskVolume' in data.columns:
+                ask_vol = day_data['AskVolume']
+                day_stats['ask_volume_mean'] = float(ask_vol.mean())
+                day_stats['ask_volume_std'] = float(ask_vol.std())
+                day_stats['ask_volume_total'] = float(ask_vol.sum())
+
+            # Bid/Ask ratio
+            if 'BidVolume' in data.columns and 'AskVolume' in data.columns:
+                # Calculate ratio where both > 0
+                valid_mask = (day_data['BidVolume'] > 0) & (day_data['AskVolume'] > 0)
+                if valid_mask.sum() > 0:
+                    ratio = day_data.loc[valid_mask, 'BidVolume'] / day_data.loc[valid_mask, 'AskVolume']
+                    day_stats['bidask_ratio_mean'] = float(ratio.mean())
+                    day_stats['bidask_ratio_median'] = float(ratio.median())
+                    day_stats['bidask_ratio_std'] = float(ratio.std())
+
+                    # Imbalance (Bid - Ask) / (Bid + Ask)
+                    imbalance = (day_data['BidVolume'] - day_data['AskVolume']) / (
+                        day_data['BidVolume'] + day_data['AskVolume'] + 1e-10
+                    )
+                    day_stats['imbalance_mean'] = float(imbalance.mean())
+                    day_stats['imbalance_std'] = float(imbalance.std())
+                    day_stats['buy_pressure_pct'] = float((imbalance > 0).sum() / len(imbalance) * 100)
+
+            results[day_name] = day_stats
+
+        # ANOVA test across weekdays for volume
+        if 'Volume' in data.columns and len(results) >= 3:
+            from scipy.stats import f_oneway
+            weekday_volumes = [
+                df[df['weekday'] == dow]['Volume'].values
+                for dow in range(5)
+                if len(df[df['weekday'] == dow]) > 0
+            ]
+            if len(weekday_volumes) >= 3:
+                f_stat, p_value = f_oneway(*weekday_volumes)
+                results['anova'] = {
+                    'f_stat': float(f_stat),
+                    'p_value': float(p_value),
+                    'significant': p_value < 0.05
+                }
+
+        return results
+
+    def _analyze_volume_by_timeofday(
+        self,
+        data: pd.DataFrame,
+        target_times: List[time]
+    ) -> Dict[str, Dict[str, float]]:
+        """
+        Analyze volume patterns at specific times of day.
+
+        Returns
+        -------
+        Dict with volume statistics for each target time
+        """
+        results = {}
+
+        for target_time in target_times:
+            time_str = str(target_time)
+
+            # Filter data to target time (±1 minute window)
+            time_mask = (
+                (data.index.hour == target_time.hour) &
+                (data.index.minute >= max(0, target_time.minute - 1)) &
+                (data.index.minute <= min(59, target_time.minute + 1))
+            )
+
+            time_data = data[time_mask]
+            if len(time_data) < 2:
+                continue
+
+            time_stats = {
+                'n': len(time_data)
+            }
+
+            # Volume statistics
+            if 'Volume' in data.columns:
+                vol = time_data['Volume']
+                time_stats['volume_mean'] = float(vol.mean())
+                time_stats['volume_std'] = float(vol.std())
+                time_stats['volume_median'] = float(vol.median())
+
+                # Compare to daily average
+                daily_avg = data['Volume'].mean()
+                time_stats['volume_vs_daily_avg'] = float(vol.mean() / daily_avg) if daily_avg > 0 else np.nan
+
+            # Bid/Ask volume at this time
+            if 'BidVolume' in data.columns and 'AskVolume' in data.columns:
+                bid_vol = time_data['BidVolume']
+                ask_vol = time_data['AskVolume']
+
+                time_stats['bid_volume_mean'] = float(bid_vol.mean())
+                time_stats['ask_volume_mean'] = float(ask_vol.mean())
+
+                # Imbalance at this time
+                valid_mask = (time_data['BidVolume'] > 0) | (time_data['AskVolume'] > 0)
+                if valid_mask.sum() > 0:
+                    imbalance = (time_data.loc[valid_mask, 'BidVolume'] - time_data.loc[valid_mask, 'AskVolume']) / (
+                        time_data.loc[valid_mask, 'BidVolume'] + time_data.loc[valid_mask, 'AskVolume'] + 1e-10
+                    )
+                    time_stats['imbalance_mean'] = float(imbalance.mean())
+                    time_stats['imbalance_std'] = float(imbalance.std())
+
+                    # Direction bias
+                    time_stats['buy_pressure_pct'] = float((imbalance > 0).sum() / len(imbalance) * 100)
+                    time_stats['sell_pressure_pct'] = float((imbalance < 0).sum() / len(imbalance) * 100)
+
+            results[time_str] = time_stats
+
+        return results
+
+    def _analyze_bidask_imbalance(
+        self,
+        data: pd.DataFrame
+    ) -> Dict[str, float]:
+        """
+        Analyze bid/ask volume imbalance patterns.
+
+        Returns
+        -------
+        Dict with imbalance statistics
+        """
+        if 'BidVolume' not in data.columns or 'AskVolume' not in data.columns:
+            return {}
+
+        # Calculate imbalance: (Bid - Ask) / (Bid + Ask)
+        imbalance = (data['BidVolume'] - data['AskVolume']) / (
+            data['BidVolume'] + data['AskVolume'] + 1e-10
+        )
+
+        results = {
+            'imbalance_mean': float(imbalance.mean()),
+            'imbalance_std': float(imbalance.std()),
+            'imbalance_skew': float(imbalance.skew()),
+            'imbalance_kurtosis': float(imbalance.kurtosis()),
+        }
+
+        # Persistence analysis - autocorrelation
+        if len(imbalance) > 10:
+            results['imbalance_autocorr_1'] = float(imbalance.autocorr(1))
+            results['imbalance_autocorr_5'] = float(imbalance.autocorr(5))
+            results['imbalance_autocorr_10'] = float(imbalance.autocorr(10))
+
+        # Directional analysis
+        results['buy_pressure_pct'] = float((imbalance > 0).sum() / len(imbalance) * 100)
+        results['sell_pressure_pct'] = float((imbalance < 0).sum() / len(imbalance) * 100)
+        results['neutral_pct'] = float((imbalance == 0).sum() / len(imbalance) * 100)
+
+        # Extreme imbalance events
+        imbalance_abs = imbalance.abs()
+        threshold_90 = imbalance_abs.quantile(0.90)
+        threshold_95 = imbalance_abs.quantile(0.95)
+        threshold_99 = imbalance_abs.quantile(0.99)
+
+        results['extreme_imbalance_90pct'] = float(threshold_90)
+        results['extreme_imbalance_95pct'] = float(threshold_95)
+        results['extreme_imbalance_99pct'] = float(threshold_99)
+
+        # Clustering of buy/sell pressure
+        buy_runs = (imbalance > 0.1).astype(int)
+        sell_runs = (imbalance < -0.1).astype(int)
+
+        results['avg_buy_run_length'] = float(self._calculate_run_length(buy_runs))
+        results['avg_sell_run_length'] = float(self._calculate_run_length(sell_runs))
+
+        return results
+
+    def _analyze_order_flow_toxicity(
+        self,
+        data: pd.DataFrame
+    ) -> Dict[str, float]:
+        """
+        Analyze order flow toxicity using VPIN-like metrics.
+
+        Order flow toxicity measures informed trading and adverse selection risk.
+
+        Returns
+        -------
+        Dict with toxicity metrics
+        """
+        if 'BidVolume' not in data.columns or 'AskVolume' not in data.columns:
+            return {}
+
+        results = {}
+
+        # Volume-synchronized probability of informed trading (VPIN)
+        # Simplified version: uses bid/ask volume imbalance as proxy
+        buy_volume = data['BidVolume']
+        sell_volume = data['AskVolume']
+        total_volume = buy_volume + sell_volume
+
+        # Avoid division by zero
+        valid_mask = total_volume > 0
+        if valid_mask.sum() < 10:
+            return {'error': 'Insufficient valid volume data'}
+
+        # Order imbalance
+        order_imbalance = np.abs(buy_volume - sell_volume)[valid_mask]
+        total_volume_valid = total_volume[valid_mask]
+
+        # VPIN proxy: average absolute order imbalance / total volume
+        vpin_proxy = order_imbalance / total_volume_valid
+        results['vpin_mean'] = float(vpin_proxy.mean())
+        results['vpin_std'] = float(vpin_proxy.std())
+        results['vpin_median'] = float(vpin_proxy.median())
+
+        # Rolling VPIN (10-period window)
+        if len(vpin_proxy) > 10:
+            vpin_series = pd.Series(vpin_proxy.values, index=data[valid_mask].index)
+            rolling_vpin = vpin_series.rolling(10).mean()
+            results['vpin_rolling_mean'] = float(rolling_vpin.mean())
+            results['vpin_rolling_max'] = float(rolling_vpin.max())
+
+            # Toxicity regime detection (high VPIN periods)
+            high_toxicity_threshold = vpin_proxy.quantile(0.75)
+            high_toxicity_periods = (vpin_proxy > high_toxicity_threshold).sum()
+            results['high_toxicity_pct'] = float(high_toxicity_periods / len(vpin_proxy) * 100)
+
+        # Volume concentration
+        # Measure if volume is concentrated in few large trades (toxic) vs distributed
+        if 'Volume' in data.columns:
+            vol = data['Volume'][valid_mask]
+            if len(vol) > 0:
+                results['volume_concentration_hhi'] = float(
+                    ((vol / vol.sum()) ** 2).sum()
+                )
+
+        # Buy-sell volume asymmetry persistence
+        buy_pct = buy_volume[valid_mask] / total_volume_valid
+        results['buy_volume_pct_mean'] = float(buy_pct.mean())
+        results['buy_volume_pct_std'] = float(buy_pct.std())
+
+        # Autocorrelation of order flow (persistence)
+        if len(buy_pct) > 10:
+            buy_pct_series = pd.Series(buy_pct.values)
+            results['order_flow_autocorr_1'] = float(buy_pct_series.autocorr(1))
+            results['order_flow_autocorr_5'] = float(buy_pct_series.autocorr(5))
+
+        return results
+
+    def _analyze_volume_by_month(
+        self,
+        data: pd.DataFrame,
+        selected_months: List[int]
+    ) -> Dict[int, Dict[str, float]]:
+        """
+        Analyze volume patterns for each month.
+
+        Returns
+        -------
+        Dict mapping month number to volume statistics
+        """
+        results = {}
+
+        for month in selected_months:
+            month_data = data[data.index.month == month]
+            if len(month_data) < 2:
+                continue
+
+            month_stats = {
+                'n': len(month_data)
+            }
+
+            # Total volume
+            if 'Volume' in data.columns:
+                vol = month_data['Volume']
+                month_stats['volume_mean'] = float(vol.mean())
+                month_stats['volume_std'] = float(vol.std())
+                month_stats['volume_total'] = float(vol.sum())
+
+                # Compare to overall average
+                overall_avg = data['Volume'].mean()
+                month_stats['volume_vs_overall'] = float(vol.mean() / overall_avg) if overall_avg > 0 else np.nan
+
+            # Bid/Ask analysis
+            if 'BidVolume' in data.columns and 'AskVolume' in data.columns:
+                bid_vol = month_data['BidVolume']
+                ask_vol = month_data['AskVolume']
+
+                month_stats['bid_volume_mean'] = float(bid_vol.mean())
+                month_stats['ask_volume_mean'] = float(ask_vol.mean())
+
+                # Imbalance for this month
+                valid_mask = (month_data['BidVolume'] > 0) | (month_data['AskVolume'] > 0)
+                if valid_mask.sum() > 0:
+                    imbalance = (month_data.loc[valid_mask, 'BidVolume'] - month_data.loc[valid_mask, 'AskVolume']) / (
+                        month_data.loc[valid_mask, 'BidVolume'] + month_data.loc[valid_mask, 'AskVolume'] + 1e-10
+                    )
+                    month_stats['imbalance_mean'] = float(imbalance.mean())
+                    month_stats['buy_pressure_pct'] = float((imbalance > 0).sum() / len(imbalance) * 100)
+
+            results[month] = month_stats
+
+        return results
+
+    def _calculate_run_length(self, binary_series: pd.Series) -> float:
+        """
+        Calculate average run length of 1s in a binary series.
+
+        Parameters
+        ----------
+        binary_series : pd.Series
+            Series of 0s and 1s
+
+        Returns
+        -------
+        float
+            Average length of consecutive 1s
+        """
+        if len(binary_series) == 0 or binary_series.sum() == 0:
+            return 0.0
+
+        # Find runs of 1s
+        runs = []
+        current_run = 0
+
+        for val in binary_series:
+            if val == 1:
+                current_run += 1
+            else:
+                if current_run > 0:
+                    runs.append(current_run)
+                    current_run = 0
+
+        # Don't forget the last run if it ends with 1
+        if current_run > 0:
+            runs.append(current_run)
+
+        return np.mean(runs) if runs else 0.0
+
     def _parse_season_months(
         self,
         months: Optional[List[int]],
@@ -2801,7 +3740,8 @@ class HistoricalScreener:
         volume_bucket: Optional[int] = None,
         resample_rule: str = "5min",
         write_db: bool = True,
-        file_manager: Optional[IntradayFileManager] = None
+        file_manager: Optional[IntradayFileManager] = None,
+        skip_initial_load: bool = False
     ):
         """
         Create HistoricalScreener from SCID files.
@@ -2822,6 +3762,8 @@ class HistoricalScreener:
             Whether to write to database (default: True)
         file_manager : Optional[IntradayFileManager]
             Existing file manager to reuse (optional - singleton pattern handles Arctic reuse automatically)
+        skip_initial_load : bool
+            If True, skips initial data loading (useful when screens will use tick_data directly)
 
         Returns:
         --------
@@ -2841,6 +3783,13 @@ class HistoricalScreener:
             resample_rule='1T'
         )
 
+        # Skip initial load when using tick data in screens (avoids double loading)
+        screener = HistoricalScreener.from_scids(
+            ['PA', 'PL', 'HG'],
+            start_date='2020-01-01',
+            skip_initial_load=True  # Tick data loaded directly by screens
+        )
+
         # Multiple screeners automatically share the same Arctic instance
         screener1 = HistoricalScreener.from_scids(['CL'])
         screener2 = HistoricalScreener.from_scids(['NG'])  # Reuses same Arctic connection
@@ -2850,6 +3799,9 @@ class HistoricalScreener:
         The IntradayFileManager now uses a singleton pattern for Arctic instances,
         preventing LMDB "already opened" errors automatically. Manual file_manager
         parameter is optional.
+
+        When using screens with use_tick_data=True, set skip_initial_load=True to
+        avoid loading and resampling data twice (once in from_scids, once in screens).
         """
         # Reuse existing manager or create new one
         if file_manager is None:
@@ -2862,32 +3814,42 @@ class HistoricalScreener:
         end = datetime.strptime(end_date, "%Y-%m-%d") if end_date else None
 
         data = {}
-        for t in tickers:
-            # Add _F suffix if not present
-            symbol = t if t.endswith('_F') else f"{t}_F"
 
-            try:
-                df, gaps = mgr.load_front_month_series(
-                    symbol=symbol,
-                    start=start,
-                    end=end,
-                    resample_rule=resample_rule,
-                    volume_bucket_size=volume_bucket
-                )
+        if skip_initial_load:
+            # Create empty DataFrames for tickers - tick data will be loaded by screens
+            print(f"[from_scids] Skipping initial data load - tick data will be loaded by screens")
+            for t in tickers:
+                symbol = t if t.endswith('_F') else f"{t}_F"
+                # Create minimal empty DataFrame with proper index type
+                data[symbol] = pd.DataFrame(index=pd.DatetimeIndex([]), columns=['Open', 'High', 'Low', 'Last', 'Volume'])
+        else:
+            # Load and resample data normally
+            for t in tickers:
+                # Add _F suffix if not present
+                symbol = t if t.endswith('_F') else f"{t}_F"
 
-                if not df.empty:
-                    data[symbol] = df
-                    print(f"Loaded {symbol}: {len(df):,} records from {df.index[0]} to {df.index[-1]}")
-                    if gaps:
-                        print(f"  - {len(gaps)} gaps detected")
-                else:
-                    print(f"Warning: No data loaded for {symbol}")
+                try:
+                    df, gaps = mgr.load_front_month_series(
+                        symbol=symbol,
+                        start=start,
+                        end=end,
+                        resample_rule=resample_rule,
+                        volume_bucket_size=volume_bucket
+                    )
 
-            except Exception as e:
-                print(f"Error loading {symbol}: {e}")
+                    if not df.empty:
+                        data[symbol] = df
+                        print(f"Loaded {symbol}: {len(df):,} records from {df.index[0]} to {df.index[-1]}")
+                        if gaps:
+                            print(f"  - {len(gaps)} gaps detected")
+                    else:
+                        print(f"Warning: No data loaded for {symbol}")
 
-        if not data:
-            raise ValueError("No data loaded for any tickers")
+                except Exception as e:
+                    print(f"Error loading {symbol}: {e}")
+
+            if not data:
+                raise ValueError("No data loaded for any tickers")
 
         return cls(data, mgr)
 

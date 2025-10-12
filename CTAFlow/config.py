@@ -7,6 +7,10 @@ import os
 
 intraday_db_path = "lmdb:\\F:\\data\\intraday"
 
+# Weekly Update Configuration
+# Set to False to disable automated weekly updates
+ENABLE_WEEKLY_UPDATES = os.getenv("CTAFLOW_ENABLE_WEEKLY_UPDATES", "false").lower() in ("true", "1", "yes")
+
 # ArcticDB URIs (primary data storage)
 INTRADAY_ADB_PATH = "lmdb://F:/Data/intraday"  # ArcticDB URI for intraday data
 DAILY_ADB_PATH = "lmdb://F:/Data/daily"  # ArcticDB URI for daily market data

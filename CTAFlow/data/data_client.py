@@ -51,6 +51,7 @@ from ..config import (
     CURVE_ADB_PATH,
     COT_ADB_PATH,
     INTRADAY_ADB_PATH,
+    ENABLE_WEEKLY_UPDATES,
 )
 from .update_management import (
     COT_REFRESH_EVENT,
@@ -96,11 +97,59 @@ class DataClient:
 
     _weekly_update_lock = threading.Lock()
     _weekly_update_checked = False
+    _weekly_updates_enabled = ENABLE_WEEKLY_UPDATES  # Runtime override
+
+    @classmethod
+    def enable_weekly_updates(cls) -> None:
+        """Enable automated weekly updates at runtime.
+
+        This overrides the ENABLE_WEEKLY_UPDATES config setting for the current session.
+
+        Examples
+        --------
+        >>> from CTAFlow.data import DataClient
+        >>> DataClient.enable_weekly_updates()
+        >>> print("Weekly updates enabled")
+        """
+        cls._weekly_updates_enabled = True
+        print("[WeeklyUpdate] Automated weekly updates ENABLED")
+
+    @classmethod
+    def disable_weekly_updates(cls) -> None:
+        """Disable automated weekly updates at runtime.
+
+        This overrides the ENABLE_WEEKLY_UPDATES config setting for the current session.
+
+        Examples
+        --------
+        >>> from CTAFlow.data import DataClient
+        >>> DataClient.disable_weekly_updates()
+        >>> print("Weekly updates disabled")
+        """
+        cls._weekly_updates_enabled = False
+        print("[WeeklyUpdate] Automated weekly updates DISABLED")
+
+    @classmethod
+    def is_weekly_updates_enabled(cls) -> bool:
+        """Check if automated weekly updates are currently enabled.
+
+        Returns
+        -------
+        bool
+            True if weekly updates are enabled, False otherwise
+
+        Examples
+        --------
+        >>> from CTAFlow.data import DataClient
+        >>> if DataClient.is_weekly_updates_enabled():
+        ...     print("Weekly updates are active")
+        """
+        return cls._weekly_updates_enabled
 
     def __init__(
         self,
         *,
-        use_arctic: bool = True,
+        use_arctic: bool = False,
         daily_uri: Optional[str] = None,
         curve_uri: Optional[str] = None,
         cot_uri: Optional[str] = None,
@@ -184,7 +233,18 @@ class DataClient:
         return self._cot_processor
 
     def _ensure_weekly_updates(self) -> None:
-        """Run the weekly market data update if it is due."""
+        """Run the weekly market data update if it is due.
+
+        Can be disabled by:
+        1. Setting ENABLE_WEEKLY_UPDATES=False in config.py
+        2. Setting environment variable CTAFLOW_ENABLE_WEEKLY_UPDATES=false
+        3. Calling DataClient.disable_weekly_updates() at runtime
+        """
+        import time
+
+        # Check if weekly updates are enabled (runtime override or config)
+        if not self._weekly_updates_enabled:
+            return
 
         cls = type(self)
         with cls._weekly_update_lock:
@@ -196,28 +256,147 @@ class DataClient:
         if not scheduler.is_due():
             return
 
+        # Start verbose progress tracking
+        print("\n" + "="*70)
+        print("WEEKLY UPDATE STARTED")
+        print("="*70)
+        print(f"Trigger: Automated weekly data refresh")
+        print(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print("="*70 + "\n")
+
         attempt_details = {"trigger": "query_market_data"}
         scheduler.mark_attempt(attempt_details)
 
+        # Step 1: Import DataProcessor
+        print("[1/3] Importing DataProcessor...")
         try:
-            from .data_processor import SimpleDataProcessor
+            from .data_processor import DataProcessor
+            print("      ✓ DataProcessor imported successfully\n")
         except Exception as exc:  # pragma: no cover - defensive
             scheduler.mark_failure(f"import_error: {exc}", details=attempt_details)
-            print(f"[WeeklyUpdate] Unable to import SimpleDataProcessor: {exc}")
+            print(f"      ✗ Unable to import DataProcessor: {exc}\n")
+            print("="*70)
+            print("WEEKLY UPDATE FAILED")
+            print("="*70 + "\n")
             return
 
+        # Step 2: Initialize processor
+        print("[2/3] Initializing data processor...")
         try:
-            processor = SimpleDataProcessor(self)
+            processor = DataProcessor(self)
+            print("      ✓ DataProcessor initialized\n")
+        except Exception as exc:
+            scheduler.mark_failure(f"initialization_error: {exc}", details=attempt_details)
+            print(f"      ✗ Failed to initialize DataProcessor: {exc}\n")
+            print("="*70)
+            print("WEEKLY UPDATE FAILED")
+            print("="*70 + "\n")
+            return
+
+        # Step 3: Run update
+        print("[3/3] Running update_all_tickers...")
+        print("      DLY Folder: {}".format(str(DLY_DATA_PATH)))
+        print("      COT Progress: Enabled")
+        print("      Metadata Recording: Enabled")
+        print("-"*70 + "\n")
+
+        start_time = time.time()
+        try:
             summary = processor.update_all_tickers(
                 dly_folder=str(DLY_DATA_PATH),
-                cot_progress=False,
+                cot_progress=True,  # Enable COT progress for verbose output
                 record_metadata=True,
                 metadata_event=WEEKLY_MARKET_UPDATE_EVENT,
             )
         except Exception as exc:  # pragma: no cover - runtime safeguard
+            elapsed = time.time() - start_time
             scheduler.mark_failure(str(exc), details=attempt_details)
-            print(f"[WeeklyUpdate] update_all_tickers failed: {exc}")
+            print(f"\n      ✗ update_all_tickers failed after {elapsed:.1f}s: {exc}\n")
+            print("="*70)
+            print("WEEKLY UPDATE FAILED")
+            print("="*70 + "\n")
             return
+
+        # Calculate summary statistics
+        elapsed = time.time() - start_time
+
+        # Extract summary information
+        cot_metrics = summary.get('cot_metrics', {})
+        updates = summary.get('updates', {})
+        errors = summary.get('errors', {})
+        skipped = summary.get('skipped', [])
+
+        # COT statistics
+        cot_rows = cot_metrics.get('total_rows', 0)
+        cot_ticker_results = cot_metrics.get('ticker_results', {})
+        cot_success = len(cot_ticker_results.get('success', []))
+        cot_failed = cot_ticker_results.get('failed', {})
+
+        # Market/Curve statistics
+        total_symbols = len(updates)
+        symbols_with_errors = len(errors)
+        successful_symbols = total_symbols - symbols_with_errors
+
+        # Count market and curve updates
+        market_updates = 0
+        curve_updates = 0
+        total_market_rows = 0
+        total_curve_rows = 0
+
+        for symbol, details in updates.items():
+            market_result = details.get('market_result', {})
+            curve_result = details.get('curve_result', {})
+
+            if market_result and market_result.get('appended_rows', 0) > 0:
+                market_updates += 1
+                total_market_rows += market_result.get('appended_rows', 0)
+
+            if curve_result and curve_result.get('updated', False):
+                curve_updates += 1
+                # Count rows from curve result if available
+                curve_rows = curve_result.get('total_rows', 0)
+                if curve_rows > 0:
+                    total_curve_rows += curve_rows
+
+        # Print detailed summary
+        print("\n" + "="*70)
+        print("WEEKLY UPDATE COMPLETE")
+        print("="*70)
+        print(f"Total Time: {elapsed:.1f}s ({elapsed/60:.1f} minutes)")
+        print("")
+        print("COT Data:")
+        print(f"  • Total Rows Processed: {cot_rows:,}")
+        print(f"  • Tickers Successful: {cot_success}")
+        print(f"  • Tickers Failed: {len(cot_failed)}")
+        if cot_failed:
+            print(f"    Failed tickers: {', '.join(list(cot_failed.keys())[:5])}" +
+                  (" ..." if len(cot_failed) > 5 else ""))
+        print("")
+        print("Market Data:")
+        print(f"  • Symbols Processed: {total_symbols}")
+        print(f"  • Successful Updates: {market_updates}")
+        print(f"  • Total Rows Added: {total_market_rows:,}")
+        print("")
+        print("Curve Data:")
+        print(f"  • Curves Updated: {curve_updates}")
+        if total_curve_rows > 0:
+            print(f"  • Total Curve Rows: {total_curve_rows:,}")
+        print("")
+        if skipped:
+            print(f"Skipped Symbols: {len(skipped)}")
+            print(f"  {', '.join(skipped[:10])}" + (" ..." if len(skipped) > 10 else ""))
+            print("")
+        if errors:
+            print(f"Errors: {symbols_with_errors} symbols")
+            for symbol, error_dict in list(errors.items())[:5]:
+                if 'market' in error_dict:
+                    print(f"  • {symbol} (market): {error_dict['market'][:80]}")
+                if 'curve' in error_dict:
+                    print(f"  • {symbol} (curve): {error_dict['curve'][:80]}")
+            if len(errors) > 5:
+                print(f"  ... and {len(errors) - 5} more symbols with errors")
+            print("")
+        print("="*70 + "\n")
 
         scheduler.mark_success(summarize_update_summary(summary))
 
@@ -779,7 +958,287 @@ class DataClient:
                 return market_keys
         except Exception:
             return []
-    
+
+    def query_market_data(
+        self,
+        tickers: Optional[Union[str, Sequence[str]]] = None,
+        *,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        columns: Optional[Sequence[str]] = None,
+        resample: Optional[str] = None,
+        where: Optional[str] = None,
+        combine_datasets: bool = False,
+        daily: bool = False,
+        timeframe: Optional[str] = None
+    ) -> Union[pd.DataFrame, Dict[str, pd.DataFrame]]:
+        """
+        Advanced market data querying function with flexible filtering and aggregation.
+
+        Parameters:
+        -----------
+        tickers : str, sequence of str, or None
+            Ticker symbol(s) to query. If None, returns all available data.
+            Can use ticker symbols (e.g., 'ZC_F', 'CL_F') or commodity names (e.g., 'CORN', 'CRUDE_OIL').
+
+        start_date : str, optional
+            Start date filter in 'YYYY-MM-DD' format
+
+        end_date : str, optional
+            End date filter in 'YYYY-MM-DD' format
+
+        columns : sequence of str, optional
+            Specific columns to return. Returns all if not specified.
+
+        resample : str, optional
+            Pandas resampling frequency (e.g., 'D' for daily, 'W' for weekly, 'H' for hourly).
+            Automatically aggregates OHLC data appropriately.
+
+        where : str, optional
+            Custom pandas HDFStore where clause for advanced filtering.
+
+        combine_datasets : bool, default False
+            If True and multiple tickers requested, combines all data into single DataFrame.
+            If False, returns dict with ticker as keys.
+
+        daily : bool, default False
+            If True, queries daily resampled data from market/daily/* keys instead of raw data.
+            This is much faster for analysis requiring daily frequency data.
+
+        timeframe : str, optional
+            Specific timeframe to query from pre-resampled data (e.g., '5min', '15min', '1h').
+            Queries from market/{ticker}/{timeframe} keys.
+            Examples: '1min', '5min', '15min', '30min', '1h', '4h', 'daily'
+
+        Returns:
+        --------
+        pd.DataFrame or Dict[str, pd.DataFrame]
+            Market data matching the query criteria.
+            Returns DataFrame if single ticker or combine_datasets=True.
+            Returns Dict if multiple tickers and combine_datasets=False.
+
+        Examples:
+        ---------
+        >>> client = DataClient()
+
+        # Query single ticker
+        >>> df = client.query_market_data('ZC_F', start_date='2024-01-01', end_date='2024-12-31')
+
+        # Query multiple tickers with resampling
+        >>> data = client.query_market_data(['ZC_F', 'CL_F'], resample='D', columns=['Open', 'High', 'Low', 'Last'])
+
+        # Combine multiple tickers into single DataFrame
+        >>> df = client.query_market_data(['ZC_F', 'CL_F'], combine_datasets=True)
+
+        # Query by symbol name
+        >>> df = client.query_market_data('CORN', start_date='2024-06-01')
+
+        # Advanced filtering
+        >>> df = client.query_market_data('ZC_F', where='Volume > 1000', columns=['Open', 'High', 'Low', 'Last', 'Volume'])
+
+        # Query daily data (much faster for daily analysis)
+        >>> daily_df = client.query_market_data('ZC_F', daily=True, start_date='2024-01-01')
+
+        # Query multiple tickers with daily data
+        >>> daily_data = client.query_market_data(['ZC_F', 'CL_F'], daily=True, columns=['Open', 'High', 'Low', 'Last'])
+
+        # Query specific timeframe (5-minute bars)
+        >>> df_5min = client.query_market_data('CL_F', timeframe='5min', start_date='2024-01-01')
+
+        # Query multiple tickers with specific timeframe
+        >>> data_15min = client.query_market_data(['ZC_F', 'CL_F'], timeframe='15min')
+        """
+
+        self._ensure_weekly_updates()
+
+        # Handle ticker input
+        if isinstance(tickers, str):
+            tickers = [tickers]
+
+        market_keys: Optional[List[str]]
+        if tickers is None:
+            market_keys = None  # Determine after opening the store
+        else:
+            market_keys = []
+            for ticker in tickers:
+                # Ensure ticker has _F suffix (all market symbols end with _F)
+                ticker_upper = ticker.upper()
+                if not ticker_upper.endswith('_F'):
+                    ticker_upper = f"{ticker_upper}_F"
+
+                # Build market key
+                if ticker.startswith('market/'):
+                    market_keys.append(ticker)
+                else:
+                    if timeframe:
+                        # Query from specific timeframe sub-key: market/{ticker}/{timeframe}
+                        market_keys.append(f"market/{ticker_upper}/{timeframe}")
+                    elif daily:
+                        market_keys.append(f"market/daily/{ticker_upper}")
+                    else:
+                        market_keys.append(f"market/{ticker_upper}")
+
+        # Build where clause for date filtering
+        date_conditions = []
+        if start_date:
+            date_conditions.append(f"index >= '{start_date}'")
+        if end_date:
+            date_conditions.append(f"index <= '{end_date}'")
+
+        combined_where = None
+        if date_conditions and where:
+            combined_where = f"({' & '.join(date_conditions)}) & ({where})"
+        elif date_conditions:
+            combined_where = ' & '.join(date_conditions)
+        elif where:
+            combined_where = where
+
+        # Query data
+        results: Dict[str, pd.DataFrame] = {}
+        requested_count = len(market_keys) if market_keys is not None else 0
+
+        if not self.market_path.exists():
+            return pd.DataFrame() if requested_count == 1 or combine_datasets else {}
+
+        try:
+            with pd.HDFStore(self.market_path, "r") as store:
+                if market_keys is None:
+                    available_keys = [
+                        key.lstrip("/")
+                        for key in store.keys()
+                        if key.startswith("/market/")
+                    ]
+                    if daily:
+                        market_keys = [key for key in available_keys if key.startswith("market/daily/")]
+                    else:
+                        market_keys = [
+                            key
+                            for key in available_keys
+                            if key.startswith("market/") and not key.startswith("market/daily/")
+                        ]
+                requested_count = len(market_keys)
+
+                for market_key in market_keys:
+                    if market_key not in store:
+                        print(f"Warning: {market_key} not found in available data")
+                        continue
+
+                    try:
+                        df = store.select(
+                            market_key,
+                            where=combined_where,
+                            columns=columns,
+                        )
+
+                        # Apply resampling if requested
+                        if resample and len(df) > 0:
+                            df = self._resample_ohlc_data(df, resample)
+
+                        # Extract ticker name for results key
+                        if timeframe:
+                            # Remove market/{ticker}/{timeframe} -> extract ticker only
+                            ticker_name = market_key.replace('market/', '').split('/')[0]
+                        elif daily:
+                            ticker_name = market_key.replace('market/daily/', '')
+                        else:
+                            ticker_name = market_key.replace('market/', '')
+                        results[ticker_name] = df
+
+                    except Exception as e:
+                        print(f"Error querying {market_key}: {e}")
+                        continue
+        except Exception as e:
+            print(f"Error opening market data store: {e}")
+            return pd.DataFrame() if requested_count == 1 or combine_datasets else {}
+
+        # Return results
+        if not results:
+            return pd.DataFrame() if requested_count == 1 or combine_datasets else {}
+
+        if len(results) == 1 and not combine_datasets:
+            return list(results.values())[0]
+        elif combine_datasets:
+            return self._combine_market_datasets(results)
+        else:
+            return results
+
+    def _resample_ohlc_data(self, df: pd.DataFrame, freq: str) -> pd.DataFrame:
+        """
+        Resample OHLC data with appropriate aggregation rules.
+
+        Parameters:
+        -----------
+        df : pd.DataFrame
+            Market data with OHLC columns
+        freq : str
+            Pandas frequency string
+
+        Returns:
+        --------
+        pd.DataFrame
+            Resampled data
+        """
+        if len(df) == 0:
+            return df
+
+        # Define aggregation rules for different column types
+        agg_rules = {}
+
+        # OHLC aggregation
+        for col in df.columns:
+            col_lower = col.lower()
+            if col_lower in ['open']:
+                agg_rules[col] = 'first'
+            elif col_lower in ['high']:
+                agg_rules[col] = 'max'
+            elif col_lower in ['low']:
+                agg_rules[col] = 'min'
+            elif col_lower in ['last', 'close']:
+                agg_rules[col] = 'last'
+            elif col_lower in ['volume', 'bidvolume', 'askvolume']:
+                agg_rules[col] = 'sum'
+            elif col_lower in ['numberoftrades']:
+                agg_rules[col] = 'sum'
+            else:
+                # Default to mean for other numeric columns
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    agg_rules[col] = 'mean'
+                else:
+                    agg_rules[col] = 'first'
+
+        return df.resample(freq).agg(agg_rules).dropna()
+
+    def _combine_market_datasets(self, datasets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+        """
+        Combine multiple market ticker_sets into a single DataFrame.
+
+        Parameters:
+        -----------
+        ticker_sets : Dict[str, pd.DataFrame]
+            Dictionary of ticker -> DataFrame
+
+        Returns:
+        --------
+        pd.DataFrame
+            Combined DataFrame with MultiIndex columns (ticker, column)
+        """
+        if not datasets:
+            return pd.DataFrame()
+
+        if len(datasets) == 1:
+            return list(datasets.values())[0]
+
+        # Create MultiIndex columns
+        combined_data = {}
+        for ticker, df in datasets.items():
+            for col in df.columns:
+                combined_data[(ticker, col)] = df[col]
+
+        result = pd.DataFrame(combined_data)
+        result.columns = pd.MultiIndex.from_tuples(result.columns, names=['Ticker', 'Field'])
+
+        return result
+
     def get_market_summary(self, key: str) -> Dict[str, Any]:
         """
         Get summary information about a specific market dataset.
@@ -843,11 +1302,11 @@ class DataClient:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         columns: Optional[Sequence[str]] = None,
-
         resample: Optional[str] = None,
         where: Optional[str] = None,
         combine_datasets: bool = False,
-        daily: bool = False
+        daily: bool = False,
+        timeframe: Optional[str] = None
     ) -> Union[pd.DataFrame, Dict[str, pd.DataFrame]]:
         """
         Advanced market data querying function with flexible filtering and aggregation.
@@ -896,7 +1355,7 @@ class DataClient:
         # Query single ticker
         >>> df = client.query_market_data('ZC_F', start_date='2024-01-01', end_date='2024-12-31')
         
-        # Query multiple tickers with resampling  
+        # Query multiple tickers with resampling
         >>> data = client.query_market_data(['ZC_F', 'CL_F'], resample='D', columns=['Open', 'High', 'Low', 'Last'])
         
         # Combine multiple tickers into single DataFrame
@@ -936,11 +1395,14 @@ class DataClient:
                 if ticker.startswith('market/'):
                     market_keys.append(ticker)
                 else:
-                    if daily:
+                    if timeframe:
+                        # Query from specific timeframe sub-key: market/{ticker}/{timeframe}
+                        market_keys.append(f"market/{ticker_upper}/{timeframe}")
+                    elif daily:
                         market_keys.append(f"market/daily/{ticker_upper}")
                     else:
                         market_keys.append(f"market/{ticker_upper}")
-        
+
         # Build where clause for date filtering
         date_conditions = []
         if start_date:
@@ -998,7 +1460,10 @@ class DataClient:
                             df = self._resample_ohlc_data(df, resample)
 
                         # Extract ticker name for results key
-                        if daily:
+                        if timeframe:
+                            # Remove market/{ticker}/{timeframe} -> extract ticker only
+                            ticker_name = market_key.replace('market/', '').split('/')[0]
+                        elif daily:
                             ticker_name = market_key.replace('market/daily/', '')
                         else:
                             ticker_name = market_key.replace('market/', '')
@@ -1070,11 +1535,11 @@ class DataClient:
     
     def _combine_market_datasets(self, datasets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         """
-        Combine multiple market datasets into a single DataFrame.
+        Combine multiple market ticker_sets into a single DataFrame.
         
         Parameters:
         -----------
-        datasets : Dict[str, pd.DataFrame]
+        ticker_sets : Dict[str, pd.DataFrame]
             Dictionary of ticker -> DataFrame
             
         Returns:
@@ -1398,11 +1863,11 @@ class DataClient:
     
     def _combine_curve_datasets(self, datasets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         """
-        Combine multiple curve datasets into a single DataFrame.
+        Combine multiple curve ticker_sets into a single DataFrame.
         
         Parameters:
         -----------
-        datasets : Dict[str, pd.DataFrame]
+        ticker_sets : Dict[str, pd.DataFrame]
             Dictionary of curve_type -> DataFrame
             
         Returns:
@@ -2275,7 +2740,7 @@ class DataClient:
             # Show available daily data keys
             updated_keys = self.list_market_data()
             daily_keys = [key for key in updated_keys if key.startswith('market/daily/')]
-            print(f"\nTotal daily datasets now available: {len(daily_keys)}")
+            print(f"\nTotal daily ticker_sets now available: {len(daily_keys)}")
         
         return results
     

@@ -174,6 +174,14 @@ def _read_dly(path: str) -> pd.DataFrame:
     if date_col != 'date':
         df = df.rename(columns={date_col: 'date'})
 
+    # Filter out rows where date column contains contract codes (single letter + digits like F10, H25)
+    # These are not valid dates and should be excluded
+    if 'date' in df.columns:
+        # Keep only rows where date doesn't match contract code pattern (e.g., F10, H25, M06)
+        contract_code_pattern = r'^[A-Z]\d{2,}$'
+        is_contract_code = df['date'].astype(str).str.match(contract_code_pattern, case=False)
+        df = df[~is_contract_code]
+
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date"]).set_index("date").sort_index()
     return df
@@ -595,7 +603,7 @@ class DLYContractManager:
         *,
         file_paths: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
-        """Update existing HDF5 curve datasets with the latest .dly data."""
+        """Update existing HDF5 curve ticker_sets with the latest .dly data."""
 
         # Check existing data structure to preserve column count
         existing_max_buckets = None
