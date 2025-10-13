@@ -166,7 +166,9 @@ class HistoricalScreener:
         sess_end_mins: Optional[int] = None,
         test_vol: bool = True,
         months: Optional[List[int]] = None,
-        season: Optional[str] = None
+        season: Optional[str] = None,
+        _selected_months: Optional[List[int]] = None,
+        _precomputed_sessions: Optional[Dict[str, Dict[str, any]]] = None
     ) -> Dict[str, Dict[str, any]]:
         """
         Screen for intraday momentum patterns across multiple sessions.
@@ -199,6 +201,10 @@ class HistoricalScreener:
             - spring: Mar, Apr, May (3, 4, 5)
             - summer: Jun, Jul, Aug (6, 7, 8)
             - fall: Sep, Oct, Nov (9, 10, 11)
+        _selected_months : Optional[List[int]]
+            Internal override for month selection when using cached data.
+        _precomputed_sessions : Optional[Dict[str, Dict[str, any]]]
+            Pre-filtered session data keyed by ticker for performance.
 
         Returns:
         --------
@@ -223,8 +229,12 @@ class HistoricalScreener:
         """
         session_starts, session_ends = self._convert_times(session_starts, session_ends)
 
-        # Determine which months to analyze
-        selected_months = self._parse_season_months(months, season)
+        # Determine which months to analyze (allow override when precomputed)
+        selected_months = (
+            _selected_months
+            if _selected_months is not None
+            else self._parse_season_months(months, season)
+        )
 
         # Default closing window to match opening window
         if sess_end_hrs is None:
@@ -234,39 +244,76 @@ class HistoricalScreener:
 
         results = {}
 
+        precomputed_sessions = _precomputed_sessions or {}
+
         for t in self.tickers:
-            # Get data for this ticker
-            is_synthetic = self.synthetic_tickers.get(t, False)
+            cache_entry = precomputed_sessions.get(t)
 
-            if is_synthetic:
-                synthetic_obj = self.data[t]
-                ticker_data = synthetic_obj.price if hasattr(synthetic_obj, 'price') else synthetic_obj.data_engine.build_spread_series(return_ohlc=True)
-            else:
-                ticker_data = self.data[t]
+            if cache_entry:
+                is_synthetic = cache_entry.get('is_synthetic', self.synthetic_tickers.get(t, False))
+                ticker_data = cache_entry.get('data')
+                price_col = cache_entry.get('price_col')
+                filtered_months_label = cache_entry.get('filtered_months', selected_months if selected_months else 'all')
+                n_observations = cache_entry.get('n_observations', len(ticker_data) if ticker_data is not None else 0)
 
-            if ticker_data.empty:
-                results[t] = {'error': 'No data available'}
-                continue
-
-            # Filter by months/season if specified
-            if selected_months is not None:
-                ticker_data = self._filter_by_months(ticker_data, selected_months)
-                if ticker_data.empty:
+                if ticker_data is None or ticker_data.empty:
                     results[t] = {
-                        'error': 'No data available for selected months/season',
-                        'selected_months': selected_months
+                        'error': cache_entry.get('error', 'No data available'),
+                        'filtered_months': filtered_months_label,
+                        'ticker': t,
+                        'is_synthetic': is_synthetic
                     }
+                    if selected_months is not None:
+                        results[t]['selected_months'] = selected_months
                     continue
+            else:
+                # Get data for this ticker
+                is_synthetic = self.synthetic_tickers.get(t, False)
+
+                if is_synthetic:
+                    synthetic_obj = self.data[t]
+                    ticker_data = synthetic_obj.price if hasattr(synthetic_obj, 'price') else synthetic_obj.data_engine.build_spread_series(return_ohlc=True)
+                else:
+                    ticker_data = self.data[t]
+
+                if ticker_data.empty:
+                    results[t] = {'error': 'No data available'}
+                    continue
+
+                # Filter by months/season if specified
+                if selected_months is not None:
+                    ticker_data = self._filter_by_months(ticker_data, selected_months)
+                    if ticker_data.empty:
+                        results[t] = {
+                            'error': 'No data available for selected months/season',
+                            'selected_months': selected_months
+                        }
+                        continue
+
+                price_col = 'Close' if 'Close' in ticker_data.columns else ticker_data.columns[0]
+                filtered_months_label = selected_months if selected_months else 'all'
+                n_observations = len(ticker_data)
+
+            if price_col is None and ticker_data is not None:
+                price_col = 'Close' if 'Close' in ticker_data.columns else ticker_data.columns[0]
 
             ticker_results = {
                 'ticker': t,
                 'is_synthetic': is_synthetic,
-                'n_observations': len(ticker_data),
-                'filtered_months': selected_months if selected_months else 'all'
+                'n_observations': n_observations,
+                'filtered_months': filtered_months_label
             }
 
             for i, (start_time, end_time) in enumerate(zip(session_starts, session_ends)):
                 session_key = f"session_{i}"
+
+                # Use pre-filtered session data when available
+                session_df = None
+                if cache_entry and 'sessions' in cache_entry:
+                    session_df = cache_entry['sessions'].get((start_time, end_time))
+
+                if session_df is None and ticker_data is not None:
+                    session_df = self._extract_session_data(ticker_data, start_time, end_time, price_col)
 
                 # Perform session momentum analysis with filtered data
                 momentum_stats = self._session_momentum_analysis(
@@ -279,7 +326,10 @@ class HistoricalScreener:
                     end_mins=sess_end_mins,
                     momentum_days=st_momentum_days,
                     test_vol=test_vol,
-                    data=ticker_data  # Pass filtered data
+                    data=ticker_data,
+                    session_data=session_df,
+                    price_col=price_col,
+                    is_synthetic=is_synthetic
                 )
 
                 ticker_results[session_key] = momentum_stats
@@ -435,6 +485,66 @@ class HistoricalScreener:
 
         return results
 
+    def _prepare_momentum_session_cache(
+        self,
+        session_pairs: Tuple[Tuple[time, time], ...],
+        selected_months: Optional[List[int]]
+    ) -> Dict[str, Dict[str, any]]:
+        """Pre-filter ticker data for momentum screens to avoid redundant work."""
+        cache: Dict[str, Dict[str, any]] = {}
+
+        for ticker in self.tickers:
+            is_synthetic = self.synthetic_tickers.get(ticker, False)
+
+            if is_synthetic:
+                synthetic_obj = self.data[ticker]
+                base_data = synthetic_obj.price if hasattr(synthetic_obj, 'price') else synthetic_obj.data_engine.build_spread_series(return_ohlc=True)
+            else:
+                base_data = self.data[ticker]
+
+            if base_data.empty:
+                cache[ticker] = {
+                    'data': None,
+                    'is_synthetic': is_synthetic,
+                    'filtered_months': selected_months if selected_months else 'all',
+                    'error': 'No data available'
+                }
+                continue
+
+            filtered_data = base_data
+            if selected_months is not None:
+                filtered_data = self._filter_by_months(base_data, selected_months)
+                if filtered_data.empty:
+                    cache[ticker] = {
+                        'data': None,
+                        'is_synthetic': is_synthetic,
+                        'filtered_months': selected_months,
+                        'error': 'No data available for selected months/season'
+                    }
+                    continue
+
+            price_col = 'Close' if 'Close' in filtered_data.columns else filtered_data.columns[0]
+
+            session_map: Dict[Tuple[time, time], pd.DataFrame] = {}
+            for session_start, session_end in session_pairs:
+                session_map[(session_start, session_end)] = self._extract_session_data(
+                    filtered_data,
+                    session_start,
+                    session_end,
+                    price_col
+                )
+
+            cache[ticker] = {
+                'data': filtered_data,
+                'is_synthetic': is_synthetic,
+                'price_col': price_col,
+                'sessions': session_map,
+                'n_observations': len(filtered_data),
+                'filtered_months': selected_months if selected_months else 'all'
+            }
+
+        return cache
+
     def run_screens(
         self,
         screen_params: List[ScreenParams],
@@ -453,6 +563,12 @@ class HistoricalScreener:
             List of ScreenParams objects defining each screen to run
         output_format : str, default 'dict'
             Output format: 'dict' returns nested dictionary, 'dataframe' returns flat DataFrame
+
+        Notes
+        -----
+        Momentum screens share cached session slices when possible so running
+        multiple configurations with overlapping hours avoids redundant
+        filtering.
 
         Returns
         -------
@@ -491,10 +607,29 @@ class HistoricalScreener:
         >>> results = screener.run_screens(screens)
         """
         composite_results = {}
+        momentum_cache: Dict[Tuple[Tuple[time, time], Tuple[time, time], Optional[Tuple[int, ...]]], Dict[str, Dict[str, any]]] = {}
 
         for params in screen_params:
-            # Parse parameters and run appropriate screen
-            screen_result = self._parse_params(params)
+            if params.screen_type == 'momentum':
+                session_starts, session_ends = self._convert_times(params.session_starts, params.session_ends)
+                selected_months = self._parse_season_months(params.months, params.season)
+                session_pairs = tuple(zip(session_starts, session_ends))
+                months_key = tuple(selected_months) if selected_months else None
+                cache_key = (tuple(session_starts), tuple(session_ends), months_key)
+
+                if cache_key not in momentum_cache:
+                    momentum_cache[cache_key] = self._prepare_momentum_session_cache(session_pairs, selected_months)
+
+                screen_result = self._parse_params(
+                    params,
+                    session_starts=session_starts,
+                    session_ends=session_ends,
+                    _selected_months=selected_months,
+                    _precomputed_sessions=momentum_cache[cache_key]
+                )
+            else:
+                # Parse parameters and run appropriate screen
+                screen_result = self._parse_params(params)
 
             # Store results with the screen name as key
             composite_results[params.name] = screen_result
@@ -507,7 +642,7 @@ class HistoricalScreener:
         else:
             raise ValueError(f"output_format must be 'dict' or 'dataframe', got '{output_format}'")
 
-    def _parse_params(self, params: ScreenParams) -> Dict[str, Dict]:
+    def _parse_params(self, params: ScreenParams, **kwargs) -> Dict[str, Dict]:
         """
         Parse ScreenParams and execute the appropriate screening method.
 
@@ -515,6 +650,8 @@ class HistoricalScreener:
         ----------
         params : ScreenParams
             Screen configuration parameters
+        **kwargs : dict
+            Additional keyword arguments forwarded to the underlying screen method.
 
         Returns
         -------
@@ -527,10 +664,16 @@ class HistoricalScreener:
             If screen_type is invalid or required parameters are missing
         """
         if params.screen_type == 'momentum':
+            momentum_kwargs = dict(kwargs)
+            override_session_starts = momentum_kwargs.pop('session_starts', params.session_starts)
+            override_session_ends = momentum_kwargs.pop('session_ends', params.session_ends)
+            selected_months_override = momentum_kwargs.pop('_selected_months', None)
+            precomputed_sessions = momentum_kwargs.pop('_precomputed_sessions', None)
+
             # Run momentum screen with provided parameters
             return self.intraday_momentum_screen(
-                session_starts=params.session_starts,
-                session_ends=params.session_ends,
+                session_starts=override_session_starts,
+                session_ends=override_session_ends,
                 st_momentum_days=params.st_momentum_days,
                 sess_start_hrs=params.sess_start_hrs,
                 sess_start_minutes=params.sess_start_minutes,
@@ -538,7 +681,10 @@ class HistoricalScreener:
                 sess_end_mins=params.sess_end_mins,
                 test_vol=params.test_vol,
                 months=params.months,
-                season=params.season
+                season=params.season,
+                _selected_months=selected_months_override,
+                _precomputed_sessions=precomputed_sessions,
+                **momentum_kwargs
             )
 
         elif params.screen_type == 'seasonality':
@@ -655,7 +801,10 @@ class HistoricalScreener:
         end_mins: Optional[int] = None,
         momentum_days: int = 3,
         test_vol: bool = True,
-        data: Optional[pd.DataFrame] = None
+        data: Optional[pd.DataFrame] = None,
+        session_data: Optional[pd.DataFrame] = None,
+        price_col: Optional[str] = None,
+        is_synthetic: Optional[bool] = None
     ) -> Dict[str, any]:
         """
         Analyze momentum patterns for a specific trading session.
@@ -690,6 +839,12 @@ class HistoricalScreener:
             Whether to analyze volume patterns
         data : Optional[pd.DataFrame]
             Pre-filtered data to use (e.g., month-filtered). If None, loads from self.data
+        session_data : Optional[pd.DataFrame]
+            Pre-filtered session slice to avoid recomputing within the method.
+        price_col : Optional[str]
+            Column to use for price data; inferred if not supplied.
+        is_synthetic : Optional[bool]
+            Override for synthetic ticker detection when data already provided.
 
         Returns:
         --------
@@ -698,26 +853,27 @@ class HistoricalScreener:
         """
         # Get data for this ticker if not provided
         if data is None:
-            is_synthetic = self.synthetic_tickers.get(ticker, False)
+            # Load data when not provided
+            resolved_is_synthetic = self.synthetic_tickers.get(ticker, False) if is_synthetic is None else is_synthetic
 
-            if is_synthetic:
+            if resolved_is_synthetic:
                 # Extract price data from SyntheticSymbol
                 synthetic_obj = self.data[ticker]
                 data = synthetic_obj.price if hasattr(synthetic_obj, 'price') else synthetic_obj.data_engine.build_spread_series(return_ohlc=True)
             else:
                 data = self.data[ticker]
+
+            is_synthetic = resolved_is_synthetic
         else:
-            # If data is provided, determine synthetic status from the ticker
-            is_synthetic = self.synthetic_tickers.get(ticker, False)
+            # If data is provided, determine synthetic status from the ticker when not supplied
+            if is_synthetic is None:
+                is_synthetic = self.synthetic_tickers.get(ticker, False)
 
         if data.empty:
             return {'error': 'No data available', 'ticker': ticker}
 
         # Determine price column based on data type
-        if is_synthetic:
-            # For synthetic spreads, use 'Close' column or the spread value itself
-            price_col = 'Close' if 'Close' in data.columns else data.columns[0]
-        else:
+        if price_col is None:
             price_col = 'Close' if 'Close' in data.columns else data.columns[0]
 
         # Create time windows
@@ -725,12 +881,14 @@ class HistoricalScreener:
         closing_window = timedelta(hours=end_hrs or start_hrs, minutes=end_mins or start_mins)
 
         # Extract session data using time of day filtering
-        daily_sessions = self._extract_session_data(
-            data,
-            session_start,
-            session_end,
-            price_col
-        )
+        daily_sessions = session_data
+        if daily_sessions is None:
+            daily_sessions = self._extract_session_data(
+                data,
+                session_start,
+                session_end,
+                price_col
+            )
 
         if daily_sessions.empty:
             return {'error': 'No session data found', 'ticker': ticker}
