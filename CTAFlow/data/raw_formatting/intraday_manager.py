@@ -156,6 +156,9 @@ class IntradayFileManager:
         # Cache for discovered files
         self._scid_files: Dict[str, List[Path]] = {}
 
+        # Lazily instantiated readers (construction can be expensive)
+        self._scid_reader: Optional[ScidReader] = None
+
         # Initialize DataClient for HDF5
         self.data_client = DataClient(market_path=self.market_data_path)
 
@@ -203,6 +206,17 @@ class IntradayFileManager:
             total_files = sum(len(files) for files in mapping.values())
             self.logger.info(f"Discovered {total_files} SCID files for {len(mapping)} symbols")
 
+    def _get_scid_reader(self) -> Optional[ScidReader]:
+        """Reuse a single ScidReader instance to avoid repeated initialization cost."""
+        if self._scid_reader is None:
+            try:
+                self._scid_reader = ScidReader(self.data_path)
+            except Exception as exc:
+                if self.logger:
+                    self.logger.error(f"Failed to initialise ScidReader for {self.data_path}: {exc}")
+                self._scid_reader = None
+        return self._scid_reader
+
     def get_available_symbols(self) -> List[str]:
         """Get list of symbols with available SCID files."""
         return list(self._scid_files.keys())
@@ -245,8 +259,10 @@ class IntradayFileManager:
             self.logger.info(f"Loading front month series for {symbol} from {len(scid_files)} files")
 
         try:
-            # Initialize ScidReader with directory
-            reader = ScidReader(self.data_path)
+            # Initialize ScidReader with directory (reuse cached instance when possible)
+            reader = self._get_scid_reader()
+            if reader is None:
+                return pd.DataFrame(), None
 
             # Convert file paths to strings for load_scid_files
             file_paths = [str(f) for f in scid_files]
@@ -317,7 +333,9 @@ class IntradayFileManager:
 
         try:
             file_paths = [str(f) for f in scid_files]
-            reader = ScidReader(self.data_path)
+            reader = self._get_scid_reader()
+            if reader is None:
+                return pd.DataFrame()
 
             # Load all files - returns Dict[str, pd.DataFrame]
             file_dict = reader.load_scid_files(
