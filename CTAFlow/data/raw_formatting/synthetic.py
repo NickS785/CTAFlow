@@ -172,6 +172,7 @@ UNIT_CONVERSIONS = {
     ('$/bu', '$/mt'): None,  # Requires symbol type
     ('$/mt', '$/bu'): None,  # Requires symbol type
     ('cents/bu', '$/mt'): None,  # Requires symbol type
+    ('cents/bu', '$/ton'): None,  # Requires symbol type (bushel weight varies by commodity)
 
     # Cents to dollar conversions
     ('cents/bu', '$/bu'): 0.01,
@@ -241,9 +242,42 @@ def convert_units(value: float, from_unit: str, to_unit: str, symbol: Optional[s
         if factor is None:
             if symbol is None:
                 raise ValueError(f"Conversion {from_unit} -> {to_unit} requires symbol specification")
+
             # Handle bushel conversions (requires symbol-specific logic)
-            # This would need integration with bushels_to_metric_tons
-            raise NotImplementedError(f"Bushel conversions not yet implemented in this context")
+            if not HAS_CONVERSIONS:
+                raise NotImplementedError(
+                    f"Bushel conversions require CTAFlow.utils.unit_conversions module"
+                )
+
+            # Extract commodity name from symbol
+            _, commodity = detect_contract_unit(symbol)
+
+            # Handle cents/bu -> $/ton conversion
+            if key == ('cents/bu', '$/ton'):
+                # Convert cents to dollars first, then bushels to metric tons, then to short tons
+                # 1 metric ton = 1.10231 short tons
+                dollars_per_bu = value * 0.01  # cents to dollars
+                metric_tons = bushels_to_metric_tons(1.0, commodity)  # Get MT per bushel
+                short_tons_per_bushel = metric_tons * 1.10231  # Convert MT to short tons
+                return dollars_per_bu / short_tons_per_bushel  # $/bu / (short tons/bu) = $/ton
+
+            # Handle $/bu -> $/mt conversion
+            elif key == ('$/bu', '$/mt'):
+                metric_tons_per_bushel = bushels_to_metric_tons(1.0, commodity)
+                return value / metric_tons_per_bushel
+
+            # Handle $/mt -> $/bu conversion
+            elif key == ('$/mt', '$/bu'):
+                metric_tons_per_bushel = bushels_to_metric_tons(1.0, commodity)
+                return value * metric_tons_per_bushel
+
+            # Handle cents/bu -> $/mt conversion
+            elif key == ('cents/bu', '$/mt'):
+                dollars_per_bu = value * 0.01
+                metric_tons_per_bushel = bushels_to_metric_tons(1.0, commodity)
+                return dollars_per_bu / metric_tons_per_bushel
+            else:
+                raise NotImplementedError(f"Bushel conversion {from_unit} -> {to_unit} not implemented")
         return value * factor
 
     raise ValueError(f"Unknown unit conversion: {from_unit} -> {to_unit}")
@@ -1204,7 +1238,7 @@ class IntradayLeg:
                        base_weight: float = 1.0,
                        start_date: Optional[str] = None,
                        end_date: Optional[str] = None,
-                       resample_rule='5min',
+                       resample_rule='1T',
                        **kwargs):
         if not path:
             path = str(DLY_DATA_PATH)
@@ -1611,7 +1645,7 @@ class SyntheticSymbol:
             path: Optional[str] = None,
             start_date: Optional[str] = None,
             end_date: Optional[str] = None,
-            resample_rule: str = '5min',
+            resample_rule: str = '1T',
             ticker: Optional[str] = None,
             full_name: Optional[str] = None,
             spread_type: str = "product",
@@ -1634,8 +1668,8 @@ class SyntheticSymbol:
         end_date : str, optional
             End date for data filtering (ISO format: 'YYYY-MM-DD')
         resample_rule : str
-            Resampling rule for tick data (default: '5min')
-            Examples: '1T' (1-minute), '5T' (5-minute), '1H' (hourly)
+            Resampling rule for tick data (default: '1T' for 1-minute bars)
+            Examples: '30S' (30-second), '1T' (1-minute), '5T' (5-minute), '1H' (hourly)
         ticker : str, optional
             Custom ticker symbol for the spread (auto-generated if None)
         full_name : str, optional
@@ -1929,3 +1963,90 @@ class SyntheticSymbol:
                 resample_kwargs = {}
 
             return spread_series.resample(resample_rule, **resample_kwargs).last()
+
+    def save_to_hdf(
+        self,
+        ticker: Optional[str] = None,
+        client: Optional[DataClient] = None
+    ) -> None:
+        """
+        Save this SyntheticSymbol to HDF5 storage via DataClient.
+
+        Uses DataClient.save_synthetic_symbol() under the hood with proper
+        storage structure: market/synthetic/{ticker}
+
+        Parameters:
+        -----------
+        ticker : str, optional
+            Ticker symbol for storage. If None, uses self.ticker
+        client : DataClient, optional
+            DataClient instance to use. If None, creates new instance.
+
+        Examples:
+        ---------
+        >>> weights = {'CL_F': 3.0, 'HO_F': -2.0, 'RB_F': -1.0}
+        >>> crack = SyntheticSymbol.from_weights_dict(weights, ticker='CRACK_321')
+        >>> crack.save_to_hdf()  # Saves to market/synthetic/CRACK_321
+        >>> crack.save_to_hdf(ticker='CRACK_CUSTOM')  # Override ticker
+        """
+        if client is None:
+            client = DataClient()
+
+        client.save_synthetic_symbol(self, ticker=ticker)
+
+    @classmethod
+    def load_from_dclient(
+        cls,
+        ticker: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        reconstruct: bool = True,
+        client: Optional[DataClient] = None
+    ) -> 'SyntheticSymbol':
+        """
+        Load SyntheticSymbol from DataClient storage.
+
+        Reconstructs the full object by reloading legs from market data
+        if reconstruct=True (default).
+
+        Parameters:
+        -----------
+        ticker : str
+            Ticker symbol of stored synthetic spread
+        start_date : str, optional
+            Start date for filtering (ISO format: 'YYYY-MM-DD')
+        end_date : str, optional
+            End date for filtering (ISO format: 'YYYY-MM-DD')
+        reconstruct : bool
+            If True (default), reconstructs full SyntheticSymbol by reloading legs.
+            If False, returns faster but with limited functionality.
+        client : DataClient, optional
+            DataClient instance to use. If None, creates new instance.
+
+        Returns:
+        --------
+        SyntheticSymbol
+            Loaded and reconstructed synthetic symbol
+
+        Examples:
+        ---------
+        >>> # Load full synthetic symbol with all legs reconstructed
+        >>> crack = SyntheticSymbol.load_from_dclient('CRACK_321')
+        >>> print(crack.price.head())
+
+        >>> # Load with date filtering
+        >>> crack_2024 = SyntheticSymbol.load_from_dclient(
+        ...     'CRACK_321',
+        ...     start_date='2024-01-01',
+        ...     end_date='2024-12-31'
+        ... )
+        """
+        if client is None:
+            client = DataClient()
+
+        return client.load_synthetic_symbol(
+            ticker=ticker,
+            start_date=start_date,
+            end_date=end_date,
+            reconstruct=reconstruct
+        )

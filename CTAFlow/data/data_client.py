@@ -959,6 +959,410 @@ class DataClient:
         except Exception:
             return []
 
+    # ---------------------------------------------------------------------
+    # Synthetic Symbol Storage
+    # ---------------------------------------------------------------------
+    def save_synthetic_symbol(
+        self,
+        synthetic: 'SyntheticSymbol',
+        ticker: Optional[str] = None,
+        replace: bool = True
+    ) -> None:
+        """
+        Save SyntheticSymbol to HDF5 storage.
+
+        Stores under market/synthetic/{ticker} with sub-keys:
+        - price: Main spread price series (pd.Series or pd.DataFrame)
+        - legs_data: Individual leg data (pd.DataFrame with MultiIndex columns)
+        - metadata: Configuration dict (weights, reference_unit, leg_symbols, etc.)
+        - volume: Volume data if available (for intraday spreads)
+
+        Parameters:
+        -----------
+        synthetic : SyntheticSymbol
+            SyntheticSymbol instance to save
+        ticker : str, optional
+            Ticker symbol for storage. If None, uses synthetic.ticker
+        replace : bool
+            If True, replace existing data. If False, raise error if exists.
+
+        Examples:
+        ---------
+        >>> from CTAFlow.data.raw_formatting.synthetic import SyntheticSymbol
+        >>> weights = {'CL_F': 3.0, 'HO_F': -2.0, 'RB_F': -1.0}
+        >>> crack = SyntheticSymbol.from_weights_dict(weights, ticker='CRACK_321')
+        >>> client = DataClient()
+        >>> client.save_synthetic_symbol(crack)
+        """
+        # Import here to avoid circular dependency
+        from ..data.raw_formatting.synthetic import SyntheticSymbol as SynthSymbol
+
+        if not isinstance(synthetic, SynthSymbol):
+            raise TypeError(f"Expected SyntheticSymbol, got {type(synthetic)}")
+
+        # Determine ticker
+        ticker = ticker or synthetic.ticker
+        if not ticker:
+            raise ValueError("Ticker must be provided either as argument or in synthetic.ticker")
+
+        # Check if exists and handle replace flag
+        base_key = f"market/synthetic/{ticker}"
+        if not replace and self.market_key_exists(f"{base_key}/metadata"):
+            raise ValueError(f"Synthetic symbol '{ticker}' already exists. Set replace=True to overwrite.")
+
+        # 1. Save price data (Series or DataFrame)
+        if synthetic.price is not None:
+            price_df = synthetic.price if isinstance(synthetic.price, pd.DataFrame) else synthetic.price.to_frame('Close')
+            self.write_market(price_df, f"{base_key}/price", replace=replace)
+
+        # 2. Save legs data (MultiIndex DataFrame)
+        if hasattr(synthetic, 'legs_df') and synthetic.legs_df is not None and not synthetic.legs_df.empty:
+            self.write_market(synthetic.legs_df, f"{base_key}/legs_data", replace=replace)
+
+        # 3. Save metadata as DataFrame (HDF5 doesn't store dicts directly)
+        metadata = {
+            'ticker': ticker,
+            'full_name': synthetic.full_name,
+            'type': synthetic.type,
+            'intraday': synthetic.intraday,
+        }
+
+        # Extract leg information
+        leg_symbols = []
+        leg_weights = []
+        for leg in synthetic.legs:
+            if hasattr(leg, 'symbol'):
+                leg_symbols.append(leg.symbol)
+                leg_weights.append(leg.base_weight)
+
+        metadata['leg_symbols'] = ','.join(leg_symbols)  # Store as comma-separated string
+        metadata['leg_weights'] = ','.join(map(str, leg_weights))  # Store as comma-separated string
+
+        # Get reference unit from engine
+        if hasattr(synthetic.data_engine, 'reference_unit'):
+            metadata['reference_unit'] = synthetic.data_engine.reference_unit
+
+        # Convert metadata dict to single-row DataFrame for HDF5 storage
+        metadata_df = pd.DataFrame([metadata])
+        metadata_df.index = pd.DatetimeIndex([pd.Timestamp.now()])  # Add timestamp index
+        self.write_market(metadata_df, f"{base_key}/metadata", replace=replace)
+
+        # 4. Save volume data if available (for intraday spreads)
+        if hasattr(synthetic, 'volume_data') and synthetic.volume_data is not None:
+            if isinstance(synthetic.volume_data, pd.DataFrame) and not synthetic.volume_data.empty:
+                self.write_market(synthetic.volume_data, f"{base_key}/volume", replace=replace)
+
+        print(f"[DataClient] Saved synthetic symbol '{ticker}' to {base_key}")
+
+    def load_synthetic_symbol(
+        self,
+        ticker: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        reconstruct: bool = False
+    ) -> Union['SyntheticSymbol', Dict[str, Any]]:
+        """
+        Load SyntheticSymbol from HDF5 storage.
+
+        Parameters:
+        -----------
+        ticker : str
+            Synthetic symbol ticker
+        start_date : str, optional
+            Start date for filtering (ISO format)
+        end_date : str, optional
+            End date for filtering (ISO format)
+        reconstruct : bool
+            If True, reconstructs full SyntheticSymbol object by reloading legs.
+            If False, returns dict with price, legs_data, metadata only (faster).
+
+        Returns:
+        --------
+        SyntheticSymbol or Dict
+            Full SyntheticSymbol object if reconstruct=True
+            Dict with 'price', 'legs_data', 'metadata', 'volume' keys if False
+
+        Examples:
+        ---------
+        >>> client = DataClient()
+        >>> # Fast loading (metadata + prices only)
+        >>> data = client.load_synthetic_symbol('CRACK_321', reconstruct=False)
+        >>> print(data['metadata']['leg_symbols'])
+
+        >>> # Full reconstruction
+        >>> synthetic = client.load_synthetic_symbol('CRACK_321', reconstruct=True)
+        >>> print(synthetic.price.head())
+        """
+        base_key = f"market/synthetic/{ticker}"
+
+        # Check if exists
+        if not self.market_key_exists(f"{base_key}/metadata"):
+            raise ValueError(f"Synthetic symbol '{ticker}' not found in storage")
+
+        # Load metadata
+        metadata_df = self.query_market_data(
+            tickers=[f"synthetic/{ticker}/metadata"],
+            start_date=start_date,
+            end_date=end_date
+        )
+
+        if isinstance(metadata_df, dict):
+            metadata_df = metadata_df.get(f"synthetic/{ticker}/metadata")
+
+        if metadata_df is None or metadata_df.empty:
+            raise ValueError(f"Could not load metadata for synthetic symbol '{ticker}'")
+
+        # Extract metadata from last row
+        metadata_row = metadata_df.iloc[-1]
+        metadata = metadata_row.to_dict()
+
+        # Parse leg symbols and weights from comma-separated strings
+        if 'leg_symbols' in metadata and isinstance(metadata['leg_symbols'], str):
+            metadata['leg_symbols'] = metadata['leg_symbols'].split(',')
+        if 'leg_weights' in metadata and isinstance(metadata['leg_weights'], str):
+            metadata['leg_weights'] = [float(w) for w in metadata['leg_weights'].split(',')]
+
+        # Load price data
+        price_data = self.query_market_data(
+            tickers=[f"synthetic/{ticker}/price"],
+            start_date=start_date,
+            end_date=end_date
+        )
+
+        if isinstance(price_data, dict):
+            price_data = price_data.get(f"synthetic/{ticker}/price")
+
+        # Load legs data if available
+        legs_data = None
+        if self.market_key_exists(f"{base_key}/legs_data"):
+            legs_data = self.query_market_data(
+                tickers=[f"synthetic/{ticker}/legs_data"],
+                start_date=start_date,
+                end_date=end_date
+            )
+            if isinstance(legs_data, dict):
+                legs_data = legs_data.get(f"synthetic/{ticker}/legs_data")
+
+        # Load volume data if available
+        volume_data = None
+        if self.market_key_exists(f"{base_key}/volume"):
+            volume_data = self.query_market_data(
+                tickers=[f"synthetic/{ticker}/volume"],
+                start_date=start_date,
+                end_date=end_date
+            )
+            if isinstance(volume_data, dict):
+                volume_data = volume_data.get(f"synthetic/{ticker}/volume")
+
+        # Fast mode: return dict
+        if not reconstruct:
+            return {
+                'price': price_data,
+                'legs_data': legs_data,
+                'metadata': metadata,
+                'volume': volume_data
+            }
+
+        # Reconstruction mode: rebuild SyntheticSymbol
+        # Import here to avoid circular dependency
+        from ..data.raw_formatting.synthetic import SyntheticSymbol, IntradayLeg, CrossSpreadLeg
+        from ..data.raw_formatting.spread_manager import SpreadData
+
+        leg_symbols = metadata.get('leg_symbols', [])
+        leg_weights = metadata.get('leg_weights', [])
+        is_intraday = metadata.get('intraday', False)
+
+        if not leg_symbols or not leg_weights:
+            raise ValueError(f"Metadata missing leg_symbols or leg_weights for '{ticker}'")
+
+        # Reload legs from market data
+        legs = []
+        for symbol, weight in zip(leg_symbols, leg_weights):
+            if is_intraday:
+                # Load as IntradayLeg
+                leg = IntradayLeg.load_from_dclient(
+                    symbol=symbol,
+                    base_weight=weight,
+                    start_date=start_date,
+                    end_date=end_date,
+                    daily=False
+                )
+            else:
+                # Load as CrossSpreadLeg
+                leg = CrossSpreadLeg.load_from_dclient(
+                    symbol=symbol,
+                    base_weight=weight,
+                    start_date=start_date,
+                    end_date=end_date
+                )
+            legs.append(leg)
+
+        # Reconstruct SyntheticSymbol
+        synthetic = SyntheticSymbol(
+            legs=legs,
+            type=metadata.get('type', 'product'),
+            ticker=ticker,
+            full_name=metadata.get('full_name', ticker),
+            intraday=is_intraday
+        )
+
+        # Restore volume data if available
+        if volume_data is not None:
+            synthetic.volume_data = volume_data
+
+        return synthetic
+
+    def query_synthetic_symbols(
+        self,
+        tickers: Optional[Union[str, List[str]]] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        include_metadata: bool = True
+    ) -> Union[pd.DataFrame, Dict[str, pd.DataFrame]]:
+        """
+        Query synthetic symbol price data with optional metadata.
+
+        Similar to query_market_data but for synthetic spreads stored under
+        market/synthetic/{ticker} keys.
+
+        Parameters:
+        -----------
+        tickers : str or List[str], optional
+            Ticker symbol(s) to query. If None, returns all synthetic symbols.
+        start_date : str, optional
+            Start date filter (ISO format)
+        end_date : str, optional
+            End date filter (ISO format)
+        include_metadata : bool
+            If True, includes metadata DataFrame in results
+
+        Returns:
+        --------
+        pd.DataFrame or Dict[str, pd.DataFrame]
+            Price data for requested synthetic symbols.
+            If single ticker: returns DataFrame
+            If multiple tickers: returns dict with ticker keys
+
+        Examples:
+        ---------
+        >>> client = DataClient()
+        >>> # Query single synthetic
+        >>> df = client.query_synthetic_symbols('CRACK_321', start_date='2024-01-01')
+        >>> # Query multiple synthetics
+        >>> data = client.query_synthetic_symbols(['CRACK_321', 'ZC_ZS'])
+        """
+        # Handle ticker input
+        if isinstance(tickers, str):
+            tickers = [tickers]
+
+        # If no tickers specified, list all available
+        if tickers is None:
+            tickers = self.list_synthetic_symbols()
+
+        if not tickers:
+            return {}
+
+        # Build market keys for each ticker
+        price_keys = [f"synthetic/{ticker}/price" for ticker in tickers]
+
+        # Query price data
+        results = self.query_market_data(
+            tickers=price_keys,
+            start_date=start_date,
+            end_date=end_date
+        )
+
+        # Clean up keys to remove 'synthetic/' prefix and '/price' suffix
+        if isinstance(results, dict):
+            cleaned_results = {}
+            for key, df in results.items():
+                # Extract ticker from 'synthetic/TICKER/price'
+                ticker_name = key.replace('synthetic/', '').replace('/price', '')
+                cleaned_results[ticker_name] = df
+
+            # Return single DataFrame if only one ticker
+            if len(cleaned_results) == 1:
+                return list(cleaned_results.values())[0]
+
+            return cleaned_results
+        else:
+            # Single result
+            return results
+
+    def list_synthetic_symbols(self) -> List[str]:
+        """
+        Return list of all stored synthetic symbol tickers.
+
+        Returns:
+        --------
+        List[str]
+            List of ticker symbols for all synthetic symbols in storage
+
+        Examples:
+        ---------
+        >>> client = DataClient()
+        >>> symbols = client.list_synthetic_symbols()
+        >>> print(symbols)
+        ['CRACK_321', 'ZC_ZS', 'GC_SI_RATIO']
+        """
+        if not self.market_path.exists():
+            return []
+
+        try:
+            with pd.HDFStore(self.market_path, "r") as store:
+                all_keys = store.keys()
+
+                # Find all keys matching pattern /market/synthetic/{ticker}/metadata
+                synthetic_tickers = set()
+                for key in all_keys:
+                    if '/market/synthetic/' in key and '/metadata' in key:
+                        # Extract ticker from '/market/synthetic/TICKER/metadata'
+                        parts = key.split('/')
+                        if len(parts) >= 4 and parts[2] == 'synthetic':
+                            ticker = parts[3]
+                            synthetic_tickers.add(ticker)
+
+                return sorted(list(synthetic_tickers))
+        except Exception:
+            return []
+
+    def delete_synthetic_symbol(self, ticker: str) -> None:
+        """
+        Delete synthetic symbol and all its sub-keys from storage.
+
+        Removes:
+        - market/synthetic/{ticker}/price
+        - market/synthetic/{ticker}/legs_data
+        - market/synthetic/{ticker}/metadata
+        - market/synthetic/{ticker}/volume
+
+        Parameters:
+        -----------
+        ticker : str
+            Ticker symbol of synthetic to delete
+
+        Examples:
+        ---------
+        >>> client = DataClient()
+        >>> client.delete_synthetic_symbol('CRACK_321')
+        """
+        base_key = f"market/synthetic/{ticker}"
+
+        # Check if exists
+        if not self.market_key_exists(f"{base_key}/metadata"):
+            raise ValueError(f"Synthetic symbol '{ticker}' not found in storage")
+
+        # Delete all sub-keys
+        sub_keys = ['price', 'legs_data', 'metadata', 'volume']
+
+        with pd.HDFStore(self.market_path, "a") as store:
+            for sub_key in sub_keys:
+                full_key = f"/{base_key}/{sub_key}"
+                if full_key in store.keys():
+                    del store[full_key]
+
+        print(f"[DataClient] Deleted synthetic symbol '{ticker}' from storage")
+
     def query_market_data(
         self,
         tickers: Optional[Union[str, Sequence[str]]] = None,

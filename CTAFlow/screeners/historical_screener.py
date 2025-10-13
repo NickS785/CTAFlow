@@ -163,7 +163,14 @@ class ScreenParams:
 class HistoricalScreener:
     """Screener created to find seasonal and momentum patterns in intraday and daily data"""
 
-    def __init__(self, ticker_data: Dict[str, Union[pd.DataFrame, SyntheticSymbol]], file_mgr:IntradayFileManager=None):
+    def __init__(
+        self,
+        ticker_data: Dict[str, Union[pd.DataFrame, SyntheticSymbol]],
+        file_mgr: IntradayFileManager = None,
+        is_tick_data: bool = False,
+        tick_aggregation_window: str = '1T',
+        scid_folder: Optional[str] = None
+    ):
         """
         Initialize HistoricalScreener with ticker data.
 
@@ -173,6 +180,33 @@ class HistoricalScreener:
             Dictionary mapping ticker symbols to either DataFrames or SyntheticSymbol objects
         file_mgr : IntradayFileManager, optional
             File manager for loading additional data
+        is_tick_data : bool
+            If True, indicates that ticker_data contains tick-level data that should be
+            aggregated and cached. The data will be resampled according to tick_aggregation_window.
+            Default: False
+        tick_aggregation_window : str
+            Aggregation window for tick data (default: '1T' for 1-minute bars).
+            Used when is_tick_data=True or when loading from SCID files.
+        scid_folder : str, optional
+            Path to SCID folder. Used as cache key when is_tick_data=True.
+            If None and is_tick_data=True, uses 'preloaded' as cache key.
+
+        Examples:
+        ---------
+        # Standard initialization with aggregated data
+        >>> screener = HistoricalScreener(ticker_data)
+
+        # With tick-level data that needs aggregation
+        >>> tick_data = {
+        ...     'CL_F': cl_tick_df,
+        ...     'HO_F': ho_tick_df
+        ... }
+        >>> screener = HistoricalScreener(
+        ...     ticker_data=tick_data,
+        ...     is_tick_data=True,
+        ...     tick_aggregation_window='1T',
+        ...     scid_folder='/path/to/scid'
+        ... )
         """
         self.data = ticker_data
         self.tickers = list(ticker_data.keys())
@@ -189,6 +223,14 @@ class HistoricalScreener:
         # Structure: {(scid_folder, tick_aggregation_window): {ticker: DataFrame}}
         # This allows reuse across multiple screens with the same tick data config
         self._tick_data_cache: Dict[Tuple[str, str], Dict[str, pd.DataFrame]] = {}
+
+        # If tick data flag is set, aggregate and cache the ticker_data
+        if is_tick_data:
+            self._cache_tick_data(
+                tick_data=ticker_data,
+                aggregation_window=tick_aggregation_window,
+                scid_folder=scid_folder
+            )
 
     def clear_tick_data_cache(self, scid_folder: Optional[str] = None, tick_aggregation_window: Optional[str] = None):
         """
@@ -237,6 +279,63 @@ class HistoricalScreener:
                 for key in keys_to_remove:
                     del self._tick_data_cache[key]
                 print(f"[Tick Data Cache] Cleared {len(keys_to_remove)} cached configurations for {scid_folder}")
+
+    def _cache_tick_data(
+        self,
+        tick_data: Dict[str, Union[pd.DataFrame, SyntheticSymbol]],
+        aggregation_window: str,
+        scid_folder: Optional[str]
+    ):
+        """
+        Cache tick data for efficient reuse across screens WITHOUT resampling.
+
+        Parameters
+        ----------
+        tick_data : Dict[str, Union[pd.DataFrame, SyntheticSymbol]]
+            Dictionary mapping ticker symbols to tick DataFrames or SyntheticSymbol objects
+        aggregation_window : str
+            Aggregation window identifier for cache key (not used for resampling)
+        scid_folder : str, optional
+            SCID folder path for cache key. If None, uses 'preloaded'.
+        """
+        # Determine cache key
+        if scid_folder is not None:
+            cache_path = str(Path(scid_folder).resolve())
+        else:
+            cache_path = 'preloaded'
+
+        cache_key = (cache_path, aggregation_window)
+
+        # Initialize cache entry
+        cached_data = {}
+
+        print(f"[Tick Data] Caching {len(tick_data)} tickers (NO resampling)...")
+
+        for ticker, data in tick_data.items():
+            # Skip SyntheticSymbol objects - they handle their own tick data
+            if isinstance(data, SyntheticSymbol):
+                print(f"[Tick Data] {ticker}: SyntheticSymbol, skipping (uses leg data)")
+                continue
+
+            if data is None or data.empty:
+                print(f"[Tick Data] {ticker}: Empty data, skipping")
+                continue
+
+            try:
+                # Cache tick data AS-IS without any resampling
+                cached_data[ticker] = data
+                print(f"[Tick Data] {ticker}: {len(data):,} bars cached")
+
+            except Exception as e:
+                print(f"[Warning] {ticker}: Failed to cache tick data ({e})")
+
+        # Store in cache
+        if cached_data:
+            self._tick_data_cache[cache_key] = cached_data
+            print(f"[Tick Data] Successfully cached {len(cached_data)}/{len(tick_data)} tickers")
+            print(f"[Tick Data] Cache key: {cache_key}")
+        else:
+            print(f"[Warning] No tick data was successfully cached")
 
     def intraday_momentum_screen(
         self,
