@@ -4,4 +4,3 @@ venv/Lib
 project_goals.md
 __pycache__/
 .pyc
-tests/*
