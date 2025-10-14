@@ -17,25 +17,25 @@ session_starts = ["02:30", "08:30"]
 
 session_ends = ["10:30", "15:00"]
 
-london_winter_seasonality = ScreenParams("seasonality",months=[12,1,2,3], target_times=london_tgt_times, period_length=timedelta(hours=2), use_tick_data=True, scid_folder=DLY_DATA_PATH)
+london_winter_seasonality = ScreenParams("seasonality",months=[12,1,2,3], target_times=london_tgt_times, period_length=timedelta(hours=2), volume_bucket_size=500)
 
-london_spring_seasonality = ScreenParams("seasonality", months=[3,4,5,], target_times=london_tgt_times, period_length=two_h, use_tick_data=True, scid_folder=DLY_DATA_PATH)
+london_spring_seasonality = ScreenParams("seasonality", months=[3,4,5,], target_times=london_tgt_times, period_length=two_h, volume_bucket_size=500)
 
-london_fall_seasonality = ScreenParams("seasonality", months=[9,10,11], target_times=london_tgt_times, period_length=two_h, use_tick_data=True, scid_folder=DLY_DATA_PATH)
+london_fall_seasonality = ScreenParams("seasonality", months=[9,10,11], target_times=london_tgt_times, period_length=two_h, volume_bucket_size=500)
 
-london_summer_seasonality = ScreenParams("seasonality", months=[5,6,7,8], target_times=london_tgt_times, period_length=two_h, use_tick_data=True, scid_folder=DLY_DATA_PATH)
+london_summer_seasonality = ScreenParams("seasonality", months=[5,6,7,8], target_times=london_tgt_times, period_length=two_h, volume_bucket_size=500)
 
-usa_winter_seasonality = ScreenParams("seasonality", months=[12,1,2,3], target_times=usa_tgt_times, period_length=two_h, use_tick_data=True, scid_folder=DLY_DATA_PATH)
+usa_winter_seasonality = ScreenParams("seasonality", months=[12,1,2,3], target_times=usa_tgt_times, period_length=two_h, volume_bucket_size=500)
 
-usa_spring_seasonality = ScreenParams("seasonality", months=[3,4,5], target_times=usa_tgt_times, period_length=two_h, use_tick_data=True, scid_folder=DLY_DATA_PATH)
+usa_spring_seasonality = ScreenParams("seasonality", months=[3,4,5], target_times=usa_tgt_times, period_length=two_h, volume_bucket_size=500)
 
-usa_fall_seasonality = ScreenParams("seasonality", months=[9,10,11], target_times=usa_tgt_times, period_length=two_h, use_tick_data=True, scid_folder=DLY_DATA_PATH)
+usa_fall_seasonality = ScreenParams("seasonality", months=[9,10,11], target_times=usa_tgt_times, period_length=two_h, volume_bucket_size=500)
 
-usa_summer_seasonality = ScreenParams("seasonality", months=[5,6,7,8], target_times=usa_tgt_times, period_length=two_h, use_tick_data=True, scid_folder=DLY_DATA_PATH)
+usa_summer_seasonality = ScreenParams("seasonality", months=[5,6,7,8], target_times=usa_tgt_times, period_length=two_h, volume_bucket_size=500)
 
-london_seasonality = ScreenParams("seasonality", target_times=london_tgt_times, period_length=two_h, use_tick_data=True, scid_folder=DLY_DATA_PATH)
+london_seasonality = ScreenParams("seasonality", target_times=london_tgt_times, period_length=two_h, volume_bucket_size=500)
 
-usa_seasonality = ScreenParams("seasonality", target_times=usa_tgt_times, period_length=two_h, use_tick_data=True,scid_folder=DLY_DATA_PATH)
+usa_seasonality = ScreenParams("seasonality", target_times=usa_tgt_times, period_length=two_h, volume_bucket_size=500)
 
 summer_momentum = ScreenParams("momentum", months=[5,6,7,8], session_starts=session_starts, session_ends=session_ends, sess_start_hrs=1, sess_start_minutes=30)
 

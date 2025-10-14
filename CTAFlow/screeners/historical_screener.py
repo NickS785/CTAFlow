@@ -54,14 +54,16 @@ class ScreenParams:
     dayofweek_screen : bool
         Whether to analyze day-of-week patterns (default: True)
 
-    # Tick data parameters (for volume analysis)
-    use_tick_data : bool
-        If True, loads tick data from .scid files for high-precision volume analysis (default: False)
-    scid_folder : Optional[Union[str, Path]]
-        Path to folder containing .scid files (required if use_tick_data=True)
-    tick_aggregation_window : str
-        Time window for aggregating tick data (default: '1T' for 1-minute)
-        Examples: '30S' (30-sec), '1T' (1-min), '5T' (5-min)
+    # Volume bucket parameters
+    volume_bucket_size : Union[int, Dict[str, int]]
+        Size of volume buckets for aggregation. Can be:
+        - int: Same bucket size for all symbols (default: 500 contracts)
+        - Dict[str, int]: Per-symbol bucket sizes for volume-aware bucketing
+          Example: {'CL_F': 500, 'RB_F': 100, 'NG_F': 300}
+        Larger sizes reduce noise but may miss short-term patterns
+    use_file_manager : bool
+        If True, uses IntradayFileManager backend (supports write, gap detection)
+        If False, uses lightweight ScidReader backend (read-only, faster) (default: False)
 
     Examples
     --------
@@ -83,23 +85,23 @@ class ScreenParams:
     ...     dayofweek_screen=True
     ... )
 
-    # Seasonality screen with tick data (1-minute resolution)
-    >>> tick_seasonality = ScreenParams(
+    # Seasonality screen with large volume buckets (1000 contracts)
+    >>> large_bucket_seasonality = ScreenParams(
     ...     screen_type='seasonality',
-    ...     name='winter_tick_volume',
+    ...     name='winter_large_bucket',
     ...     season='winter',
     ...     target_times=["09:30", "14:00"],
-    ...     use_tick_data=True,
-    ...     scid_folder='/path/to/scid/files',
-    ...     tick_aggregation_window='1T'
+    ...     volume_bucket_size=1000
     ... )
 
-    # Custom months momentum screen
-    >>> q1_momentum = ScreenParams(
+    # Momentum screen with per-symbol bucket sizes (volume-aware)
+    >>> volume_aware_momentum = ScreenParams(
     ...     screen_type='momentum',
     ...     months=[1, 2, 3],
     ...     session_starts=["09:30"],
-    ...     session_ends=["16:00"]
+    ...     session_ends=["16:00"],
+    ...     volume_bucket_size={'CL_F': 500, 'RB_F': 100, 'NG_F': 300},
+    ...     use_file_manager=False
     ... )
     """
     screen_type: str  # 'momentum' or 'seasonality'
@@ -122,10 +124,9 @@ class ScreenParams:
     period_length: Optional[Union[int, timedelta]] = None
     dayofweek_screen: bool = True
 
-    # Tick data parameters
-    use_tick_data: bool = False
-    scid_folder: Optional[Union[str, Path]] = None
-    tick_aggregation_window: str = '1T'
+    # Volume bucket parameters
+    volume_bucket_size: Union[int, Dict[str, int]] = 500
+    use_file_manager: bool = False
 
     def __post_init__(self):
         """Validate parameters and auto-generate name if not provided."""
@@ -144,20 +145,30 @@ class ScreenParams:
             if self.target_times is None:
                 raise ValueError("Seasonality screens require target_times")
 
-        # Validate tick data parameters
-        if self.use_tick_data and self.scid_folder is None:
-            raise ValueError("scid_folder must be provided when use_tick_data=True")
+        # Validate volume bucket parameters
+        if isinstance(self.volume_bucket_size, dict):
+            # Validate dict-based bucket sizes
+            if not self.volume_bucket_size:
+                raise ValueError("volume_bucket_size dict cannot be empty")
+            for symbol, size in self.volume_bucket_size.items():
+                if not isinstance(size, int) or size <= 0:
+                    raise ValueError(
+                        f"volume_bucket_size for {symbol} must be a positive integer, got {size}"
+                    )
+        else:
+            # Validate single bucket size
+            if self.volume_bucket_size <= 0:
+                raise ValueError(f"volume_bucket_size must be positive, got {self.volume_bucket_size}")
 
         # Auto-generate name if not provided
         if self.name is None:
-            tick_suffix = "_tick" if self.use_tick_data else ""
             if self.season:
-                self.name = f"{self.season}_{self.screen_type}{tick_suffix}"
+                self.name = f"{self.season}_{self.screen_type}"
             elif self.months:
                 month_str = "_".join(map(str, self.months))
-                self.name = f"months_{month_str}_{self.screen_type}{tick_suffix}"
+                self.name = f"months_{month_str}_{self.screen_type}"
             else:
-                self.name = f"all_{self.screen_type}{tick_suffix}"
+                self.name = f"all_{self.screen_type}"
 
 
 class HistoricalScreener:
@@ -167,9 +178,7 @@ class HistoricalScreener:
         self,
         ticker_data: Dict[str, Union[pd.DataFrame, SyntheticSymbol]],
         file_mgr: IntradayFileManager = None,
-        is_tick_data: bool = False,
-        tick_aggregation_window: str = '1T',
-        scid_folder: Optional[str] = None
+        volume_bucketed_loader: Optional['VolumeBucketedDataLoader'] = None
     ):
         """
         Initialize HistoricalScreener with ticker data.
@@ -180,32 +189,21 @@ class HistoricalScreener:
             Dictionary mapping ticker symbols to either DataFrames or SyntheticSymbol objects
         file_mgr : IntradayFileManager, optional
             File manager for loading additional data
-        is_tick_data : bool
-            If True, indicates that ticker_data contains tick-level data that should be
-            aggregated and cached. The data will be resampled according to tick_aggregation_window.
-            Default: False
-        tick_aggregation_window : str
-            Aggregation window for tick data (default: '1T' for 1-minute bars).
-            Used when is_tick_data=True or when loading from SCID files.
-        scid_folder : str, optional
-            Path to SCID folder. Used as cache key when is_tick_data=True.
-            If None and is_tick_data=True, uses 'preloaded' as cache key.
+        volume_bucketed_loader : VolumeBucketedDataLoader, optional
+            Loader for volume-bucketed data. If None, a default loader will be created
+            when running screens with volume bucket parameters.
 
         Examples:
         ---------
-        # Standard initialization with aggregated data
+        # Standard initialization with pre-aggregated data
         >>> screener = HistoricalScreener(ticker_data)
 
-        # With tick-level data that needs aggregation
-        >>> tick_data = {
-        ...     'CL_F': cl_tick_df,
-        ...     'HO_F': ho_tick_df
-        ... }
+        # With custom volume-bucketed loader
+        >>> from CTAFlow.data import VolumeBucketedDataLoader
+        >>> loader = VolumeBucketedDataLoader(volume_bucket_size=1000, use_file_manager=True)
         >>> screener = HistoricalScreener(
-        ...     ticker_data=tick_data,
-        ...     is_tick_data=True,
-        ...     tick_aggregation_window='1T',
-        ...     scid_folder='/path/to/scid'
+        ...     ticker_data=ticker_data,
+        ...     volume_bucketed_loader=loader
         ... )
         """
         self.data = ticker_data
@@ -219,123 +217,8 @@ class HistoricalScreener:
             for ticker, data in ticker_data.items()
         }
 
-        # Tick data cache: stores loaded tick data to avoid redundant loading
-        # Structure: {(scid_folder, tick_aggregation_window): {ticker: DataFrame}}
-        # This allows reuse across multiple screens with the same tick data config
-        self._tick_data_cache: Dict[Tuple[str, str], Dict[str, pd.DataFrame]] = {}
-
-        # If tick data flag is set, aggregate and cache the ticker_data
-        if is_tick_data:
-            self._cache_tick_data(
-                tick_data=ticker_data,
-                aggregation_window=tick_aggregation_window,
-                scid_folder=scid_folder
-            )
-
-    def clear_tick_data_cache(self, scid_folder: Optional[str] = None, tick_aggregation_window: Optional[str] = None):
-        """
-        Clear the tick data cache.
-
-        Parameters
-        ----------
-        scid_folder : Optional[str]
-            If provided, only clear cache for this specific scid_folder.
-            If None, clears all cached tick data.
-        tick_aggregation_window : Optional[str]
-            If provided along with scid_folder, only clear cache for this specific configuration.
-            Ignored if scid_folder is None.
-
-        Examples
-        --------
-        >>> # Clear all cached tick data
-        >>> screener.clear_tick_data_cache()
-        >>>
-        >>> # Clear cache for specific folder
-        >>> screener.clear_tick_data_cache(scid_folder='/path/to/scid')
-        >>>
-        >>> # Clear cache for specific configuration
-        >>> screener.clear_tick_data_cache(scid_folder='/path/to/scid', tick_aggregation_window='1T')
-        """
-        if scid_folder is None:
-            # Clear all cache
-            cleared_count = len(self._tick_data_cache)
-            self._tick_data_cache.clear()
-            print(f"[Tick Data Cache] Cleared all {cleared_count} cached configurations")
-        else:
-            # Clear specific configuration(s)
-            resolved_path = str(Path(scid_folder).resolve())
-
-            if tick_aggregation_window is not None:
-                # Clear specific configuration
-                cache_key = (resolved_path, tick_aggregation_window)
-                if cache_key in self._tick_data_cache:
-                    del self._tick_data_cache[cache_key]
-                    print(f"[Tick Data Cache] Cleared cache for {scid_folder} at {tick_aggregation_window}")
-                else:
-                    print(f"[Tick Data Cache] No cache found for {scid_folder} at {tick_aggregation_window}")
-            else:
-                # Clear all configurations for this folder
-                keys_to_remove = [key for key in self._tick_data_cache.keys() if key[0] == resolved_path]
-                for key in keys_to_remove:
-                    del self._tick_data_cache[key]
-                print(f"[Tick Data Cache] Cleared {len(keys_to_remove)} cached configurations for {scid_folder}")
-
-    def _cache_tick_data(
-        self,
-        tick_data: Dict[str, Union[pd.DataFrame, SyntheticSymbol]],
-        aggregation_window: str,
-        scid_folder: Optional[str]
-    ):
-        """
-        Cache tick data for efficient reuse across screens WITHOUT resampling.
-
-        Parameters
-        ----------
-        tick_data : Dict[str, Union[pd.DataFrame, SyntheticSymbol]]
-            Dictionary mapping ticker symbols to tick DataFrames or SyntheticSymbol objects
-        aggregation_window : str
-            Aggregation window identifier for cache key (not used for resampling)
-        scid_folder : str, optional
-            SCID folder path for cache key. If None, uses 'preloaded'.
-        """
-        # Determine cache key
-        if scid_folder is not None:
-            cache_path = str(Path(scid_folder).resolve())
-        else:
-            cache_path = 'preloaded'
-
-        cache_key = (cache_path, aggregation_window)
-
-        # Initialize cache entry
-        cached_data = {}
-
-        print(f"[Tick Data] Caching {len(tick_data)} tickers (NO resampling)...")
-
-        for ticker, data in tick_data.items():
-            # Skip SyntheticSymbol objects - they handle their own tick data
-            if isinstance(data, SyntheticSymbol):
-                print(f"[Tick Data] {ticker}: SyntheticSymbol, skipping (uses leg data)")
-                continue
-
-            if data is None or data.empty:
-                print(f"[Tick Data] {ticker}: Empty data, skipping")
-                continue
-
-            try:
-                # Cache tick data AS-IS without any resampling
-                cached_data[ticker] = data
-                print(f"[Tick Data] {ticker}: {len(data):,} bars cached")
-
-            except Exception as e:
-                print(f"[Warning] {ticker}: Failed to cache tick data ({e})")
-
-        # Store in cache
-        if cached_data:
-            self._tick_data_cache[cache_key] = cached_data
-            print(f"[Tick Data] Successfully cached {len(cached_data)}/{len(tick_data)} tickers")
-            print(f"[Tick Data] Cache key: {cache_key}")
-        else:
-            print(f"[Warning] No tick data was successfully cached")
+        # Volume-bucketed data loader (optional, created on-demand if needed)
+        self._volume_loader = volume_bucketed_loader
 
     def intraday_momentum_screen(
         self,
@@ -2282,190 +2165,6 @@ class HistoricalScreener:
         patterns.sort(key=lambda x: x.get('strength', 0), reverse=True)
 
         return patterns
-
-    def _load_tick_data_from_scid(
-        self,
-        ticker: str,
-        scid_folder: Union[str, Path],
-        start: Optional[datetime] = None,
-        end: Optional[datetime] = None,
-        aggregation_window: str = '1T'
-    ) -> pd.DataFrame:
-        """
-        Load tick data from .scid files for a ticker and aggregate to specified window.
-
-        This method provides tick-level precision for volume analysis by loading
-        raw tick data from Sierra Chart .scid files and aggregating it to the
-        specified time window (e.g., '1T' for 1-minute bars).
-
-        Parameters
-        ----------
-        ticker : str
-            Trading symbol (e.g., 'CL_F', 'NG_F')
-        scid_folder : Union[str, Path]
-            Path to folder containing .scid files
-        start : Optional[datetime]
-            Start date/time for data filtering
-        end : Optional[datetime]
-            End date/time for data filtering
-        aggregation_window : str
-            Pandas resample rule for aggregation (default: '1T' for 1-minute)
-            Examples: '1T' (1-min), '30S' (30-sec), '5T' (5-min), '15T' (15-min)
-
-        Returns
-        -------
-        pd.DataFrame
-            Aggregated OHLCV data with BidVolume and AskVolume columns
-            Index: DatetimeIndex (UTC)
-            Columns: Open, High, Low, Close, NumTrades, TotalVolume, BidVolume, AskVolume
-
-        Notes
-        -----
-        - Uses IntradayFileManager for efficient .scid file loading
-        - Automatically detects and processes front month contracts
-        - Tick-level data provides true order flow precision
-        - Aggregation preserves bid/ask volume for microstructure analysis
-
-        Examples
-        --------
-        >>> # Load 1-minute aggregated tick data
-        >>> tick_data = screener._load_tick_data_from_scid(
-        ...     'CL_F',
-        ...     scid_folder='/path/to/scid/files',
-        ...     aggregation_window='1T'
-        ... )
-        >>>
-        >>> # Load 30-second bars for high-resolution analysis
-        >>> tick_data = screener._load_tick_data_from_scid(
-        ...     'CL_F',
-        ...     scid_folder='/path/to/scid/files',
-        ...     start=datetime(2024, 1, 1),
-        ...     end=datetime(2024, 12, 31),
-        ...     aggregation_window='30S'
-        ... )
-        """
-        scid_path = Path(scid_folder)
-        if not scid_path.exists():
-            raise FileNotFoundError(f"SCID folder not found: {scid_folder}")
-
-        # Check if we already have this data cached
-        cache_key = (str(scid_path.resolve()), aggregation_window)
-        if cache_key in self._tick_data_cache and ticker in self._tick_data_cache[cache_key]:
-            print(f"[Tick Data] Using cached data for {ticker} at {aggregation_window} resolution")
-            return self._tick_data_cache[cache_key][ticker]
-
-        # Initialize IntradayFileManager to discover and load .scid files
-        manager = IntradayFileManager(data_path=scid_path)
-
-        # Ensure _F suffix is present for IntradayFileManager compatibility
-        # E.g., 'CL' -> 'CL_F', 'CL_F' -> 'CL_F' (already has suffix)
-        symbol_with_f = ticker if ticker.endswith('_F') else f"{ticker}_F"
-
-        # Load front month series with specified time range
-        df, gaps = manager.load_front_month_series(
-            symbol=symbol_with_f,
-            start=start,
-            end=end,
-            resample_rule=aggregation_window,
-            detect_gaps=True
-        )
-
-        if df.empty:
-            raise ValueError(f"No tick data loaded for {ticker} from {scid_folder}")
-
-        # Log gap information if available
-        if gaps:
-            gap_summary = manager.get_gap_summary(gaps)
-            print(f"[Tick Data] {ticker}: Detected {gap_summary['total_gaps']} gaps, "
-                  f"{gap_summary.get('data_missing_count', 0)} missing data periods")
-
-        # Save to cache before returning
-        if cache_key not in self._tick_data_cache:
-            self._tick_data_cache[cache_key] = {}
-        self._tick_data_cache[cache_key][ticker] = df
-        print(f"[Tick Data] Cached {ticker} data for future use")
-
-        return df
-
-    def _aggregate_tick_data(
-        self,
-        tick_data: pd.DataFrame,
-        aggregation_window: str = '1T'
-    ) -> pd.DataFrame:
-        """
-        Aggregate tick data to specified time window while preserving bid/ask volumes.
-
-        Parameters
-        ----------
-        tick_data : pd.DataFrame
-            Raw or pre-aggregated tick data with OHLCV + BidVolume/AskVolume
-        aggregation_window : str
-            Pandas resample rule (e.g., '1T', '5T', '15T', '1H')
-
-        Returns
-        -------
-        pd.DataFrame
-            Aggregated data with proper OHLCV and volume calculations
-
-        Notes
-        -----
-        - Open: First value in window
-        - High: Maximum value in window
-        - Low: Minimum value in window
-        - Close: Last value in window
-        - NumTrades: Sum of trades in window
-        - TotalVolume: Sum of total volume
-        - BidVolume: Sum of bid-side volume
-        - AskVolume: Sum of ask-side volume
-        """
-        if tick_data.empty:
-            return tick_data
-
-        # Ensure datetime index is UTC
-        if tick_data.index.tz is None:
-            tick_data = tick_data.tz_localize('UTC')
-        elif str(tick_data.index.tz) != 'UTC':
-            tick_data = tick_data.tz_convert('UTC')
-
-        # Resample OHLC
-        agg_dict = {
-            'Open': 'first',
-            'High': 'max',
-            'Low': 'min',
-            'Close': 'last'
-        }
-
-        # Add volume fields if present
-        if 'NumTrades' in tick_data.columns:
-            agg_dict['NumTrades'] = 'sum'
-        if 'TotalVolume' in tick_data.columns:
-            agg_dict['TotalVolume'] = 'sum'
-        if 'Volume' in tick_data.columns:
-            agg_dict['Volume'] = 'sum'
-        if 'BidVolume' in tick_data.columns:
-            agg_dict['BidVolume'] = 'sum'
-        if 'AskVolume' in tick_data.columns:
-            agg_dict['AskVolume'] = 'sum'
-
-        # Perform resampling
-        resampled = tick_data.resample(aggregation_window).agg(agg_dict)
-
-        # Drop rows with all NaN (no data in that window)
-        resampled = resampled.dropna(how='all')
-
-        # Forward fill OHLC prices (common in sparse tick data)
-        price_cols = ['Open', 'High', 'Low', 'Close']
-        existing_price_cols = [c for c in price_cols if c in resampled.columns]
-        if existing_price_cols:
-            resampled[existing_price_cols] = resampled[existing_price_cols].fillna(method='ffill')
-
-        # Fill volume columns with 0 (no trades = zero volume)
-        volume_cols = ['NumTrades', 'TotalVolume', 'Volume', 'BidVolume', 'AskVolume']
-        existing_volume_cols = [c for c in volume_cols if c in resampled.columns]
-        if existing_volume_cols:
-            resampled[existing_volume_cols] = resampled[existing_volume_cols].fillna(0)
-
-        return resampled
 
     def _calculate_synthetic_spread_volume(
         self,

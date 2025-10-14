@@ -13,6 +13,7 @@ This module contains classes and functions for:
 
 # Core data processing classes
 from .data_client import DataClient
+from .volume_bucketed_loader import VolumeBucketedDataLoader
 from .raw_formatting import *
 from .retrieval import fetch_market_cot_data, fetch_data_sync, convert_cot_date_to_datetime
 from .ticker_classifier import TickerClassifier
@@ -35,6 +36,7 @@ __all__ = [
     # Primary data processing classes
     'DataProcessor',
     'DataClient',
+    'VolumeBucketedDataLoader',
 
     # Core data classes
     'FuturesCurveManager',
