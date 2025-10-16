@@ -6,6 +6,7 @@ from datetime import datetime, date, timedelta, time
 from dataclasses import dataclass, field
 from ..data import IntradayFileManager, DataClient, SyntheticSymbol
 from ..config import DLY_DATA_PATH, INTRADAY_ADB_PATH
+from ..utils.session import filter_session_bars
 from scipy import stats
 
 
@@ -52,6 +53,12 @@ class ScreenParams:
         Length of period to aggregate for seasonality (default: None)
     dayofweek_screen : bool
         Whether to analyze day-of-week patterns (default: True)
+    seasonality_session_start : Union[str, time]
+        Local session start time applied before seasonality calculations (default "00:00").
+    seasonality_session_end : Union[str, time]
+        Local session end time applied before seasonality calculations (default "23:59:59").
+    tz : str
+        Olson timezone for the seasonality session filter (default "America/Chicago").
 
     Examples
     --------
@@ -100,6 +107,9 @@ class ScreenParams:
     target_times: Optional[List[Union[str, time]]] = None
     period_length: Optional[Union[int, timedelta]] = None
     dayofweek_screen: bool = True
+    seasonality_session_start: Union[str, time] = "00:00"
+    seasonality_session_end: Union[str, time] = "23:59:59"
+    tz: str = "America/Chicago"
 
     def __post_init__(self):
         """Validate parameters and auto-generate name if not provided."""
@@ -201,6 +211,15 @@ class HistoricalScreener:
             - spring: Mar, Apr, May (3, 4, 5)
             - summer: Jun, Jul, Aug (6, 7, 8)
             - fall: Sep, Oct, Nov (9, 10, 11)
+        session_start : Optional[Union[str, time]]
+            Local session start time for filtering intraday bars (default "00:00").
+        session_end : Optional[Union[str, time]]
+            Local session end time for filtering intraday bars (default "23:59:59").
+        tz : str
+            Olson timezone string used to interpret the session window.
+        include_volume : bool
+            Legacy flag retained for backwards compatibility. When True, raises a
+            NotImplementedError explaining that volume analytics moved to OrderflowScan.
         _selected_months : Optional[List[int]]
             Internal override for month selection when using cached data.
         _precomputed_sessions : Optional[Dict[str, Dict[str, any]]]
@@ -344,7 +363,11 @@ class HistoricalScreener:
         period_length: Optional[Union[int, timedelta]] = None,
         dayofweek_screen: bool = True,
         months: Optional[List[int]] = None,
-        season: Optional[str] = None
+        season: Optional[str] = None,
+        session_start: Optional[Union[str, time]] = None,
+        session_end: Optional[Union[str, time]] = None,
+        tz: str = "America/Chicago",
+        include_volume: bool = False,
     ) -> Dict[str, Dict[str, any]]:
         """
         Screen for seasonality patterns in intraday data.
@@ -379,7 +402,9 @@ class HistoricalScreener:
         Returns:
         --------
         Dict[str, Dict[str, any]]
-            Results dictionary with seasonality analysis for each ticker
+            Results dictionary with seasonality analysis for each ticker. Each ticker
+            entry includes metadata describing the session window and the number of
+            sessions available after filtering.
 
         Examples:
         ---------
@@ -410,8 +435,18 @@ class HistoricalScreener:
             dayofweek_screen=True
         )
         """
+        if include_volume:
+            raise NotImplementedError("Volume analytics moved to OrderflowScan")
+
+        session_start_value = session_start if session_start is not None else "00:00"
+        session_end_value = session_end if session_end is not None else "23:59:59"
+
+        session_start_time = self._convert_times([session_start_value])[0]
+        session_end_time = self._convert_times([session_end_value])[0]
+
         # Convert times to time objects
         converted_times = self._convert_times(target_times)
+        self._validate_target_times(converted_times, session_start_time, session_end_time)
 
         # Determine which months to analyze
         selected_months = self._parse_season_months(months, season)
@@ -432,29 +467,64 @@ class HistoricalScreener:
                 results[ticker] = {'error': 'No data available'}
                 continue
 
-            # Filter by months/season if specified
+            # Filter to session window in local timezone
+            session_data = filter_session_bars(
+                data,
+                tz,
+                session_start_time,
+                session_end_time,
+            )
+
+            if session_data.empty:
+                results[ticker] = {
+                    'error': 'No data available within session window',
+                    'session_start': session_start_time.strftime("%H:%M:%S"),
+                    'session_end': session_end_time.strftime("%H:%M:%S"),
+                    'tz': tz,
+                }
+                continue
+
             if selected_months is not None:
-                data = self._filter_by_months(data, selected_months)
-                if data.empty:
+                session_data = self._filter_by_months(session_data, selected_months)
+                if session_data.empty:
                     results[ticker] = {
                         'error': 'No data available for selected months/season',
-                        'selected_months': selected_months
+                        'selected_months': selected_months,
+                        'session_start': session_start_time.strftime("%H:%M:%S"),
+                        'session_end': session_end_time.strftime("%H:%M:%S"),
+                        'tz': tz,
                     }
                     continue
 
             # Determine price column
-            price_col = 'Close' if 'Close' in data.columns else data.columns[0]
+            price_col = 'Close' if 'Close' in session_data.columns else session_data.columns[0]
 
             ticker_results = {
                 'ticker': ticker,
                 'is_synthetic': is_synthetic,
-                'n_observations': len(data),
+                'n_observations': len(session_data),
                 'filtered_months': selected_months if selected_months else 'all'
+            }
+
+            if isinstance(session_data.index, pd.DatetimeIndex):
+                index_dt = session_data.index
+            else:
+                index_dt = pd.to_datetime(session_data.index)
+                session_data.index = index_dt
+            if index_dt.tz is None:
+                session_dates = index_dt.normalize()
+            else:
+                session_dates = index_dt.tz_convert(tz).normalize()
+            ticker_results['metadata'] = {
+                'session_start': session_start_time.strftime("%H:%M:%S"),
+                'session_end': session_end_time.strftime("%H:%M:%S"),
+                'tz': tz,
+                'n_sessions': int(session_dates.nunique()),
             }
 
             # Day-of-week analysis
             if dayofweek_screen:
-                dow_results = self._analyze_dayofweek_patterns(data, price_col, is_synthetic)
+                dow_results = self._analyze_dayofweek_patterns(session_data, price_col, is_synthetic)
                 ticker_results['dayofweek_returns'] = dow_results['returns']
                 ticker_results['dayofweek_volatility'] = dow_results['volatility']
 
@@ -462,7 +532,7 @@ class HistoricalScreener:
             time_predictions = {}
             for target_time in converted_times:
                 pred_stats = self._test_time_predictability(
-                    data,
+                    session_data,
                     price_col,
                     target_time,
                     is_synthetic,
@@ -474,7 +544,7 @@ class HistoricalScreener:
 
             # Month-by-month analysis if filtering is applied
             if selected_months is not None:
-                month_analysis = self._analyze_by_month(data, price_col, is_synthetic, selected_months)
+                month_analysis = self._analyze_by_month(session_data, price_col, is_synthetic, selected_months)
                 ticker_results['month_breakdown'] = month_analysis
 
             # Rank strongest patterns
@@ -694,7 +764,10 @@ class HistoricalScreener:
                 period_length=params.period_length,
                 dayofweek_screen=params.dayofweek_screen,
                 months=params.months,
-                season=params.season
+                season=params.season,
+                session_start=params.seasonality_session_start,
+                session_end=params.seasonality_session_end,
+                tz=params.tz
             )
 
         else:
@@ -2603,6 +2676,29 @@ class HistoricalScreener:
             return s_start, s_end
         else:
             return s_start
+
+    @staticmethod
+    def _time_in_session(target: time, session_start: time, session_end: time) -> bool:
+        start_us = (session_start.hour * 3600 + session_start.minute * 60 + session_start.second) * 1_000_000 + session_start.microsecond
+        end_us = (session_end.hour * 3600 + session_end.minute * 60 + session_end.second) * 1_000_000 + session_end.microsecond
+        target_us = (target.hour * 3600 + target.minute * 60 + target.second) * 1_000_000 + target.microsecond
+
+        if start_us <= end_us:
+            return start_us <= target_us <= end_us
+        return target_us >= start_us or target_us <= end_us
+
+    def _validate_target_times(
+        self,
+        target_times: List[time],
+        session_start: time,
+        session_end: time,
+    ) -> None:
+        for target_time in target_times:
+            if not self._time_in_session(target_time, session_start, session_end):
+                raise ValueError(
+                    f"Target time {target_time.strftime('%H:%M:%S')} falls outside the session window "
+                    f"{session_start.strftime('%H:%M:%S')} - {session_end.strftime('%H:%M:%S')}"
+                )
 
     def plot_momentum_scatter(
         self,
