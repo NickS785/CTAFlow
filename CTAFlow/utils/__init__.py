@@ -10,6 +10,8 @@ from .unit_conversions import (
     bushels_to_kilograms,
     bushels_to_metric_tons,
 )
+from .session import filter_session_bars, filter_session_ticks
+from .volume_bucket import auto_bucket_size, ticks_to_volume_buckets
 
 __all__ = [
     'TenorInterpolator',
@@ -26,5 +28,9 @@ __all__ = [
     "last_year_predicts_this_year",
     "log_returns",
     "prewindow_feature",
-    "prewindow_predicts_month"
+    "prewindow_predicts_month",
+    "filter_session_bars",
+    "filter_session_ticks",
+    "auto_bucket_size",
+    "ticks_to_volume_buckets",
 ]
