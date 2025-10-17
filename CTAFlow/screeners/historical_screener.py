@@ -2963,12 +2963,13 @@ class HistoricalScreener:
             symbol = t if t.endswith('_F') else f"{t}_F"
 
             try:
-                df, gaps = mgr.load_front_month_series(
+                df = mgr.load_front_month_series(
                     symbol=symbol,
                     start=start,
                     end=end,
                     resample_rule=resample_rule,
-                    volume_bucket_size=volume_bucket
+                    volume_bucket_size=volume_bucket,
+                    detect_gaps=False
                 )
 
                 if not df.empty:

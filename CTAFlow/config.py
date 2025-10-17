@@ -5,21 +5,20 @@ import toml
 import os
 
 
-intraday_db_path = "lmdb:\\F:\\data\\intraday"
-
 # Weekly Update Configuration
 # Set to False to disable automated weekly updates
-ENABLE_WEEKLY_UPDATES = os.getenv("CTAFLOW_ENABLE_WEEKLY_UPDATES", "false").lower() in ("true", "1", "yes")
+ENABLE_WEEKLY_UPDATES = os.getenv("CTAFLOW_ENABLE_WEEKLY_UPDATES", "true").lower() in ("true", "1", "yes")
 
-# ArcticDB URIs (primary data storage)
-INTRADAY_ADB_PATH = "lmdb://F:/Data/intraday"  # ArcticDB URI for intraday data
+# Parquet storage paths (PRIMARY intraday data storage)
+INTRADAY_DATA_PATH = Path("F:\\Data\\intraday")  # Parquet files for intraday data
 DAILY_ADB_PATH = "lmdb://F:/Data/daily"  # ArcticDB URI for daily market data
 CURVE_ADB_PATH = "lmdb://F:/Data/curves"  # ArcticDB URI for forward curve data
 COT_ADB_PATH = "lmdb://F:/Data/cot"  # ArcticDB URI for COT data
 
-# Legacy HDF5 paths (deprecated - use Arctic instead)
-MARKET_DATA_PATH = Path("F:\\", 'Data', 'market_data.hd5')
-COT_DATA_PATH = Path("F:\\", 'Data', 'cot_data.hd5')
+# Legacy paths (deprecated)
+INTRADAY_ADB_PATH = "lmdb://F:/Data/intraday"  # DEPRECATED: Use INTRADAY_DATA_PATH instead
+MARKET_DATA_PATH = Path("F:\\", 'Data', 'market_data.hd5')  # DEPRECATED: Legacy HDF5
+COT_DATA_PATH = Path("F:\\", 'Data', 'cot_data.hd5')  # DEPRECATED: Legacy HDF5
 
 # File system paths
 DATA_DIR = Path("F:\\Data ")

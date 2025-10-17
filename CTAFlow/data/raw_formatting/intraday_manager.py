@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 from sierrapy.parser import ScidReader, AsyncScidReader, bucket_by_volume, resample_ohlcv
 
-from ...config import DLY_DATA_PATH, MARKET_DATA_PATH, INTRADAY_ADB_PATH
+from ...config import DLY_DATA_PATH, MARKET_DATA_PATH, INTRADAY_ADB_PATH, INTRADAY_DATA_PATH
 from ..data_client import DataClient
 from ..update_management import (
     INTRADAY_UPDATE_EVENT,
@@ -110,6 +110,327 @@ class GapInfo:
     gap_type: str  # 'weekend', 'holiday', 'data_missing', 'contract_roll'
     contracts_affected: List[str]
 
+
+class AsyncParquetWriter:
+    """
+    Asynchronous Parquet writer for intraday data from AsyncScidReader.
+
+    Writes data to organized Parquet file structure:
+        F:/Data/intraday/
+            CL_F/
+                CL_F_1T.parquet
+                CL_F_5T.parquet
+                CL_F_vol500.parquet
+            NG_F/
+                NG_F_1T.parquet
+                ...
+
+    Features:
+        - Async I/O for high throughput
+        - Per-symbol directory organization
+        - Automatic append/update mode
+        - Compression (snappy by default)
+        - Duplicate handling
+    """
+
+    def __init__(self,
+                 parquet_base_path: Optional[Path] = None,
+                 compression: str = 'snappy',
+                 enable_logging: bool = True):
+        """
+        Initialize async Parquet writer.
+
+        Args:
+            parquet_base_path: Base path for Parquet storage (default: INTRADAY_DATA_PATH)
+            compression: Compression codec ('snappy', 'gzip', 'brotli', None)
+            enable_logging: Enable logging
+        """
+        self.base_path = Path(parquet_base_path) if parquet_base_path else INTRADAY_DATA_PATH
+        self.compression = compression
+
+        # Setup logging
+        if enable_logging:
+            self.logger = logging.getLogger(f"{self.__class__.__name__}")
+            self.logger.setLevel(logging.INFO)
+        else:
+            self.logger = None
+
+        # Create base directory
+        if not self.base_path.exists():
+            self.base_path.mkdir(parents=True, exist_ok=True)
+            if self.logger:
+                self.logger.info(f"Created Parquet base directory: {self.base_path}")
+
+    def _get_file_path(self,
+                       symbol: str,
+                       timeframe: Optional[str] = None,
+                       volume_bucket_size: Optional[int] = None) -> Path:
+        """Get Parquet file path for symbol and parameters."""
+        # Create symbol directory
+        symbol_dir = self.base_path / symbol
+        symbol_dir.mkdir(parents=True, exist_ok=True)
+
+        # Construct filename
+        if volume_bucket_size:
+            filename = f"{symbol}_vol{volume_bucket_size}.parquet"
+        elif timeframe:
+            filename = f"{symbol}_{timeframe}.parquet"
+        else:
+            filename = f"{symbol}_raw.parquet"
+
+        return symbol_dir / filename
+
+    async def write_dataframe(self,
+                             df: pd.DataFrame,
+                             symbol: str,
+                             timeframe: Optional[str] = None,
+                             volume_bucket_size: Optional[int] = None,
+                             mode: str = 'append') -> Dict[str, any]:
+        """
+        Write DataFrame to Parquet file asynchronously.
+
+        Args:
+            df: DataFrame to write (must have DatetimeIndex)
+            symbol: Trading symbol
+            timeframe: Time-based resampling rule
+            volume_bucket_size: Volume bucket size
+            mode: 'append' (merge with existing), 'replace' (overwrite), or 'create' (fail if exists)
+
+        Returns:
+            Dictionary with write statistics
+        """
+        if df.empty:
+            return {
+                'success': False,
+                'symbol': symbol,
+                'records_written': 0,
+                'error': 'Empty DataFrame'
+            }
+
+        file_path = self._get_file_path(symbol, timeframe, volume_bucket_size)
+
+        try:
+            # Run blocking I/O in executor to avoid blocking event loop
+            loop = asyncio.get_event_loop()
+
+            if mode == 'replace' or not file_path.exists():
+                # Direct write
+                await loop.run_in_executor(
+                    None,
+                    lambda: df.to_parquet(file_path, compression=self.compression, index=True)
+                )
+                records_written = len(df)
+                write_mode = 'replace' if file_path.exists() else 'create'
+
+            elif mode == 'append':
+                # Read existing, merge, write
+                existing_df = await loop.run_in_executor(
+                    None,
+                    pd.read_parquet,
+                    file_path
+                )
+
+                # Combine and deduplicate
+                combined_df = pd.concat([existing_df, df])
+                combined_df = combined_df[~combined_df.index.duplicated(keep='last')].sort_index()
+
+                # Write combined
+                await loop.run_in_executor(
+                    None,
+                    lambda: combined_df.to_parquet(file_path, compression=self.compression, index=True)
+                )
+                records_written = len(combined_df) - len(existing_df)
+                write_mode = 'append'
+
+            else:  # mode == 'create'
+                if file_path.exists():
+                    return {
+                        'success': False,
+                        'symbol': symbol,
+                        'records_written': 0,
+                        'error': f'File already exists: {file_path}'
+                    }
+                await loop.run_in_executor(
+                    None,
+                    lambda: df.to_parquet(file_path, compression=self.compression, index=True)
+                )
+                records_written = len(df)
+                write_mode = 'create'
+
+            if self.logger:
+                self.logger.info(
+                    f"[Async] Wrote {records_written:,} records to {file_path.name} "
+                    f"(mode: {write_mode})"
+                )
+
+            return {
+                'success': True,
+                'symbol': symbol,
+                'file_path': str(file_path),
+                'records_written': records_written,
+                'mode': write_mode,
+                'date_range': {
+                    'start': df.index[0],
+                    'end': df.index[-1]
+                } if not df.empty else None,
+                'timeframe': timeframe,
+                'volume_bucket_size': volume_bucket_size
+            }
+
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"[Async] Error writing {symbol}: {e}")
+
+            return {
+                'success': False,
+                'symbol': symbol,
+                'file_path': str(file_path),
+                'records_written': 0,
+                'error': str(e)
+            }
+
+    async def read_dataframe(self,
+                            symbol: str,
+                            timeframe: Optional[str] = None,
+                            volume_bucket_size: Optional[int] = None,
+                            start: Optional[datetime] = None,
+                            end: Optional[datetime] = None) -> pd.DataFrame:
+        """
+        Read DataFrame from Parquet file asynchronously.
+
+        Args:
+            symbol: Trading symbol
+            timeframe: Time-based resampling
+            volume_bucket_size: Volume bucket size
+            start: Start date filter
+            end: End date filter
+
+        Returns:
+            DataFrame with intraday data
+        """
+        file_path = self._get_file_path(symbol, timeframe, volume_bucket_size)
+
+        if not file_path.exists():
+            if self.logger:
+                self.logger.warning(f"[Async] File not found: {file_path}")
+            return pd.DataFrame()
+
+        try:
+            loop = asyncio.get_event_loop()
+            df = await loop.run_in_executor(None, pd.read_parquet, file_path)
+
+            # Apply date filters
+            if start is not None:
+                df = df[df.index >= start]
+            if end is not None:
+                df = df[df.index <= end]
+
+            if self.logger:
+                self.logger.info(f"[Async] Read {len(df):,} records from {file_path.name}")
+
+            return df
+
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"[Async] Error reading {symbol}: {e}")
+            return pd.DataFrame()
+
+    async def batch_write_from_reader(self,
+                                      reader: AsyncScidReader,
+                                      symbols: List[str],
+                                      timeframe: Optional[str] = None,
+                                      volume_bucket_size: Optional[int] = None,
+                                      start: Optional[datetime] = None,
+                                      end: Optional[datetime] = None,
+                                      max_concurrent: int = 5,
+                                      mode: str = 'append') -> Dict[str, Dict[str, any]]:
+        """
+        Batch write data from AsyncScidReader to Parquet files.
+
+        Args:
+            reader: AsyncScidReader instance
+            symbols: List of symbols to process
+            timeframe: Time-based resampling rule
+            volume_bucket_size: Volume bucket size
+            start: Start date filter
+            end: End date filter
+            max_concurrent: Maximum concurrent tasks
+            mode: Write mode ('append', 'replace', 'create')
+
+        Returns:
+            Dictionary mapping symbols to write results
+        """
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def process_symbol(symbol: str) -> Dict[str, any]:
+            async with semaphore:
+                try:
+                    # Load data from reader
+                    df = await reader.load_front_month_series(
+                        ticker=symbol.replace('_F', ''),
+                        start=start,
+                        end=end,
+                        resample_rule=timeframe,
+                        volume_per_bar=volume_bucket_size
+                    )
+
+                    if df.empty:
+                        return {
+                            'success': False,
+                            'symbol': symbol,
+                            'records_written': 0,
+                            'error': 'No data loaded from reader'
+                        }
+
+                    # Write to Parquet
+                    return await self.write_dataframe(
+                        df=df,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        volume_bucket_size=volume_bucket_size,
+                        mode=mode
+                    )
+
+                except Exception as e:
+                    if self.logger:
+                        self.logger.error(f"[Async] Error processing {symbol}: {e}")
+                    return {
+                        'success': False,
+                        'symbol': symbol,
+                        'records_written': 0,
+                        'error': str(e)
+                    }
+
+        # Create tasks for all symbols
+        tasks = [process_symbol(symbol) for symbol in symbols]
+
+        # Run all tasks concurrently
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Build results dictionary
+        result_dict = {}
+        for symbol, result in zip(symbols, results):
+            if isinstance(result, Exception):
+                result_dict[symbol] = {
+                    'success': False,
+                    'symbol': symbol,
+                    'records_written': 0,
+                    'error': str(result)
+                }
+            else:
+                result_dict[symbol] = result
+
+        # Summary
+        total_records = sum(r.get('records_written', 0) for r in result_dict.values())
+        successful = sum(1 for r in result_dict.values() if r.get('success', False))
+
+        if self.logger:
+            self.logger.info(
+                f"[Async] Batch write complete: {successful}/{len(symbols)} successful, "
+                f"{total_records:,} total records"
+            )
+
+        return result_dict
 
 
 class IntradayFileManager:
@@ -232,7 +553,7 @@ class IntradayFileManager:
                                 end: Optional[datetime] = None,
                                 resample_rule: Optional[str] = None,
                                 volume_bucket_size: Optional[int] = None,
-                                detect_gaps: bool = True) -> Tuple[pd.DataFrame, Optional[List[GapInfo]]]:
+                                detect_gaps: bool = True):
         """
         Load continuous front month data using ScidReader.load_front_month_series.
 
@@ -247,14 +568,15 @@ class IntradayFileManager:
             detect_gaps: If True, analyze and return gap information
 
         Returns:
-            Tuple of (DataFrame, List[GapInfo]) where GapInfo is None if detect_gaps=False
+            If detect_gaps=True: Tuple of (DataFrame, List[GapInfo])
+            If detect_gaps=False: DataFrame only
         """
         scid_files = self.get_scid_files_for_symbol(symbol)
 
         if not scid_files:
             if self.logger:
                 self.logger.warning(f"No SCID files found for {symbol}")
-            return pd.DataFrame(), None
+            return (pd.DataFrame(), None) if detect_gaps else pd.DataFrame()
 
         if self.logger:
             self.logger.info(f"Loading front month series for {symbol} from {len(scid_files)} files")
@@ -263,7 +585,7 @@ class IntradayFileManager:
             # Initialize ScidReader with directory (reuse cached instance when possible)
             reader = self._get_scid_reader()
             if reader is None:
-                return pd.DataFrame(), None
+                return (pd.DataFrame(), None) if detect_gaps else pd.DataFrame()
 
             # Convert file paths to strings for load_scid_files
             file_paths = [str(f) for f in scid_files]
@@ -279,7 +601,7 @@ class IntradayFileManager:
             if df.empty:
                 if self.logger:
                     self.logger.warning(f"No data loaded for {symbol}")
-                return pd.DataFrame(), None
+                return (pd.DataFrame(), None) if detect_gaps else pd.DataFrame()
 
             # Apply volume bucketing if requested (after front month loading)
             if volume_bucket_size:
@@ -298,12 +620,12 @@ class IntradayFileManager:
                 date_range = f"{df.index[0]} to {df.index[-1]}"
                 self.logger.info(f"Loaded {len(df):,} records from {date_range}")
 
-            return df, gaps
+            return (df, gaps) if detect_gaps else df
 
         except Exception as e:
             if self.logger:
                 self.logger.error(f"Error loading front month series for {symbol}: {e}")
-            return pd.DataFrame(), None
+            return (pd.DataFrame(), None) if detect_gaps else pd.DataFrame()
 
     def load_scid_files_batch(self,
                               symbol: str,

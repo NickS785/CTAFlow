@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import time
-from typing import Callable, Dict, Iterable, List, Optional, Sequence
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -13,7 +14,7 @@ from ..utils.session import filter_session_ticks
 from ..utils.volume_bucket import auto_bucket_size, ticks_to_volume_buckets
 from stats_utils.fdr import fdr_bh
 
-__all__ = ["OrderflowParams", "orderflow_scan"]
+__all__ = ["OrderflowParams", "OrderflowScanner", "orderflow_scan"]
 
 
 @dataclass(slots=True)
@@ -216,24 +217,483 @@ def _seasonality_table(
     return table
 
 
+class OrderflowScanner:
+    """
+    Orderflow scanner for tick data analysis.
+
+    Analyzes volume-bucketed tick data for seasonality patterns, pressure metrics,
+    and orderflow events. Stores results in HDF5 for persistence.
+
+    Features:
+        - Volume bucket analysis with auto-sizing
+        - Buy/ask pressure metrics and VPIN calculation
+        - Intraday seasonality detection (weekly, week-of-month)
+        - Event detection with FDR-corrected significance
+        - HDF5 storage with per-symbol organization
+    """
+
+    def __init__(self,
+                 params: OrderflowParams,
+                 hdf_path: Optional[Path | str] = None):
+        """
+        Initialize OrderflowScanner.
+
+        Args:
+            params: OrderflowParams configuration
+            hdf_path: Path to HDF5 file for results storage (created if doesn't exist)
+        """
+        self.params = params
+        self.hdf_path = Path(hdf_path) if hdf_path else None
+        self.results: Dict[str, Dict[str, object]] = {}
+
+        # Parse session times once
+        self.session_start = _parse_time(params.session_start)
+        self.session_end = _parse_time(params.session_end)
+
+    def scan(self, tick_data: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str, object]]:
+        """
+        Scan tick data for all symbols.
+
+        Args:
+            tick_data: Dictionary mapping symbols to their tick DataFrames
+
+        Returns:
+            Dictionary mapping symbols to analysis results
+        """
+        self.results = {}
+
+        for symbol, ticks in tick_data.items():
+            try:
+                if ticks is None or ticks.empty:
+                    self.results[symbol] = {"error": "No tick data"}
+                    continue
+
+                # Normalize timestamp column
+                ticks = _normalize_tick_timestamps(ticks)
+
+            except Exception as exc:
+                self.results[symbol] = {"error": str(exc)}
+                continue
+
+            # Process symbol
+            result = self._process_symbol(symbol, ticks)
+            self.results[symbol] = result
+
+        return self.results
+
+    def _process_symbol(self, symbol: str, ticks: pd.DataFrame) -> Dict[str, object]:
+        """Process a single symbol's tick data."""
+        # Filter to session window
+        filtered = filter_session_ticks(ticks, self.params.tz, self.session_start, self.session_end)
+        if filtered.empty:
+            return {
+                "error": "No ticks within session window",
+                "metadata": {
+                    "session_start": self.params.session_start,
+                    "session_end": self.params.session_end,
+                    "tz": self.params.tz,
+                    "n_sessions": 0,
+                    "n_buckets": 0,
+                },
+            }
+
+        # Collapse and bucket
+        collapsed = _collapse_ticks(filtered)
+        bucket_param: Optional[int]
+        if isinstance(self.params.bucket_size, str) and self.params.bucket_size.lower() == "auto":
+            bucket_param = auto_bucket_size(
+                collapsed,
+                cadence_target=self.params.cadence_target,
+                grid_multipliers=self.params.grid_multipliers,
+            )
+            selection_method = "auto"
+        else:
+            bucket_param = int(self.params.bucket_size)
+            if bucket_param <= 0:
+                raise ValueError("bucket_size must be positive")
+            selection_method = "manual"
+
+        bucket_df = ticks_to_volume_buckets(collapsed, bucket_param)
+        if bucket_df.empty:
+            return {
+                "error": "No buckets generated",
+                "metadata": {
+                    "session_start": self.params.session_start,
+                    "session_end": self.params.session_end,
+                    "tz": self.params.tz,
+                    "n_sessions": 0,
+                    "n_buckets": 0,
+                    "bucket_size": bucket_param,
+                    "bucket_selection": selection_method,
+                },
+            }
+
+        # Calculate metrics
+        bucket_df = bucket_df.copy()
+        bucket_df["ticker"] = symbol
+        bucket_df["vpin"] = (
+            bucket_df["Imbalance"].abs() / bucket_param
+        ).rolling(window=self.params.vpin_window, min_periods=1).mean()
+
+        # Buy pressure: AskShare > 0.5 means more buying (aggressors hitting ask)
+        bucket_df["buy_pressure"] = bucket_df["AskShare"] - 0.5
+
+        # Sell pressure: Calculate from bid side
+        # First try BidShare if available, otherwise derive from AskShare
+        if "BidShare" in bucket_df.columns:
+            bucket_df["sell_pressure"] = bucket_df["BidShare"] - 0.5
+        else:
+            # BidShare = 1 - AskShare, so sell_pressure = (1 - AskShare) - 0.5 = 0.5 - AskShare
+            bucket_df["sell_pressure"] = 0.5 - bucket_df["AskShare"]
+
+        # Quote-based pressure (if quote data available)
+        if "AskQuoteShare" in bucket_df.columns and bucket_df["AskQuoteShare"].notna().any():
+            bucket_df["quote_buy_pressure"] = bucket_df["AskQuoteShare"] - 0.5
+
+        bucket_df["session_date"] = bucket_df["ts_end"].dt.tz_convert(self.params.tz).dt.date
+        bucket_df["weekday"] = bucket_df["ts_end"].dt.day_name()
+        bucket_df["weekday_number"] = bucket_df["ts_end"].dt.dayofweek
+        bucket_df["week_of_month"] = ((bucket_df["ts_end"].dt.day - 1) // 7) + 1
+
+        # Pressure metrics - buy and sell pressure always available
+        metrics = {
+            "buy_pressure": bucket_df["buy_pressure"],
+            "sell_pressure": bucket_df["sell_pressure"]
+        }
+
+        # Add quote-based pressure if available
+        if "quote_buy_pressure" in bucket_df.columns:
+            metrics["quote_buy_pressure"] = bucket_df["quote_buy_pressure"]
+
+        # Intraday pressure table
+        intraday = _intraday_pressure_table(bucket_df, metrics, symbol)
+
+        # Event detection
+        events_list: List[pd.DataFrame] = []
+        for metric_name in metrics:
+            z_col = f"{metric_name}_z"
+            bucket_df[z_col] = _robust_daily_zscores(bucket_df, metric_name, "session_date")
+            events_list.append(
+                _event_runs(
+                    bucket_df,
+                    metric_name,
+                    z_col,
+                    self.params.threshold_z,
+                    symbol,
+                )
+            )
+        events = pd.concat(events_list, ignore_index=True) if events_list else pd.DataFrame()
+
+        # Seasonality analysis
+        n_sessions = int(bucket_df["session_date"].nunique())
+        exploratory_flag = n_sessions < self.params.min_days
+
+        weekly_tables: List[pd.DataFrame] = []
+        for metric_name in metrics:
+            weekly_tables.append(
+                _seasonality_table(
+                    bucket_df,
+                    ["weekday"],
+                    metric_name,
+                    symbol,
+                    exploratory=exploratory_flag,
+                )
+            )
+        df_weekly = pd.concat(weekly_tables, ignore_index=True) if weekly_tables else pd.DataFrame()
+
+        wom_tables: List[pd.DataFrame] = []
+        for metric_name in metrics:
+            table = _seasonality_table(
+                bucket_df,
+                ["week_of_month", "weekday"],
+                metric_name,
+                symbol,
+                exploratory=exploratory_flag,
+            )
+            wom_tables.append(table)
+        df_wom = pd.concat(wom_tables, ignore_index=True) if wom_tables else pd.DataFrame()
+
+        # Metadata
+        metadata = {
+            "session_start": self.params.session_start,
+            "session_end": self.params.session_end,
+            "tz": self.params.tz,
+            "bucket_size": bucket_param,
+            "bucket_selection": selection_method,
+            "n_sessions": n_sessions,
+            "days": n_sessions,
+            "n_buckets": int(len(bucket_df)),
+            "exploratory": n_sessions < self.params.min_days,
+        }
+
+        # Select bucket columns
+        bucket_cols = [
+            "ticker",
+            "bucket",
+            "ts_start",
+            "ts_end",
+            "AskVolume",
+            "BidVolume",
+            "TotalVolume",
+            "n_ticks",
+            "AskShare",
+            "Imbalance",
+            "ImbalanceFraction",
+            "vpin",
+            "buy_pressure",
+            "sell_pressure",
+        ]
+
+        # Add optional columns if present
+        if "AskQuoteShare" in bucket_df.columns:
+            bucket_cols.append("AskQuoteShare")
+        if "quote_buy_pressure" in bucket_df.columns:
+            bucket_cols.append("quote_buy_pressure")
+        if "AskQuoteVolume" in bucket_df.columns:
+            bucket_cols.append("AskQuoteVolume")
+        if "BidQuoteVolume" in bucket_df.columns:
+            bucket_cols.append("BidQuoteVolume")
+        if "BidShare" in bucket_df.columns:
+            bucket_cols.append("BidShare")
+
+        return {
+            "df_buckets": bucket_df[bucket_cols].copy(),
+            "df_intraday_pressure": intraday,
+            "df_events": events,
+            "df_weekly": df_weekly,
+            "df_wom_weekday": df_wom,
+            "metadata": metadata,
+        }
+
+    def write_to_hdf(self, hdf_path: Optional[Path | str] = None) -> Dict[str, str]:
+        """
+        Write scan results to HDF5 file.
+
+        Creates organized HDF5 structure:
+            /orderflow/{symbol}/buckets
+            /orderflow/{symbol}/intraday_pressure
+            /orderflow/{symbol}/events
+            /orderflow/{symbol}/weekly
+            /orderflow/{symbol}/wom_weekday
+            /orderflow/{symbol}/metadata
+
+        Args:
+            hdf_path: Path to HDF5 file (uses self.hdf_path if not provided)
+
+        Returns:
+            Dictionary mapping symbols to write status
+
+        Examples:
+            scanner = OrderflowScanner(params, hdf_path='orderflow_results.h5')
+            scanner.scan(tick_data)
+            status = scanner.write_to_hdf()
+        """
+        if not self.results:
+            raise ValueError("No results to write. Run scan() first.")
+
+        target_path = Path(hdf_path) if hdf_path else self.hdf_path
+        if target_path is None:
+            raise ValueError("No HDF5 path provided")
+
+        target_path = Path(target_path)
+
+        # Create parent directory if needed
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        write_status = {}
+
+        with pd.HDFStore(target_path, mode='a') as store:
+            for symbol, result in self.results.items():
+                try:
+                    if "error" in result:
+                        write_status[symbol] = f"skipped: {result['error']}"
+                        continue
+
+                    base_key = f"orderflow/{symbol}"
+
+                    # Write each DataFrame
+                    for df_name in ["df_buckets", "df_intraday_pressure", "df_events", "df_weekly", "df_wom_weekday"]:
+                        df = result.get(df_name)
+                        if df is not None and not df.empty:
+                            df = df.copy()
+
+                            # Convert time columns to strings for HDF5 compatibility
+                            for col in df.columns:
+                                if hasattr(df[col], 'dtype') and df[col].dtype == 'object':
+                                    if len(df[col]) > 0 and isinstance(df[col].iloc[0], time):
+                                        df[col] = df[col].astype(str)
+
+                            key = f"{base_key}/{df_name.replace('df_', '')}"
+                            store.put(key, df, format='table', data_columns=True)
+
+                    # Write metadata as series
+                    if "metadata" in result:
+                        metadata_series = pd.Series(result["metadata"])
+                        store.put(f"{base_key}/metadata", metadata_series)
+
+                    write_status[symbol] = "success"
+
+                except Exception as e:
+                    write_status[symbol] = f"error: {str(e)}"
+
+        return write_status
+
+    def read_from_hdf(self,
+                     symbols: Optional[List[str]] = None,
+                     hdf_path: Optional[Path | str] = None) -> Dict[str, Dict[str, object]]:
+        """
+        Read scan results from HDF5 file.
+
+        Args:
+            symbols: List of symbols to read (reads all if None)
+            hdf_path: Path to HDF5 file (uses self.hdf_path if not provided)
+
+        Returns:
+            Dictionary mapping symbols to their results
+
+        Examples:
+            scanner = OrderflowScanner(params, hdf_path='orderflow_results.h5')
+            results = scanner.read_from_hdf(symbols=['CL_F', 'NG_F'])
+        """
+        target_path = Path(hdf_path) if hdf_path else self.hdf_path
+        if target_path is None:
+            raise ValueError("No HDF5 path provided")
+
+        target_path = Path(target_path)
+        if not target_path.exists():
+            raise FileNotFoundError(f"HDF5 file not found: {target_path}")
+
+        results = {}
+
+        with pd.HDFStore(target_path, mode='r') as store:
+            # Get all symbols if not specified
+            if symbols is None:
+                all_keys = store.keys()
+                symbols = list(set(k.split('/')[2] for k in all_keys if k.startswith('/orderflow/')))
+
+            for symbol in symbols:
+                try:
+                    base_key = f"/orderflow/{symbol}"
+                    result = {}
+
+                    # Read DataFrames
+                    df_names = {
+                        "buckets": "df_buckets",
+                        "intraday_pressure": "df_intraday_pressure",
+                        "events": "df_events",
+                        "weekly": "df_weekly",
+                        "wom_weekday": "df_wom_weekday",
+                    }
+
+                    for hdf_name, result_name in df_names.items():
+                        key = f"{base_key}/{hdf_name}"
+                        if key in store:
+                            result[result_name] = store.get(key)
+
+                    # Read metadata
+                    metadata_key = f"{base_key}/metadata"
+                    if metadata_key in store:
+                        metadata_series = store.get(metadata_key)
+                        result["metadata"] = metadata_series.to_dict()
+
+                    results[symbol] = result
+
+                except Exception as e:
+                    results[symbol] = {"error": str(e)}
+
+        return results
+
+
+def _normalize_tick_timestamps(ticks: pd.DataFrame) -> pd.DataFrame:
+    """Ensure tick data has a 'ts' column for timestamp and handle duplicates."""
+    ticks = ticks.copy()
+
+    # First, get or create the 'ts' column
+    if "ts" not in ticks.columns:
+        # Check for alternative timestamp column names
+        if isinstance(ticks.index, pd.DatetimeIndex):
+            ticks.insert(0, "ts", ticks.index)
+        else:
+            # Check common timestamp column names
+            ts_candidates = ["timestamp", "datetime", "time", "date"]
+            found = False
+            for candidate in ts_candidates:
+                if candidate in ticks.columns:
+                    ticks.rename(columns={candidate: "ts"}, inplace=True)
+                    found = True
+                    break
+
+            if not found:
+                raise ValueError(
+                    "Tick data must have a 'ts' column, DatetimeIndex, or one of: "
+                    f"{', '.join(ts_candidates)}"
+                )
+
+    # Handle duplicate timestamps by aggregating
+    if ticks["ts"].duplicated().any():
+        # Group by timestamp and sum numeric columns (typical for tick data)
+        numeric_cols = ticks.select_dtypes(include=[np.number]).columns.tolist()
+        if numeric_cols:
+            # Aggregate: sum volumes, keep first for non-numeric
+            agg_dict = {col: 'sum' for col in numeric_cols}
+            ticks = ticks.groupby("ts", as_index=False).agg(agg_dict)
+        else:
+            # If no numeric columns, just keep first occurrence
+            ticks = ticks.drop_duplicates(subset=["ts"], keep="first")
+
+    return ticks
+
+
 def orderflow_scan(
-    tick_source: Callable[[str], pd.DataFrame],
-    symbols: Iterable[str],
+    tick_data: Dict[str, pd.DataFrame],
     params: OrderflowParams,
 ) -> Dict[str, Dict[str, object]]:
+    """
+    Scan orderflow patterns in tick data (convenience function).
+
+    This is a wrapper around OrderflowScanner.scan() for backward compatibility.
+    For more features (like HDF5 persistence), use OrderflowScanner directly.
+
+    Args:
+        tick_data: Dictionary mapping symbols to their tick DataFrames
+        params: OrderflowParams configuration
+
+    Returns:
+        Dictionary mapping symbols to analysis results
+
+    Examples:
+        # Simple scan
+        results = orderflow_scan(tick_data, params)
+
+        # For HDF5 persistence, use the class:
+        scanner = OrderflowScanner(params, hdf_path='results.h5')
+        results = scanner.scan(tick_data)
+        scanner.write_to_hdf()
+    """
+    scanner = OrderflowScanner(params)
+    return scanner.scan(tick_data)
+
+
+def _deprecated_orderflow_scan(
+    tick_data: Dict[str, pd.DataFrame],
+    params: OrderflowParams,
+) -> Dict[str, Dict[str, object]]:
+    """Old implementation - keeping for reference only."""
     results: Dict[str, Dict[str, object]] = {}
     session_start = _parse_time(params.session_start)
     session_end = _parse_time(params.session_end)
 
-    for symbol in symbols:
+    for symbol, ticks in tick_data.items():
         try:
-            ticks = tick_source(symbol)
-        except Exception as exc:  # pragma: no cover - tick loader failure path
-            results[symbol] = {"error": str(exc)}
-            continue
+            if ticks is None or ticks.empty:
+                results[symbol] = {"error": "No tick data"}
+                continue
 
-        if ticks is None or ticks.empty:
-            results[symbol] = {"error": "No tick data"}
+            # Normalize timestamp column
+            ticks = _normalize_tick_timestamps(ticks)
+
+        except Exception as exc:  # pragma: no cover - tick data normalization failure
+            results[symbol] = {"error": str(exc)}
             continue
 
         filtered = filter_session_ticks(ticks, params.tz, session_start, session_end)
@@ -389,20 +849,26 @@ def orderflow_scan(
     return results
 
 
-def _default_tick_loader_factory(path_template: str) -> Callable[[str], pd.DataFrame]:
+def _load_tick_data_dict(path_template: str, symbols: List[str]) -> Dict[str, pd.DataFrame]:
+    """Load tick data for multiple symbols into a dictionary."""
     from pathlib import Path
 
-    def _loader(symbol: str) -> pd.DataFrame:
+    tick_data: Dict[str, pd.DataFrame] = {}
+    for symbol in symbols:
         path = Path(path_template.format(symbol=symbol))
         if not path.exists():
-            raise FileNotFoundError(f"No tick file found for {symbol} at {path}")
-        if path.suffix.lower() == ".csv":
-            return pd.read_csv(path)
-        if path.suffix.lower() == ".parquet":
-            return pd.read_parquet(path)
-        raise ValueError(f"Unsupported tick format: {path.suffix}")
-
-    return _loader
+            print(f"Warning: No tick file found for {symbol} at {path}")
+            continue
+        try:
+            if path.suffix.lower() == ".csv":
+                tick_data[symbol] = pd.read_csv(path, index_col=0, parse_dates=True)
+            elif path.suffix.lower() == ".parquet":
+                tick_data[symbol] = pd.read_parquet(path)
+            else:
+                print(f"Warning: Unsupported tick format for {symbol}: {path.suffix}")
+        except Exception as e:
+            print(f"Error loading {symbol}: {e}")
+    return tick_data
 
 
 def _build_arg_parser() -> "argparse.ArgumentParser":
@@ -454,8 +920,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         grid_multipliers=tuple(args.grid) if args.grid else (0.5, 0.75, 1.0, 1.25, 1.5),
     )
 
-    tick_loader = _default_tick_loader_factory(args.ticks_path)
-    scan_results = orderflow_scan(tick_loader, args.symbols, params)
+    # Load tick data into dictionary
+    tick_data = _load_tick_data_dict(args.ticks_path, args.symbols)
+    if not tick_data:
+        print("Error: No tick data could be loaded for any symbols")
+        return
+
+    scan_results = orderflow_scan(tick_data, params)
     for symbol, payload in scan_results.items():
         print(f"=== {symbol} ===")
         if "error" in payload:

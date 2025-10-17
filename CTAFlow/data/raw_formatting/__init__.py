@@ -5,6 +5,7 @@ from .spread_manager import (
 )
 from .intraday_manager import (
     IntradayFileManager,
+    AsyncParquetWriter,
     get_arctic_instance,
     clear_arctic_cache,
     get_cached_arctic_uris,
@@ -20,6 +21,7 @@ __all__ = [
     "SpreadData",
     "SyntheticSymbol",
     "IntradayFileManager",
+    "AsyncParquetWriter",
     "get_arctic_instance",
     "clear_arctic_cache",
     "get_cached_arctic_uris",
