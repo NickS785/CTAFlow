@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -15,6 +15,45 @@ from ..utils.volume_bucket import auto_bucket_size, ticks_to_volume_buckets
 from stats_utils.fdr import fdr_bh
 
 __all__ = ["OrderflowParams", "OrderflowScanner", "orderflow_scan"]
+
+
+_MONTH_TO_SEASON = {
+    1: "winter",
+    2: "winter",
+    3: "spring",
+    4: "spring",
+    5: "spring",
+    6: "summer",
+    7: "summer",
+    8: "summer",
+    9: "fall",
+    10: "fall",
+    11: "fall",
+    12: "winter",
+}
+
+_SEASON_ALIASES = {
+    "winter": "winter",
+    "spring": "spring",
+    "summer": "summer",
+    "fall": "fall",
+    "autumn": "fall",
+}
+
+_QUARTER_ALIASES = {
+    "q1": 1,
+    "q2": 2,
+    "q3": 3,
+    "q4": 4,
+    "quarter1": 1,
+    "quarter2": 2,
+    "quarter3": 3,
+    "quarter4": 4,
+    "quarter_1": 1,
+    "quarter_2": 2,
+    "quarter_3": 3,
+    "quarter_4": 4,
+}
 
 
 @dataclass(slots=True)
@@ -28,6 +67,8 @@ class OrderflowParams:
     min_days: int = 30
     cadence_target: int = 50
     grid_multipliers: Sequence[float] = (0.5, 0.75, 1.0, 1.25, 1.5)
+    month_filter: Optional[Sequence[int]] = None
+    season_filter: Optional[Sequence[str]] = None
 
 
 _TimeLike = str | time
@@ -98,7 +139,8 @@ def _intraday_pressure_table(
 ) -> pd.DataFrame:
     records: List[Dict[str, object]] = []
     df = df.copy()
-    df["clock_time"] = df["ts_end"].dt.time
+    if "clock_time" not in df.columns:
+        df["clock_time"] = df["ts_end"].dt.time
     for metric_name, series in metrics.items():
         metric_df = pd.DataFrame({"value": series, "clock_time": df["clock_time"]}).dropna()
         if metric_df.empty:
@@ -215,6 +257,155 @@ def _seasonality_table(
     table["q_value"] = fdr_result.q_values
     table["sig_fdr_5pct"] = table["q_value"] <= 0.05
     return table
+
+
+def _normalize_season_filters(values: Sequence[str]) -> Tuple[set[str], set[int], List[str]]:
+    seasons: set[str] = set()
+    quarters: set[int] = set()
+    normalized: List[str] = []
+    for raw in values:
+        if raw is None:
+            continue
+        label = str(raw).strip().lower()
+        if not label:
+            continue
+        if label in _SEASON_ALIASES:
+            canonical = _SEASON_ALIASES[label]
+            seasons.add(canonical)
+            normalized.append(canonical)
+        elif label in _QUARTER_ALIASES:
+            quarter = _QUARTER_ALIASES[label]
+            quarters.add(_QUARTER_ALIASES[label])
+            normalized.append(f"Q{_QUARTER_ALIASES[label]}")
+        else:
+            raise ValueError(f"Unsupported season/quarter label: {raw}")
+    # Preserve input order but drop duplicates
+    normalized_unique = list(dict.fromkeys(normalized))
+    return seasons, quarters, normalized_unique
+
+
+def _build_period_filter(
+    df: pd.DataFrame,
+    month_filter: Optional[Sequence[int]],
+    season_filter: Optional[Sequence[str]],
+) -> Tuple[Optional[pd.Series], Dict[str, object]]:
+    filters: Dict[str, object] = {}
+    mask = pd.Series(True, index=df.index, dtype=bool)
+    applied = False
+
+    if month_filter:
+        months = sorted({int(m) for m in month_filter})
+        for month in months:
+            if month < 1 or month > 12:
+                raise ValueError(f"Month filter values must be between 1 and 12. Got {month}.")
+        mask &= df["month"].isin(months)
+        filters["months"] = months
+        applied = True
+
+    if season_filter:
+        seasons, quarters, normalized = _normalize_season_filters(season_filter)
+        if seasons:
+            mask &= df["season"].isin(seasons)
+        if quarters:
+            mask &= df["quarter"].isin(list(quarters))
+            filters["quarters"] = sorted(quarters)
+        if normalized:
+            filters["season_filters"] = normalized
+        applied = True
+
+    if not applied:
+        return None, filters
+
+    return mask, filters
+
+
+def _metric_bias(metric: str, mean_value: float) -> str:
+    if np.isnan(mean_value) or mean_value == 0:
+        return "neutral"
+    lower_metric = metric.lower()
+    if lower_metric in {"buy_pressure", "quote_buy_pressure"}:
+        return "buy" if mean_value > 0 else "sell"
+    if lower_metric == "sell_pressure":
+        return "sell" if mean_value > 0 else "buy"
+    return "positive" if mean_value > 0 else "negative"
+
+
+def _weekly_peak_pressure(
+    bucket_df: pd.DataFrame,
+    weekly_table: pd.DataFrame,
+    metrics: Dict[str, pd.Series],
+    ticker: str,
+) -> pd.DataFrame:
+    columns = [
+        "ticker",
+        "metric",
+        "weekday",
+        "clock_time",
+        "pressure_bias",
+        "seasonality_mean",
+        "seasonality_t_stat",
+        "seasonality_q_value",
+        "seasonality_n",
+        "seasonality_sig_fdr_5pct",
+        "intraday_mean",
+        "intraday_median",
+        "intraday_n",
+        "exploratory",
+    ]
+
+    if weekly_table is None or weekly_table.empty:
+        return pd.DataFrame(columns=columns)
+
+    sig_mask = weekly_table.get("sig_fdr_5pct", pd.Series(dtype=bool)).fillna(False)
+    if not sig_mask.any():
+        return pd.DataFrame(columns=columns)
+
+    records: List[Dict[str, object]] = []
+
+    for _, row in weekly_table.loc[sig_mask].iterrows():
+        metric = row["metric"]
+        weekday = row["weekday"]
+        if metric not in metrics:
+            continue
+        subset = bucket_df.loc[bucket_df["weekday"] == weekday, ["clock_time", metric]]
+        subset = subset.dropna(subset=[metric])
+        if subset.empty:
+            continue
+        grouped = subset.groupby("clock_time")[metric].agg(["mean", "median", "count"])
+        if grouped.empty:
+            continue
+
+        weekly_mean = float(row.get("mean", np.nan))
+        if np.isnan(weekly_mean):
+            target_time = grouped["mean"].abs().idxmax()
+        elif weekly_mean > 0:
+            target_time = grouped["mean"].idxmax()
+        else:
+            target_time = grouped["mean"].idxmin()
+
+        peak = grouped.loc[target_time]
+        bias = _metric_bias(metric, weekly_mean if not np.isnan(weekly_mean) else float(peak["mean"]))
+
+        records.append(
+            {
+                "ticker": ticker,
+                "metric": metric,
+                "weekday": weekday,
+                "clock_time": target_time,
+                "pressure_bias": bias,
+                "seasonality_mean": weekly_mean,
+                "seasonality_t_stat": float(row.get("t_stat", np.nan)),
+                "seasonality_q_value": float(row.get("q_value", np.nan)),
+                "seasonality_n": int(row.get("n", 0)) if not pd.isna(row.get("n")) else 0,
+                "seasonality_sig_fdr_5pct": bool(row.get("sig_fdr_5pct", False)),
+                "intraday_mean": float(peak["mean"]),
+                "intraday_median": float(peak["median"]),
+                "intraday_n": int(peak["count"]),
+                "exploratory": bool(row.get("exploratory", False)),
+            }
+        )
+
+    return pd.DataFrame(records, columns=columns)
 
 
 class OrderflowScanner:
@@ -350,10 +541,44 @@ class OrderflowScanner:
         if "AskQuoteShare" in bucket_df.columns and bucket_df["AskQuoteShare"].notna().any():
             bucket_df["quote_buy_pressure"] = bucket_df["AskQuoteShare"] - 0.5
 
-        bucket_df["session_date"] = bucket_df["ts_end"].dt.tz_convert(self.params.tz).dt.date
-        bucket_df["weekday"] = bucket_df["ts_end"].dt.day_name()
-        bucket_df["weekday_number"] = bucket_df["ts_end"].dt.dayofweek
-        bucket_df["week_of_month"] = ((bucket_df["ts_end"].dt.day - 1) // 7) + 1
+        local_ts_end = bucket_df["ts_end"].dt.tz_convert(self.params.tz)
+        bucket_df["session_date"] = local_ts_end.dt.date
+        bucket_df["weekday"] = local_ts_end.dt.day_name()
+        bucket_df["weekday_number"] = local_ts_end.dt.dayofweek
+        bucket_df["week_of_month"] = ((local_ts_end.dt.day - 1) // 7) + 1
+        bucket_df["month"] = local_ts_end.dt.month
+        bucket_df["quarter"] = local_ts_end.dt.quarter
+        bucket_df["season"] = bucket_df["month"].map(_MONTH_TO_SEASON)
+        bucket_df["clock_time"] = local_ts_end.dt.time
+
+        pre_filter_sessions = int(bucket_df["session_date"].nunique())
+
+        mask, filters_applied = _build_period_filter(
+            bucket_df,
+            self.params.month_filter,
+            self.params.season_filter,
+        )
+
+        if mask is not None:
+            bucket_df = bucket_df.loc[mask].copy()
+
+        if bucket_df.empty:
+            return {
+                "error": "No buckets after applying seasonal filters",
+                "metadata": {
+                    "session_start": self.params.session_start,
+                    "session_end": self.params.session_end,
+                    "tz": self.params.tz,
+                    "n_sessions": 0,
+                    "n_buckets": 0,
+                    "bucket_size": bucket_param,
+                    "bucket_selection": selection_method,
+                    "filters": filters_applied,
+                    "days": 0,
+                    "exploratory": True,
+                    "n_sessions_pre_filter": pre_filter_sessions,
+                },
+            }
 
         # Pressure metrics - buy and sell pressure always available
         metrics = {
@@ -400,6 +625,7 @@ class OrderflowScanner:
                 )
             )
         df_weekly = pd.concat(weekly_tables, ignore_index=True) if weekly_tables else pd.DataFrame()
+        df_weekly_peak = _weekly_peak_pressure(bucket_df, df_weekly, metrics, symbol)
 
         wom_tables: List[pd.DataFrame] = []
         for metric_name in metrics:
@@ -424,6 +650,8 @@ class OrderflowScanner:
             "days": n_sessions,
             "n_buckets": int(len(bucket_df)),
             "exploratory": n_sessions < self.params.min_days,
+            "filters": filters_applied,
+            "n_sessions_pre_filter": pre_filter_sessions,
         }
 
         # Select bucket columns
@@ -462,6 +690,7 @@ class OrderflowScanner:
             "df_events": events,
             "df_weekly": df_weekly,
             "df_wom_weekday": df_wom,
+            "df_weekly_peak_pressure": df_weekly_peak,
             "metadata": metadata,
         }
 
@@ -512,7 +741,14 @@ class OrderflowScanner:
                     base_key = f"orderflow/{symbol}"
 
                     # Write each DataFrame
-                    for df_name in ["df_buckets", "df_intraday_pressure", "df_events", "df_weekly", "df_wom_weekday"]:
+                    for df_name in [
+                        "df_buckets",
+                        "df_intraday_pressure",
+                        "df_events",
+                        "df_weekly",
+                        "df_wom_weekday",
+                        "df_weekly_peak_pressure",
+                    ]:
                         df = result.get(df_name)
                         if df is not None and not df.empty:
                             df = df.copy()
@@ -583,6 +819,7 @@ class OrderflowScanner:
                         "events": "df_events",
                         "weekly": "df_weekly",
                         "wom_weekday": "df_wom_weekday",
+                        "weekly_peak_pressure": "df_weekly_peak_pressure",
                     }
 
                     for hdf_name, result_name in df_names.items():
