@@ -55,5 +55,8 @@ london_seasonals = [london_fall_seasonality, london_winter_seasonality, london_s
 momentums = [spring_momentum, summer_momentum, fall_momentum, winter_momentum, momentum_generic]
 
 us_of_screen = OrderflowParams(session_start="08:30", session_end="15:30")
+us_of_winter = OrderflowParams(session_start="08:30", session_end="15:30", month_filter=[11,12,1,2,3], name="us_winter")
+us_of_summer = OrderflowParams(session_start="08:30", session_end="15:30", month_filter=[5,6,7,8], name="us_summer")
 london_of_screen = OrderflowParams(session_start="02:30", session_end="11:30", vpin_window=30)
-
+london_of_winter = OrderflowParams(session_start="02:30", session_end="11:30", month_filter=[11,12,1,2,3], name="london_winter")
+london_of_summer = OrderflowParams(session_start="02:30", session_end="11:30", month_filter=[5,6,7,8], name="london_summer")

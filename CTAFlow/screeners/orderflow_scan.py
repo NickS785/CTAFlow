@@ -69,6 +69,7 @@ class OrderflowParams:
     grid_multipliers: Sequence[float] = (0.5, 0.75, 1.0, 1.25, 1.5)
     month_filter: Optional[Sequence[int]] = None
     season_filter: Optional[Sequence[str]] = None
+    name: Optional[str] = None  # Optional name for identifying scan results
 
 
 _TimeLike = str | time
@@ -417,29 +418,34 @@ class OrderflowScanner:
 
     Features:
         - Volume bucket analysis with auto-sizing
-        - Buy/ask pressure metrics and VPIN calculation
+        - Buy/sell pressure metrics and VPIN calculation
         - Intraday seasonality detection (weekly, week-of-month)
         - Event detection with FDR-corrected significance
         - HDF5 storage with per-symbol organization
+        - Multi-scan support: Run multiple configurations (like HistoricalScreener.run_screens)
     """
 
     def __init__(self,
-                 params: OrderflowParams,
+                 params: Optional[OrderflowParams] = None,
                  hdf_path: Optional[Path | str] = None):
         """
         Initialize OrderflowScanner.
 
         Args:
-            params: OrderflowParams configuration
+            params: OrderflowParams configuration (optional if using run_scans)
             hdf_path: Path to HDF5 file for results storage (created if doesn't exist)
         """
         self.params = params
         self.hdf_path = Path(hdf_path) if hdf_path else None
         self.results: Dict[str, Dict[str, object]] = {}
 
-        # Parse session times once
-        self.session_start = _parse_time(params.session_start)
-        self.session_end = _parse_time(params.session_end)
+        # Parse session times once (if params provided)
+        if params:
+            self.session_start = _parse_time(params.session_start)
+            self.session_end = _parse_time(params.session_end)
+        else:
+            self.session_start = None
+            self.session_end = None
 
     def scan(self, tick_data: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str, object]]:
         """
@@ -694,6 +700,202 @@ class OrderflowScanner:
             "metadata": metadata,
         }
 
+    def _process_symbol_from_buckets(
+        self,
+        symbol: str,
+        bucket_df: pd.DataFrame,
+        bucket_param: int
+    ) -> Dict[str, object]:
+        """
+        Process a single symbol using pre-computed volume buckets.
+
+        This method is used by run_scans() to reuse bucket data when multiple
+        scans share the same session parameters.
+
+        Args:
+            symbol: Trading symbol
+            bucket_df: Pre-computed bucket DataFrame
+            bucket_param: Bucket size used
+
+        Returns:
+            Dictionary with analysis results
+        """
+        # Make a copy to avoid modifying shared data
+        bucket_df = bucket_df.copy()
+
+        # Calculate metrics
+        bucket_df["ticker"] = symbol
+        bucket_df["vpin"] = (
+            bucket_df["Imbalance"].abs() / bucket_param
+        ).rolling(window=self.params.vpin_window, min_periods=1).mean()
+
+        # Buy pressure: AskShare > 0.5 means more buying (aggressors hitting ask)
+        bucket_df["buy_pressure"] = bucket_df["AskShare"] - 0.5
+
+        # Sell pressure: Calculate from bid side
+        if "BidShare" in bucket_df.columns:
+            bucket_df["sell_pressure"] = bucket_df["BidShare"] - 0.5
+        else:
+            bucket_df["sell_pressure"] = 0.5 - bucket_df["AskShare"]
+
+        # Quote-based pressure (if quote data available)
+        if "AskQuoteShare" in bucket_df.columns and bucket_df["AskQuoteShare"].notna().any():
+            bucket_df["quote_buy_pressure"] = bucket_df["AskQuoteShare"] - 0.5
+
+        # Add temporal columns
+        local_ts_end = bucket_df["ts_end"].dt.tz_convert(self.params.tz)
+        bucket_df["session_date"] = local_ts_end.dt.date
+        bucket_df["weekday"] = local_ts_end.dt.day_name()
+        bucket_df["weekday_number"] = local_ts_end.dt.dayofweek
+        bucket_df["week_of_month"] = ((local_ts_end.dt.day - 1) // 7) + 1
+        bucket_df["month"] = local_ts_end.dt.month
+        bucket_df["quarter"] = local_ts_end.dt.quarter
+        bucket_df["season"] = bucket_df["month"].map(_MONTH_TO_SEASON)
+        bucket_df["clock_time"] = local_ts_end.dt.time
+
+        pre_filter_sessions = int(bucket_df["session_date"].nunique())
+
+        # Apply seasonal/temporal filters
+        mask, filters_applied = _build_period_filter(
+            bucket_df,
+            self.params.month_filter,
+            self.params.season_filter,
+        )
+
+        if mask is not None:
+            bucket_df = bucket_df.loc[mask].copy()
+
+        if bucket_df.empty:
+            return {
+                "error": "No buckets after applying seasonal filters",
+                "metadata": {
+                    "session_start": self.params.session_start,
+                    "session_end": self.params.session_end,
+                    "tz": self.params.tz,
+                    "n_sessions": 0,
+                    "n_buckets": 0,
+                    "bucket_size": bucket_param,
+                    "bucket_selection": "auto",  # Shared bucket always uses auto
+                    "filters": filters_applied,
+                    "days": 0,
+                    "exploratory": True,
+                    "n_sessions_pre_filter": pre_filter_sessions,
+                },
+            }
+
+        # Pressure metrics
+        metrics = {
+            "buy_pressure": bucket_df["buy_pressure"],
+            "sell_pressure": bucket_df["sell_pressure"]
+        }
+
+        if "quote_buy_pressure" in bucket_df.columns:
+            metrics["quote_buy_pressure"] = bucket_df["quote_buy_pressure"]
+
+        # Intraday pressure table
+        intraday = _intraday_pressure_table(bucket_df, metrics, symbol)
+
+        # Event detection
+        events_list: List[pd.DataFrame] = []
+        for metric_name in metrics:
+            z_col = f"{metric_name}_z"
+            bucket_df[z_col] = _robust_daily_zscores(bucket_df, metric_name, "session_date")
+            events_list.append(
+                _event_runs(
+                    bucket_df,
+                    metric_name,
+                    z_col,
+                    self.params.threshold_z,
+                    symbol,
+                )
+            )
+        events = pd.concat(events_list, ignore_index=True) if events_list else pd.DataFrame()
+
+        # Seasonality analysis
+        n_sessions = int(bucket_df["session_date"].nunique())
+        exploratory_flag = n_sessions < self.params.min_days
+
+        weekly_tables: List[pd.DataFrame] = []
+        for metric_name in metrics:
+            weekly_tables.append(
+                _seasonality_table(
+                    bucket_df,
+                    ["weekday"],
+                    metric_name,
+                    symbol,
+                    exploratory=exploratory_flag,
+                )
+            )
+        df_weekly = pd.concat(weekly_tables, ignore_index=True) if weekly_tables else pd.DataFrame()
+        df_weekly_peak = _weekly_peak_pressure(bucket_df, df_weekly, metrics, symbol)
+
+        wom_tables: List[pd.DataFrame] = []
+        for metric_name in metrics:
+            table = _seasonality_table(
+                bucket_df,
+                ["week_of_month", "weekday"],
+                metric_name,
+                symbol,
+                exploratory=exploratory_flag,
+            )
+            wom_tables.append(table)
+        df_wom = pd.concat(wom_tables, ignore_index=True) if wom_tables else pd.DataFrame()
+
+        # Metadata
+        metadata = {
+            "session_start": self.params.session_start,
+            "session_end": self.params.session_end,
+            "tz": self.params.tz,
+            "bucket_size": bucket_param,
+            "bucket_selection": "auto",  # Shared bucket always uses auto
+            "n_sessions": n_sessions,
+            "days": n_sessions,
+            "n_buckets": int(len(bucket_df)),
+            "exploratory": n_sessions < self.params.min_days,
+            "filters": filters_applied,
+            "n_sessions_pre_filter": pre_filter_sessions,
+        }
+
+        # Select bucket columns
+        bucket_cols = [
+            "ticker",
+            "bucket",
+            "ts_start",
+            "ts_end",
+            "AskVolume",
+            "BidVolume",
+            "TotalVolume",
+            "n_ticks",
+            "AskShare",
+            "Imbalance",
+            "ImbalanceFraction",
+            "vpin",
+            "buy_pressure",
+            "sell_pressure",
+        ]
+
+        # Add optional columns if present
+        if "AskQuoteShare" in bucket_df.columns:
+            bucket_cols.append("AskQuoteShare")
+        if "quote_buy_pressure" in bucket_df.columns:
+            bucket_cols.append("quote_buy_pressure")
+        if "AskQuoteVolume" in bucket_df.columns:
+            bucket_cols.append("AskQuoteVolume")
+        if "BidQuoteVolume" in bucket_df.columns:
+            bucket_cols.append("BidQuoteVolume")
+        if "BidShare" in bucket_df.columns:
+            bucket_cols.append("BidShare")
+
+        return {
+            "df_buckets": bucket_df[bucket_cols].copy(),
+            "df_intraday_pressure": intraday,
+            "df_events": events,
+            "df_weekly": df_weekly,
+            "df_wom_weekday": df_wom,
+            "df_weekly_peak_pressure": df_weekly_peak,
+            "metadata": metadata,
+        }
+
     def write_to_hdf(self, hdf_path: Optional[Path | str] = None) -> Dict[str, str]:
         """
         Write scan results to HDF5 file.
@@ -839,6 +1041,284 @@ class OrderflowScanner:
                     results[symbol] = {"error": str(e)}
 
         return results
+
+    def run_scans(
+        self,
+        scan_params: List[OrderflowParams],
+        tick_data: Dict[str, pd.DataFrame],
+        output_format: str = 'dict'
+    ) -> Dict[str, Dict[str, Dict[str, object]]]:
+        """
+        Run multiple orderflow scans with different configurations.
+
+        Similar to HistoricalScreener.run_screens(), this method allows you to run
+        multiple scanning configurations (e.g., different sessions, seasons, or
+        bucket sizes) and combine the results into a single output.
+
+        **Optimization**: If all scans use the same session times, volume bucket data
+        is computed once and reused across all scans.
+
+        Args:
+            scan_params: List of OrderflowParams objects defining each scan to run
+            tick_data: Dictionary mapping symbols to their tick DataFrames
+            output_format: Output format ('dict' or 'dataframe')
+
+        Returns:
+            Dictionary mapping scan names to results:
+            {scan_name: {symbol: results}}
+
+        Examples:
+            # Run scans for multiple sessions
+            scanner = OrderflowScanner()
+            scans = [
+                OrderflowParams(
+                    name='asia_session',
+                    session_start='02:30',
+                    session_end='08:30',
+                    season_filter=['winter']
+                ),
+                OrderflowParams(
+                    name='us_session',
+                    session_start='09:30',
+                    session_end='16:00',
+                    season_filter=['winter']
+                ),
+                OrderflowParams(
+                    name='full_day',
+                    session_start='00:00',
+                    session_end='23:59',
+                    month_filter=[1, 2, 12]
+                )
+            ]
+            results = scanner.run_scans(scans, tick_data)
+            # Access: results['asia_session']['CL_F']
+
+            # Run scans for different seasons (optimized - same session)
+            scans = [
+                OrderflowParams(
+                    name='winter_orderflow',
+                    session_start='09:30',
+                    session_end='16:00',
+                    season_filter=['winter'],
+                    bucket_size='auto'
+                ),
+                OrderflowParams(
+                    name='summer_orderflow',
+                    session_start='09:30',
+                    session_end='16:00',
+                    season_filter=['summer'],
+                    bucket_size='auto'
+                )
+            ]
+            # Only computes volume buckets once since sessions are identical
+            results = scanner.run_scans(scans, tick_data)
+
+            # Auto-generate names if not provided
+            scans = [
+                OrderflowParams(session_start='02:30', session_end='08:30'),
+                OrderflowParams(session_start='09:30', session_end='16:00')
+            ]
+            results = scanner.run_scans(scans, tick_data)
+            # Names: 'scan_0230_0830', 'scan_0930_1600'
+        """
+        if not scan_params:
+            raise ValueError("scan_params cannot be empty")
+
+        # Auto-detect if all scans use the same session
+        sessions = [(p.session_start, p.session_end, p.tz) for p in scan_params]
+        same_session = len(set(sessions)) == 1
+
+        composite_results = {}
+
+        if same_session:
+            # Optimization: Compute volume buckets once and reuse
+            # This is much faster when running multiple seasonal/temporal filters
+            # on the same session window
+            shared_bucket_data = {}
+
+            # Get the common session parameters
+            common_params = scan_params[0]
+
+            # Pre-compute bucketed data for all symbols
+            for symbol, ticks in tick_data.items():
+                try:
+                    if ticks is None or ticks.empty:
+                        continue
+
+                    # Normalize timestamp column
+                    ticks = _normalize_tick_timestamps(ticks)
+
+                    # Filter to session window
+                    session_start = _parse_time(common_params.session_start)
+                    session_end = _parse_time(common_params.session_end)
+                    filtered = filter_session_ticks(ticks, common_params.tz, session_start, session_end)
+
+                    if filtered.empty:
+                        continue
+
+                    # Collapse and bucket (shared computation)
+                    collapsed = _collapse_ticks(filtered)
+
+                    # Determine bucket size (use first scan's bucket_size)
+                    if isinstance(common_params.bucket_size, str) and common_params.bucket_size.lower() == "auto":
+                        bucket_param = auto_bucket_size(
+                            collapsed,
+                            cadence_target=common_params.cadence_target,
+                            grid_multipliers=common_params.grid_multipliers,
+                        )
+                    else:
+                        bucket_param = int(common_params.bucket_size)
+
+                    bucket_df = ticks_to_volume_buckets(collapsed, bucket_param)
+
+                    if not bucket_df.empty:
+                        shared_bucket_data[symbol] = (bucket_df, bucket_param)
+
+                except Exception:
+                    # Skip symbols with errors in pre-processing
+                    continue
+
+            # Now run each scan using the shared bucket data
+            for i, params in enumerate(scan_params):
+                scan_name = params.name if params.name else self._generate_scan_name(params, i)
+
+                # Create temporary scanner
+                temp_scanner = OrderflowScanner(params, hdf_path=self.hdf_path)
+
+                # Process each symbol using shared bucket data
+                scan_result = {}
+                for symbol, (bucket_df, bucket_param) in shared_bucket_data.items():
+                    # Process symbol with pre-computed buckets
+                    result = temp_scanner._process_symbol_from_buckets(
+                        symbol, bucket_df, bucket_param
+                    )
+                    scan_result[symbol] = result
+
+                composite_results[scan_name] = scan_result
+
+        else:
+            # Different sessions - run each scan independently
+            for i, params in enumerate(scan_params):
+                scan_name = params.name if params.name else self._generate_scan_name(params, i)
+
+                # Create temporary scanner with these params
+                temp_scanner = OrderflowScanner(params, hdf_path=self.hdf_path)
+
+                # Run scan
+                scan_result = temp_scanner.scan(tick_data)
+
+                # Store results with scan name as key
+                composite_results[scan_name] = scan_result
+
+        # Store results in instance
+        self.results = composite_results
+
+        # Convert to requested format
+        if output_format.lower() == 'dataframe':
+            return self._composite_to_dataframe(composite_results)
+        elif output_format.lower() == 'dict':
+            return composite_results
+        else:
+            raise ValueError(f"output_format must be 'dict' or 'dataframe', got '{output_format}'")
+
+    def _generate_scan_name(self, params: OrderflowParams, index: int) -> str:
+        """Generate automatic scan name from parameters."""
+        parts = []
+
+        # Add session info
+        start_str = params.session_start.replace(':', '')
+        end_str = params.session_end.replace(':', '')
+        parts.append(f"scan_{start_str}_{end_str}")
+
+        # Add filter info
+        if params.season_filter:
+            # Get first season/quarter as identifier
+            seasons, quarters, normalized = _normalize_season_filters(params.season_filter)
+            if normalized:
+                parts.append(normalized[0].lower())
+
+        if params.month_filter:
+            # Use first and last month as identifier
+            months = sorted(params.month_filter)
+            if len(months) == 1:
+                parts.append(f"m{months[0]}")
+            else:
+                parts.append(f"m{months[0]}_m{months[-1]}")
+
+        # Add bucket size if not auto
+        if isinstance(params.bucket_size, int):
+            parts.append(f"b{params.bucket_size}")
+
+        # If we only have the scan prefix, add index
+        if len(parts) == 1:
+            parts.append(str(index))
+
+        return '_'.join(parts)
+
+    def _composite_to_dataframe(self, composite_results: Dict[str, Dict[str, Dict]]) -> pd.DataFrame:
+        """
+        Convert composite results dictionary to a flattened DataFrame.
+
+        Args:
+            composite_results: {scan_name: {symbol: results}}
+
+        Returns:
+            DataFrame with MultiIndex (scan_name, symbol)
+        """
+        records = []
+
+        for scan_name, scan_results in composite_results.items():
+            for symbol, result in scan_results.items():
+                if 'error' in result:
+                    record = {
+                        'scan_name': scan_name,
+                        'symbol': symbol,
+                        'error': result['error']
+                    }
+                else:
+                    # Extract key metadata
+                    metadata = result.get('metadata', {})
+                    record = {
+                        'scan_name': scan_name,
+                        'symbol': symbol,
+                        'n_sessions': metadata.get('n_sessions', 0),
+                        'n_buckets': metadata.get('n_buckets', 0),
+                        'bucket_size': metadata.get('bucket_size'),
+                        'bucket_selection': metadata.get('bucket_selection'),
+                        'exploratory': metadata.get('exploratory', False),
+                        'session_start': metadata.get('session_start'),
+                        'session_end': metadata.get('session_end'),
+                        'tz': metadata.get('tz'),
+                    }
+
+                    # Add filter info if present
+                    if 'filters' in metadata:
+                        record['filters'] = str(metadata['filters'])
+                    if 'n_sessions_pre_filter' in metadata:
+                        record['n_sessions_pre_filter'] = metadata['n_sessions_pre_filter']
+
+                    # Count significant results
+                    df_weekly = result.get('df_weekly')
+                    if isinstance(df_weekly, pd.DataFrame) and not df_weekly.empty:
+                        record['n_significant_weekly'] = df_weekly['sig_fdr_5pct'].sum()
+                    else:
+                        record['n_significant_weekly'] = 0
+
+                    df_events = result.get('df_events')
+                    if isinstance(df_events, pd.DataFrame):
+                        record['n_events'] = len(df_events)
+                    else:
+                        record['n_events'] = 0
+
+                records.append(record)
+
+        df = pd.DataFrame(records)
+
+        # Set MultiIndex
+        if not df.empty:
+            df = df.set_index(['scan_name', 'symbol'])
+
+        return df
 
 
 def _normalize_tick_timestamps(ticks: pd.DataFrame) -> pd.DataFrame:

@@ -319,10 +319,21 @@ class AsyncParquetWriter:
             loop = asyncio.get_event_loop()
             df = await loop.run_in_executor(None, pd.read_parquet, file_path)
 
-            # Apply date filters
+            # Apply date filters with timezone-aware comparison
             if start is not None:
+                # Ensure start is timezone-aware if df.index is timezone-aware
+                if df.index.tz is not None and start.tzinfo is None:
+                    start = pd.Timestamp(start).tz_localize(df.index.tz)
+                elif df.index.tz is None and start.tzinfo is not None:
+                    start = start.replace(tzinfo=None)
                 df = df[df.index >= start]
+
             if end is not None:
+                # Ensure end is timezone-aware if df.index is timezone-aware
+                if df.index.tz is not None and end.tzinfo is None:
+                    end = pd.Timestamp(end).tz_localize(df.index.tz)
+                elif df.index.tz is None and end.tzinfo is not None:
+                    end = end.replace(tzinfo=None)
                 df = df[df.index <= end]
 
             if self.logger:
@@ -431,6 +442,161 @@ class AsyncParquetWriter:
             )
 
         return result_dict
+
+    async def batch_read_to_dict(self,
+                                 symbols: List[str],
+                                 timeframe: Optional[str] = None,
+                                 volume_bucket_size: Optional[int] = None,
+                                 start: Optional[datetime] = None,
+                                 end: Optional[datetime] = None,
+                                 max_concurrent: int = 10) -> Dict[str, pd.DataFrame]:
+        """
+        Load multiple tickers into a dictionary asynchronously.
+
+        This method is designed for batch loading data for analysis tools like
+        orderflow_scan which expect Dict[str, pd.DataFrame] input.
+
+        Args:
+            symbols: List of trading symbols to load
+            timeframe: Time-based resampling (e.g., '1T', '5T')
+            volume_bucket_size: Volume bucket size
+            start: Start date filter
+            end: End date filter
+            max_concurrent: Maximum concurrent read operations
+
+        Returns:
+            Dictionary mapping symbols to their DataFrames
+
+        Examples:
+            # Load multiple symbols for orderflow analysis
+            writer = AsyncParquetWriter()
+            tick_data = await writer.batch_read_to_dict(
+                symbols=['CL_F', 'NG_F', 'ZC_F'],
+                timeframe='1T',
+                start=datetime(2024, 1, 1),
+                end=datetime(2024, 12, 31)
+            )
+
+            # Use with orderflow_scan
+            from CTAFlow.screeners import orderflow_scan, OrderflowParams
+            params = OrderflowParams(session_start='09:00', session_end='16:00')
+            results = orderflow_scan(tick_data, params)
+
+            # Load volume-bucketed data
+            tick_data = await writer.batch_read_to_dict(
+                symbols=['CL_F', 'NG_F'],
+                volume_bucket_size=500,
+                start=datetime(2024, 6, 1)
+            )
+        """
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def load_symbol(symbol: str) -> tuple[str, pd.DataFrame]:
+            async with semaphore:
+                try:
+                    df = await self.read_dataframe(
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        volume_bucket_size=volume_bucket_size,
+                        start=start,
+                        end=end
+                    )
+
+                    if not df.empty and self.logger:
+                        self.logger.info(
+                            f"[Async] Loaded {len(df):,} records for {symbol} "
+                            f"({df.index[0]} to {df.index[-1]})"
+                        )
+
+                    return symbol, df
+
+                except Exception as e:
+                    if self.logger:
+                        self.logger.error(f"[Async] Error loading {symbol}: {e}")
+                    return symbol, pd.DataFrame()
+
+        # Create tasks for all symbols
+        tasks = [load_symbol(symbol) for symbol in symbols]
+
+        # Run all tasks concurrently
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Build results dictionary, filtering out errors and empty DataFrames
+        result_dict = {}
+        for result in results:
+            if isinstance(result, Exception):
+                if self.logger:
+                    self.logger.error(f"[Async] Task exception: {result}")
+                continue
+
+            symbol, df = result
+            if not df.empty:
+                result_dict[symbol] = df
+            elif self.logger:
+                self.logger.warning(f"[Async] No data found for {symbol}")
+
+        # Summary
+        total_records = sum(len(df) for df in result_dict.values())
+        loaded = len(result_dict)
+
+        if self.logger:
+            self.logger.info(
+                f"[Async] Batch read complete: {loaded}/{len(symbols)} symbols loaded, "
+                f"{total_records:,} total records"
+            )
+
+        return result_dict
+
+    def batch_read_to_dict_sync(self,
+                                symbols: List[str],
+                                timeframe: Optional[str] = None,
+                                volume_bucket_size: Optional[int] = None,
+                                start: Optional[datetime] = None,
+                                end: Optional[datetime] = None,
+                                max_concurrent: int = 10) -> Dict[str, pd.DataFrame]:
+        """
+        Load multiple tickers into a dictionary (synchronous wrapper).
+
+        This is a synchronous wrapper around batch_read_to_dict() for convenience
+        when working in non-async contexts.
+
+        Args:
+            symbols: List of trading symbols to load
+            timeframe: Time-based resampling
+            volume_bucket_size: Volume bucket size
+            start: Start date filter
+            end: End date filter
+            max_concurrent: Maximum concurrent read operations
+
+        Returns:
+            Dictionary mapping symbols to their DataFrames
+
+        Examples:
+            # Synchronous usage
+            writer = AsyncParquetWriter()
+            tick_data = writer.batch_read_to_dict_sync(
+                symbols=['CL_F', 'NG_F', 'ZC_F'],
+                timeframe='1T',
+                start=datetime(2024, 1, 1)
+            )
+
+            # Direct use with orderflow_scan
+            from CTAFlow.screeners import orderflow_scan, OrderflowParams
+            tick_data = AsyncParquetWriter().batch_read_to_dict_sync(
+                symbols=['CL_F', 'NG_F'],
+                volume_bucket_size=500
+            )
+            params = OrderflowParams(session_start='09:00', session_end='16:00')
+            results = orderflow_scan(tick_data, params)
+        """
+        return asyncio.run(self.batch_read_to_dict(
+            symbols=symbols,
+            timeframe=timeframe,
+            volume_bucket_size=volume_bucket_size,
+            start=start,
+            end=end,
+            max_concurrent=max_concurrent
+        ))
 
 
 class IntradayFileManager:

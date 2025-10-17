@@ -142,12 +142,12 @@ def get_all_mappings() -> dict:
 def search_mappings(search_term: str) -> dict:
     """
     Search for mappings containing the search term.
-    
+
     Parameters:
     -----------
     search_term : str
         Term to search for (case-insensitive)
-    
+
     Returns:
     --------
     dict
@@ -159,7 +159,7 @@ def search_mappings(search_term: str) -> dict:
         'matching_commodities': [],
         'matching_codes': []
     }
-    
+
     # Search tickers
     for ticker in TICKER_TO_CODE.keys():
         if search_lower in ticker.lower():
@@ -168,7 +168,7 @@ def search_mappings(search_term: str) -> dict:
                 'commodity': FUTURES_MAP['tickers'][ticker],
                 'cot_code': TICKER_TO_CODE[ticker]
             })
-    
+
     # Search commodities
     for commodity in FUTURES_MAP['COT']['codes'].keys():
         if search_lower in commodity.lower():
@@ -179,7 +179,7 @@ def search_mappings(search_term: str) -> dict:
                 'cot_code': code,
                 'ticker': ticker
             })
-    
+
     # Search codes
     for code in REV_TICKER_CODES.keys():
         if search_lower in code:
@@ -190,7 +190,21 @@ def search_mappings(search_term: str) -> dict:
                 'commodity': commodity,
                 'ticker': ticker
             })
-    
+
     return results
+
+
+# ==========================================
+# CENTRALIZED CONSTANTS
+# ==========================================
+
+# Month code mapping (centralized from multiple locations)
+MONTH_CODE_MAP = {
+    'F': 1, 'G': 2, 'H': 3, 'J': 4, 'K': 5, 'M': 6,
+    'N': 7, 'Q': 8, 'U': 9, 'V': 10, 'X': 11, 'Z': 12
+}
+
+# Reverse mapping for convenience
+MONTH_NUMBER_TO_CODE = {v: k for k, v in MONTH_CODE_MAP.items()}
 
 
