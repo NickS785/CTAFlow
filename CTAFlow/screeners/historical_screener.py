@@ -8,6 +8,23 @@ from ..data import IntradayFileManager, DataClient, SyntheticSymbol
 from ..config import DLY_DATA_PATH, INTRADAY_ADB_PATH
 from ..utils.session import filter_session_bars
 from scipy import stats
+from CTAFlow.features.event_study import EventSpec, run_event_study
+from CTAFlow.features.event_helpers import baseline_hourly_mean
+
+
+def _target_time_event_fn(target_time: time, tz: str):
+    """Return an event flagger for the provided ``target_time`` in ``tz``."""
+
+    target_hour = target_time.hour
+    target_minute = target_time.minute
+
+    def _flag(df: pd.DataFrame) -> pd.Series:
+        idx = pd.DatetimeIndex(df.index)
+        localized = idx.tz_localize(tz) if idx.tz is None else idx.tz_convert(tz)
+        mask = (localized.hour == target_hour) & (localized.minute == target_minute)
+        return pd.Series(mask, index=df.index)
+
+    return _flag
 
 
 @dataclass
@@ -211,6 +228,12 @@ class HistoricalScreener:
             - spring: Mar, Apr, May (3, 4, 5)
             - summer: Jun, Jul, Aug (6, 7, 8)
             - fall: Sep, Oct, Nov (9, 10, 11)
+        include_volume : bool
+            Retained for API compatibility; volume analytics are handled by
+            :class:`OrderflowScanner`.
+        event_pre_bars, event_post_bars : int
+            Number of bars to include before and after each target-time
+            observation when computing event studies.
         session_start : Optional[Union[str, time]]
             Local session start time for filtering intraday bars (default "00:00").
         session_end : Optional[Union[str, time]]
@@ -368,6 +391,8 @@ class HistoricalScreener:
         session_end: Optional[Union[str, time]] = None,
         tz: str = "America/Chicago",
         include_volume: bool = False,
+        event_pre_bars: int = 30,
+        event_post_bars: int = 30,
     ) -> Dict[str, Dict[str, any]]:
         """
         Screen for seasonality patterns in intraday data.
@@ -522,6 +547,30 @@ class HistoricalScreener:
                 'n_sessions': int(session_dates.nunique()),
             }
 
+            prices = session_data[price_col].astype(float)
+            if is_synthetic:
+                ret_series = prices.diff()
+            else:
+                with np.errstate(divide='ignore'):
+                    ret_series = np.log(prices).diff()
+            ret_series = ret_series.dropna()
+            ret_df = pd.DataFrame({'ret': ret_series})
+
+            event_studies: Dict[str, Dict[str, object]] = {}
+            if not ret_df.empty:
+                def _baseline(frame: pd.DataFrame) -> pd.Series:
+                    return baseline_hourly_mean(frame, ret_col='ret')
+
+                for target_time in converted_times:
+                    spec = EventSpec(
+                        name=f"tod_{target_time.strftime('%H%M')}",
+                        event_fn=_target_time_event_fn(target_time, tz),
+                        pre=int(event_pre_bars),
+                        post=int(event_post_bars),
+                        baseline_fn=_baseline,
+                    )
+                    event_studies[target_time.strftime('%H:%M')] = run_event_study(ret_df, spec, ret_col='ret')
+
             # Day-of-week analysis
             if dayofweek_screen:
                 dow_results = self._analyze_dayofweek_patterns(session_data, price_col, is_synthetic)
@@ -541,6 +590,7 @@ class HistoricalScreener:
                 time_predictions[str(target_time)] = pred_stats
 
             ticker_results['time_predictability'] = time_predictions
+            ticker_results['event_studies'] = event_studies
 
             # Month-by-month analysis if filtering is applied
             if selected_months is not None:

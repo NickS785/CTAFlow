@@ -16,6 +16,7 @@ from scipy import stats
 from ..utils.session import filter_session_ticks
 from ..utils.volume_bucket import auto_bucket_size, ticks_to_volume_buckets
 from stats_utils.fdr import fdr_bh
+from CTAFlow.features.event_study import EventSpec, run_event_study
 
 __all__ = ["OrderflowParams", "OrderflowScanner", "orderflow_scan"]
 
@@ -73,6 +74,8 @@ class OrderflowParams:
     month_filter: Optional[Sequence[int]] = None
     season_filter: Optional[Sequence[str]] = None
     name: Optional[str] = None  # Optional name for identifying scan results
+    event_pre_bars: int = 5
+    event_post_bars: int = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,6 +255,33 @@ def _event_runs(
             }
         )
     return pd.DataFrame(records)
+
+
+def _event_flagger(event_times: pd.DatetimeIndex):
+    """Return an event function compatible with :class:`EventSpec`."""
+
+    if event_times.empty:
+        def _no_events(df: pd.DataFrame) -> pd.Series:
+            return pd.Series(False, index=df.index)
+
+        return _no_events
+
+    times = pd.DatetimeIndex(event_times)
+    times = times[~times.duplicated()].sort_values()
+    if times.tz is None:
+        times = times.tz_localize("UTC")
+    else:
+        times = times.tz_convert("UTC")
+
+    encoded = times.view("int64")
+
+    def _flag(df: pd.DataFrame) -> pd.Series:
+        idx = pd.DatetimeIndex(df.index)
+        idx = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+        mask = np.in1d(idx.view("int64"), encoded)
+        return pd.Series(mask, index=df.index)
+
+    return _flag
 
 
 def _seasonality_table(
@@ -667,6 +697,35 @@ class OrderflowScanner:
             )
         events = pd.concat(events_list, ignore_index=True) if events_list else pd.DataFrame()
 
+        event_studies: Dict[str, Dict[str, object]] = {}
+        if not bucket_df.empty and not events.empty:
+            ts_end_index = pd.DatetimeIndex(bucket_df["ts_end"])
+            ts_end_index = ts_end_index.tz_localize("UTC") if ts_end_index.tz is None else ts_end_index.tz_convert("UTC")
+
+            for metric_name, series in metrics.items():
+                metric_events = events[events["metric"] == metric_name]
+                if metric_events.empty:
+                    continue
+
+                event_times = pd.to_datetime(metric_events["ts_end"])
+                event_times = pd.DatetimeIndex(event_times)
+                event_times = event_times.intersection(ts_end_index)
+                if event_times.empty:
+                    continue
+
+                metric_frame = pd.DataFrame({"ret": series.astype(float).values}, index=ts_end_index)
+                metric_frame = metric_frame.dropna()
+                if metric_frame.empty:
+                    continue
+
+                spec = EventSpec(
+                    name=f"{metric_name}_events",
+                    event_fn=_event_flagger(event_times),
+                    pre=int(self.params.event_pre_bars),
+                    post=int(self.params.event_post_bars),
+                )
+                event_studies[metric_name] = run_event_study(metric_frame, spec, ret_col="ret")
+
         # Seasonality analysis
         n_sessions = int(bucket_df["session_date"].nunique())
         exploratory_flag = n_sessions < self.params.min_days
@@ -746,6 +805,7 @@ class OrderflowScanner:
             "df_buckets": bucket_df[bucket_cols].copy(),
             "df_intraday_pressure": intraday,
             "df_events": events,
+            "event_study": event_studies,
             "df_weekly": df_weekly,
             "df_wom_weekday": df_wom,
             "df_weekly_peak_pressure": df_weekly_peak,

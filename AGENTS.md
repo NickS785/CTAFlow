@@ -46,6 +46,12 @@ The codebase follows a modular pipeline architecture with four main components:
 - **`signals_processing.py`**: Core technical analysis and COT signal generation
   - `COTProcessor`: Handles COT data cleaning and positioning metrics
   - `TechnicalAnalysis`: Calculates selective technical indicators and volatility normalization
+- Synthetic liquidity and seasonality utilities live under `CTAFlow/utils/` as
+  `synthetic_liquidity.py` and `seasonality.py`. Screeners and analytics code
+  import from these shared helpers rather than `CTAFlow/features`.
+- The orderflow and historical seasonality screeners automatically attach
+  event-study diagnostics using `CTAFlow.features.event_study`, aligning events
+  with registered target times.
 - **`feature_engineering.py`**: Intraday microstructure features
   - `IntradayFeatures`: Microstructure and intraday feature extraction
 - **`curve_analysis.py`**: Advanced futures curve analysis framework

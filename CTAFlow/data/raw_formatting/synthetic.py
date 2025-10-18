@@ -1636,7 +1636,7 @@ class SyntheticSymbol:
         self.legs_df = self._generate_legs_data()
 
         # Calculate combined spread price
-        self.price = self._calculate_legs_price()
+        self.price = self._initialize_price_frame()
 
     @classmethod
     def from_weights_dict(
@@ -2050,3 +2050,14 @@ class SyntheticSymbol:
             end_date=end_date,
             reconstruct=reconstruct
         )
+    def _initialize_price_frame(self) -> Union[pd.Series, pd.DataFrame]:
+        """Build the default price representation for the synthetic symbol."""
+
+        if self.intraday or isinstance(self.data_engine, IntradaySpreadEngine):
+            try:
+                return self.data_engine.build_spread_series(return_ohlc=True)
+            except ValueError:
+                # Fall back to close-only series if OHLC construction fails
+                return self.data_engine.build_spread_series(return_ohlc=False)
+
+        return self._calculate_legs_price()
