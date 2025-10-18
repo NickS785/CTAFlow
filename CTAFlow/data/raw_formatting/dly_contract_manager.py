@@ -18,27 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple, Sequence
 import numpy as np
 import pandas as pd
 
-from CTAFlow.config import MARKET_DATA_PATH, RAW_MARKET_DATA_PATH, DLY_DATA_PATH
-
-
-# Default location for DLY files
-
-
-MONTH_CODE_MAP = {
-    "F": 1,  # Jan
-    "G": 2,  # Feb
-    "H": 3,  # Mar
-
-    "J": 4,  # Apr
-    "K": 5,  # May
-    "M": 6,  # Jun
-    "N": 7,  # Jul
-    "Q": 8,  # Aug
-    "U": 9,  # Sep
-    "V": 10, # Oct
-    "X": 11, # Nov
-    "Z": 12, # Dec
-}
+from CTAFlow.config import MARKET_DATA_PATH, RAW_MARKET_DATA_PATH, DLY_DATA_PATH, MONTH_CODE_MAP
 
 
 @dataclass(frozen=True)
