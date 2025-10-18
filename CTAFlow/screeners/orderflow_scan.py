@@ -1,6 +1,9 @@
 """Orderflow seasonality and event detection on volume buckets."""
 from __future__ import annotations
 
+import os
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import time
 from pathlib import Path
@@ -72,6 +75,21 @@ class OrderflowParams:
     name: Optional[str] = None  # Optional name for identifying scan results
 
 
+@dataclass(frozen=True, slots=True)
+class _SessionKey:
+    session_start: str
+    session_end: str
+    tz: str
+
+
+@dataclass(frozen=True, slots=True)
+class _BucketKey:
+    mode: str
+    bucket_size: Optional[int]
+    cadence_target: Optional[int]
+    grid_multipliers: Optional[Tuple[float, ...]]
+
+
 _TimeLike = str | time
 
 
@@ -88,6 +106,40 @@ def _time_to_micros(value: time) -> int:
     return (
         ((value.hour * 60 + value.minute) * 60 + value.second) * 1_000_000
         + value.microsecond
+    )
+
+
+def _normalize_time_str(value: _TimeLike) -> str:
+    return _parse_time(value).strftime("%H:%M:%S")
+
+
+def _make_session_key(params: OrderflowParams) -> _SessionKey:
+    return _SessionKey(
+        session_start=_normalize_time_str(params.session_start),
+        session_end=_normalize_time_str(params.session_end),
+        tz=params.tz,
+    )
+
+
+def _make_bucket_key(params: OrderflowParams) -> _BucketKey:
+    if isinstance(params.bucket_size, str) and params.bucket_size.lower() == "auto":
+        multipliers = tuple(float(x) for x in params.grid_multipliers)
+        return _BucketKey(
+            mode="auto",
+            bucket_size=None,
+            cadence_target=int(params.cadence_target),
+            grid_multipliers=multipliers,
+        )
+
+    bucket_size = int(params.bucket_size)
+    if bucket_size <= 0:
+        raise ValueError("bucket_size must be positive")
+
+    return _BucketKey(
+        mode="manual",
+        bucket_size=bucket_size,
+        cadence_target=None,
+        grid_multipliers=None,
     )
 
 
@@ -704,7 +756,8 @@ class OrderflowScanner:
         self,
         symbol: str,
         bucket_df: pd.DataFrame,
-        bucket_param: int
+        bucket_param: int,
+        selection_method: str = "auto",
     ) -> Dict[str, object]:
         """
         Process a single symbol using pre-computed volume buckets.
@@ -775,7 +828,7 @@ class OrderflowScanner:
                     "n_sessions": 0,
                     "n_buckets": 0,
                     "bucket_size": bucket_param,
-                    "bucket_selection": "auto",  # Shared bucket always uses auto
+                    "bucket_selection": selection_method,
                     "filters": filters_applied,
                     "days": 0,
                     "exploratory": True,
@@ -847,7 +900,7 @@ class OrderflowScanner:
             "session_end": self.params.session_end,
             "tz": self.params.tz,
             "bucket_size": bucket_param,
-            "bucket_selection": "auto",  # Shared bucket always uses auto
+            "bucket_selection": selection_method,
             "n_sessions": n_sessions,
             "days": n_sessions,
             "n_buckets": int(len(bucket_df)),
@@ -1055,8 +1108,10 @@ class OrderflowScanner:
         multiple scanning configurations (e.g., different sessions, seasons, or
         bucket sizes) and combine the results into a single output.
 
-        **Optimization**: If all scans use the same session times, volume bucket data
-        is computed once and reused across all scans.
+        **Optimization**: Volume buckets are pre-calculated per session window and
+        reused across scans, even when running multiple sessions in parallel. This
+        dramatically reduces the work required when experimenting with different
+        seasonal filters or bucket configurations.
 
         Args:
             scan_params: List of OrderflowParams objects defining each scan to run
@@ -1124,90 +1179,59 @@ class OrderflowScanner:
         if not scan_params:
             raise ValueError("scan_params cannot be empty")
 
-        # Auto-detect if all scans use the same session
-        sessions = [(p.session_start, p.session_end, p.tz) for p in scan_params]
-        same_session = len(set(sessions)) == 1
+        session_groups: Dict[_SessionKey, List[Tuple[int, OrderflowParams]]] = defaultdict(list)
+        session_order: List[_SessionKey] = []
+        for index, params in enumerate(scan_params):
+            session_key = _make_session_key(params)
+            if session_key not in session_groups:
+                session_order.append(session_key)
+            session_groups[session_key].append((index, params))
 
-        composite_results = {}
+        composite_results: Dict[str, Dict[str, Dict[str, object]]] = {}
+        collapsed_cache: Dict[_SessionKey, Dict[str, pd.DataFrame]] = {}
+        bucket_cache: Dict[Tuple[_SessionKey, _BucketKey], Dict[str, Tuple[pd.DataFrame, int, str]]] = {}
 
-        if same_session:
-            # Optimization: Compute volume buckets once and reuse
-            # This is much faster when running multiple seasonal/temporal filters
-            # on the same session window
-            shared_bucket_data = {}
+        for session_key in session_order:
+            group = session_groups[session_key]
+            collapsed = collapsed_cache.get(session_key)
+            if collapsed is None:
+                collapsed = _precompute_session_collapsed(tick_data, session_key)
+                collapsed_cache[session_key] = collapsed
 
-            # Get the common session parameters
-            common_params = scan_params[0]
+            for i, params in group:
+                scan_name = params.name if params.name else self._generate_scan_name(params, i)
+                temp_scanner = OrderflowScanner(params, hdf_path=self.hdf_path)
+                bucket_key = _make_bucket_key(params)
+                cache_key = (session_key, bucket_key)
 
-            # Pre-compute bucketed data for all symbols
-            for symbol, ticks in tick_data.items():
-                try:
-                    if ticks is None or ticks.empty:
-                        continue
+                shared_bucket_data = bucket_cache.get(cache_key)
+                if shared_bucket_data is None:
+                    shared_bucket_data = _compute_bucket_data(collapsed, bucket_key)
+                    bucket_cache[cache_key] = shared_bucket_data
 
-                    # Normalize timestamp column
-                    ticks = _normalize_tick_timestamps(ticks)
-
-                    # Filter to session window
-                    session_start = _parse_time(common_params.session_start)
-                    session_end = _parse_time(common_params.session_end)
-                    filtered = filter_session_ticks(ticks, common_params.tz, session_start, session_end)
-
-                    if filtered.empty:
-                        continue
-
-                    # Collapse and bucket (shared computation)
-                    collapsed = _collapse_ticks(filtered)
-
-                    # Determine bucket size (use first scan's bucket_size)
-                    if isinstance(common_params.bucket_size, str) and common_params.bucket_size.lower() == "auto":
-                        bucket_param = auto_bucket_size(
-                            collapsed,
-                            cadence_target=common_params.cadence_target,
-                            grid_multipliers=common_params.grid_multipliers,
+                scan_result: Dict[str, Dict[str, object]] = {}
+                for symbol, ticks in tick_data.items():
+                    bucket_info = shared_bucket_data.get(symbol)
+                    if bucket_info is not None:
+                        bucket_df, bucket_param, selection_method = bucket_info
+                        result = temp_scanner._process_symbol_from_buckets(
+                            symbol,
+                            bucket_df,
+                            bucket_param,
+                            selection_method,
                         )
                     else:
-                        bucket_param = int(common_params.bucket_size)
+                        try:
+                            if ticks is None or ticks.empty:
+                                result = {"error": "No tick data"}
+                            else:
+                                normalized = _normalize_tick_timestamps(ticks)
+                                result = temp_scanner._process_symbol(symbol, normalized)
+                        except Exception as exc:
+                            result = {"error": str(exc)}
 
-                    bucket_df = ticks_to_volume_buckets(collapsed, bucket_param)
-
-                    if not bucket_df.empty:
-                        shared_bucket_data[symbol] = (bucket_df, bucket_param)
-
-                except Exception:
-                    # Skip symbols with errors in pre-processing
-                    continue
-
-            # Now run each scan using the shared bucket data
-            for i, params in enumerate(scan_params):
-                scan_name = params.name if params.name else self._generate_scan_name(params, i)
-
-                # Create temporary scanner
-                temp_scanner = OrderflowScanner(params, hdf_path=self.hdf_path)
-
-                # Process each symbol using shared bucket data
-                scan_result = {}
-                for symbol, (bucket_df, bucket_param) in shared_bucket_data.items():
-                    # Process symbol with pre-computed buckets
-                    result = temp_scanner._process_symbol_from_buckets(
-                        symbol, bucket_df, bucket_param
-                    )
                     scan_result[symbol] = result
 
-                composite_results[scan_name] = scan_result
-
-        else:
-            # Different sessions - run each scan independently
-            for i, params in enumerate(scan_params):
-                scan_name = params.name if params.name else self._generate_scan_name(params, i)
-
-                # Create temporary scanner with these params
-                temp_scanner = OrderflowScanner(params, hdf_path=self.hdf_path)
-
-                # Run scan
-                scan_result = temp_scanner.scan(tick_data)
-
-                # Store results with scan name as key
                 composite_results[scan_name] = scan_result
 
         # Store results in instance
@@ -1359,6 +1383,143 @@ def _normalize_tick_timestamps(ticks: pd.DataFrame) -> pd.DataFrame:
             ticks = ticks.drop_duplicates(subset=["ts"], keep="first")
 
     return ticks
+
+
+def _determine_worker_count(task_count: int) -> int:
+    max_workers = os.cpu_count() or 1
+    if task_count <= 1 or max_workers <= 1:
+        return 1
+    return min(task_count, max_workers)
+
+
+def _precompute_symbol_collapsed(args: Tuple[str, pd.DataFrame, _SessionKey]) -> Tuple[str, Optional[pd.DataFrame]]:
+    symbol, ticks, session_key = args
+    try:
+        if ticks is None or ticks.empty:
+            return symbol, None
+
+        ticks = _normalize_tick_timestamps(ticks)
+        filtered = filter_session_ticks(
+            ticks,
+            session_key.tz,
+            session_key.session_start,
+            session_key.session_end,
+        )
+
+        if filtered.empty:
+            return symbol, None
+
+        collapsed = _collapse_ticks(filtered)
+        if collapsed.empty:
+            return symbol, None
+
+        return symbol, collapsed
+    except Exception:
+        return symbol, None
+
+
+def _precompute_session_collapsed(
+    tick_data: Dict[str, pd.DataFrame],
+    session_key: _SessionKey,
+) -> Dict[str, pd.DataFrame]:
+    if not tick_data:
+        return {}
+
+    tasks = [
+        (symbol, ticks, session_key)
+        for symbol, ticks in tick_data.items()
+    ]
+
+    worker_count = _determine_worker_count(len(tasks))
+    results: Dict[str, pd.DataFrame] = {}
+
+    if worker_count == 1:
+        for task in tasks:
+            symbol, collapsed = _precompute_symbol_collapsed(task)
+            if collapsed is not None:
+                results[symbol] = collapsed
+        return results
+
+    with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(_precompute_symbol_collapsed, task): task[0]
+            for task in tasks
+        }
+        for future in as_completed(futures):
+            symbol, collapsed = future.result()
+            if collapsed is not None:
+                results[symbol] = collapsed
+
+    return results
+
+
+def _compute_symbol_buckets(
+    args: Tuple[str, pd.DataFrame, _BucketKey]
+) -> Tuple[str, Optional[Tuple[pd.DataFrame, int, str]]]:
+    symbol, collapsed, bucket_key = args
+    try:
+        if collapsed is None or collapsed.empty:
+            return symbol, None
+
+        if bucket_key.mode == "auto":
+            bucket_param = auto_bucket_size(
+                collapsed,
+                cadence_target=bucket_key.cadence_target,
+                grid_multipliers=bucket_key.grid_multipliers or (),
+            )
+            selection_method = "auto"
+        else:
+            bucket_param = bucket_key.bucket_size
+            selection_method = "manual"
+
+        if bucket_param is None:
+            return symbol, None
+
+        if int(bucket_param) <= 0:
+            return symbol, None
+
+        bucket_df = ticks_to_volume_buckets(collapsed, int(bucket_param))
+        if bucket_df.empty:
+            return symbol, None
+
+        return symbol, (bucket_df, int(bucket_param), selection_method)
+    except Exception:
+        return symbol, None
+
+
+def _compute_bucket_data(
+    collapsed_data: Dict[str, pd.DataFrame],
+    bucket_key: _BucketKey,
+) -> Dict[str, Tuple[pd.DataFrame, int, str]]:
+    if not collapsed_data:
+        return {}
+
+    tasks = [
+        (symbol, collapsed, bucket_key)
+        for symbol, collapsed in collapsed_data.items()
+    ]
+
+    worker_count = _determine_worker_count(len(tasks))
+    results: Dict[str, Tuple[pd.DataFrame, int, str]] = {}
+
+    if worker_count == 1:
+        for task in tasks:
+            symbol, bucket_info = _compute_symbol_buckets(task)
+            if bucket_info is not None:
+                results[symbol] = bucket_info
+        return results
+
+    with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(_compute_symbol_buckets, task): task[0]
+            for task in tasks
+        }
+        for future in as_completed(futures):
+            symbol, bucket_info = future.result()
+            if bucket_info is not None:
+                results[symbol] = bucket_info
+
+    return results
 
 
 def orderflow_scan(
