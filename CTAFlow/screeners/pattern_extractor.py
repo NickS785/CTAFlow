@@ -1,672 +1,439 @@
-"""
-Pattern extraction module for screener results.
-
-This module processes results from HistoricalScreener and OrderflowScanner to identify
-significant recurring patterns (weekly, monthly, seasonal, etc.) and generate time series
-for each pattern.
-
-Supported screener types:
-- Orderflow scans: events, buckets, wom_weekday, weekly_peak, weekly, intraday_pressure
-- Historical momentum screens: session returns, momentum correlations
-- Historical seasonality screens: time-of-day patterns, day-of-week patterns
-"""
-
+"""Utilities for organising and analysing screener pattern output."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union, Tuple, Literal, Any
-from datetime import datetime, date, time, timedelta
-from collections import defaultdict
+from datetime import time
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import pandas as pd
-import numpy as np
 
-
-__all__ = [
-    "PatternExtractor",
-    "PatternResult",
-    "extract_patterns_from_orderflow",
-    "extract_patterns_from_historical",
-]
+from CTAFlow.screeners.historical_screener import HistoricalScreener, ScreenParams
+from CTAFlow.utils.seasonal import aggregate_window, log_returns, monthly_returns, tod_mask
+from CTAFlow.utils.session import filter_session_bars
 
 
 @dataclass
-class PatternResult:
-    """
-    Container for a single extracted pattern with its time series.
+class PatternSummary:
+    """Container describing a statistically significant pattern."""
 
-    Attributes
-    ----------
-    pattern_type : str
-        Type of pattern (e.g., 'weekly', 'wom_weekday', 'seasonal', 'event')
-    symbol : str
-        Trading symbol this pattern applies to
-    metric : str
-        Metric name (e.g., 'buy_pressure', 'momentum', 'returns')
-    description : str
-        Human-readable description of the pattern
-    trigger_conditions : Dict[str, Any]
-        Conditions that trigger this pattern (e.g., {'weekday': 'Monday', 'week_of_month': 1})
-    dates : pd.DatetimeIndex
-        Dates when this pattern occurred
-    values : np.ndarray
-        Values corresponding to each date
-    statistics : Dict[str, float]
-        Statistical measures (mean, std, t_stat, p_value, etc.)
-    significance : str
-        Significance level ('high', 'medium', 'low', 'exploratory')
-    frequency : str
-        Pattern frequency ('weekly', 'monthly', 'daily', 'intraday')
-    metadata : Dict[str, Any]
-        Additional metadata from the screener
-    """
-    pattern_type: str
+    key: str
     symbol: str
-    metric: str
+    source_screen: str
+    screen_params: Optional[ScreenParams]
+    pattern_type: str
     description: str
-    trigger_conditions: Dict[str, Any]
-    dates: pd.DatetimeIndex
-    values: np.ndarray
-    statistics: Dict[str, float]
-    significance: str
-    frequency: str
+    strength: Optional[float]
+    payload: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-    def to_series(self) -> pd.Series:
-        """Convert pattern to pandas Series with datetime index."""
-        return pd.Series(self.values, index=self.dates, name=f"{self.symbol}_{self.pattern_type}")
+    def as_dict(self) -> Dict[str, Any]:
+        """Return a serialisable representation suitable for JSON/export."""
 
-    def __repr__(self) -> str:
-        return (
-            f"PatternResult({self.pattern_type}, {self.symbol}, {self.metric}, "
-            f"freq={self.frequency}, sig={self.significance}, n={len(self.dates)})"
-        )
+        params_dict: Optional[Dict[str, Any]]
+        if self.screen_params is None:
+            params_dict = None
+        else:
+            params_dict = {
+                field_name: getattr(self.screen_params, field_name)
+                for field_name in self.screen_params.__dataclass_fields__  # type: ignore[attr-defined]
+            }
+
+        return {
+            "pattern_type": self.pattern_type,
+            "description": self.description,
+            "strength": self.strength,
+            "source_screen": self.source_screen,
+            "screen_parameters": params_dict,
+            "metadata": self.metadata,
+            "pattern_payload": self.payload,
+        }
 
 
 class PatternExtractor:
-    """
-    Extracts significant patterns from screener results.
+    """Restructure screener output and expose analysis helpers."""
 
-    This class processes results from both OrderflowScanner and HistoricalScreener
-    to identify significant recurring patterns and generate time series for each pattern.
-
-    Examples
-    --------
-    # Extract patterns from orderflow scan results
-    >>> from CTAFlow.screeners import OrderflowScanner, PatternExtractor
-    >>> scanner = OrderflowScanner(params)
-    >>> results = scanner.scan(tick_data)
-    >>> extractor = PatternExtractor()
-    >>> patterns = extractor.extract_orderflow_patterns(results)
-    >>> # Get all Monday patterns
-    >>> monday_patterns = extractor.filter_patterns(weekday='Monday')
-
-    # Extract from historical screener results
-    >>> from CTAFlow.screeners import HistoricalScreener, PatternExtractor
-    >>> screener = HistoricalScreener.from_parquet(['CL_F', 'NG_F'], timeframe='1T')
-    >>> results = screener.run_screens([momentum_params, seasonality_params])
-    >>> extractor = PatternExtractor()
-    >>> patterns = extractor.extract_historical_patterns(results)
-
-    # Filter and analyze patterns
-    >>> high_sig = extractor.filter_patterns(significance='high')
-    >>> weekly_patterns = extractor.filter_patterns(frequency='weekly')
-    >>> cl_patterns = extractor.filter_patterns(symbol='CL_F')
-    """
-
-    def __init__(self, min_observations: int = 10, significance_threshold: float = 0.05):
-        """
-        Initialize PatternExtractor.
-
-        Parameters
-        ----------
-        min_observations : int
-            Minimum number of observations to consider a pattern valid (default: 10)
-        significance_threshold : float
-            P-value threshold for statistical significance (default: 0.05)
-        """
-        self.min_observations = min_observations
-        self.significance_threshold = significance_threshold
-        self.patterns: List[PatternResult] = []
-
-    def extract_orderflow_patterns(
+    def __init__(
         self,
-        orderflow_results: Dict[str, Dict[str, Any]],
-        include_exploratory: bool = False
-    ) -> List[PatternResult]:
-        """
-        Extract patterns from OrderflowScanner results.
+        screener: HistoricalScreener,
+        results: Mapping[str, Mapping[str, Dict[str, Any]]],
+        screen_params: Optional[Sequence[ScreenParams]] = None,
+    ) -> None:
+        self._screener = screener
+        self._results = results
+        self._screen_params: Dict[str, ScreenParams] = (
+            {params.name: params for params in screen_params}
+            if screen_params is not None
+            else {}
+        )
 
-        Parameters
-        ----------
-        orderflow_results : Dict[str, Dict[str, Any]]
-            Results from OrderflowScanner.scan() or OrderflowScanner.run_scans()
-            Expected structure: {symbol: {category: dataframe/data, ...}}
-            Categories: 'df_events', 'df_weekly', 'df_wom_weekday', 'df_weekly_peak_pressure', etc.
-        include_exploratory : bool
-            Include exploratory (low sample size) patterns (default: False)
+        self._pattern_index: Dict[str, Dict[str, PatternSummary]] = {}
+        self._build_index()
 
-        Returns
-        -------
-        List[PatternResult]
-            List of extracted patterns
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    @property
+    def patterns(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        """Return patterns grouped by symbol and keyed by pattern identifier."""
 
-        Notes
-        -----
-        Processes the following orderflow result types:
-        - df_weekly: Day-of-week seasonality patterns
-        - df_wom_weekday: Week-of-month + weekday patterns
-        - df_weekly_peak_pressure: Peak pressure times by weekday
-        - df_events: Event detection (runs of significant pressure)
-        """
-        patterns = []
+        return {
+            symbol: {key: summary.as_dict() for key, summary in entries.items()}
+            for symbol, entries in self._pattern_index.items()
+        }
 
-        for symbol, symbol_data in orderflow_results.items():
-            if isinstance(symbol_data, dict) and 'error' in symbol_data:
-                print(f"Skipping {symbol}: {symbol_data['error']}")
-                continue
+    def get_pattern_keys(self, symbol: str) -> List[str]:
+        """Return all pattern identifiers for ``symbol``."""
 
-            # Extract weekly patterns (day-of-week)
-            if 'df_weekly' in symbol_data:
-                df_weekly = symbol_data['df_weekly']
-                if isinstance(df_weekly, pd.DataFrame) and not df_weekly.empty:
-                    patterns.extend(self._extract_weekly_patterns(df_weekly, symbol, include_exploratory))
+        return list(self._pattern_index.get(symbol, {}).keys())
 
-            # Extract week-of-month + weekday patterns
-            if 'df_wom_weekday' in symbol_data:
-                df_wom = symbol_data['df_wom_weekday']
-                if isinstance(df_wom, pd.DataFrame) and not df_wom.empty:
-                    patterns.extend(self._extract_wom_weekday_patterns(df_wom, symbol, include_exploratory))
+    def get_pattern_summary(self, symbol: str, pattern_key: str) -> PatternSummary:
+        """Retrieve the :class:`PatternSummary` for the requested pattern."""
 
-            # Extract peak pressure patterns
-            if 'df_weekly_peak_pressure' in symbol_data:
-                df_peak = symbol_data['df_weekly_peak_pressure']
-                if isinstance(df_peak, pd.DataFrame) and not df_peak.empty:
-                    patterns.extend(self._extract_peak_pressure_patterns(df_peak, symbol, include_exploratory))
+        try:
+            return self._pattern_index[symbol][pattern_key]
+        except KeyError as exc:  # pragma: no cover - user error surface
+            raise KeyError(f"Unknown pattern '{pattern_key}' for symbol '{symbol}'") from exc
 
-            # Extract event patterns
-            if 'df_events' in symbol_data:
-                df_events = symbol_data['df_events']
-                if isinstance(df_events, pd.DataFrame) and not df_events.empty:
-                    patterns.extend(self._extract_event_patterns(df_events, symbol))
+    def get_pattern_series(self, symbol: str, pattern_key: str) -> pd.Series:
+        """Return the time-series associated with a pattern."""
 
-        self.patterns.extend(patterns)
-        return patterns
+        summary = self.get_pattern_summary(symbol, pattern_key)
+        screen_type = summary.metadata.get("screen_type")
 
-    def extract_historical_patterns(
+        if summary.pattern_type in {"weekday_mean", "weekday_returns"}:
+            return self._extract_weekday_series(symbol, summary)
+
+        if summary.pattern_type in {"time_predictive_nextday", "time_predictive_nextweek"}:
+            return self._extract_time_of_day_series(symbol, summary)
+
+        if summary.pattern_type in {
+            "abnormal_month",
+            "high_sharpe_month",
+            "annual_seasonality",
+            "lag_month_momentum",
+            "prewindow_predictor",
+        }:
+            return self._extract_monthly_series(symbol, summary)
+
+        raise NotImplementedError(
+            f"Pattern type '{summary.pattern_type}' from screen '{screen_type}' is not supported yet"
+        )
+
+    def get_pattern_dates(self, symbol: str, pattern_key: str) -> List[pd.Timestamp]:
+        """Return the unique dates where the pattern occurs."""
+
+        series = self.get_pattern_series(symbol, pattern_key)
+        return list(pd.Index(series.index).unique())
+
+    def rebase_price_series(
         self,
-        historical_results: Dict[str, Dict[str, Dict]],
-        min_correlation: float = 0.3,
-        include_exploratory: bool = False
-    ) -> List[PatternResult]:
-        """
-        Extract patterns from HistoricalScreener results.
+        symbol: str,
+        pattern_key: str,
+        price_col: str = "Close",
+    ) -> pd.DataFrame:
+        """Construct a rebased price series using pattern occurrences."""
 
-        Parameters
-        ----------
-        historical_results : Dict[str, Dict[str, Dict]]
-            Results from HistoricalScreener.run_screens()
-            Expected structure: {screen_name: {symbol: screen_results}}
-        min_correlation : float
-            Minimum correlation coefficient to consider a pattern significant (default: 0.3)
-        include_exploratory : bool
-            Include exploratory (low sample size) patterns (default: False)
+        pattern_series = self.get_pattern_series(symbol, pattern_key)
+        if pattern_series.empty:
+            return pd.DataFrame(columns=["pattern_return", "close", "rebased"])
 
-        Returns
-        -------
-        List[PatternResult]
-            List of extracted patterns
+        price_series = self._get_price_series(symbol, price_col)
+        daily_close = price_series.groupby(price_series.index.normalize()).last()
+        aligned_close = daily_close.reindex(pattern_series.index, method="ffill")
 
-        Notes
-        -----
-        Processes the following historical screener result types:
-        - Momentum screens: session momentum, opening/closing returns
-        - Seasonality screens: time-of-day patterns, day-of-week patterns
-        """
-        patterns = []
+        rebased = (pattern_series.fillna(0).add(1.0)).cumprod()
 
-        for screen_name, screen_data in historical_results.items():
-            for symbol, symbol_results in screen_data.items():
-                if isinstance(symbol_results, dict) and 'error' in symbol_results:
-                    print(f"Skipping {symbol} in {screen_name}: {symbol_results['error']}")
+        return pd.DataFrame(
+            {
+                "pattern_return": pattern_series,
+                "close": aligned_close,
+                "rebased": rebased,
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # Index construction
+    # ------------------------------------------------------------------
+    def _build_index(self) -> None:
+        for screen_name, ticker_results in self._results.items():
+            params = self._screen_params.get(screen_name)
+            screen_type = getattr(params, "screen_type", None)
+
+            for symbol, result in ticker_results.items():
+                if not isinstance(result, Mapping) or "error" in result:
                     continue
 
-                # Determine screen type from screen_name or results
-                if 'momentum' in screen_name.lower() or 'session' in str(symbol_results).lower():
-                    patterns.extend(
-                        self._extract_momentum_patterns(
-                            symbol_results, symbol, screen_name, min_correlation, include_exploratory
-                        )
-                    )
-                elif 'seasonality' in screen_name.lower() or 'tod' in screen_name.lower():
-                    patterns.extend(
-                        self._extract_seasonality_patterns(
-                            symbol_results, symbol, screen_name, include_exploratory
-                        )
-                    )
+                symbol_patterns = self._pattern_index.setdefault(symbol, {})
 
-        self.patterns.extend(patterns)
-        return patterns
+                for summary in self._iter_pattern_summaries(
+                    symbol=symbol,
+                    screen_name=screen_name,
+                    screen_type=screen_type,
+                    ticker_result=result,
+                    params=params,
+                ):
+                    symbol_patterns[summary.key] = summary
 
-    def filter_patterns(
+    def _iter_pattern_summaries(
         self,
-        pattern_type: Optional[str] = None,
-        symbol: Optional[str] = None,
-        metric: Optional[str] = None,
-        significance: Optional[Literal['high', 'medium', 'low', 'exploratory']] = None,
-        frequency: Optional[str] = None,
-        weekday: Optional[str] = None,
-        week_of_month: Optional[int] = None,
-        min_observations: Optional[int] = None
-    ) -> List[PatternResult]:
-        """
-        Filter patterns by various criteria.
-
-        Parameters
-        ----------
-        pattern_type : Optional[str]
-            Filter by pattern type (e.g., 'weekly', 'wom_weekday', 'event')
-        symbol : Optional[str]
-            Filter by symbol
-        metric : Optional[str]
-            Filter by metric name
-        significance : Optional[str]
-            Filter by significance level
-        frequency : Optional[str]
-            Filter by frequency
-        weekday : Optional[str]
-            Filter by weekday in trigger conditions
-        week_of_month : Optional[int]
-            Filter by week of month in trigger conditions
-        min_observations : Optional[int]
-            Minimum number of observations
-
-        Returns
-        -------
-        List[PatternResult]
-            Filtered patterns
-        """
-        filtered = self.patterns
-
-        if pattern_type:
-            filtered = [p for p in filtered if p.pattern_type == pattern_type]
-        if symbol:
-            filtered = [p for p in filtered if p.symbol == symbol]
-        if metric:
-            filtered = [p for p in filtered if p.metric == metric]
-        if significance:
-            filtered = [p for p in filtered if p.significance == significance]
-        if frequency:
-            filtered = [p for p in filtered if p.frequency == frequency]
-        if weekday:
-            filtered = [p for p in filtered if p.trigger_conditions.get('weekday') == weekday]
-        if week_of_month:
-            filtered = [p for p in filtered if p.trigger_conditions.get('week_of_month') == week_of_month]
-        if min_observations:
-            filtered = [p for p in filtered if len(p.dates) >= min_observations]
-
-        return filtered
-
-    def get_pattern_summary(self) -> pd.DataFrame:
-        """
-        Get summary DataFrame of all extracted patterns.
-
-        Returns
-        -------
-        pd.DataFrame
-            Summary with columns: symbol, pattern_type, metric, frequency, significance,
-            n_observations, mean, std, t_stat, p_value, description
-        """
-        if not self.patterns:
-            return pd.DataFrame()
-
-        summary_data = []
-        for pattern in self.patterns:
-            summary_data.append({
-                'symbol': pattern.symbol,
-                'pattern_type': pattern.pattern_type,
-                'metric': pattern.metric,
-                'frequency': pattern.frequency,
-                'significance': pattern.significance,
-                'n_observations': len(pattern.dates),
-                'mean': pattern.statistics.get('mean', np.nan),
-                'std': pattern.statistics.get('std', np.nan),
-                't_stat': pattern.statistics.get('t_stat', np.nan),
-                'p_value': pattern.statistics.get('p_value', np.nan),
-                'description': pattern.description,
-                **pattern.trigger_conditions
-            })
-
-        return pd.DataFrame(summary_data)
-
-    def _extract_weekly_patterns(
-        self, df: pd.DataFrame, symbol: str, include_exploratory: bool
-    ) -> List[PatternResult]:
-        """Extract day-of-week patterns."""
-        patterns = []
-
-        for _, row in df.iterrows():
-            # Skip exploratory if not included
-            if row.get('exploratory', False) and not include_exploratory:
-                continue
-
-            # Skip non-significant patterns
-            if 'sig_fdr_5pct' in row and not row['sig_fdr_5pct']:
-                continue
-
-            # Determine significance
-            p_value = row.get('p_value', 1.0)
-            sig = self._classify_significance(p_value, row.get('exploratory', False))
-
-            # Build pattern
-            pattern = PatternResult(
-                pattern_type='weekly',
-                symbol=symbol,
-                metric=row.get('metric', 'unknown'),
-                description=f"{row.get('weekday', 'N/A')} {row.get('metric', 'unknown')} pattern",
-                trigger_conditions={'weekday': row.get('weekday', None)},
-                dates=pd.DatetimeIndex([]),  # No specific dates in weekly summary
-                values=np.array([row.get('mean', 0.0)]),
-                statistics={
-                    'mean': row.get('mean', 0.0),
-                    't_stat': row.get('t_stat', 0.0),
-                    'p_value': p_value,
-                    'n': row.get('n', 0)
-                },
-                significance=sig,
-                frequency='weekly',
-                metadata={'exploratory': row.get('exploratory', False)}
+        symbol: str,
+        screen_name: str,
+        screen_type: Optional[str],
+        ticker_result: Mapping[str, Any],
+        params: Optional[ScreenParams],
+    ) -> Iterable[PatternSummary]:
+        strongest: Iterable[Dict[str, Any]] = ticker_result.get("strongest_patterns", [])  # type: ignore[assignment]
+        for pattern in strongest:
+            yield self._build_summary(
+                symbol,
+                screen_name,
+                screen_type,
+                params,
+                pattern,
+                origin="strongest_patterns",
             )
-            patterns.append(pattern)
 
-        return patterns
+    def _build_summary(
+        self,
+        symbol: str,
+        screen_name: str,
+        screen_type: Optional[str],
+        params: Optional[ScreenParams],
+        pattern: Mapping[str, Any],
+        origin: str,
+    ) -> PatternSummary:
+        pattern_type = self._infer_pattern_type(pattern)
+        strength = self._extract_strength(pattern)
+        description = str(pattern.get("description", pattern_type))
 
-    def _extract_wom_weekday_patterns(
-        self, df: pd.DataFrame, symbol: str, include_exploratory: bool
-    ) -> List[PatternResult]:
-        """Extract week-of-month + weekday patterns."""
-        patterns = []
+        qualifiers: List[str] = [pattern_type]
+        for key in ("day", "time", "lag", "month"):
+            if key in pattern and pattern[key] is not None:
+                qualifiers.append(str(pattern[key]))
+        key = "|".join([screen_name, *qualifiers])
 
-        for _, row in df.iterrows():
-            # Skip exploratory if not included
-            if row.get('exploratory', False) and not include_exploratory:
-                continue
-
-            # Skip non-significant patterns
-            if 'sig_fdr_5pct' in row and not row['sig_fdr_5pct']:
-                continue
-
-            # Determine significance
-            p_value = row.get('p_value', 1.0)
-            sig = self._classify_significance(p_value, row.get('exploratory', False))
-
-            # Build pattern
-            pattern = PatternResult(
-                pattern_type='wom_weekday',
-                symbol=symbol,
-                metric=row.get('metric', 'unknown'),
-                description=(
-                    f"Week {row.get('week_of_month', 'N/A')} {row.get('weekday', 'N/A')} "
-                    f"{row.get('metric', 'unknown')} pattern"
-                ),
-                trigger_conditions={
-                    'week_of_month': row.get('week_of_month', None),
-                    'weekday': row.get('weekday', None)
-                },
-                dates=pd.DatetimeIndex([]),
-                values=np.array([row.get('mean', 0.0)]),
-                statistics={
-                    'mean': row.get('mean', 0.0),
-                    't_stat': row.get('t_stat', 0.0),
-                    'p_value': p_value,
-                    'n': row.get('n', 0)
-                },
-                significance=sig,
-                frequency='monthly',
-                metadata={'exploratory': row.get('exploratory', False)}
-            )
-            patterns.append(pattern)
-
-        return patterns
-
-    def _extract_peak_pressure_patterns(
-        self, df: pd.DataFrame, symbol: str, include_exploratory: bool
-    ) -> List[PatternResult]:
-        """Extract peak pressure time patterns."""
-        patterns = []
-
-        for _, row in df.iterrows():
-            # Skip exploratory if not included
-            if row.get('exploratory', False) and not include_exploratory:
-                continue
-
-            # Skip non-significant patterns
-            if 'seasonality_sig_fdr_5pct' in row and not row['seasonality_sig_fdr_5pct']:
-                continue
-
-            # Determine significance
-            p_value = row.get('seasonality_q_value', 1.0)
-            sig = self._classify_significance(p_value, row.get('exploratory', False))
-
-            # Build pattern
-            pattern = PatternResult(
-                pattern_type='peak_pressure',
-                symbol=symbol,
-                metric=row.get('metric', 'unknown'),
-                description=(
-                    f"{row.get('weekday', 'N/A')} peak {row.get('pressure_bias', 'N/A')} pressure "
-                    f"at {row.get('clock_time', 'N/A')}"
-                ),
-                trigger_conditions={
-                    'weekday': row.get('weekday', None),
-                    'clock_time': str(row.get('clock_time', None)),
-                    'pressure_bias': row.get('pressure_bias', None)
-                },
-                dates=pd.DatetimeIndex([]),
-                values=np.array([row.get('seasonality_mean', 0.0)]),
-                statistics={
-                    'seasonality_mean': row.get('seasonality_mean', 0.0),
-                    'seasonality_t_stat': row.get('seasonality_t_stat', 0.0),
-                    'seasonality_q_value': p_value,
-                    'seasonality_n': row.get('seasonality_n', 0),
-                    'intraday_mean': row.get('intraday_mean', 0.0),
-                    'intraday_median': row.get('intraday_median', 0.0)
-                },
-                significance=sig,
-                frequency='weekly',
-                metadata={'exploratory': row.get('exploratory', False)}
-            )
-            patterns.append(pattern)
-
-        return patterns
-
-    def _extract_event_patterns(
-        self, df: pd.DataFrame, symbol: str
-    ) -> List[PatternResult]:
-        """Extract significant event patterns."""
-        patterns = []
-
-        for _, row in df.iterrows():
-            # Events are already filtered for significance by the scanner
-            ts_start = pd.to_datetime(row.get('ts_start'))
-            ts_end = pd.to_datetime(row.get('ts_end'))
-
-            pattern = PatternResult(
-                pattern_type='event',
-                symbol=symbol,
-                metric=row.get('metric', 'unknown'),
-                description=(
-                    f"{row.get('direction', 'N/A')} {row.get('metric', 'unknown')} event "
-                    f"at {ts_start.strftime('%Y-%m-%d %H:%M')}"
-                ),
-                trigger_conditions={
-                    'direction': row.get('direction', None),
-                    'time_range': (ts_start, ts_end)
-                },
-                dates=pd.DatetimeIndex([ts_start]),
-                values=np.array([row.get('max_abs_z', 0.0)]),
-                statistics={
-                    'max_abs_z': row.get('max_abs_z', 0.0),
-                    'run_len': row.get('run_len', 0)
-                },
-                significance='high',  # Events are pre-filtered
-                frequency='intraday',
-                metadata={
-                    'ts_start': ts_start,
-                    'ts_end': ts_end,
-                    'run_len': row.get('run_len', 0)
+        metadata = {
+            "pattern_origin": origin,
+            "screen_type": screen_type,
+        }
+        if screen_type == "seasonality" and isinstance(params, ScreenParams):
+            metadata.update(
+                {
+                    "target_time": pattern.get("time"),
+                    "most_prevalent_day": pattern.get("most_prevalent_day"),
                 }
             )
-            patterns.append(pattern)
 
-        return patterns
+        return PatternSummary(
+            key=key,
+            symbol=symbol,
+            source_screen=screen_name,
+            screen_params=params,
+            pattern_type=pattern_type,
+            description=description,
+            strength=strength,
+            payload=dict(pattern),
+            metadata=metadata,
+        )
 
-    def _extract_momentum_patterns(
-        self,
-        results: Dict,
-        symbol: str,
-        screen_name: str,
-        min_correlation: float,
-        include_exploratory: bool
-    ) -> List[PatternResult]:
-        """Extract momentum patterns from historical screener."""
-        patterns = []
+    # ------------------------------------------------------------------
+    # Series reconstruction helpers
+    # ------------------------------------------------------------------
+    def _extract_weekday_series(self, symbol: str, summary: PatternSummary) -> pd.Series:
+        params = summary.screen_params
+        if params is None or params.screen_type != "seasonality":
+            raise ValueError("Weekday patterns require seasonality screen parameters")
 
-        # Look for momentum-related keys in results
-        for key, value in results.items():
-            if isinstance(value, dict):
-                # Check for correlation data
-                if 'correlation' in key.lower() or 'corr' in key.lower():
-                    corr_value = value.get('correlation', value.get('corr', 0.0))
-                    p_value = value.get('p_value', 1.0)
+        session_data, price_col, is_synthetic = self._get_seasonality_session_data(symbol, params)
+        returns = self._compute_intraday_returns(session_data, price_col, is_synthetic)
+        if returns.empty:
+            return pd.Series(dtype=float)
 
-                    if abs(corr_value) >= min_correlation:
-                        sig = self._classify_significance(p_value, False)
-                        pattern = PatternResult(
-                            pattern_type='momentum',
-                            symbol=symbol,
-                            metric='momentum_correlation',
-                            description=f"{screen_name} {key} correlation pattern",
-                            trigger_conditions={'session': key},
-                            dates=pd.DatetimeIndex([]),
-                            values=np.array([corr_value]),
-                            statistics={
-                                'correlation': corr_value,
-                                'p_value': p_value,
-                                'n': value.get('n', 0)
-                            },
-                            significance=sig,
-                            frequency='daily',
-                            metadata={'screen_name': screen_name}
-                        )
-                        patterns.append(pattern)
+        daily_returns = returns.groupby(returns.index.normalize()).sum()
+        target_day = summary.payload.get("day")
+        if target_day is None:
+            return daily_returns
 
-        return patterns
+        weekday_number = self._weekday_name_to_number(target_day)
+        mask = daily_returns.index.dayofweek == weekday_number
+        return daily_returns[mask]
 
-    def _extract_seasonality_patterns(
-        self,
-        results: Dict,
-        symbol: str,
-        screen_name: str,
-        include_exploratory: bool
-    ) -> List[PatternResult]:
-        """Extract seasonality patterns from historical screener."""
-        patterns = []
+    def _extract_time_of_day_series(self, symbol: str, summary: PatternSummary) -> pd.Series:
+        params = summary.screen_params
+        if params is None or params.screen_type != "seasonality":
+            raise ValueError("Time-of-day patterns require seasonality screen parameters")
 
-        # Look for seasonality-related keys
-        for key, value in results.items():
-            if isinstance(value, dict):
-                # Check for time-of-day or day-of-week patterns
-                if 'mean' in value and 't_stat' in value:
-                    p_value = value.get('p_value', 1.0)
+        target_time_raw = summary.payload.get("time")
+        if target_time_raw is None:
+            raise ValueError("Pattern payload missing target time")
 
-                    if p_value < self.significance_threshold or include_exploratory:
-                        sig = self._classify_significance(p_value, value.get('exploratory', False))
-                        pattern = PatternResult(
-                            pattern_type='seasonality',
-                            symbol=symbol,
-                            metric=key,
-                            description=f"{screen_name} {key} seasonal pattern",
-                            trigger_conditions={'time_period': key},
-                            dates=pd.DatetimeIndex([]),
-                            values=np.array([value.get('mean', 0.0)]),
-                            statistics={
-                                'mean': value.get('mean', 0.0),
-                                't_stat': value.get('t_stat', 0.0),
-                                'p_value': p_value,
-                                'n': value.get('n', 0)
-                            },
-                            significance=sig,
-                            frequency='intraday',
-                            metadata={'screen_name': screen_name}
-                        )
-                        patterns.append(pattern)
-
-        return patterns
-
-    def _classify_significance(self, p_value: float, exploratory: bool) -> str:
-        """Classify significance level based on p-value."""
-        if exploratory:
-            return 'exploratory'
-        elif p_value < 0.001:
-            return 'high'
-        elif p_value < 0.05:
-            return 'medium'
+        if isinstance(target_time_raw, str):
+            target_time_obj = pd.to_datetime(target_time_raw).time()
+        elif isinstance(target_time_raw, time):
+            target_time_obj = target_time_raw
         else:
-            return 'low'
+            target_time_obj = pd.to_datetime(target_time_raw).time()
+
+        session_data, price_col, is_synthetic = self._get_seasonality_session_data(symbol, params)
+        if session_data.empty:
+            return pd.Series(dtype=float)
+
+        period_length = params.period_length
+        if isinstance(period_length, (int, float)):
+            period_length = pd.Timedelta(minutes=period_length)
+
+        returns = self._compute_time_of_day_returns(
+            session_data,
+            price_col,
+            is_synthetic,
+            target_time_obj,
+            period_length,
+        )
+        return returns
+
+    def _extract_monthly_series(self, symbol: str, summary: PatternSummary) -> pd.Series:
+        price_df = self._get_price_series(symbol, price_col="Close")
+        if price_df.empty:
+            return pd.Series(dtype=float)
+
+        price_col = price_df.columns[0]
+        use_log_returns = not self._screener.synthetic_tickers.get(symbol, False)
+        monthly_ret = monthly_returns(
+            price_df,
+            price_col=price_col,
+            use_log_returns=use_log_returns,
+        )
+
+        series = monthly_ret[price_col]
+        if summary.pattern_type == "abnormal_month":
+            month_name = summary.payload.get("month")
+            if month_name:
+                mask = series.index.month_name() == month_name
+                series = series[mask]
+        return series
+
+    # ------------------------------------------------------------------
+    # Low-level utilities
+    # ------------------------------------------------------------------
+    def _get_price_series(self, symbol: str, price_col: str) -> pd.DataFrame:
+        data = self._screener.data[symbol]
+        if data.empty:
+            return pd.DataFrame(columns=[price_col])
+        if price_col not in data.columns:
+            price_col = data.columns[0]
+        return data[[price_col]].copy()
+
+    def _get_seasonality_session_data(
+        self,
+        symbol: str,
+        params: ScreenParams,
+    ) -> Tuple[pd.DataFrame, str, bool]:
+        data = self._screener.data[symbol]
+        if data.empty:
+            return pd.DataFrame(), "Close", False
+
+        session_start = params.seasonality_session_start or "00:00"
+        session_end = params.seasonality_session_end or "23:59:59"
+
+        start_time = self._screener._convert_times([session_start])[0]
+        end_time = self._screener._convert_times([session_end])[0]
+        tz = params.tz or "America/Chicago"
+
+        session_data = filter_session_bars(
+            data,
+            tz,
+            start_time,
+            end_time,
+        )
+
+        months = self._screener._parse_season_months(params.months, params.season)
+        if months:
+            session_data = self._screener._filter_by_months(session_data, months)
+
+        if session_data.empty:
+            return session_data, "Close", self._screener.synthetic_tickers.get(symbol, False)
+
+        price_col = "Close" if "Close" in session_data.columns else session_data.columns[0]
+        is_synthetic = self._screener.synthetic_tickers.get(symbol, False)
+        return session_data, price_col, is_synthetic
+
+    @staticmethod
+    def _compute_intraday_returns(
+        session_data: pd.DataFrame,
+        price_col: str,
+        is_synthetic: bool,
+    ) -> pd.Series:
+        if session_data.empty:
+            return pd.Series(dtype=float)
+
+        if is_synthetic:
+            returns = session_data[price_col].diff()
+        else:
+            valid_prices = session_data[price_col] > 0
+            prices = session_data.loc[valid_prices, price_col]
+            returns = pd.Series(index=session_data.index, dtype=float)
+            returns.loc[valid_prices] = log_returns(prices)
+        return returns.dropna()
+
+    @staticmethod
+    def _compute_time_of_day_returns(
+        session_data: pd.DataFrame,
+        price_col: str,
+        is_synthetic: bool,
+        target_time: time,
+        period_length: Optional[pd.Timedelta],
+    ) -> pd.Series:
+        returns = PatternExtractor._compute_intraday_returns(session_data, price_col, is_synthetic)
+        if returns.empty:
+            return pd.Series(dtype=float)
+
+        mask = tod_mask(returns.index, target_time.strftime("%H:%M"))
+        if period_length:
+            window_bars = max(int(period_length.total_seconds() / 60 / 5), 1)
+            daily_returns = aggregate_window(returns, mask, window_bars)
+        else:
+            daily_returns = returns[mask]
+
+        if not isinstance(daily_returns.index, pd.DatetimeIndex):
+            daily_returns.index = pd.to_datetime(daily_returns.index)
+        daily_returns = daily_returns.groupby(daily_returns.index.date).sum()
+        daily_returns.index = pd.to_datetime(daily_returns.index)
+        return daily_returns
+
+    @staticmethod
+    def _infer_pattern_type(pattern: Mapping[str, Any]) -> str:
+        for key in ("type", "pattern_type", "momentum_type"):
+            value = pattern.get(key)
+            if value:
+                return str(value)
+        return pattern.get("description", "pattern").replace(" ", "_")
+
+    @staticmethod
+    def _extract_strength(pattern: Mapping[str, Any]) -> Optional[float]:
+        for key in ("strength", "f_stat", "correlation", "sharpe", "t_stat"):
+            value = pattern.get(key)
+            if value is not None:
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    @staticmethod
+    def _weekday_name_to_number(name: str) -> int:
+        weekdays = {
+            "monday": 0,
+            "tuesday": 1,
+            "wednesday": 2,
+            "thursday": 3,
+            "friday": 4,
+            "saturday": 5,
+            "sunday": 6,
+        }
+        try:
+            return weekdays[name.lower()]
+        except KeyError as exc:  # pragma: no cover - defensive guard
+            raise ValueError(f"Unknown weekday '{name}'") from exc
 
 
-# Convenience functions
-def extract_patterns_from_orderflow(
-    orderflow_results: Dict[str, Dict[str, Any]],
-    min_observations: int = 10,
-    include_exploratory: bool = False
-) -> List[PatternResult]:
-    """
-    Extract patterns from orderflow scan results (convenience function).
-
-    Parameters
-    ----------
-    orderflow_results : Dict[str, Dict[str, Any]]
-        Results from OrderflowScanner
-    min_observations : int
-        Minimum observations for valid pattern
-    include_exploratory : bool
-        Include exploratory patterns
-
-    Returns
-    -------
-    List[PatternResult]
-        Extracted patterns
-    """
-    extractor = PatternExtractor(min_observations=min_observations)
-    return extractor.extract_orderflow_patterns(orderflow_results, include_exploratory)
-
-
-def extract_patterns_from_historical(
-    historical_results: Dict[str, Dict[str, Dict]],
-    min_observations: int = 10,
-    min_correlation: float = 0.3,
-    include_exploratory: bool = False
-) -> List[PatternResult]:
-    """
-    Extract patterns from historical screener results (convenience function).
-
-    Parameters
-    ----------
-    historical_results : Dict[str, Dict[str, Dict]]
-        Results from HistoricalScreener
-    min_observations : int
-        Minimum observations for valid pattern
-    min_correlation : float
-        Minimum correlation for momentum patterns
-    include_exploratory : bool
-        Include exploratory patterns
-
-    Returns
-    -------
-    List[PatternResult]
-        Extracted patterns
-    """
-    extractor = PatternExtractor(min_observations=min_observations)
-    return extractor.extract_historical_patterns(historical_results, min_correlation, include_exploratory)
+__all__ = ["PatternExtractor", "PatternSummary"]
