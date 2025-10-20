@@ -12,6 +12,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 from scipy import stats
+from tqdm.auto import tqdm
+import logging
 
 from ..utils.session import filter_session_ticks
 from ..utils.volume_bucket import auto_bucket_size, ticks_to_volume_buckets
@@ -175,13 +177,17 @@ def _robust_daily_zscores(df: pd.DataFrame, metric: str, date_col: str) -> pd.Se
 
 
 def _collapse_ticks(ticks: pd.DataFrame) -> pd.DataFrame:
-    numeric_cols = [col for col in ticks.columns if col != "ts"]
-    collapsed = (
-        ticks.groupby("ts", as_index=False)[numeric_cols]
-        .sum(numeric_only=True)
-        .sort_values("ts")
-        .reset_index(drop=True)
-    )
+    """Collapse ticks at same timestamp by summing volumes."""
+    # Get numeric columns once (exclude 'ts')
+    numeric_cols = [col for col in ticks.columns if col != "ts" and np.issubdtype(ticks[col].dtype, np.number)]
+
+    if not numeric_cols:
+        # No numeric data to collapse, just return sorted unique timestamps
+        return ticks.drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
+
+    # Group and sum - already sorted by groupby, no need to re-sort
+    collapsed = ticks.groupby("ts", as_index=False, sort=True)[numeric_cols].sum()
+
     return collapsed
 
 
@@ -479,54 +485,104 @@ class OrderflowScanner:
 
     def __init__(self,
                  params: Optional[OrderflowParams] = None,
-                 hdf_path: Optional[Path | str] = None):
+                 hdf_path: Optional[Path | str] = None,
+                 verbose: bool = True):
         """
         Initialize OrderflowScanner.
 
         Args:
             params: OrderflowParams configuration (optional if using run_scans)
             hdf_path: Path to HDF5 file for results storage (created if doesn't exist)
+            verbose: Enable verbose logging (default: True)
         """
         self.params = params
         self.hdf_path = Path(hdf_path) if hdf_path else None
         self.results: Dict[str, Dict[str, object]] = {}
+        self.verbose = verbose
+
+        # Setup logging
+        self.logger = logging.getLogger(f"{__name__}.OrderflowScanner")
+        if verbose and not self.logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+            self.logger.addHandler(handler)
+            self.logger.setLevel(logging.INFO)
 
         # Parse session times once (if params provided)
         if params:
             self.session_start = _parse_time(params.session_start)
             self.session_end = _parse_time(params.session_end)
+            if verbose:
+                self.logger.info(f"Initialized OrderflowScanner")
+                self.logger.info(f"  Session: {params.session_start} to {params.session_end} ({params.tz})")
+                self.logger.info(f"  Bucket size: {params.bucket_size}, VPIN window: {params.vpin_window}")
         else:
             self.session_start = None
             self.session_end = None
 
-    def scan(self, tick_data: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str, object]]:
+    def scan(self, tick_data: Dict[str, pd.DataFrame], max_workers: Optional[int] = None, show_progress: bool = True) -> Dict[str, Dict[str, object]]:
         """
-        Scan tick data for all symbols.
+        Scan tick data for all symbols with parallel processing.
 
         Args:
             tick_data: Dictionary mapping symbols to their tick DataFrames
+            max_workers: Maximum number of parallel workers (default: None = auto)
+            show_progress: Show progress bar during processing (default: True)
 
         Returns:
             Dictionary mapping symbols to analysis results
         """
+        if self.verbose:
+            self.logger.info(f"Starting orderflow scan for {len(tick_data)} symbols")
+
         self.results = {}
 
-        for symbol, ticks in tick_data.items():
+        # Helper function for processing a single symbol
+        def _process_single_symbol(symbol: str, ticks: pd.DataFrame) -> Tuple[str, Dict[str, object]]:
             try:
                 if ticks is None or ticks.empty:
-                    self.results[symbol] = {"error": "No tick data"}
-                    continue
+                    return (symbol, {"error": "No tick data"})
 
                 # Normalize timestamp column
                 ticks = _normalize_tick_timestamps(ticks)
 
-            except Exception as exc:
-                self.results[symbol] = {"error": str(exc)}
-                continue
+                # Process symbol
+                result = self._process_symbol(symbol, ticks)
+                return (symbol, result)
 
-            # Process symbol
-            result = self._process_symbol(symbol, ticks)
-            self.results[symbol] = result
+            except Exception as exc:
+                if self.verbose:
+                    self.logger.error(f"Error processing symbol {symbol}: {str(exc)}")
+                return (symbol, {"error": str(exc)})
+
+        # Process symbols in parallel using ThreadPoolExecutor (symbols is dict, not just list)
+        symbols_list = list(tick_data.keys())
+
+        if max_workers is None or max_workers > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(_process_single_symbol, symbol, tick_data[symbol]): symbol for symbol in symbols_list}
+
+                iterator = as_completed(futures) if not show_progress else tqdm(
+                    as_completed(futures),
+                    total=len(symbols_list),
+                    desc="Orderflow Scan",
+                    unit="symbol"
+                )
+
+                for future in iterator:
+                    symbol, result = future.result()
+                    self.results[symbol] = result
+        else:
+            # Sequential processing with optional progress bar
+            iterator = tqdm(symbols_list, desc="Orderflow Scan", unit="symbol") if show_progress else symbols_list
+            for symbol in iterator:
+                symbol_name, result = _process_single_symbol(symbol, tick_data[symbol])
+                self.results[symbol_name] = result
+
+        if self.verbose:
+            successful = sum(1 for r in self.results.values() if 'error' not in r)
+            self.logger.info(f"Completed orderflow scan: {successful}/{len(self.results)} successful")
 
         return self.results
 
@@ -1099,7 +1155,8 @@ class OrderflowScanner:
         self,
         scan_params: List[OrderflowParams],
         tick_data: Dict[str, pd.DataFrame],
-        output_format: str = 'dict'
+        output_format: str = 'dict',
+        show_progress: bool = True
     ) -> Dict[str, Dict[str, Dict[str, object]]]:
         """
         Run multiple orderflow scans with different configurations.
@@ -1179,6 +1236,9 @@ class OrderflowScanner:
         if not scan_params:
             raise ValueError("scan_params cannot be empty")
 
+        if self.verbose:
+            self.logger.info(f"Running {len(scan_params)} orderflow scans")
+
         session_groups: Dict[_SessionKey, List[Tuple[int, OrderflowParams]]] = defaultdict(list)
         session_order: List[_SessionKey] = []
         for index, params in enumerate(scan_params):
@@ -1187,26 +1247,35 @@ class OrderflowScanner:
                 session_order.append(session_key)
             session_groups[session_key].append((index, params))
 
+        if self.verbose:
+            self.logger.info(f"  Grouped into {len(session_order)} unique session(s)")
+
         composite_results: Dict[str, Dict[str, Dict[str, object]]] = {}
         collapsed_cache: Dict[_SessionKey, Dict[str, pd.DataFrame]] = {}
         bucket_cache: Dict[Tuple[_SessionKey, _BucketKey], Dict[str, Tuple[pd.DataFrame, int, str]]] = {}
 
-        for session_key in session_order:
+        # Iterate with progress tracking
+        session_iterator = tqdm(session_order, desc="Processing Sessions", unit="session") if show_progress else session_order
+
+        for session_key in session_iterator:
             group = session_groups[session_key]
             collapsed = collapsed_cache.get(session_key)
             if collapsed is None:
-                collapsed = _precompute_session_collapsed(tick_data, session_key)
+                collapsed = _precompute_session_collapsed(tick_data, session_key, verbose=self.verbose, show_progress=show_progress)
                 collapsed_cache[session_key] = collapsed
 
             for i, params in group:
                 scan_name = params.name if params.name else self._generate_scan_name(params, i)
-                temp_scanner = OrderflowScanner(params, hdf_path=self.hdf_path)
+                if self.verbose:
+                    self.logger.info(f"Running scan: {scan_name}")
+
+                temp_scanner = OrderflowScanner(params, hdf_path=self.hdf_path, verbose=False)
                 bucket_key = _make_bucket_key(params)
                 cache_key = (session_key, bucket_key)
 
                 shared_bucket_data = bucket_cache.get(cache_key)
                 if shared_bucket_data is None:
-                    shared_bucket_data = _compute_bucket_data(collapsed, bucket_key)
+                    shared_bucket_data = _compute_bucket_data(collapsed, bucket_key, verbose=self.verbose, show_progress=show_progress)
                     bucket_cache[cache_key] = shared_bucket_data
 
                 scan_result: Dict[str, Dict[str, object]] = {}
@@ -1347,6 +1416,12 @@ class OrderflowScanner:
 
 def _normalize_tick_timestamps(ticks: pd.DataFrame) -> pd.DataFrame:
     """Ensure tick data has a 'ts' column for timestamp and handle duplicates."""
+
+    # Fast path: already normalized with no duplicates
+    if "ts" in ticks.columns and not ticks["ts"].duplicated().any():
+        return ticks
+
+    # Need to normalize - make a copy
     ticks = ticks.copy()
 
     # First, get or create the 'ts' column
@@ -1355,7 +1430,7 @@ def _normalize_tick_timestamps(ticks: pd.DataFrame) -> pd.DataFrame:
         if isinstance(ticks.index, pd.DatetimeIndex):
             ticks.insert(0, "ts", ticks.index)
         else:
-            # Check common timestamp column names
+            # Check common timestamp column names (pre-defined list)
             ts_candidates = ["timestamp", "datetime", "time", "date"]
             found = False
             for candidate in ts_candidates:
@@ -1370,12 +1445,13 @@ def _normalize_tick_timestamps(ticks: pd.DataFrame) -> pd.DataFrame:
                     f"{', '.join(ts_candidates)}"
                 )
 
-    # Handle duplicate timestamps by aggregating
+    # Handle duplicate timestamps by aggregating (only if duplicates exist)
     if ticks["ts"].duplicated().any():
-        # Group by timestamp and sum numeric columns (typical for tick data)
-        numeric_cols = ticks.select_dtypes(include=[np.number]).columns.tolist()
+        # Pre-filter to numeric columns only once
+        numeric_cols = [col for col in ticks.columns if col != "ts" and np.issubdtype(ticks[col].dtype, np.number)]
+
         if numeric_cols:
-            # Aggregate: sum volumes, keep first for non-numeric
+            # Aggregate: sum volumes for numeric columns
             agg_dict = {col: 'sum' for col in numeric_cols}
             ticks = ticks.groupby("ts", as_index=False).agg(agg_dict)
         else:
@@ -1385,11 +1461,52 @@ def _normalize_tick_timestamps(ticks: pd.DataFrame) -> pd.DataFrame:
     return ticks
 
 
-def _determine_worker_count(task_count: int) -> int:
+def _determine_worker_count(task_count: int, verbose: bool = False) -> int:
     max_workers = os.cpu_count() or 1
     if task_count <= 1 or max_workers <= 1:
-        return 1
-    return min(task_count, max_workers)
+        workers = 1
+    else:
+        workers = min(task_count, max_workers)
+
+    if verbose:
+        logger = logging.getLogger(__name__)
+        logger.info(f"Using {workers} workers for {task_count} tasks (CPU count: {max_workers})")
+
+    return workers
+
+
+def _filter_and_collapse_ticks(
+    ticks: pd.DataFrame,
+    tz: str,
+    session_start: str,
+    session_end: str
+) -> Optional[pd.DataFrame]:
+    """Combined filter + collapse operation for efficiency.
+
+    Performs session filtering and timestamp collapsing in a single optimized pass.
+    """
+    if ticks.empty:
+        return None
+
+    # Normalize timestamps
+    ticks = _normalize_tick_timestamps(ticks)
+
+    # Filter to session window
+    filtered = filter_session_ticks(ticks, tz, session_start, session_end)
+
+    if filtered.empty:
+        return None
+
+    # Collapse duplicates - optimized for already-filtered data
+    numeric_cols = [col for col in filtered.columns if col != "ts" and np.issubdtype(filtered[col].dtype, np.number)]
+
+    if not numeric_cols:
+        return filtered.drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
+
+    # Group and sum in one pass
+    collapsed = filtered.groupby("ts", as_index=False, sort=True)[numeric_cols].sum()
+
+    return collapsed if not collapsed.empty else None
 
 
 def _precompute_symbol_collapsed(args: Tuple[str, pd.DataFrame, _SessionKey]) -> Tuple[str, Optional[pd.DataFrame]]:
@@ -1398,20 +1515,13 @@ def _precompute_symbol_collapsed(args: Tuple[str, pd.DataFrame, _SessionKey]) ->
         if ticks is None or ticks.empty:
             return symbol, None
 
-        ticks = _normalize_tick_timestamps(ticks)
-        filtered = filter_session_ticks(
+        # Combined operation for better performance
+        collapsed = _filter_and_collapse_ticks(
             ticks,
             session_key.tz,
             session_key.session_start,
-            session_key.session_end,
+            session_key.session_end
         )
-
-        if filtered.empty:
-            return symbol, None
-
-        collapsed = _collapse_ticks(filtered)
-        if collapsed.empty:
-            return symbol, None
 
         return symbol, collapsed
     except Exception:
@@ -1421,34 +1531,78 @@ def _precompute_symbol_collapsed(args: Tuple[str, pd.DataFrame, _SessionKey]) ->
 def _precompute_session_collapsed(
     tick_data: Dict[str, pd.DataFrame],
     session_key: _SessionKey,
+    verbose: bool = False,
+    show_progress: bool = True,
+    use_threads: bool = True
 ) -> Dict[str, pd.DataFrame]:
+    """Pre-compute session-filtered collapsed data for all symbols.
+
+    Args:
+        tick_data: Dictionary of symbol -> tick DataFrame
+        session_key: Session configuration (times, timezone)
+        verbose: Enable logging
+        show_progress: Show progress bar
+        use_threads: Use ThreadPoolExecutor (True) vs ProcessPoolExecutor (False)
+                     Threads are faster for I/O-bound operations with smaller data
+
+    Returns:
+        Dictionary of symbol -> collapsed DataFrame
+    """
     if not tick_data:
         return {}
+
+    if verbose:
+        logger = logging.getLogger(__name__)
+        logger.info(f"Pre-computing session data for {len(tick_data)} symbols")
+        logger.info(f"  Session: {session_key.session_start} to {session_key.session_end} ({session_key.tz})")
+        logger.info(f"  Using {'threads' if use_threads else 'processes'} for parallelism")
 
     tasks = [
         (symbol, ticks, session_key)
         for symbol, ticks in tick_data.items()
     ]
 
-    worker_count = _determine_worker_count(len(tasks))
+    worker_count = _determine_worker_count(len(tasks), verbose=verbose)
     results: Dict[str, pd.DataFrame] = {}
 
+    # Sequential processing
     if worker_count == 1:
-        for task in tasks:
+        iterator = tqdm(tasks, desc="Session Preprocessing", unit="symbol") if show_progress else tasks
+        for task in iterator:
             symbol, collapsed = _precompute_symbol_collapsed(task)
             if collapsed is not None:
                 results[symbol] = collapsed
+        if verbose:
+            logger = logging.getLogger(__name__)
+            logger.info(f"Pre-computed session data for {len(results)}/{len(tick_data)} symbols")
         return results
 
-    with ProcessPoolExecutor(max_workers=worker_count) as executor:
+    # Parallel processing - choose executor type
+    if use_threads:
+        from concurrent.futures import ThreadPoolExecutor
+        ExecutorClass = ThreadPoolExecutor
+    else:
+        ExecutorClass = ProcessPoolExecutor
+
+    with ExecutorClass(max_workers=worker_count) as executor:
         futures = {
             executor.submit(_precompute_symbol_collapsed, task): task[0]
             for task in tasks
         }
-        for future in as_completed(futures):
+        iterator = as_completed(futures) if not show_progress else tqdm(
+            as_completed(futures),
+            total=len(tasks),
+            desc="Session Preprocessing",
+            unit="symbol"
+        )
+        for future in iterator:
             symbol, collapsed = future.result()
             if collapsed is not None:
                 results[symbol] = collapsed
+
+    if verbose:
+        logger = logging.getLogger(__name__)
+        logger.info(f"Pre-computed session data for {len(results)}/{len(tick_data)} symbols")
 
     return results
 
@@ -1490,34 +1644,77 @@ def _compute_symbol_buckets(
 def _compute_bucket_data(
     collapsed_data: Dict[str, pd.DataFrame],
     bucket_key: _BucketKey,
+    verbose: bool = False,
+    show_progress: bool = True,
+    use_threads: bool = True
 ) -> Dict[str, Tuple[pd.DataFrame, int, str]]:
+    """Compute volume buckets for collapsed tick data.
+
+    Args:
+        collapsed_data: Dictionary of symbol -> collapsed DataFrame
+        bucket_key: Bucket configuration (size, mode)
+        verbose: Enable logging
+        show_progress: Show progress bar
+        use_threads: Use ThreadPoolExecutor (True) vs ProcessPoolExecutor (False)
+
+    Returns:
+        Dictionary of symbol -> (bucket_df, bucket_size, method)
+    """
     if not collapsed_data:
         return {}
+
+    if verbose:
+        logger = logging.getLogger(__name__)
+        mode_desc = f"{bucket_key.mode} (size={bucket_key.bucket_size})" if bucket_key.mode == "manual" else f"{bucket_key.mode} (target={bucket_key.cadence_target})"
+        logger.info(f"Computing volume buckets for {len(collapsed_data)} symbols ({mode_desc})")
+        logger.info(f"  Using {'threads' if use_threads else 'processes'} for parallelism")
 
     tasks = [
         (symbol, collapsed, bucket_key)
         for symbol, collapsed in collapsed_data.items()
     ]
 
-    worker_count = _determine_worker_count(len(tasks))
+    worker_count = _determine_worker_count(len(tasks), verbose=verbose)
     results: Dict[str, Tuple[pd.DataFrame, int, str]] = {}
 
+    # Sequential processing
     if worker_count == 1:
-        for task in tasks:
+        iterator = tqdm(tasks, desc="Bucket Computation", unit="symbol") if show_progress else tasks
+        for task in iterator:
             symbol, bucket_info = _compute_symbol_buckets(task)
             if bucket_info is not None:
                 results[symbol] = bucket_info
+        if verbose:
+            logger = logging.getLogger(__name__)
+            logger.info(f"Computed buckets for {len(results)}/{len(collapsed_data)} symbols")
         return results
 
-    with ProcessPoolExecutor(max_workers=worker_count) as executor:
+    # Parallel processing - choose executor type
+    if use_threads:
+        from concurrent.futures import ThreadPoolExecutor
+        ExecutorClass = ThreadPoolExecutor
+    else:
+        ExecutorClass = ProcessPoolExecutor
+
+    with ExecutorClass(max_workers=worker_count) as executor:
         futures = {
             executor.submit(_compute_symbol_buckets, task): task[0]
             for task in tasks
         }
-        for future in as_completed(futures):
+        iterator = as_completed(futures) if not show_progress else tqdm(
+            as_completed(futures),
+            total=len(tasks),
+            desc="Bucket Computation",
+            unit="symbol"
+        )
+        for future in iterator:
             symbol, bucket_info = future.result()
             if bucket_info is not None:
                 results[symbol] = bucket_info
+
+    if verbose:
+        logger = logging.getLogger(__name__)
+        logger.info(f"Computed buckets for {len(results)}/{len(collapsed_data)} symbols")
 
     return results
 

@@ -8,6 +8,9 @@ from ..data import IntradayFileManager, DataClient, SyntheticSymbol
 from ..config import DLY_DATA_PATH, INTRADAY_ADB_PATH
 from ..utils.session import filter_session_bars
 from scipy import stats
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm.auto import tqdm
+import logging
 
 
 @dataclass
@@ -142,7 +145,7 @@ class ScreenParams:
 class HistoricalScreener:
     """Screener created to find seasonal and momentum patterns in intraday and daily data"""
 
-    def __init__(self, ticker_data: Dict[str, Union[pd.DataFrame, SyntheticSymbol]], file_mgr:IntradayFileManager=None):
+    def __init__(self, ticker_data: Dict[str, Union[pd.DataFrame, SyntheticSymbol]], file_mgr:IntradayFileManager=None, verbose: bool = True):
         """
         Initialize HistoricalScreener with ticker data.
 
@@ -152,17 +155,34 @@ class HistoricalScreener:
             Dictionary mapping ticker symbols to either DataFrames or SyntheticSymbol objects
         file_mgr : IntradayFileManager, optional
             File manager for loading additional data
+        verbose : bool, optional
+            Enable verbose logging (default: True)
         """
         self.data = ticker_data
         self.tickers = list(ticker_data.keys())
         self.mgr = file_mgr or IntradayFileManager(data_path=DLY_DATA_PATH, arctic_uri=INTRADAY_ADB_PATH)
         self.method = "arctic"
+        self.verbose = verbose
+
+        # Setup logging
+        self.logger = logging.getLogger(f"{__name__}.HistoricalScreener")
+        if verbose and not self.logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+            self.logger.addHandler(handler)
+            self.logger.setLevel(logging.INFO)
 
         # Track which tickers are synthetic spreads
         self.synthetic_tickers = {
             ticker: isinstance(data, SyntheticSymbol)
             for ticker, data in ticker_data.items()
         }
+
+        if self.verbose:
+            self.logger.info(f"Initialized HistoricalScreener with {len(self.tickers)} tickers")
+            synth_count = sum(self.synthetic_tickers.values())
+            if synth_count > 0:
+                self.logger.info(f"  - {synth_count} synthetic spreads, {len(self.tickers) - synth_count} regular tickers")
 
 
     def intraday_momentum_screen(
@@ -178,7 +198,9 @@ class HistoricalScreener:
         months: Optional[List[int]] = None,
         season: Optional[str] = None,
         _selected_months: Optional[List[int]] = None,
-        _precomputed_sessions: Optional[Dict[str, Dict[str, any]]] = None
+        _precomputed_sessions: Optional[Dict[str, Dict[str, any]]] = None,
+        max_workers: Optional[int] = None,
+        show_progress: bool = True
     ) -> Dict[str, Dict[str, any]]:
         """
         Screen for intraday momentum patterns across multiple sessions.
@@ -224,6 +246,10 @@ class HistoricalScreener:
             Internal override for month selection when using cached data.
         _precomputed_sessions : Optional[Dict[str, Dict[str, any]]]
             Pre-filtered session data keyed by ticker for performance.
+        max_workers : Optional[int]
+            Maximum number of parallel workers. If None, uses min(32, cpu_count + 4).
+        show_progress : bool
+            Show progress bar during processing (default: True)
 
         Returns:
         --------
@@ -261,99 +287,135 @@ class HistoricalScreener:
         if sess_end_mins is None:
             sess_end_mins = sess_start_minutes
 
-        results = {}
+        if self.verbose:
+            self.logger.info(f"Starting intraday momentum screen for {len(self.tickers)} tickers")
+            self.logger.info(f"  Sessions: {len(session_starts)} session(s)")
+            self.logger.info(f"  Momentum days: {st_momentum_days}, Opening window: {sess_start_hrs}h {sess_start_minutes}m")
+            if selected_months:
+                self.logger.info(f"  Filtering to months: {selected_months}")
 
+        results = {}
         precomputed_sessions = _precomputed_sessions or {}
 
-        for t in self.tickers:
-            cache_entry = precomputed_sessions.get(t)
+        # Helper function for processing a single ticker
+        def _process_single_ticker(t: str) -> Tuple[str, Dict[str, any]]:
+            try:
+                cache_entry = precomputed_sessions.get(t)
 
-            if cache_entry:
-                is_synthetic = cache_entry.get('is_synthetic', self.synthetic_tickers.get(t, False))
-                ticker_data = cache_entry.get('data')
-                price_col = cache_entry.get('price_col')
-                filtered_months_label = cache_entry.get('filtered_months', selected_months if selected_months else 'all')
-                n_observations = cache_entry.get('n_observations', len(ticker_data) if ticker_data is not None else 0)
+                if cache_entry:
+                    is_synthetic = cache_entry.get('is_synthetic', self.synthetic_tickers.get(t, False))
+                    ticker_data = cache_entry.get('data')
+                    price_col = cache_entry.get('price_col')
+                    filtered_months_label = cache_entry.get('filtered_months', selected_months if selected_months else 'all')
+                    n_observations = cache_entry.get('n_observations', len(ticker_data) if ticker_data is not None else 0)
 
-                if ticker_data is None or ticker_data.empty:
-                    results[t] = {
-                        'error': cache_entry.get('error', 'No data available'),
-                        'filtered_months': filtered_months_label,
-                        'ticker': t,
-                        'is_synthetic': is_synthetic
-                    }
-                    if selected_months is not None:
-                        results[t]['selected_months'] = selected_months
-                    continue
-            else:
-                # Get data for this ticker
-                is_synthetic = self.synthetic_tickers.get(t, False)
-
-                if is_synthetic:
-                    synthetic_obj = self.data[t]
-                    ticker_data = synthetic_obj.price if hasattr(synthetic_obj, 'price') else synthetic_obj.data_engine.build_spread_series(return_ohlc=True)
-                else:
-                    ticker_data = self.data[t]
-
-                if ticker_data.empty:
-                    results[t] = {'error': 'No data available'}
-                    continue
-
-                # Filter by months/season if specified
-                if selected_months is not None:
-                    ticker_data = self._filter_by_months(ticker_data, selected_months)
-                    if ticker_data.empty:
-                        results[t] = {
-                            'error': 'No data available for selected months/season',
-                            'selected_months': selected_months
+                    if ticker_data is None or ticker_data.empty:
+                        result = {
+                            'error': cache_entry.get('error', 'No data available'),
+                            'filtered_months': filtered_months_label,
+                            'ticker': t,
+                            'is_synthetic': is_synthetic
                         }
-                        continue
+                        if selected_months is not None:
+                            result['selected_months'] = selected_months
+                        return (t, result)
+                else:
+                    # Get data for this ticker
+                    is_synthetic = self.synthetic_tickers.get(t, False)
 
-                price_col = 'Close' if 'Close' in ticker_data.columns else ticker_data.columns[0]
-                filtered_months_label = selected_months if selected_months else 'all'
-                n_observations = len(ticker_data)
+                    if is_synthetic:
+                        synthetic_obj = self.data[t]
+                        ticker_data = synthetic_obj.price if hasattr(synthetic_obj, 'price') else synthetic_obj.data_engine.build_spread_series(return_ohlc=True)
+                    else:
+                        ticker_data = self.data[t]
 
-            if price_col is None and ticker_data is not None:
-                price_col = 'Close' if 'Close' in ticker_data.columns else ticker_data.columns[0]
+                    if ticker_data.empty:
+                        return (t, {'error': 'No data available'})
 
-            ticker_results = {
-                'ticker': t,
-                'is_synthetic': is_synthetic,
-                'n_observations': n_observations,
-                'filtered_months': filtered_months_label
-            }
+                    # Filter by months/season if specified
+                    if selected_months is not None:
+                        ticker_data = self._filter_by_months(ticker_data, selected_months)
+                        if ticker_data.empty:
+                            return (t, {
+                                'error': 'No data available for selected months/season',
+                                'selected_months': selected_months
+                            })
 
-            for i, (start_time, end_time) in enumerate(zip(session_starts, session_ends)):
-                session_key = f"session_{i}"
+                    price_col = 'Close' if 'Close' in ticker_data.columns else ticker_data.columns[0]
+                    filtered_months_label = selected_months if selected_months else 'all'
+                    n_observations = len(ticker_data)
 
-                # Use pre-filtered session data when available
-                session_df = None
-                if cache_entry and 'sessions' in cache_entry:
-                    session_df = cache_entry['sessions'].get((start_time, end_time))
+                if price_col is None and ticker_data is not None:
+                    price_col = 'Close' if 'Close' in ticker_data.columns else ticker_data.columns[0]
 
-                if session_df is None and ticker_data is not None:
-                    session_df = self._extract_session_data(ticker_data, start_time, end_time, price_col)
+                ticker_results = {
+                    'ticker': t,
+                    'is_synthetic': is_synthetic,
+                    'n_observations': n_observations,
+                    'filtered_months': filtered_months_label
+                }
 
-                # Perform session momentum analysis with filtered data
-                momentum_stats = self._session_momentum_analysis(
-                    ticker=t,
-                    session_start=start_time,
-                    session_end=end_time,
-                    start_hrs=sess_start_hrs,
-                    start_mins=sess_start_minutes,
-                    end_hrs=sess_end_hrs,
-                    end_mins=sess_end_mins,
-                    momentum_days=st_momentum_days,
-                    test_vol=test_vol,
-                    data=ticker_data,
-                    session_data=session_df,
-                    price_col=price_col,
-                    is_synthetic=is_synthetic
+                for i, (start_time, end_time) in enumerate(zip(session_starts, session_ends)):
+                    session_key = f"session_{i}"
+
+                    # Use pre-filtered session data when available
+                    session_df = None
+                    if cache_entry and 'sessions' in cache_entry:
+                        session_df = cache_entry['sessions'].get((start_time, end_time))
+
+                    if session_df is None and ticker_data is not None:
+                        session_df = self._extract_session_data(ticker_data, start_time, end_time, price_col)
+
+                    # Perform session momentum analysis with filtered data
+                    momentum_stats = self._session_momentum_analysis(
+                        ticker=t,
+                        session_start=start_time,
+                        session_end=end_time,
+                        start_hrs=sess_start_hrs,
+                        start_mins=sess_start_minutes,
+                        end_hrs=sess_end_hrs,
+                        end_mins=sess_end_mins,
+                        momentum_days=st_momentum_days,
+                        test_vol=test_vol,
+                        data=ticker_data,
+                        session_data=session_df,
+                        price_col=price_col,
+                        is_synthetic=is_synthetic
+                    )
+
+                    ticker_results[session_key] = momentum_stats
+
+                return (t, ticker_results)
+            except Exception as e:
+                if self.verbose:
+                    self.logger.error(f"Error processing ticker {t}: {str(e)}")
+                return (t, {'error': str(e), 'ticker': t})
+
+        # Process tickers in parallel if max_workers > 1 or None
+        if max_workers is None or max_workers > 1:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(_process_single_ticker, ticker): ticker for ticker in self.tickers}
+
+                iterator = as_completed(futures) if not show_progress else tqdm(
+                    as_completed(futures),
+                    total=len(self.tickers),
+                    desc="Momentum Screen",
+                    unit="ticker"
                 )
 
-                ticker_results[session_key] = momentum_stats
+                for future in iterator:
+                    ticker, result = future.result()
+                    results[ticker] = result
+        else:
+            # Sequential processing with optional progress bar
+            iterator = tqdm(self.tickers, desc="Momentum Screen", unit="ticker") if show_progress else self.tickers
+            for ticker in iterator:
+                ticker_sym, result = _process_single_ticker(ticker)
+                results[ticker_sym] = result
 
-            results[t] = ticker_results
+        if self.verbose:
+            successful = sum(1 for r in results.values() if 'error' not in r)
+            self.logger.info(f"Completed momentum screen: {successful}/{len(results)} successful")
 
         return results
 
@@ -368,6 +430,8 @@ class HistoricalScreener:
         session_end: Optional[Union[str, time]] = None,
         tz: str = "America/Chicago",
         include_volume: bool = False,
+        max_workers: Optional[int] = None,
+        show_progress: bool = True
     ) -> Dict[str, Dict[str, any]]:
         """
         Screen for seasonality patterns in intraday data.
@@ -451,107 +515,143 @@ class HistoricalScreener:
         # Determine which months to analyze
         selected_months = self._parse_season_months(months, season)
 
+        if self.verbose:
+            self.logger.info(f"Starting seasonality screen for {len(self.tickers)} tickers")
+            self.logger.info(f"  Target times: {[str(t) for t in converted_times]}")
+            self.logger.info(f"  Session window: {session_start_time} to {session_end_time} ({tz})")
+            if selected_months:
+                self.logger.info(f"  Filtering to months: {selected_months}")
+
         results = {}
 
-        for ticker in self.tickers:
-            # Get data for this ticker
-            is_synthetic = self.synthetic_tickers.get(ticker, False)
+        # Helper function for processing a single ticker
+        def _process_single_ticker(ticker: str) -> Tuple[str, Dict[str, any]]:
+            try:
+                # Get data for this ticker
+                is_synthetic = self.synthetic_tickers.get(ticker, False)
 
-            if is_synthetic:
-                synthetic_obj = self.data[ticker]
-                data = synthetic_obj.price if hasattr(synthetic_obj, 'price') else synthetic_obj.data_engine.build_spread_series(return_ohlc=True)
-            else:
-                data = self.data[ticker]
+                if is_synthetic:
+                    synthetic_obj = self.data[ticker]
+                    data = synthetic_obj.price if hasattr(synthetic_obj, 'price') else synthetic_obj.data_engine.build_spread_series(return_ohlc=True)
+                else:
+                    data = self.data[ticker]
 
-            if data.empty:
-                results[ticker] = {'error': 'No data available'}
-                continue
+                if data.empty:
+                    return (ticker, {'error': 'No data available'})
 
-            # Filter to session window in local timezone
-            session_data = filter_session_bars(
-                data,
-                tz,
-                session_start_time,
-                session_end_time,
-            )
+                # Filter to session window in local timezone
+                session_data = filter_session_bars(
+                    data,
+                    tz,
+                    session_start_time,
+                    session_end_time,
+                )
 
-            if session_data.empty:
-                results[ticker] = {
-                    'error': 'No data available within session window',
-                    'session_start': session_start_time.strftime("%H:%M:%S"),
-                    'session_end': session_end_time.strftime("%H:%M:%S"),
-                    'tz': tz,
-                }
-                continue
-
-            if selected_months is not None:
-                session_data = self._filter_by_months(session_data, selected_months)
                 if session_data.empty:
-                    results[ticker] = {
-                        'error': 'No data available for selected months/season',
-                        'selected_months': selected_months,
+                    return (ticker, {
+                        'error': 'No data available within session window',
                         'session_start': session_start_time.strftime("%H:%M:%S"),
                         'session_end': session_end_time.strftime("%H:%M:%S"),
                         'tz': tz,
-                    }
-                    continue
+                    })
 
-            # Determine price column
-            price_col = 'Close' if 'Close' in session_data.columns else session_data.columns[0]
+                if selected_months is not None:
+                    session_data = self._filter_by_months(session_data, selected_months)
+                    if session_data.empty:
+                        return (ticker, {
+                            'error': 'No data available for selected months/season',
+                            'selected_months': selected_months,
+                            'session_start': session_start_time.strftime("%H:%M:%S"),
+                            'session_end': session_end_time.strftime("%H:%M:%S"),
+                            'tz': tz,
+                        })
 
-            ticker_results = {
-                'ticker': ticker,
-                'is_synthetic': is_synthetic,
-                'n_observations': len(session_data),
-                'filtered_months': selected_months if selected_months else 'all'
-            }
+                # Determine price column
+                price_col = 'Close' if 'Close' in session_data.columns else session_data.columns[0]
 
-            if isinstance(session_data.index, pd.DatetimeIndex):
-                index_dt = session_data.index
-            else:
-                index_dt = pd.to_datetime(session_data.index)
-                session_data.index = index_dt
-            if index_dt.tz is None:
-                session_dates = index_dt.normalize()
-            else:
-                session_dates = index_dt.tz_convert(tz).normalize()
-            ticker_results['metadata'] = {
-                'session_start': session_start_time.strftime("%H:%M:%S"),
-                'session_end': session_end_time.strftime("%H:%M:%S"),
-                'tz': tz,
-                'n_sessions': int(session_dates.nunique()),
-            }
+                ticker_results = {
+                    'ticker': ticker,
+                    'is_synthetic': is_synthetic,
+                    'n_observations': len(session_data),
+                    'filtered_months': selected_months if selected_months else 'all'
+                }
 
-            # Day-of-week analysis
-            if dayofweek_screen:
-                dow_results = self._analyze_dayofweek_patterns(session_data, price_col, is_synthetic)
-                ticker_results['dayofweek_returns'] = dow_results['returns']
-                ticker_results['dayofweek_volatility'] = dow_results['volatility']
+                if isinstance(session_data.index, pd.DatetimeIndex):
+                    index_dt = session_data.index
+                else:
+                    index_dt = pd.to_datetime(session_data.index)
+                    session_data.index = index_dt
+                if index_dt.tz is None:
+                    session_dates = index_dt.normalize()
+                else:
+                    session_dates = index_dt.tz_convert(tz).normalize()
+                ticker_results['metadata'] = {
+                    'session_start': session_start_time.strftime("%H:%M:%S"),
+                    'session_end': session_end_time.strftime("%H:%M:%S"),
+                    'tz': tz,
+                    'n_sessions': int(session_dates.nunique()),
+                }
 
-            # Time-of-day predictability
-            time_predictions = {}
-            for target_time in converted_times:
-                pred_stats = self._test_time_predictability(
-                    session_data,
-                    price_col,
-                    target_time,
-                    is_synthetic,
-                    period_length
+                # Day-of-week analysis
+                if dayofweek_screen:
+                    dow_results = self._analyze_dayofweek_patterns(session_data, price_col, is_synthetic)
+                    ticker_results['dayofweek_returns'] = dow_results['returns']
+                    ticker_results['dayofweek_volatility'] = dow_results['volatility']
+
+                # Time-of-day predictability
+                time_predictions = {}
+                for target_time in converted_times:
+                    pred_stats = self._test_time_predictability(
+                        session_data,
+                        price_col,
+                        target_time,
+                        is_synthetic,
+                        period_length
+                    )
+                    time_predictions[str(target_time)] = pred_stats
+
+                ticker_results['time_predictability'] = time_predictions
+
+                # Month-by-month analysis if filtering is applied
+                if selected_months is not None:
+                    month_analysis = self._analyze_by_month(session_data, price_col, is_synthetic, selected_months)
+                    ticker_results['month_breakdown'] = month_analysis
+
+                # Rank strongest patterns
+                strongest = self._rank_seasonal_strength(ticker_results)
+                ticker_results['strongest_patterns'] = strongest
+
+                return (ticker, ticker_results)
+            except Exception as e:
+                if self.verbose:
+                    self.logger.error(f"Error processing ticker {ticker}: {str(e)}")
+                return (ticker, {'error': str(e), 'ticker': ticker})
+
+        # Process tickers in parallel if max_workers > 1 or None
+        if max_workers is None or max_workers > 1:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(_process_single_ticker, ticker): ticker for ticker in self.tickers}
+
+                iterator = as_completed(futures) if not show_progress else tqdm(
+                    as_completed(futures),
+                    total=len(self.tickers),
+                    desc="Seasonality Screen",
+                    unit="ticker"
                 )
-                time_predictions[str(target_time)] = pred_stats
 
-            ticker_results['time_predictability'] = time_predictions
+                for future in iterator:
+                    ticker, result = future.result()
+                    results[ticker] = result
+        else:
+            # Sequential processing with optional progress bar
+            iterator = tqdm(self.tickers, desc="Seasonality Screen", unit="ticker") if show_progress else self.tickers
+            for ticker in iterator:
+                ticker_sym, result = _process_single_ticker(ticker)
+                results[ticker_sym] = result
 
-            # Month-by-month analysis if filtering is applied
-            if selected_months is not None:
-                month_analysis = self._analyze_by_month(session_data, price_col, is_synthetic, selected_months)
-                ticker_results['month_breakdown'] = month_analysis
-
-            # Rank strongest patterns
-            strongest = self._rank_seasonal_strength(ticker_results)
-            ticker_results['strongest_patterns'] = strongest
-
-            results[ticker] = ticker_results
+        if self.verbose:
+            successful = sum(1 for r in results.values() if 'error' not in r)
+            self.logger.info(f"Completed seasonality screen: {successful}/{len(results)} successful")
 
         return results
 
@@ -1963,6 +2063,7 @@ class HistoricalScreener:
             'total_observations': len(df)
         }
 
+
         return result
 
     def _rank_seasonal_strength(
@@ -3117,6 +3218,147 @@ class HistoricalScreener:
 
         return cls(data, None)
 
+    @classmethod
+    def from_parquet(
+        cls,
+        symbols: List[str],
+        parquet_path: Optional[str] = None,
+        timeframe: Optional[str] = None,
+        volume_bucket_size: Optional[int] = None,
+        start: Optional[Union[str, datetime]] = None,
+        end: Optional[Union[str, datetime]] = None,
+        max_concurrent: int = 5
+    ):
+        """
+        Create HistoricalScreener from Parquet files using AsyncParquetWriter infrastructure.
+
+        Parameters
+        ----------
+        symbols : List[str]
+            List of symbols to load (e.g., ['CL_F', 'NG_F', 'ZC_F'])
+        parquet_path : Optional[str]
+            Base path for Parquet storage (default: INTRADAY_DATA_PATH from config)
+        timeframe : Optional[str]
+            Time-based resampling identifier (e.g., '1T', '5T', '15T')
+            If None, loads raw tick data
+        volume_bucket_size : Optional[int]
+            Volume bucket size identifier (e.g., 500, 1000)
+            Cannot be used with timeframe
+        start : Optional[Union[str, datetime]]
+            Start date/datetime filter
+        end : Optional[Union[str, datetime]]
+            End date/datetime filter
+        max_concurrent : int
+            Maximum concurrent async reads (default: 5)
+
+        Returns
+        -------
+        HistoricalScreener
+            Initialized screener with loaded parquet data
+
+        Examples
+        --------
+        # Load 1-minute data for multiple symbols
+        >>> screener = HistoricalScreener.from_parquet(
+        ...     symbols=['CL_F', 'NG_F'],
+        ...     timeframe='1T',
+        ...     start='2023-01-01',
+        ...     end='2024-01-01'
+        ... )
+
+        # Load volume bucket data
+        >>> screener = HistoricalScreener.from_parquet(
+        ...     symbols=['CL_F'],
+        ...     volume_bucket_size=500,
+        ...     start=datetime(2023, 1, 1)
+        ... )
+
+        # Load from custom path
+        >>> screener = HistoricalScreener.from_parquet(
+        ...     symbols=['ZC_F', 'ZS_F'],
+        ...     parquet_path='F:/Data/intraday/',
+        ...     timeframe='5T'
+        ... )
+
+        # Load with high concurrency
+        >>> screener = HistoricalScreener.from_parquet(
+        ...     symbols=['CL_F', 'NG_F', 'HO_F', 'RB_F'],
+        ...     timeframe='1T',
+        ...     max_concurrent=10
+        ... )
+
+        Notes
+        -----
+        - Uses AsyncParquetWriter for efficient async I/O
+        - Automatically handles timezone-aware datetime filtering
+        - Parquet files expected at: {parquet_path}/{symbol}/{symbol}_{timeframe}.parquet
+        - Returns empty dict for symbols with no data (with warning)
+        """
+        from ..data.raw_formatting.intraday_manager import AsyncParquetWriter
+        import asyncio
+
+        # Initialize AsyncParquetWriter
+        writer = AsyncParquetWriter(
+            parquet_base_path=parquet_path if parquet_path else None,
+            enable_logging=True
+        )
+
+        # Convert string dates to datetime if needed
+        if start and isinstance(start, str):
+            start = pd.to_datetime(start)
+        if end and isinstance(end, str):
+            end = pd.to_datetime(end)
+
+        # Create async loading coroutine
+        async def load_all_symbols():
+            semaphore = asyncio.Semaphore(max_concurrent)
+
+            async def load_symbol(symbol: str) -> Tuple[str, Optional[pd.DataFrame]]:
+                async with semaphore:
+                    try:
+                        df = await writer.read_dataframe(
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            volume_bucket_size=volume_bucket_size,
+                            start=start,
+                            end=end
+                        )
+
+                        if df.empty:
+                            print(f"Warning: No data loaded for {symbol}")
+                            return symbol, None
+
+                        # Print summary
+                        freq_str = f"{timeframe}" if timeframe else f"vol{volume_bucket_size}" if volume_bucket_size else "raw"
+                        print(f"Loaded {symbol} ({freq_str}): {len(df):,} records from {df.index[0]} to {df.index[-1]}")
+                        return symbol, df
+
+                    except Exception as e:
+                        print(f"Error loading {symbol}: {e}")
+                        return symbol, None
+
+            # Load all symbols concurrently
+            tasks = [load_symbol(symbol) for symbol in symbols]
+            results = await asyncio.gather(*tasks)
+            return results
+
+        # Run the async loading
+        loop = asyncio.get_event_loop()
+        results = loop.run_until_complete(load_all_symbols())
+
+        # Build data dictionary
+        data = {}
+        for symbol, df in results:
+            if df is not None:
+                data[symbol] = df
+
+        if not data:
+            raise ValueError(f"No data loaded for any symbols: {symbols}")
+
+        # Create IntradayFileManager instance for compatibility
+        mgr = IntradayFileManager(data_path=DLY_DATA_PATH, arctic_uri=INTRADAY_ADB_PATH)
+
+        return cls(data, mgr)
 
 
 def main():

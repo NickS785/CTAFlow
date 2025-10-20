@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import time
 from typing import Union
+from functools import lru_cache
 
 import pandas as pd
 
@@ -11,12 +12,15 @@ __all__ = ["filter_session_ticks", "filter_session_bars"]
 
 _TimeLike = Union[str, time]
 
-
+# Cache for parsed time objects to avoid repeated parsing
+@lru_cache(maxsize=128)
 def _parse_time(value: _TimeLike) -> time:
     """Return a :class:`datetime.time` instance for ``value``."""
 
     if isinstance(value, time):
         return value
+
+    # Convert string to time - cache result for repeated calls
     parsed = pd.to_datetime(value).time()
     if parsed.tzinfo is not None:
         # Drop timezone information if provided; session boundaries are clock times.
@@ -52,8 +56,12 @@ def _session_mask(times: pd.Series, start: time, end: time) -> pd.Series:
 
 def _ensure_series_tz(series: pd.Series, tz: str) -> pd.Series:
     """Ensure ``series`` is timezone-aware in ``tz``."""
+    # Avoid extra Series wrapper - work directly with input
+    if not isinstance(series.dtype, pd.DatetimeTZDtype) and series.dtype != 'datetime64[ns]':
+        localized = pd.to_datetime(series)
+    else:
+        localized = series
 
-    localized = pd.to_datetime(pd.Series(series))
     if localized.dt.tz is None:
         localized = localized.dt.tz_localize(tz)
     else:
@@ -85,17 +93,21 @@ def filter_session_ticks(
     session_start = _parse_time(start)
     session_end = _parse_time(end)
 
-    ticks = ticks.copy()
+    # Convert timezone once and reuse
     timestamps = _ensure_series_tz(ticks["ts"], tz)
-    ticks = ticks.drop(columns=["ts"])
-    ticks.insert(0, "ts", pd.DatetimeIndex(timestamps.to_numpy()))
+
+    # Create session mask
     mask = _session_mask(timestamps, session_start, session_end)
     if not mask.any():
-        return ticks.iloc[0:0].assign(ts=timestamps.iloc[0:0])
+        # Return empty DataFrame with correct structure
+        return ticks.iloc[0:0].copy()
 
+    # Single copy operation with filtered data
     filtered = ticks.loc[mask].copy()
-    filtered_ts = pd.DatetimeIndex(timestamps.loc[mask].to_numpy())
-    filtered.loc[:, "ts"] = filtered_ts
+
+    # Update timestamp column with timezone-aware version (reuse filtered timestamps)
+    filtered["ts"] = pd.DatetimeIndex(timestamps.loc[mask].to_numpy())
+
     return filtered
 
 
