@@ -3,13 +3,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import time
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import pandas as pd
 
-from CTAFlow.screeners.historical_screener import HistoricalScreener, ScreenParams
-from CTAFlow.utils.seasonal import aggregate_window, log_returns, monthly_returns, tod_mask
-from CTAFlow.utils.session import filter_session_bars
+try:  # Optional dependency during lightweight usage
+    from .historical_screener import HistoricalScreener, ScreenParams
+except ModuleNotFoundError:  # pragma: no cover - fallback for minimal environments
+    HistoricalScreener = Any  # type: ignore[assignment]
+    ScreenParams = Any  # type: ignore[assignment]
+from .orderflow_scan import OrderflowParams
+from ..utils.seasonal import aggregate_window, log_returns, monthly_returns, tod_mask
+from ..utils.session import filter_session_bars
+
+
+ScreenParamLike = Union[ScreenParams, OrderflowParams]
 
 
 @dataclass
@@ -19,7 +27,7 @@ class PatternSummary:
     key: str
     symbol: str
     source_screen: str
-    screen_params: Optional[ScreenParams]
+    screen_params: Optional[ScreenParamLike]
     pattern_type: str
     description: str
     strength: Optional[float]
@@ -56,11 +64,11 @@ class PatternExtractor:
         self,
         screener: HistoricalScreener,
         results: Mapping[str, Mapping[str, Dict[str, Any]]],
-        screen_params: Optional[Sequence[ScreenParams]] = None,
+        screen_params: Optional[Sequence[ScreenParamLike]] = None,
     ) -> None:
         self._screener = screener
         self._results = results
-        self._screen_params: Dict[str, ScreenParams] = (
+        self._screen_params: Dict[str, ScreenParamLike] = (
             {params.name: params for params in screen_params}
             if screen_params is not None
             else {}
@@ -115,6 +123,9 @@ class PatternExtractor:
         }:
             return self._extract_monthly_series(symbol, summary)
 
+        if summary.metadata.get("screen_type") == "orderflow" or summary.pattern_type.startswith("orderflow_"):
+            return self._extract_orderflow_series(symbol, summary)
+
         raise NotImplementedError(
             f"Pattern type '{summary.pattern_type}' from screen '{screen_type}' is not supported yet"
         )
@@ -165,7 +176,17 @@ class PatternExtractor:
 
                 symbol_patterns = self._pattern_index.setdefault(symbol, {})
 
-                for summary in self._iter_pattern_summaries(
+                if self._is_orderflow_result(result):
+                    for summary in self._iter_orderflow_summaries(
+                        symbol=symbol,
+                        screen_name=screen_name,
+                        ticker_result=result,
+                        params=params,
+                    ):
+                        symbol_patterns[summary.key] = summary
+                    continue
+
+                for summary in self._iter_historical_summaries(
                     symbol=symbol,
                     screen_name=screen_name,
                     screen_type=screen_type,
@@ -174,13 +195,13 @@ class PatternExtractor:
                 ):
                     symbol_patterns[summary.key] = summary
 
-    def _iter_pattern_summaries(
+    def _iter_historical_summaries(
         self,
         symbol: str,
         screen_name: str,
         screen_type: Optional[str],
         ticker_result: Mapping[str, Any],
-        params: Optional[ScreenParams],
+        params: Optional[ScreenParamLike],
     ) -> Iterable[PatternSummary]:
         strongest: Iterable[Dict[str, Any]] = ticker_result.get("strongest_patterns", [])  # type: ignore[assignment]
         for pattern in strongest:
@@ -193,12 +214,140 @@ class PatternExtractor:
                 origin="strongest_patterns",
             )
 
+    def _iter_orderflow_summaries(
+        self,
+        symbol: str,
+        screen_name: str,
+        ticker_result: Mapping[str, Any],
+        params: Optional[ScreenParamLike],
+    ) -> Iterable[PatternSummary]:
+        weekly = ticker_result.get("df_weekly")
+        if isinstance(weekly, pd.DataFrame) and not weekly.empty:
+            mask_series = weekly.get("sig_fdr_5pct")
+            if mask_series is not None:
+                mask_series = mask_series.fillna(False).astype(bool)
+            else:
+                mask_series = pd.Series(True, index=weekly.index)
+            for row in weekly.loc[mask_series].itertuples(index=False):
+                payload = row._asdict()
+                metric = str(payload.get("metric", ""))
+                weekday = str(payload.get("weekday", ""))
+                bias = self._orderflow_bias(metric, payload.get("mean"))
+                metadata = {
+                    "pattern_origin": "orderflow_weekly",
+                    "screen_type": "orderflow",
+                    "orderflow_bias": bias,
+                }
+                yield PatternSummary(
+                    key="|".join(filter(None, [screen_name, "orderflow_weekly", metric, weekday])),
+                    symbol=symbol,
+                    source_screen=screen_name,
+                    screen_params=params,
+                    pattern_type="orderflow_weekly",
+                    description=self._format_orderflow_weekly_description(metric, weekday, payload, bias),
+                    strength=self._orderflow_strength(payload.get("t_stat"), payload.get("mean")),
+                    payload=dict(payload),
+                    metadata=metadata,
+                )
+
+        wom = ticker_result.get("df_wom_weekday")
+        if isinstance(wom, pd.DataFrame) and not wom.empty:
+            mask_series = wom.get("sig_fdr_5pct")
+            if mask_series is not None:
+                mask_series = mask_series.fillna(False).astype(bool)
+            else:
+                mask_series = pd.Series(True, index=wom.index)
+            for row in wom.loc[mask_series].itertuples(index=False):
+                payload = row._asdict()
+                metric = str(payload.get("metric", ""))
+                weekday = str(payload.get("weekday", ""))
+                wom_value = payload.get("week_of_month")
+                bias = self._orderflow_bias(metric, payload.get("mean"))
+                parts = [screen_name, "orderflow_week_of_month", metric]
+                if wom_value is not None and not pd.isna(wom_value):
+                    parts.append(f"w{int(wom_value)}")
+                parts.append(weekday)
+                metadata = {
+                    "pattern_origin": "orderflow_week_of_month",
+                    "screen_type": "orderflow",
+                    "orderflow_bias": bias,
+                }
+                yield PatternSummary(
+                    key="|".join(filter(None, parts)),
+                    symbol=symbol,
+                    source_screen=screen_name,
+                    screen_params=params,
+                    pattern_type="orderflow_week_of_month",
+                    description=self._format_orderflow_wom_description(metric, weekday, wom_value, payload, bias),
+                    strength=self._orderflow_strength(payload.get("t_stat"), payload.get("mean")),
+                    payload=dict(payload),
+                    metadata=metadata,
+                )
+
+        peak = ticker_result.get("df_weekly_peak_pressure")
+        if isinstance(peak, pd.DataFrame) and not peak.empty:
+            for row in peak.itertuples(index=False):
+                payload = row._asdict()
+                metric = str(payload.get("metric", ""))
+                weekday = str(payload.get("weekday", ""))
+                clock_time = payload.get("clock_time")
+                bias = str(payload.get("pressure_bias", "neutral"))
+                parts = [screen_name, "orderflow_peak_pressure", metric, weekday]
+                if clock_time is not None:
+                    parts.append(str(clock_time))
+                metadata = {
+                    "pattern_origin": "orderflow_peak_pressure",
+                    "screen_type": "orderflow",
+                    "orderflow_bias": bias,
+                }
+                yield PatternSummary(
+                    key="|".join(filter(None, parts)),
+                    symbol=symbol,
+                    source_screen=screen_name,
+                    screen_params=params,
+                    pattern_type="orderflow_peak_pressure",
+                    description=self._format_orderflow_peak_description(metric, weekday, clock_time, payload, bias),
+                    strength=self._orderflow_strength(payload.get("seasonality_t_stat"), payload.get("intraday_mean")),
+                    payload=dict(payload),
+                    metadata=metadata,
+                )
+
+        events = ticker_result.get("df_events")
+        if isinstance(events, pd.DataFrame) and not events.empty:
+            if "max_abs_z" in events.columns:
+                ranked = events.nlargest(25, "max_abs_z")
+            else:
+                ranked = events.head(25)
+            for row in ranked.itertuples(index=False):
+                payload = row._asdict()
+                metric = str(payload.get("metric", ""))
+                direction = str(payload.get("direction", ""))
+                ts_start = payload.get("ts_start")
+                parts = [screen_name, "orderflow_event_run", metric, direction]
+                if ts_start is not None:
+                    parts.append(str(ts_start))
+                metadata = {
+                    "pattern_origin": "orderflow_events",
+                    "screen_type": "orderflow",
+                }
+                yield PatternSummary(
+                    key="|".join(filter(None, parts)),
+                    symbol=symbol,
+                    source_screen=screen_name,
+                    screen_params=params,
+                    pattern_type="orderflow_event_run",
+                    description=self._format_orderflow_event_description(metric, direction, payload),
+                    strength=self._orderflow_strength(payload.get("max_abs_z"), None),
+                    payload=dict(payload),
+                    metadata=metadata,
+                )
+
     def _build_summary(
         self,
         symbol: str,
         screen_name: str,
         screen_type: Optional[str],
-        params: Optional[ScreenParams],
+        params: Optional[ScreenParamLike],
         pattern: Mapping[str, Any],
         origin: str,
     ) -> PatternSummary:
@@ -434,6 +583,221 @@ class PatternExtractor:
             return weekdays[name.lower()]
         except KeyError as exc:  # pragma: no cover - defensive guard
             raise ValueError(f"Unknown weekday '{name}'") from exc
+
+    # ------------------------------------------------------------------
+    # Orderflow helpers
+    # ------------------------------------------------------------------
+    def _is_orderflow_result(self, ticker_result: Mapping[str, Any]) -> bool:
+        keys = set(ticker_result.keys())
+        if {"df_weekly", "df_events", "df_buckets"}.intersection(keys):
+            metadata = ticker_result.get("metadata")
+            return isinstance(metadata, Mapping)
+        return False
+
+    def _get_orderflow_result(self, screen_name: str, symbol: str) -> Optional[Mapping[str, Any]]:
+        screen_results = self._results.get(screen_name)
+        if not isinstance(screen_results, Mapping):
+            return None
+        result = screen_results.get(symbol)
+        if not isinstance(result, Mapping):
+            return None
+        if not self._is_orderflow_result(result):
+            return None
+        return result
+
+    def _extract_orderflow_series(self, symbol: str, summary: PatternSummary) -> pd.Series:
+        result = self._get_orderflow_result(summary.source_screen, symbol)
+        if result is None:
+            return pd.Series(dtype=float)
+
+        bucket_df = result.get("df_buckets")
+        if not isinstance(bucket_df, pd.DataFrame) or bucket_df.empty:
+            return pd.Series(dtype=float)
+
+        metric = summary.payload.get("metric")
+        if metric is None or metric not in bucket_df.columns:
+            return pd.Series(dtype=float)
+
+        df = bucket_df.copy()
+        df["ts_end"] = pd.to_datetime(df["ts_end"])
+        df = df.dropna(subset=["ts_end", metric])
+
+        pattern_type = summary.pattern_type
+
+        if pattern_type == "orderflow_weekly":
+            weekday = summary.payload.get("weekday")
+            if weekday is None or "weekday" not in df.columns:
+                return pd.Series(dtype=float)
+            mask = df["weekday"].astype(str) == str(weekday)
+        elif pattern_type == "orderflow_week_of_month":
+            mask = pd.Series(True, index=df.index)
+            weekday = summary.payload.get("weekday")
+            if weekday is not None and "weekday" in df.columns:
+                mask &= df["weekday"].astype(str) == str(weekday)
+            week_of_month = summary.payload.get("week_of_month")
+            if week_of_month is not None and "week_of_month" in df.columns:
+                try:
+                    week_value = int(week_of_month)
+                except (TypeError, ValueError):
+                    week_value = None
+                if week_value is not None:
+                    mask &= df["week_of_month"].astype(int) == week_value
+        elif pattern_type == "orderflow_peak_pressure":
+            mask = pd.Series(True, index=df.index)
+            weekday = summary.payload.get("weekday")
+            if weekday is not None and "weekday" in df.columns:
+                mask &= df["weekday"].astype(str) == str(weekday)
+            clock_time = summary.payload.get("clock_time")
+            if clock_time is not None and "clock_time" in df.columns:
+                normalized = self._normalize_time_value(clock_time)
+                mask &= df["clock_time"].apply(self._normalize_time_value) == normalized
+        elif pattern_type == "orderflow_event_run":
+            ts_start = summary.payload.get("ts_start")
+            ts_end = summary.payload.get("ts_end")
+            if ts_start is None or ts_end is None:
+                return pd.Series(dtype=float)
+            start_ts = pd.to_datetime(ts_start)
+            end_ts = pd.to_datetime(ts_end)
+            mask = (df["ts_end"] >= start_ts) & (df["ts_end"] <= end_ts)
+        else:
+            return pd.Series(dtype=float)
+
+        if mask.empty or not mask.any():
+            return pd.Series(dtype=float)
+
+        series = df.loc[mask, ["ts_end", metric]].set_index("ts_end")[metric]
+        series.name = metric
+        return series.sort_index()
+
+    @staticmethod
+    def _normalize_time_value(value: Any) -> Optional[time]:
+        if value is None:
+            return None
+        if isinstance(value, time):
+            return value
+        try:
+            return pd.to_datetime(value).time()
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _orderflow_bias(metric: str, mean_value: Any) -> str:
+        try:
+            mean = float(mean_value)
+        except (TypeError, ValueError):
+            return "neutral"
+        if pd.isna(mean) or mean == 0:
+            return "neutral"
+        lower_metric = str(metric).lower()
+        if lower_metric in {"buy_pressure", "quote_buy_pressure"}:
+            return "buy" if mean > 0 else "sell"
+        if lower_metric == "sell_pressure":
+            return "sell" if mean > 0 else "buy"
+        return "positive" if mean > 0 else "negative"
+
+    @staticmethod
+    def _orderflow_strength(primary: Any, fallback: Any) -> Optional[float]:
+        for value in (primary, fallback):
+            if value is None:
+                continue
+            try:
+                return float(abs(value))
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _format_orderflow_weekly_description(
+        metric: str,
+        weekday: str,
+        payload: Dict[str, Any],
+        bias: str,
+    ) -> str:
+        mean_value = payload.get("mean")
+        t_stat = payload.get("t_stat")
+        q_value = payload.get("q_value")
+        parts = [f"{metric} bias {bias} on {weekday}"]
+        if pd.notna(mean_value):
+            parts.append(f"mean={float(mean_value):.4f}")
+        if pd.notna(t_stat):
+            parts.append(f"t={float(t_stat):.2f}")
+        if pd.notna(q_value):
+            parts.append(f"q={float(q_value):.3g}")
+        if len(parts) == 1:
+            return parts[0]
+        return parts[0] + " (" + ", ".join(parts[1:]) + ")"
+
+    @staticmethod
+    def _format_orderflow_wom_description(
+        metric: str,
+        weekday: str,
+        wom_value: Any,
+        payload: Dict[str, Any],
+        bias: str,
+    ) -> str:
+        prefix = f"{metric} week-of-month"
+        if wom_value is not None and not pd.isna(wom_value):
+            try:
+                prefix += f" {int(wom_value)}"
+            except (TypeError, ValueError):
+                pass
+        prefix += f" {weekday} bias {bias}"
+        details: List[str] = []
+        mean_value = payload.get("mean")
+        t_stat = payload.get("t_stat")
+        q_value = payload.get("q_value")
+        if pd.notna(mean_value):
+            details.append(f"mean={float(mean_value):.4f}")
+        if pd.notna(t_stat):
+            details.append(f"t={float(t_stat):.2f}")
+        if pd.notna(q_value):
+            details.append(f"q={float(q_value):.3g}")
+        if details:
+            prefix += " (" + ", ".join(details) + ")"
+        return prefix
+
+    @staticmethod
+    def _format_orderflow_peak_description(
+        metric: str,
+        weekday: str,
+        clock_time: Any,
+        payload: Dict[str, Any],
+        bias: str,
+    ) -> str:
+        time_display = str(clock_time) if clock_time is not None else "?"
+        details: List[str] = []
+        seasonality_mean = payload.get("seasonality_mean")
+        intraday_mean = payload.get("intraday_mean")
+        if pd.notna(seasonality_mean):
+            details.append(f"seasonal_mean={float(seasonality_mean):.4f}")
+        if pd.notna(intraday_mean):
+            details.append(f"intraday_mean={float(intraday_mean):.4f}")
+        detail_str = ""
+        if details:
+            detail_str = " (" + ", ".join(details) + ")"
+        return f"{metric} peak {bias} on {weekday} at {time_display}{detail_str}"
+
+    @staticmethod
+    def _format_orderflow_event_description(
+        metric: str,
+        direction: str,
+        payload: Dict[str, Any],
+    ) -> str:
+        parts = [f"{metric} {direction} run"]
+        max_abs_z = payload.get("max_abs_z")
+        if pd.notna(max_abs_z):
+            parts.append(f"|z|={float(max_abs_z):.2f}")
+        run_len = payload.get("run_len")
+        if run_len:
+            try:
+                parts.append(f"len={int(run_len)}")
+            except (TypeError, ValueError):
+                pass
+        ts_start = payload.get("ts_start")
+        ts_end = payload.get("ts_end")
+        if ts_start is not None and ts_end is not None:
+            parts.append(f"{ts_start}→{ts_end}")
+        return " ".join(parts)
 
 
 __all__ = ["PatternExtractor", "PatternSummary"]

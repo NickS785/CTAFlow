@@ -75,3 +75,49 @@ weekday signals that survive a 5% FDR cutoff.
 
 These tables make it easy to surface persistent weekday or week-of-month patterns while
 keeping multiple-testing error under control.
+
+## Session first-N-hours screener
+
+Use `run_session_first_hours` to aggregate the opening hours of each futures session,
+compute momentum, realised volatility, and a time-of-day relative volume signal, and then
+rank symbols on each metric.
+
+```python
+from screeners.session_first_hours import SessionFirstHoursParams, run_session_first_hours
+
+params = SessionFirstHoursParams(
+    symbols=["CL", "NG", "ZC"],
+    start_date="2025-06-01",
+    end_date="2025-10-15",
+    lookback_days=20,
+    session_start_hhmm="17:00",
+    first_hours=2,
+    bar_seconds=60,
+)
+
+wide = run_session_first_hours(params)
+print(wide.tail())
+```
+
+The wide DataFrame uses a MultiIndex with metric names on the first level and symbols on
+the second. Each session includes:
+
+- **momentum** – close/open return for the opening window.
+- **realized_vol** – square-root of summed log-return variance inside the window.
+- **vol_norm_ret** – momentum scaled by the rolling standard deviation of past
+  window returns.
+- **relative_volume_tod** – actual window volume divided by the median volume observed
+  at the same minutes over the lookback window (values above 1 indicate heavier than
+  usual participation).
+
+Command line usage mirrors the Python helper:
+
+```bash
+python -m screens.run_session_first_hours --symbols CL NG ZC \
+    --start 2025-06-01 --end 2025-10-15 --lookback 20 \
+    --session-start 17:00 --first-hours 2 --bar-seconds 60 \
+    --tz America/Chicago --tail 10 --out outputs/session_first_hours.csv
+```
+
+The CLI prints the latest rows and optionally saves the entire result set to CSV or
+Parquet when `--out` is provided.
