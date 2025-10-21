@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import time
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import pandas as pd
@@ -17,7 +18,7 @@ from ..utils.seasonal import aggregate_window, log_returns, monthly_returns, tod
 from ..utils.session import filter_session_bars
 
 
-ScreenParamLike = Union[ScreenParams, OrderflowParams]
+ScreenParamLike = Union[ScreenParams, OrderflowParams, SimpleNamespace]
 
 
 @dataclass
@@ -41,10 +42,18 @@ class PatternSummary:
         if self.screen_params is None:
             params_dict = None
         else:
-            params_dict = {
-                field_name: getattr(self.screen_params, field_name)
-                for field_name in self.screen_params.__dataclass_fields__  # type: ignore[attr-defined]
-            }
+            if hasattr(self.screen_params, "__dataclass_fields__"):
+                field_names = self.screen_params.__dataclass_fields__.keys()  # type: ignore[attr-defined]
+                params_dict = {
+                    field_name: getattr(self.screen_params, field_name)
+                    for field_name in field_names
+                }
+            else:
+                params_dict = {
+                    key: value
+                    for key, value in vars(self.screen_params).items()
+                    if not key.startswith("_")
+                }
 
         return {
             "pattern_type": self.pattern_type,
@@ -542,7 +551,7 @@ class PatternExtractor:
     def _get_seasonality_session_data(
         self,
         symbol: str,
-        params: ScreenParams,
+        params: ScreenParamLike,
     ) -> Tuple[pd.DataFrame, str, bool]:
         data = self._screener.data[symbol]
         if data.empty:
