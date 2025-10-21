@@ -389,9 +389,7 @@ class PatternExtractor:
     # Series reconstruction helpers
     # ------------------------------------------------------------------
     def _extract_weekday_series(self, symbol: str, summary: PatternSummary) -> pd.Series:
-        params = summary.screen_params
-        if params is None or params.screen_type != "seasonality":
-            raise ValueError("Weekday patterns require seasonality screen parameters")
+        params = self._ensure_seasonality_params(summary, context="Weekday")
 
         session_data, price_col, is_synthetic = self._get_seasonality_session_data(symbol, params)
         returns = self._compute_intraday_returns(session_data, price_col, is_synthetic)
@@ -408,20 +406,13 @@ class PatternExtractor:
         return daily_returns[mask]
 
     def _extract_time_of_day_series(self, symbol: str, summary: PatternSummary) -> pd.Series:
-        params = summary.screen_params
-        if params is None or params.screen_type != "seasonality":
-            raise ValueError("Time-of-day patterns require seasonality screen parameters")
+        params = self._ensure_seasonality_params(summary, context="Time-of-day")
 
         target_time_raw = summary.payload.get("time")
         if target_time_raw is None:
             raise ValueError("Pattern payload missing target time")
 
-        if isinstance(target_time_raw, str):
-            target_time_obj = pd.to_datetime(target_time_raw).time()
-        elif isinstance(target_time_raw, time):
-            target_time_obj = target_time_raw
-        else:
-            target_time_obj = pd.to_datetime(target_time_raw).time()
+        target_time_obj = self._normalize_time_value(target_time_raw)
 
         session_data, price_col, is_synthetic = self._get_seasonality_session_data(symbol, params)
         if session_data.empty:
@@ -460,6 +451,82 @@ class PatternExtractor:
                 mask = series.index.month_name() == month_name
                 series = series[mask]
         return series
+
+    # ------------------------------------------------------------------
+    # Parameter resolution helpers
+    # ------------------------------------------------------------------
+    def _ensure_seasonality_params(
+        self,
+        summary: PatternSummary,
+        *,
+        context: str,
+    ) -> ScreenParams:
+        params = summary.screen_params
+        if self._is_seasonality_params(params):
+            return params  # type: ignore[return-value]
+
+        direct = self._screen_params.get(summary.source_screen)
+        if self._is_seasonality_params(direct):
+            summary.screen_params = direct
+            return direct  # type: ignore[return-value]
+
+        screen_root = summary.source_screen.split("|", 1)[0]
+        root_match = self._screen_params.get(screen_root)
+        if self._is_seasonality_params(root_match):
+            summary.screen_params = root_match
+            return root_match  # type: ignore[return-value]
+
+        seasonality_params = [
+            candidate
+            for candidate in self._screen_params.values()
+            if self._is_seasonality_params(candidate)
+        ]
+
+        target_time_raw = summary.payload.get("time")
+        matches: List[ScreenParamLike] = []
+        if target_time_raw is not None:
+            try:
+                target_time = self._normalize_time_value(target_time_raw)
+            except Exception:  # pragma: no cover - defensive guard
+                target_time = None
+
+            if target_time is not None:
+                for candidate in seasonality_params:
+                    target_times = getattr(candidate, "target_times", None)
+                    if not target_times:
+                        continue
+                    try:
+                        normalized = [self._normalize_time_value(value) for value in target_times]
+                    except Exception:  # pragma: no cover - defensive guard
+                        continue
+                    if target_time in normalized:
+                        matches.append(candidate)
+
+        if not matches and len(seasonality_params) == 1:
+            matches = seasonality_params
+
+        if matches:
+            chosen = matches[0]
+            summary.screen_params = chosen
+            return chosen  # type: ignore[return-value]
+
+        raise ValueError(
+            f"{context} patterns require seasonality screen parameters; "
+            f"no configuration available for screen '{summary.source_screen}'."
+        )
+
+    @staticmethod
+    def _is_seasonality_params(params: Optional[ScreenParamLike]) -> bool:
+        return params is not None and getattr(params, "screen_type", None) == "seasonality"
+
+    @staticmethod
+    def _normalize_time_value(value: Any) -> time:
+        if isinstance(value, time):
+            return value
+        parsed = pd.to_datetime(value).time()
+        if parsed.tzinfo is not None:
+            parsed = parsed.replace(tzinfo=None)
+        return parsed
 
     # ------------------------------------------------------------------
     # Low-level utilities
