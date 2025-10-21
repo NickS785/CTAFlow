@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import time
@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from pandas.api.types import is_numeric_dtype
 from scipy import stats
 from tqdm.auto import tqdm
 import logging
@@ -179,7 +180,7 @@ def _robust_daily_zscores(df: pd.DataFrame, metric: str, date_col: str) -> pd.Se
 def _collapse_ticks(ticks: pd.DataFrame) -> pd.DataFrame:
     """Collapse ticks at same timestamp by summing volumes."""
     # Get numeric columns once (exclude 'ts')
-    numeric_cols = [col for col in ticks.columns if col != "ts" and np.issubdtype(ticks[col].dtype, np.number)]
+    numeric_cols = [col for col in ticks.columns if col != "ts" and is_numeric_dtype(ticks[col])]
 
     if not numeric_cols:
         # No numeric data to collapse, just return sorted unique timestamps
@@ -536,6 +537,10 @@ class OrderflowScanner:
             self.logger.info(f"Starting orderflow scan for {len(tick_data)} symbols")
 
         self.results = {}
+        consecutive_failures = 0
+        recent_failures: deque[str] = deque(maxlen=3)
+        aborted_due_to_errors = False
+        total_symbols = len(tick_data)
 
         # Helper function for processing a single symbol
         def _process_single_symbol(symbol: str, ticks: pd.DataFrame) -> Tuple[str, Dict[str, object]]:
@@ -561,10 +566,14 @@ class OrderflowScanner:
         if max_workers is None or max_workers > 1:
             from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(_process_single_symbol, symbol, tick_data[symbol]): symbol for symbol in symbols_list}
+                future_to_symbol = {
+                    executor.submit(_process_single_symbol, symbol, tick_data[symbol]): symbol
+                    for symbol in symbols_list
+                }
 
-                iterator = as_completed(futures) if not show_progress else tqdm(
-                    as_completed(futures),
+                base_iterator = as_completed(future_to_symbol)
+                iterator = base_iterator if not show_progress else tqdm(
+                    base_iterator,
                     total=len(symbols_list),
                     desc="Orderflow Scan",
                     unit="symbol"
@@ -573,6 +582,27 @@ class OrderflowScanner:
                 for future in iterator:
                     symbol, result = future.result()
                     self.results[symbol] = result
+
+                    if "error" in result:
+                        consecutive_failures += 1
+                        recent_failures.append(symbol)
+                        if consecutive_failures >= 3:
+                            aborted_due_to_errors = True
+                            self.logger.error(
+                                "Encountered %d consecutive ticker failures (%s). Last error: %s. Aborting remaining scans.",
+                                consecutive_failures,
+                                ", ".join(recent_failures),
+                                result.get("error"),
+                            )
+                            if show_progress and hasattr(iterator, "close"):
+                                iterator.close()
+                            for pending_future in future_to_symbol:
+                                if not pending_future.done():
+                                    pending_future.cancel()
+                            break
+                    else:
+                        consecutive_failures = 0
+                        recent_failures.clear()
         else:
             # Sequential processing with optional progress bar
             iterator = tqdm(symbols_list, desc="Orderflow Scan", unit="symbol") if show_progress else symbols_list
@@ -580,9 +610,39 @@ class OrderflowScanner:
                 symbol_name, result = _process_single_symbol(symbol, tick_data[symbol])
                 self.results[symbol_name] = result
 
+                if "error" in result:
+                    consecutive_failures += 1
+                    recent_failures.append(symbol_name)
+                    if consecutive_failures >= 3:
+                        aborted_due_to_errors = True
+                        self.logger.error(
+                            "Encountered %d consecutive ticker failures (%s). Last error: %s. Aborting remaining scans.",
+                            consecutive_failures,
+                            ", ".join(recent_failures),
+                            result.get("error"),
+                        )
+                        break
+                else:
+                    consecutive_failures = 0
+                    recent_failures.clear()
+
+            if aborted_due_to_errors and show_progress and hasattr(iterator, "close"):
+                iterator.close()
+
         if self.verbose:
             successful = sum(1 for r in self.results.values() if 'error' not in r)
-            self.logger.info(f"Completed orderflow scan: {successful}/{len(self.results)} successful")
+            if aborted_due_to_errors:
+                self.logger.error(
+                    "Orderflow scan aborted after %d consecutive failures. %d symbols successful before abort (%d processed out of %d requested).",
+                    consecutive_failures,
+                    successful,
+                    len(self.results),
+                    total_symbols,
+                )
+            else:
+                self.logger.info(
+                    f"Completed orderflow scan: {successful}/{len(self.results)} successful"
+                )
 
         return self.results
 
@@ -1448,7 +1508,7 @@ def _normalize_tick_timestamps(ticks: pd.DataFrame) -> pd.DataFrame:
     # Handle duplicate timestamps by aggregating (only if duplicates exist)
     if ticks["ts"].duplicated().any():
         # Pre-filter to numeric columns only once
-        numeric_cols = [col for col in ticks.columns if col != "ts" and np.issubdtype(ticks[col].dtype, np.number)]
+        numeric_cols = [col for col in ticks.columns if col != "ts" and is_numeric_dtype(ticks[col])]
 
         if numeric_cols:
             # Aggregate: sum volumes for numeric columns
@@ -1498,7 +1558,7 @@ def _filter_and_collapse_ticks(
         return None
 
     # Collapse duplicates - optimized for already-filtered data
-    numeric_cols = [col for col in filtered.columns if col != "ts" and np.issubdtype(filtered[col].dtype, np.number)]
+    numeric_cols = [col for col in filtered.columns if col != "ts" and is_numeric_dtype(filtered[col])]
 
     if not numeric_cols:
         return filtered.drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
