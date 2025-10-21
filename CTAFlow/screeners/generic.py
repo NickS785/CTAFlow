@@ -10,7 +10,8 @@ energy_tickers = ["HO", "RB", "CL", "NG"]
 one_h = timedelta(hours=1)
 london_start, london_end = time(hour=2, minute=30), time(hour=11, minute=30)
 usa_start, usa_end = time(hour=8, minute=30), time(hour=15, minute=30)
-
+fall = {'month_filter':[9,10,11]}
+spring = {'month_filter': [3,4,5]}
 london_tgt_times = ["03:30", "05:00", "07:00", "09:30"]
 usa_tgt_times = ["08:30", "10:30", "13:30"]
 
@@ -53,10 +54,16 @@ usa_seasonals = [usa_winter_seasonality, usa_summer_seasonality, usa_spring_seas
 london_seasonals = [london_fall_seasonality, london_winter_seasonality, london_spring_seasonality, london_summer_seasonality, london_seasonality]
 
 momentums = [spring_momentum, summer_momentum, fall_momentum, winter_momentum, momentum_generic]
-
+us_session = {'session_start':"08:30", 'session_end':"15:30"}
+london_session = {'session_start':"02:30", "session_end":"10:30"}
 us_of_screen = OrderflowParams(session_start="08:30", session_end="15:30")
+us_of_fall = OrderflowParams(**us_session, **fall, vpin_window=25    , name="us_of_fall")
+us_of_spring = OrderflowParams(**us_session, **spring, vpin_window=25, name="us_of_spring")
 us_of_winter = OrderflowParams(session_start="08:30", session_end="15:30", month_filter=[11,12,1,2,3], name="us_winter")
 us_of_summer = OrderflowParams(session_start="08:30", session_end="15:30", month_filter=[5,6,7,8], name="us_summer")
-london_of_screen = OrderflowParams(session_start="02:30", session_end="11:30", vpin_window=30)
-london_of_winter = OrderflowParams(session_start="02:30", session_end="11:30", month_filter=[11,12,1,2,3], name="london_winter")
-london_of_summer = OrderflowParams(session_start="02:30", session_end="11:30", month_filter=[5,6,7,8], name="london_summer")
+london_of = OrderflowParams(session_start="02:30", session_end="10:30", vpin_window=30, name="london_of")
+london_of_winter = OrderflowParams(session_start="02:30", session_end="10:30", month_filter=[11,12,1,2,3], name="london_winter")
+london_of_summer = OrderflowParams(session_start="02:30", session_end="10:30", month_filter=[5,6,7,8], name="london_summer")
+london_of_spring = OrderflowParams(**london_session, **spring, vpin_window=25, name="london_of_spring")
+london_of_fall = OrderflowParams(**london_session, **fall, vpin_window=25, name="london_of_fall")
+london_of_screens = [london_of, london_of_winter, london_of_summer, london_of_spring, london_of_fall]
