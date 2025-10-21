@@ -422,8 +422,6 @@ class PatternExtractor:
             raise ValueError("Pattern payload missing target time")
 
         target_time_obj = self._normalize_time_value(target_time_raw)
-        if target_time_obj is None:
-            raise ValueError("Pattern payload contains invalid target time")
 
         session_data, price_col, is_synthetic = self._get_seasonality_session_data(symbol, params)
         if session_data.empty:
@@ -471,7 +469,7 @@ class PatternExtractor:
         summary: PatternSummary,
         *,
         context: str,
-    ) -> ScreenParamLike:
+    ) -> ScreenParams:
         params = summary.screen_params
         if self._is_seasonality_params(params):
             return params  # type: ignore[return-value]
@@ -521,17 +519,6 @@ class PatternExtractor:
             summary.screen_params = chosen
             return chosen  # type: ignore[return-value]
 
-        derived = self._derive_seasonality_params(summary)
-        if derived is not None:
-            summary.screen_params = derived
-            key = summary.source_screen
-            if key not in self._screen_params:
-                self._screen_params[key] = derived
-            root = key.split("|", 1)[0]
-            if root not in self._screen_params:
-                self._screen_params[root] = derived
-            return derived
-
         raise ValueError(
             f"{context} patterns require seasonality screen parameters; "
             f"no configuration available for screen '{summary.source_screen}'."
@@ -541,207 +528,11 @@ class PatternExtractor:
     def _is_seasonality_params(params: Optional[ScreenParamLike]) -> bool:
         return params is not None and getattr(params, "screen_type", None) == "seasonality"
 
-    def _derive_seasonality_params(self, summary: PatternSummary) -> Optional[ScreenParamLike]:
-        screen_results = self._results.get(summary.source_screen)
-        if not isinstance(screen_results, Mapping):
-            return None
-
-        ticker_result = screen_results.get(summary.symbol)
-        if not isinstance(ticker_result, Mapping):
-            return None
-
-        metadata = ticker_result.get("metadata")
-        if not isinstance(metadata, Mapping):
-            metadata = {}
-
-        session_start = metadata.get("session_start") or "00:00"
-        session_end = metadata.get("session_end") or "23:59:59"
-        tz = metadata.get("tz") or "America/Chicago"
-
-        target_times = self._collect_target_times(summary, ticker_result, session_start)
-        if not target_times:
-            return None
-
-        period_length = self._infer_period_length(summary, ticker_result)
-        months = self._parse_months_from_screen_name(summary.source_screen)
-
-        return self._instantiate_seasonality_params(
-            name=summary.source_screen,
-            target_times=target_times,
-            period_length=period_length,
-            session_start=session_start,
-            session_end=session_end,
-            tz=tz,
-            months=months,
-        )
-
-    def _collect_target_times(
-        self,
-        summary: PatternSummary,
-        ticker_result: Mapping[str, Any],
-        fallback_time: Any,
-    ) -> List[str]:
-        raw_times: List[Any] = []
-        time_predictions = ticker_result.get("time_predictability")
-        if isinstance(time_predictions, Mapping):
-            raw_times.extend(time_predictions.keys())
-
-        for value in (
-            summary.payload.get("time"),
-            summary.metadata.get("target_time"),
-        ):
-            if value is not None:
-                raw_times.append(value)
-
-        normalized: List[str] = []
-        for value in raw_times:
-            parsed = self._normalize_time_value(value)
-            if parsed is not None:
-                normalized.append(parsed.strftime("%H:%M:%S"))
-            elif isinstance(value, str):
-                normalized.append(value)
-
-        if not normalized:
-            parsed_fallback = self._normalize_time_value(fallback_time)
-            if parsed_fallback is not None:
-                normalized.append(parsed_fallback.strftime("%H:%M:%S"))
-            elif fallback_time:
-                normalized.append(str(fallback_time))
-
-        seen: set[str] = set()
-        unique: List[str] = []
-        for value in normalized:
-            if value not in seen:
-                seen.add(value)
-                unique.append(value)
-        return unique
-
     @staticmethod
-    def _parse_months_from_screen_name(screen_name: str) -> Optional[List[int]]:
-        if "months_" not in screen_name:
-            return None
-        suffix = screen_name.split("months_", 1)[1]
-        if "_seasonality" in suffix:
-            suffix = suffix.split("_seasonality", 1)[0]
-        parts = suffix.split("_")
-        months: List[int] = []
-        for part in parts:
-            try:
-                months.append(int(part))
-            except ValueError:
-                continue
-        return months or None
-
-    def _infer_period_length(
-        self,
-        summary: PatternSummary,
-        ticker_result: Mapping[str, Any],
-    ) -> Optional[pd.Timedelta]:
-        time_predictions = ticker_result.get("time_predictability")
-        if not isinstance(time_predictions, Mapping) or not time_predictions:
-            return None
-
-        target_time = self._normalize_time_value(summary.payload.get("time"))
-        key = self._match_time_key(target_time, time_predictions.keys())
-        if key is None:
-            return None
-
-        stats = time_predictions.get(key)
-        if not isinstance(stats, Mapping):
-            return None
-
-        period_minutes: Optional[float] = None
-        for candidate_key in (
-            "window_minutes",
-            "window",
-            "period_minutes",
-            "period_length",
-        ):
-            value = stats.get(candidate_key)
-            if value is None:
-                continue
-            if isinstance(value, (int, float)):
-                if value > 0:
-                    period_minutes = float(value)
-                    break
-            elif isinstance(value, str):
-                try:
-                    td = pd.to_timedelta(value)
-                except (TypeError, ValueError):
-                    try:
-                        minutes = float(value)
-                    except (TypeError, ValueError):
-                        continue
-                    else:
-                        if minutes > 0:
-                            period_minutes = float(minutes)
-                            break
-                else:
-                    return td
-
-        if period_minutes is None:
-            return None
-        return pd.to_timedelta(period_minutes, unit="m")
-
-    def _match_time_key(
-        self,
-        target_time: Optional[time],
-        keys: Iterable[Any],
-    ) -> Optional[Any]:
-        if target_time is None:
-            for key in keys:
-                return key
-            return None
-
-        for key in keys:
-            parsed = self._normalize_time_value(key)
-            if parsed is None:
-                continue
-            if parsed == target_time:
-                return key
-        return None
-
-    def _instantiate_seasonality_params(
-        self,
-        *,
-        name: str,
-        target_times: List[str],
-        period_length: Optional[pd.Timedelta],
-        session_start: Any,
-        session_end: Any,
-        tz: str,
-        months: Optional[List[int]],
-    ) -> ScreenParamLike:
-        kwargs = {
-            "screen_type": "seasonality",
-            "name": name,
-            "target_times": target_times,
-            "period_length": period_length,
-            "seasonality_session_start": session_start,
-            "seasonality_session_end": session_end,
-            "tz": tz,
-            "months": months,
-            "season": None,
-        }
-
-        if hasattr(ScreenParams, "__dataclass_fields__"):
-            try:
-                return ScreenParams(**kwargs)
-            except Exception:
-                pass
-
-        return SimpleNamespace(**kwargs)
-
-    @staticmethod
-    def _normalize_time_value(value: Any) -> Optional[time]:
-        if value is None:
-            return None
+    def _normalize_time_value(value: Any) -> time:
         if isinstance(value, time):
             return value
-        try:
-            parsed = pd.to_datetime(value).time()
-        except (TypeError, ValueError):
-            return None
+        parsed = pd.to_datetime(value).time()
         if parsed.tzinfo is not None:
             parsed = parsed.replace(tzinfo=None)
         return parsed
