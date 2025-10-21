@@ -9,8 +9,16 @@ This module contains:
 - Strategy backtesting and performance evaluation
 """
 
-from .strategy import RegimeStrategy
+from .screener_pipeline import ScreenerPipeline
 
 __all__ = [
-    'RegimeStrategy',
+    'ScreenerPipeline',
 ]
+
+try:
+    from .strategy import RegimeStrategy  # pragma: no cover - optional legacy export
+except ModuleNotFoundError:  # pragma: no cover - historical module missing in lightweight envs
+    RegimeStrategy = None  # type: ignore[assignment]
+else:
+    __all__.append('RegimeStrategy')
+

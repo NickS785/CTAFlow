@@ -390,6 +390,127 @@ def _metric_bias(metric: str, mean_value: float) -> str:
     return "positive" if mean_value > 0 else "negative"
 
 
+def _filter_inverse_metric_table(
+    table: Optional[pd.DataFrame],
+    value_col: str,
+    fallback_cols: Optional[Sequence[str]] = None,
+) -> Optional[pd.DataFrame]:
+    """Drop inverse metric rows where the associated value is negative.
+
+    The orderflow scanner generates both ``buy_pressure`` and ``sell_pressure``
+    metrics which are exact negatives of each other. This helper keeps the
+    canonical representation by filtering out rows whose directional statistic
+    is negative, ensuring we only surface the positive side of the pattern.
+
+    Args:
+        table: DataFrame containing metric results.
+        value_col: Primary column containing the directional statistic (e.g.
+            mean pressure).
+        fallback_cols: Optional ordered list of fallback columns to use when
+            ``value_col`` is missing or NaN for a given row.
+
+    Returns:
+        Filtered DataFrame with negative ``buy_pressure``/``sell_pressure``
+        entries removed. Tables with unsupported structure are returned
+        unchanged.
+    """
+
+    if table is None or not isinstance(table, pd.DataFrame) or table.empty:
+        return table
+
+    if "metric" not in table.columns:
+        return table
+
+    metrics = table["metric"].astype(str).str.lower()
+
+    if not metrics.isin(["buy_pressure", "sell_pressure"]).any():
+        return table
+
+    if value_col in table.columns:
+        values = pd.to_numeric(table[value_col], errors="coerce")
+    else:
+        values = pd.Series(np.nan, index=table.index, dtype=float)
+
+    if fallback_cols:
+        for col in fallback_cols:
+            if col in table.columns:
+                alt = pd.to_numeric(table[col], errors="coerce")
+                values = values.where(~values.isna(), alt)
+
+    mask = pd.Series(True, index=table.index, dtype=bool)
+
+    for metric_name in ("buy_pressure", "sell_pressure"):
+        metric_mask = metrics == metric_name
+        if not metric_mask.any():
+            continue
+        metric_values = values.loc[metric_mask]
+        keep = metric_values >= 0
+        keep = keep | metric_values.isna()
+        mask.loc[metric_mask] = keep
+
+    filtered = table.loc[mask].copy()
+    filtered.reset_index(drop=True, inplace=True)
+    return filtered
+
+
+def _filter_inverse_metric_events(
+    table: Optional[pd.DataFrame],
+) -> Optional[pd.DataFrame]:
+    """Filter event runs to keep only the positive side of inverse metrics."""
+
+    if table is None or not isinstance(table, pd.DataFrame) or table.empty:
+        return table
+
+    required_cols = {"metric", "direction"}
+    if not required_cols.issubset(table.columns):
+        return table
+
+    metrics = table["metric"].astype(str).str.lower()
+    if not metrics.isin(["buy_pressure", "sell_pressure"]).any():
+        return table
+
+    directions = table["direction"].astype(str).str.lower()
+    mask = pd.Series(True, index=table.index, dtype=bool)
+
+    for metric_name in ("buy_pressure", "sell_pressure"):
+        metric_mask = metrics == metric_name
+        if not metric_mask.any():
+            continue
+        keep = directions.loc[metric_mask] != "negative"
+        keep = keep | directions.loc[metric_mask].isna()
+        mask.loc[metric_mask] = keep
+
+    filtered = table.loc[mask].copy()
+    filtered.reset_index(drop=True, inplace=True)
+    return filtered
+
+
+def _apply_inverse_metric_filters(result: Dict[str, object]) -> Dict[str, object]:
+    """Apply inverse-metric filtering to all relevant result tables."""
+
+    weekly = result.get("df_weekly")
+    if isinstance(weekly, pd.DataFrame):
+        result["df_weekly"] = _filter_inverse_metric_table(weekly, "mean")
+
+    wom = result.get("df_wom_weekday")
+    if isinstance(wom, pd.DataFrame):
+        result["df_wom_weekday"] = _filter_inverse_metric_table(wom, "mean")
+
+    peak = result.get("df_weekly_peak_pressure")
+    if isinstance(peak, pd.DataFrame):
+        result["df_weekly_peak_pressure"] = _filter_inverse_metric_table(
+            peak,
+            "seasonality_mean",
+            fallback_cols=["intraday_mean"],
+        )
+
+    events = result.get("df_events")
+    if isinstance(events, pd.DataFrame):
+        result["df_events"] = _filter_inverse_metric_events(events)
+
+    return result
+
+
 def _weekly_peak_pressure(
     bucket_df: pd.DataFrame,
     weekly_table: pd.DataFrame,
@@ -858,7 +979,7 @@ class OrderflowScanner:
         if "BidShare" in bucket_df.columns:
             bucket_cols.append("BidShare")
 
-        return {
+        result = {
             "df_buckets": bucket_df[bucket_cols].copy(),
             "df_intraday_pressure": intraday,
             "df_events": events,
@@ -867,6 +988,8 @@ class OrderflowScanner:
             "df_weekly_peak_pressure": df_weekly_peak,
             "metadata": metadata,
         }
+
+        return _apply_inverse_metric_filters(result)
 
     def _process_symbol_from_buckets(
         self,
@@ -1055,7 +1178,7 @@ class OrderflowScanner:
         if "BidShare" in bucket_df.columns:
             bucket_cols.append("BidShare")
 
-        return {
+        result = {
             "df_buckets": bucket_df[bucket_cols].copy(),
             "df_intraday_pressure": intraday,
             "df_events": events,
@@ -1064,6 +1187,8 @@ class OrderflowScanner:
             "df_weekly_peak_pressure": df_weekly_peak,
             "metadata": metadata,
         }
+
+        return _apply_inverse_metric_filters(result)
 
     def write_to_hdf(self, hdf_path: Optional[Path | str] = None) -> Dict[str, str]:
         """
@@ -1204,7 +1329,7 @@ class OrderflowScanner:
                         metadata_series = store.get(metadata_key)
                         result["metadata"] = metadata_series.to_dict()
 
-                    results[symbol] = result
+                    results[symbol] = _apply_inverse_metric_filters(result)
 
                 except Exception as e:
                     results[symbol] = {"error": str(e)}

@@ -1,14 +1,61 @@
 import pandas as pd
 import numpy as np
+from datetime import time
+from dataclasses import dataclass
+from typing import List, Optional
 
 from CTAFlow.CTAFlow.screeners.orderflow_scan import OrderflowParams
 from CTAFlow.CTAFlow.screeners.pattern_extractor import PatternExtractor
+
+
+@dataclass
+class FakeScreenParams:
+    screen_type: str
+    name: str
+    months: Optional[List[int]] = None
+    target_times: Optional[List[str]] = None
+    period_length: Optional[int] = None
+    seasonality_session_start: str = "00:00"
+    seasonality_session_end: str = "23:59:59"
+    tz: str = "America/Chicago"
+    season: Optional[str] = None
+    session_starts: Optional[List[str]] = None
+    session_ends: Optional[List[str]] = None
 
 
 class DummyScreener:
     def __init__(self) -> None:
         self.data = {"ZS": pd.DataFrame()}
         self.synthetic_tickers = {}
+
+
+class SeasonalityDummyScreener:
+    def __init__(self, data: pd.DataFrame) -> None:
+        self.data = {"GC": data}
+        self.synthetic_tickers = {}
+
+    def _convert_times(self, session_starts, session_ends=None):
+        def _convert(value):
+            if isinstance(value, time):
+                return value
+            parsed = pd.to_datetime(value).time()
+            if parsed.tzinfo is not None:
+                parsed = parsed.replace(tzinfo=None)
+            return parsed
+
+        start_times = [_convert(value) for value in session_starts]
+        if session_ends is None:
+            return start_times
+        end_times = [_convert(value) for value in session_ends]
+        return start_times, end_times
+
+    def _parse_season_months(self, months, season):
+        return months
+
+    def _filter_by_months(self, data, months):
+        if not months:
+            return data
+        return data[data.index.month.isin(months)]
 
 
 def _orderflow_result_fixture() -> dict:
@@ -134,3 +181,143 @@ def test_pattern_extractor_handles_orderflow_results():
     event_series = extractor.get_pattern_series("ZS", event_key)
     assert not event_series.empty
     assert event_series.index.min() >= pd.Timestamp("2023-09-01 09:30", tz="America/Chicago")
+
+
+def test_pattern_extractor_resolves_missing_seasonality_params():
+    index = pd.date_range(
+        "2023-01-03 08:00",
+        "2023-01-06 16:00",
+        freq="5min",
+        tz="America/Chicago",
+    )
+    prices = pd.Series(100 + 0.001 * np.arange(len(index)), index=index)
+    data = pd.DataFrame({"Close": prices})
+    screener = SeasonalityDummyScreener(data)
+
+    results = {
+        "months_12_1_2_3_seasonality": {
+            "GC": {
+                "strongest_patterns": [
+                    {
+                        "type": "weekday_returns",
+                        "day": "Tuesday",
+                        "description": "Tuesday edge",
+                        "strength": 2.0,
+                    },
+                    {
+                        "type": "time_predictive_nextday",
+                        "time": "10:30:00",
+                        "description": "10:30 predicts next day",
+                        "strength": 0.5,
+                    },
+                ],
+                "metadata": {
+                    "session_start": "08:00",
+                    "session_end": "16:00",
+                    "tz": "America/Chicago",
+                },
+            }
+        }
+    }
+
+    params = [
+        FakeScreenParams(
+            screen_type="seasonality",
+            name="custom_name",
+            months=[12, 1, 2, 3],
+            target_times=["10:30"],
+            period_length=30,
+            seasonality_session_start="08:00",
+            seasonality_session_end="16:00",
+            tz="America/Chicago",
+        )
+    ]
+
+    extractor = PatternExtractor(screener, results, params)
+
+    keys = extractor.get_pattern_keys("GC")
+    weekday_key = next(k for k in keys if "weekday_returns" in k)
+    tod_key = next(k for k in keys if "time_predictive_nextday" in k)
+
+    weekday_series = extractor.get_pattern_series("GC", weekday_key)
+    assert not weekday_series.empty
+    assert all(weekday_series.index.dayofweek == 1)
+
+    tod_series = extractor.get_pattern_series("GC", tod_key)
+    assert not tod_series.empty
+    assert tod_series.index.tz is None
+
+    assert extractor.get_pattern_summary("GC", weekday_key).screen_params is params[0]
+    assert extractor.get_pattern_summary("GC", tod_key).screen_params is params[0]
+
+
+def test_pattern_extractor_derives_params_from_result_metadata():
+    tz = "America/Chicago"
+    index = pd.date_range(
+        "2023-09-01 02:30",
+        "2023-09-05 11:30",
+        freq="5min",
+        tz=tz,
+    )
+    prices = pd.Series(100 + 0.01 * np.sin(np.linspace(0, 12, len(index))), index=index)
+    data = pd.DataFrame({"Close": prices})
+    screener = SeasonalityDummyScreener(data)
+
+    results = {
+        "months_9_10_11_seasonality": {
+            "GC": {
+                "strongest_patterns": [
+                    {
+                        "type": "time_predictive_nextday",
+                        "time": "07:00:00",
+                        "description": "07:00 predicts next day",
+                        "strength": 0.4,
+                    }
+                ],
+                "metadata": {
+                    "session_start": "02:30",
+                    "session_end": "11:30",
+                    "tz": tz,
+                },
+                "time_predictability": {
+                    "07:00:00": {
+                        "next_day_significant": True,
+                        "next_day_corr": 0.25,
+                        "next_day_pvalue": 0.01,
+                        "next_week_significant": False,
+                        "next_week_corr": 0.05,
+                        "next_week_pvalue": 0.4,
+                        "window_minutes": 120,
+                    }
+                },
+            }
+        }
+    }
+
+    extractor = PatternExtractor(screener, results)
+
+    keys = extractor.get_pattern_keys("GC")
+    assert keys
+    pattern_key = keys[0]
+
+    series = extractor.get_pattern_series("GC", pattern_key)
+    assert not series.empty
+
+    summary = extractor.get_pattern_summary("GC", pattern_key)
+    params = summary.screen_params
+    assert params is not None
+    assert getattr(params, "screen_type", None) == "seasonality"
+    assert getattr(params, "name", None) == "months_9_10_11_seasonality"
+
+    target_times = getattr(params, "target_times", []) or []
+    normalized_times = {
+        PatternExtractor._normalize_time_value(value).strftime("%H:%M:%S")
+        for value in target_times
+        if PatternExtractor._normalize_time_value(value) is not None
+    }
+    assert "07:00:00" in normalized_times
+
+    assert getattr(params, "months", None) == [9, 10, 11]
+    period_length = getattr(params, "period_length", None)
+    assert period_length is not None
+    assert pd.to_timedelta(period_length) == pd.to_timedelta(120, unit="m")
