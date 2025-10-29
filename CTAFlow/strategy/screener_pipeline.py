@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import numbers
 import re
+from dataclasses import asdict, is_dataclass
 from datetime import time as time_cls
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
@@ -152,17 +153,46 @@ class ScreenerPipeline:
         return out
 
     def _items_from_patterns(self, patterns: Any) -> Iterable[Tuple[str, Mapping[str, Any]]]:
+        """Yield ``(key, pattern_mapping)`` pairs from heterogeneous payloads.
+
+        The screener outputs we ingest can be nested arbitrarily and may contain
+        raw ``dict`` objects, dataclasses, or light-weight containers produced by
+        helper utilities such as ``HorizonMapper``.  This helper normalises the
+        structure by walking the object graph and emitting any mapping that
+        declares a pattern identifier via either ``pattern_type`` or ``type``.
+
+        The returned mappings are *not* copied unless they originate from a
+        dataclass/``__dict__`` driven object.  Downstream dispatchers therefore
+        see the exact payload that the caller provided, which keeps optional
+        metadata (like ``pattern_payload``) intact regardless of the container
+        implementation used upstream.
+        """
         if patterns is None:
             return []
 
-        def _iter(obj: Any, key_hint: Optional[str] = None) -> Iterable[Tuple[str, Mapping[str, Any]]]:
+        def _coerce_mapping(obj: Any) -> Optional[Mapping[str, Any]]:
             if isinstance(obj, Mapping):
-                if "pattern_type" in obj:
-                    key = self._select_pattern_key(obj, key_hint)
-                    yield key, obj
+                return obj
+            if is_dataclass(obj):
+                return asdict(obj)
+            if hasattr(obj, "_asdict"):
+                maybe = obj._asdict()  # type: ignore[attr-defined]
+                if isinstance(maybe, Mapping):
+                    return maybe
+            state = getattr(obj, "__dict__", None)
+            if isinstance(state, Mapping):
+                return {k: state[k] for k in state.keys() if not str(k).startswith("_")}
+            return None
+
+        def _iter(obj: Any, key_hint: Optional[str] = None) -> Iterable[Tuple[str, Mapping[str, Any]]]:
+            mapping = _coerce_mapping(obj)
+            if mapping is not None:
+                if any(key in mapping for key in ("pattern_type", "type")):
+                    key = self._select_pattern_key(mapping, key_hint)
+                    yield key, mapping
                     return
 
-                for child_key, value in obj.items():
+                for child_key, value in mapping.items():
                     if isinstance(value, Mapping):
                         yield from _iter(value, str(child_key))
                     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):

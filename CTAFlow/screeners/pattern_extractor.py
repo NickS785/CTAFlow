@@ -321,36 +321,6 @@ class PatternExtractor:
                     metadata=metadata,
                 )
 
-        events = ticker_result.get("df_events")
-        if isinstance(events, pd.DataFrame) and not events.empty:
-            if "max_abs_z" in events.columns:
-                ranked = events.nlargest(25, "max_abs_z")
-            else:
-                ranked = events.head(25)
-            for row in ranked.itertuples(index=False):
-                payload = row._asdict()
-                metric = str(payload.get("metric", ""))
-                direction = str(payload.get("direction", ""))
-                ts_start = payload.get("ts_start")
-                parts = [screen_name, "orderflow_event_run", metric, direction]
-                if ts_start is not None:
-                    parts.append(str(ts_start))
-                metadata = {
-                    "pattern_origin": "orderflow_events",
-                    "screen_type": "orderflow",
-                }
-                yield PatternSummary(
-                    key="|".join(filter(None, parts)),
-                    symbol=symbol,
-                    source_screen=screen_name,
-                    screen_params=params,
-                    pattern_type="orderflow_event_run",
-                    description=self._format_orderflow_event_description(metric, direction, payload),
-                    strength=self._orderflow_strength(payload.get("max_abs_z"), None),
-                    payload=dict(payload),
-                    metadata=metadata,
-                )
-
     def _build_summary(
         self,
         symbol: str,
@@ -665,7 +635,7 @@ class PatternExtractor:
     # ------------------------------------------------------------------
     def _is_orderflow_result(self, ticker_result: Mapping[str, Any]) -> bool:
         keys = set(ticker_result.keys())
-        if {"df_weekly", "df_events", "df_buckets"}.intersection(keys):
+        if {"df_weekly", "df_intraday_pressure", "df_buckets"}.intersection(keys):
             metadata = ticker_result.get("metadata")
             return isinstance(metadata, Mapping)
         return False
@@ -727,14 +697,6 @@ class PatternExtractor:
             if clock_time is not None and "clock_time" in df.columns:
                 normalized = self._normalize_time_value(clock_time)
                 mask &= df["clock_time"].apply(self._normalize_time_value) == normalized
-        elif pattern_type == "orderflow_event_run":
-            ts_start = summary.payload.get("ts_start")
-            ts_end = summary.payload.get("ts_end")
-            if ts_start is None or ts_end is None:
-                return pd.Series(dtype=float)
-            start_ts = pd.to_datetime(ts_start)
-            end_ts = pd.to_datetime(ts_end)
-            mask = (df["ts_end"] >= start_ts) & (df["ts_end"] <= end_ts)
         else:
             return pd.Series(dtype=float)
 
@@ -852,28 +814,5 @@ class PatternExtractor:
         if details:
             detail_str = " (" + ", ".join(details) + ")"
         return f"{metric} peak {bias} on {weekday} at {time_display}{detail_str}"
-
-    @staticmethod
-    def _format_orderflow_event_description(
-        metric: str,
-        direction: str,
-        payload: Dict[str, Any],
-    ) -> str:
-        parts = [f"{metric} {direction} run"]
-        max_abs_z = payload.get("max_abs_z")
-        if pd.notna(max_abs_z):
-            parts.append(f"|z|={float(max_abs_z):.2f}")
-        run_len = payload.get("run_len")
-        if run_len:
-            try:
-                parts.append(f"len={int(run_len)}")
-            except (TypeError, ValueError):
-                pass
-        ts_start = payload.get("ts_start")
-        ts_end = payload.get("ts_end")
-        if ts_start is not None and ts_end is not None:
-            parts.append(f"{ts_start}→{ts_end}")
-        return " ".join(parts)
-
 
 __all__ = ["PatternExtractor", "PatternSummary"]

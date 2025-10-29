@@ -1,7 +1,8 @@
-"""Orderflow seasonality and event detection on volume buckets."""
+"""Orderflow seasonality analysis on volume buckets."""
 from __future__ import annotations
 
 import os
+import warnings
 from collections import defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -69,7 +70,7 @@ class OrderflowParams:
     tz: str = "America/Chicago"
     bucket_size: int | str = "auto"
     vpin_window: int = 50
-    threshold_z: float = 2.0
+    threshold_z: float = 2.0  # Deprecated; retained for CLI compatibility
     min_days: int = 30
     cadence_target: int = 50
     grid_multipliers: Sequence[float] = (0.5, 0.75, 1.0, 1.25, 1.5)
@@ -217,47 +218,6 @@ def _intraday_pressure_table(
                     "n": int(values.count()),
                 }
             )
-    return pd.DataFrame(records)
-
-
-def _event_runs(
-    df: pd.DataFrame,
-    metric: str,
-    z_col: str,
-    threshold: float,
-    ticker: str,
-) -> pd.DataFrame:
-    mask = df[z_col].abs() >= threshold
-    if not mask.any():
-        return pd.DataFrame(columns=[
-            "ticker",
-            "metric",
-            "ts_start",
-            "ts_end",
-            "run_len",
-            "max_abs_z",
-            "direction",
-        ])
-
-    runs = df.loc[mask, ["bucket", "ts_start", "ts_end", z_col]]
-    runs = runs.assign(
-        group=(runs["bucket"].diff().fillna(1) != 1).cumsum()
-    )
-    records: List[Dict[str, object]] = []
-    for _, group_df in runs.groupby("group"):
-        max_idx = group_df[z_col].abs().idxmax()
-        max_z = float(df.loc[max_idx, z_col])
-        records.append(
-            {
-                "ticker": ticker,
-                "metric": metric,
-                "ts_start": df.loc[group_df.index[0], "ts_start"],
-                "ts_end": df.loc[group_df.index[-1], "ts_end"],
-                "run_len": int(len(group_df)),
-                "max_abs_z": float(abs(max_z)),
-                "direction": "positive" if max_z >= 0 else "negative",
-            }
-        )
     return pd.DataFrame(records)
 
 
@@ -452,39 +412,6 @@ def _filter_inverse_metric_table(
     filtered.reset_index(drop=True, inplace=True)
     return filtered
 
-
-def _filter_inverse_metric_events(
-    table: Optional[pd.DataFrame],
-) -> Optional[pd.DataFrame]:
-    """Filter event runs to keep only the positive side of inverse metrics."""
-
-    if table is None or not isinstance(table, pd.DataFrame) or table.empty:
-        return table
-
-    required_cols = {"metric", "direction"}
-    if not required_cols.issubset(table.columns):
-        return table
-
-    metrics = table["metric"].astype(str).str.lower()
-    if not metrics.isin(["buy_pressure", "sell_pressure"]).any():
-        return table
-
-    directions = table["direction"].astype(str).str.lower()
-    mask = pd.Series(True, index=table.index, dtype=bool)
-
-    for metric_name in ("buy_pressure", "sell_pressure"):
-        metric_mask = metrics == metric_name
-        if not metric_mask.any():
-            continue
-        keep = directions.loc[metric_mask] != "negative"
-        keep = keep | directions.loc[metric_mask].isna()
-        mask.loc[metric_mask] = keep
-
-    filtered = table.loc[mask].copy()
-    filtered.reset_index(drop=True, inplace=True)
-    return filtered
-
-
 def _apply_inverse_metric_filters(result: Dict[str, object]) -> Dict[str, object]:
     """Apply inverse-metric filtering to all relevant result tables."""
 
@@ -503,10 +430,6 @@ def _apply_inverse_metric_filters(result: Dict[str, object]) -> Dict[str, object
             "seasonality_mean",
             fallback_cols=["intraday_mean"],
         )
-
-    events = result.get("df_events")
-    if isinstance(events, pd.DataFrame):
-        result["df_events"] = _filter_inverse_metric_events(events)
 
     return result
 
@@ -593,14 +516,13 @@ class OrderflowScanner:
     """
     Orderflow scanner for tick data analysis.
 
-    Analyzes volume-bucketed tick data for seasonality patterns, pressure metrics,
-    and orderflow events. Stores results in HDF5 for persistence.
+    Analyzes volume-bucketed tick data for seasonality patterns and pressure
+    metrics. Stores results in HDF5 for persistence.
 
     Features:
         - Volume bucket analysis with auto-sizing
         - Buy/sell pressure metrics and VPIN calculation
         - Intraday seasonality detection (weekly, week-of-month)
-        - Event detection with FDR-corrected significance
         - HDF5 storage with per-symbol organization
         - Multi-scan support: Run multiple configurations (like HistoricalScreener.run_screens)
     """
@@ -888,22 +810,6 @@ class OrderflowScanner:
         # Intraday pressure table
         intraday = _intraday_pressure_table(bucket_df, metrics, symbol)
 
-        # Event detection
-        events_list: List[pd.DataFrame] = []
-        for metric_name in metrics:
-            z_col = f"{metric_name}_z"
-            bucket_df[z_col] = _robust_daily_zscores(bucket_df, metric_name, "session_date")
-            events_list.append(
-                _event_runs(
-                    bucket_df,
-                    metric_name,
-                    z_col,
-                    self.params.threshold_z,
-                    symbol,
-                )
-            )
-        events = pd.concat(events_list, ignore_index=True) if events_list else pd.DataFrame()
-
         # Seasonality analysis
         n_sessions = int(bucket_df["session_date"].nunique())
         exploratory_flag = n_sessions < self.params.min_days
@@ -982,7 +888,6 @@ class OrderflowScanner:
         result = {
             "df_buckets": bucket_df[bucket_cols].copy(),
             "df_intraday_pressure": intraday,
-            "df_events": events,
             "df_weekly": df_weekly,
             "df_wom_weekday": df_wom,
             "df_weekly_peak_pressure": df_weekly_peak,
@@ -1087,22 +992,6 @@ class OrderflowScanner:
         # Intraday pressure table
         intraday = _intraday_pressure_table(bucket_df, metrics, symbol)
 
-        # Event detection
-        events_list: List[pd.DataFrame] = []
-        for metric_name in metrics:
-            z_col = f"{metric_name}_z"
-            bucket_df[z_col] = _robust_daily_zscores(bucket_df, metric_name, "session_date")
-            events_list.append(
-                _event_runs(
-                    bucket_df,
-                    metric_name,
-                    z_col,
-                    self.params.threshold_z,
-                    symbol,
-                )
-            )
-        events = pd.concat(events_list, ignore_index=True) if events_list else pd.DataFrame()
-
         # Seasonality analysis
         n_sessions = int(bucket_df["session_date"].nunique())
         exploratory_flag = n_sessions < self.params.min_days
@@ -1181,7 +1070,6 @@ class OrderflowScanner:
         result = {
             "df_buckets": bucket_df[bucket_cols].copy(),
             "df_intraday_pressure": intraday,
-            "df_events": events,
             "df_weekly": df_weekly,
             "df_wom_weekday": df_wom,
             "df_weekly_peak_pressure": df_weekly_peak,
@@ -1197,9 +1085,9 @@ class OrderflowScanner:
         Creates organized HDF5 structure:
             /orderflow/{symbol}/buckets
             /orderflow/{symbol}/intraday_pressure
-            /orderflow/{symbol}/events
             /orderflow/{symbol}/weekly
             /orderflow/{symbol}/wom_weekday
+            /orderflow/{symbol}/weekly_peak_pressure
             /orderflow/{symbol}/metadata
 
         Args:
@@ -1240,7 +1128,6 @@ class OrderflowScanner:
                     for df_name in [
                         "df_buckets",
                         "df_intraday_pressure",
-                        "df_events",
                         "df_weekly",
                         "df_wom_weekday",
                         "df_weekly_peak_pressure",
@@ -1312,7 +1199,6 @@ class OrderflowScanner:
                     df_names = {
                         "buckets": "df_buckets",
                         "intraday_pressure": "df_intraday_pressure",
-                        "events": "df_events",
                         "weekly": "df_weekly",
                         "wom_weekday": "df_wom_weekday",
                         "weekly_peak_pressure": "df_weekly_peak_pressure",
@@ -1581,12 +1467,6 @@ class OrderflowScanner:
                         record['n_significant_weekly'] = df_weekly['sig_fdr_5pct'].sum()
                     else:
                         record['n_significant_weekly'] = 0
-
-                    df_events = result.get('df_events')
-                    if isinstance(df_events, pd.DataFrame):
-                        record['n_events'] = len(df_events)
-                    else:
-                        record['n_events'] = 0
 
                 records.append(record)
 
@@ -2020,21 +1900,6 @@ def _deprecated_orderflow_scan(
 
         intraday = _intraday_pressure_table(bucket_df, metrics, symbol)
 
-        events_list: List[pd.DataFrame] = []
-        for metric_name in metrics:
-            z_col = f"{metric_name}_z"
-            bucket_df[z_col] = _robust_daily_zscores(bucket_df, metric_name, "session_date")
-            events_list.append(
-                _event_runs(
-                    bucket_df,
-                    metric_name,
-                    z_col,
-                    params.threshold_z,
-                    symbol,
-                )
-            )
-        events = pd.concat(events_list, ignore_index=True) if events_list else pd.DataFrame()
-
         n_sessions = int(bucket_df["session_date"].nunique())
         exploratory_flag = n_sessions < params.min_days
 
@@ -2100,7 +1965,6 @@ def _deprecated_orderflow_scan(
         results[symbol] = {
             "df_buckets": bucket_df[bucket_cols].copy(),
             "df_intraday_pressure": intraday,
-            "df_events": events,
             "df_weekly": df_weekly,
             "df_wom_weekday": df_wom,
             "metadata": metadata,
@@ -2139,7 +2003,12 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
     parser.add_argument("--session", nargs=2, metavar=("START", "END"), help="Session start/end HH:MM")
     parser.add_argument("--tz", default="America/Chicago", help="Session timezone")
     parser.add_argument("--bucket", default="auto", help="Bucket size (int or 'auto')")
-    parser.add_argument("--z", type=float, default=2.0, help="Z-score threshold for events")
+    parser.add_argument(
+        "--z",
+        type=float,
+        default=2.0,
+        help="(deprecated) Retained for compatibility; event scanning has been removed",
+    )
     parser.add_argument("--vpin-window", type=int, default=50, help="VPIN rolling window")
     parser.add_argument("--min-days", type=int, default=30, help="Minimum days for full significance")
     parser.add_argument("--cadence", type=int, default=50, help="Target buckets/day for auto tuning")
@@ -2167,6 +2036,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         bucket_value: int | str = int(bucket)
     except ValueError:
         bucket_value = bucket
+
+    if getattr(args, "z", None) is not None and args.z != 2.0:
+        warnings.warn(
+            "The --z flag is deprecated and ignored; event scanning has been removed.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
     params = OrderflowParams(
         session_start=args.session[0],

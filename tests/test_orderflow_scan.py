@@ -89,9 +89,7 @@ def test_orderflow_scan_pipeline():
     assert "df_weekly" in payload
     assert "df_wom_weekday" in payload
     assert "df_weekly_peak_pressure" in payload
-    events = payload["df_events"]
-    if not events.empty:
-        assert (events["run_len"] >= 2).any()
+    assert "df_events" not in payload
 
 
 def _make_custom_day(day: str, ask_values: Sequence[float]) -> pd.DataFrame:
