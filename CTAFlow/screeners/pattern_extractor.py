@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import time
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 import pandas as pd
 
@@ -97,6 +97,39 @@ class PatternExtractor:
             symbol: {key: summary.as_dict() for key, summary in entries.items()}
             for symbol, entries in self._pattern_index.items()
         }
+
+    def filter_patterns(
+        self,
+        symbol: str,
+        *,
+        pattern_types: Optional[Iterable[str]] = None,
+        screen_names: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Return pattern payloads filtered by type and/or originating screen."""
+
+        entries = self._pattern_index.get(symbol)
+        if not entries:
+            return {}
+
+        def _normalise(values: Optional[Iterable[str]]) -> Optional[Set[str]]:
+            if values is None:
+                return None
+            if isinstance(values, str):
+                values = [values]
+            return {str(value) for value in values}
+
+        type_filter = _normalise(pattern_types)
+        screen_filter = _normalise(screen_names)
+
+        filtered: Dict[str, Dict[str, Any]] = {}
+        for key, summary in entries.items():
+            if type_filter is not None and summary.pattern_type not in type_filter:
+                continue
+            if screen_filter is not None and summary.source_screen not in screen_filter:
+                continue
+            filtered[key] = summary.as_dict()
+
+        return filtered
 
     def get_pattern_keys(self, symbol: str) -> List[str]:
         """Return all pattern identifiers for ``symbol``."""
