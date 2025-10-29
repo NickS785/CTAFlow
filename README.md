@@ -6,9 +6,9 @@ selection, and seasonality statistics designed for systematic workflows.
 
 ## Orderflow scan
 
-The `orderflow_scan` helper ingests raw ticks, resamples them into volume buckets, flags
-pressure events, and runs seasonality tests with Benjamini–Hochberg false discovery rate
-control.
+The `orderflow_scan` helper ingests raw ticks, resamples them into volume buckets,
+summarises intraday pressure, and runs seasonality tests with Benjamini–Hochberg false
+discovery rate control.
 
 ```python
 import pandas as pd
@@ -26,7 +26,6 @@ params = OrderflowParams(
     tz="America/Chicago",
     bucket_size="auto",      # use per-asset auto-V bucket sizing
     vpin_window=50,
-    threshold_z=2.0,
     cadence_target=50,
 )
 results = orderflow_scan(tick_source, ["ZC_F", "ZS_F"], params)
@@ -36,9 +35,10 @@ Each symbol entry returns:
 
 - `df_buckets`: tidy bucket-level orderflow metrics (volume, shares, VPIN, pressure).
 - `df_intraday_pressure`: mean/median aggressor (ask) & quote pressure by bucket end-time.
-- `df_events`: merged runs where robust z-scores breach the configured threshold.
 - `df_weekly`: weekday seasonality with t-stats, two-sided p-values, and BH-FDR q-values.
 - `df_wom_weekday`: week-of-month × weekday seasonality table with the same statistics.
+- `df_weekly_peak_pressure`: blended weekly/clock-time summary of the largest seasonal
+  pressure biases.
 - `metadata`: session window, timezone, bucket size, number of sessions, and bucket counts.
 
 ### Automatic bucket sizing
@@ -58,9 +58,13 @@ Parquet tick files (file names are resolved via `{symbol}` substitution):
 
 ```bash
 python -m screeners.orderflow_scan --symbols ZC_F ZS_F \
-    --session 08:30 13:20 --tz America/Chicago --bucket auto --z 2.0 \
+    --session 08:30 13:20 --tz America/Chicago --bucket auto \
     --ticks-path "data/{symbol}.csv"
 ```
+
+> **Note**: Historical builds exposed an `--z` flag to configure event detection. That
+> functionality has been removed and the flag is now ignored (a deprecation warning is
+> emitted when supplied).
 
 The CLI prints per-symbol bucket counts, the selected bucket size, and a preview of
 weekday signals that survive a 5% FDR cutoff.

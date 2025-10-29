@@ -238,14 +238,14 @@ class ScreenerPipeline:
         if patterns is None:
             return []
 
-        def _iter(obj: Any, key_hint: Optional[str] = None) -> Iterable[Tuple[str, Mapping[str, Any]]]:
+        def _coerce_mapping(obj: Any) -> Optional[Mapping[str, Any]]:
             if isinstance(obj, Mapping):
                 if "pattern_type" in obj:
                     key = cls._select_pattern_key(obj, key_hint)
                     yield key, obj
                     return
 
-                for child_key, value in obj.items():
+                for child_key, value in mapping.items():
                     if isinstance(value, Mapping):
                         yield from _iter(value, str(child_key))
                     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):

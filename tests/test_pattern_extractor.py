@@ -125,20 +125,6 @@ def _orderflow_result_fixture() -> dict:
         }
     )
 
-    event_start = ts_end[1]
-    event_end = ts_end[3]
-    df_events = pd.DataFrame(
-        {
-            "ticker": ["ZS"],
-            "metric": ["buy_pressure"],
-            "ts_start": [event_start],
-            "ts_end": [event_end],
-            "run_len": [3],
-            "max_abs_z": [3.6],
-            "direction": ["positive"],
-        }
-    )
-
     metadata = {
         "session_start": "08:30",
         "session_end": "15:30",
@@ -153,7 +139,6 @@ def _orderflow_result_fixture() -> dict:
         "df_weekly": df_weekly,
         "df_wom_weekday": df_wom_weekday,
         "df_weekly_peak_pressure": df_weekly_peak_pressure,
-        "df_events": df_events,
         "metadata": metadata,
     }
 
@@ -167,7 +152,6 @@ def test_pattern_extractor_handles_orderflow_results():
     assert any(key.startswith("orderflow_scan|orderflow_weekly") for key in keys)
     assert any(key.startswith("orderflow_scan|orderflow_week_of_month") for key in keys)
     assert any(key.startswith("orderflow_scan|orderflow_peak_pressure") for key in keys)
-    assert any(key.startswith("orderflow_scan|orderflow_event_run") for key in keys)
 
     weekly_key = next(k for k in keys if k.startswith("orderflow_scan|orderflow_weekly"))
     weekly_summary = extractor.get_pattern_summary("ZS", weekly_key)
@@ -176,11 +160,6 @@ def test_pattern_extractor_handles_orderflow_results():
     assert not weekly_series.empty
     assert weekly_series.name == "buy_pressure"
     assert (weekly_series.index.tz is not None)
-
-    event_key = next(k for k in keys if k.startswith("orderflow_scan|orderflow_event_run"))
-    event_series = extractor.get_pattern_series("ZS", event_key)
-    assert not event_series.empty
-    assert event_series.index.min() >= pd.Timestamp("2023-09-01 09:30", tz="America/Chicago")
 
 
 def test_pattern_extractor_resolves_missing_seasonality_params():
