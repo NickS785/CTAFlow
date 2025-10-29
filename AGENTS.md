@@ -72,6 +72,9 @@ The codebase follows a modular pipeline architecture with four main components:
 
 ### Strategy Layer (`CTAFlow/strategy/`)
 - **`strategy.py`**: `RegimeStrategy` class implementing trading strategies using forecasting framework
+- **`screener_pipeline.py`**:
+  - `ScreenerPipeline`: normalises screener payloads into sparse gate columns. Keep `_items_from_patterns` compatible with nested mappings, `(key, pattern)` tuples, and generator inputs because both the screener pipeline and notebooks rely on those shapes.
+  - `HorizonMapper`: aligns realised returns with generated gates. `build_xy` requires timezone-aware `ts`, `open`, `close`, and `session_id` columns so horizon calculations remain stable.
 
 ### Configuration
 - **`CTAFlow/config.py`**: HDF5 data paths and environment setup
