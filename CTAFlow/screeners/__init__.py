@@ -1,5 +1,6 @@
 from .orderflow_scan import OrderflowParams, OrderflowScanner, orderflow_scan
 from .session_first_hours import SessionFirstHoursParams, run_session_first_hours
+from .pattern_extractor import PatternExtractor, PatternSummary
 
 try:  # pragma: no cover - optional dependency surface
     from .historical_screener import HistoricalScreener, ScreenParams
@@ -15,4 +16,6 @@ __all__ = [
     'run_session_first_hours',
     'HistoricalScreener',
     'ScreenParams',
+    'PatternExtractor',
+    "PatternSummary"
 ]

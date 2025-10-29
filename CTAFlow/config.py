@@ -19,6 +19,7 @@ COT_ADB_PATH = "lmdb://F:/Data/cot"  # ArcticDB URI for COT data
 INTRADAY_ADB_PATH = "lmdb://F:/Data/intraday"  # DEPRECATED: Use INTRADAY_DATA_PATH instead
 MARKET_DATA_PATH = Path("F:\\", 'Data', 'market_data.hd5')  # DEPRECATED: Legacy HDF5
 COT_DATA_PATH = Path("F:\\", 'Data', 'cot_data.hd5')  # DEPRECATED: Legacy HDF5
+SCREENER_RESULTS_PATH = Path("F:\\", 'Data', 'intraday', 'screener_results.hdf')
 
 # File system paths
 DATA_DIR = Path("F:\\Data ")
