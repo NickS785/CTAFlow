@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import numbers
 import re
+from dataclasses import asdict, is_dataclass
 from datetime import time as time_cls
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
@@ -152,17 +153,27 @@ class ScreenerPipeline:
         return out
 
     def _items_from_patterns(self, patterns: Any) -> Iterable[Tuple[str, Mapping[str, Any]]]:
+        """Yield ``(key, pattern)`` pairs from arbitrarily nested containers.
+
+        The method is intentionally permissive so that it can consume screener
+        payloads coming from different exporters (raw dictionaries, dataclass
+        instances, HorizonMapper objects, etc.). Any mapping-like object that
+        exposes either ``pattern_type`` or ``type`` is treated as a pattern and
+        returned with a normalised ``pattern_type`` key.
+        """
         if patterns is None:
             return []
 
         def _iter(obj: Any, key_hint: Optional[str] = None) -> Iterable[Tuple[str, Mapping[str, Any]]]:
-            if isinstance(obj, Mapping):
-                if "pattern_type" in obj:
-                    key = self._select_pattern_key(obj, key_hint)
-                    yield key, obj
+            mapping = self._coerce_pattern_mapping(obj)
+            if mapping is not None:
+                normalized = self._normalize_pattern_mapping(mapping)
+                if normalized is not None:
+                    key = self._select_pattern_key(normalized, key_hint)
+                    yield key, normalized
                     return
 
-                for child_key, value in obj.items():
+                for child_key, value in mapping.items():
                     if isinstance(value, Mapping):
                         yield from _iter(value, str(child_key))
                     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
@@ -175,6 +186,53 @@ class ScreenerPipeline:
                     yield from _iter(item, key_hint or f"pattern_{idx}")
 
         return list(_iter(patterns))
+
+    @staticmethod
+    def _coerce_pattern_mapping(obj: Any) -> Optional[Mapping[str, Any]]:
+        """Return a mapping view for ``obj`` when it behaves like a pattern."""
+
+        if isinstance(obj, Mapping):
+            return obj
+
+        if is_dataclass(obj):
+            return asdict(obj)
+
+        if hasattr(obj, "_asdict"):
+            try:
+                candidate = obj._asdict()
+            except TypeError:
+                candidate = None
+            if isinstance(candidate, Mapping):
+                return candidate
+
+        if hasattr(obj, "__dict__"):
+            data = {key: value for key, value in vars(obj).items() if not key.startswith("_")}
+            if data:
+                return data
+
+        return None
+
+    @staticmethod
+    def _normalize_pattern_mapping(mapping: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+        """Normalise pattern dictionaries to always expose ``pattern_type``."""
+
+        candidate = mapping.get("pattern_type")
+        if not candidate:
+            candidate = mapping.get("type")
+        if candidate is None:
+            return None
+
+        pattern_type = str(candidate).strip()
+        if not pattern_type:
+            return None
+
+        normalized: Dict[str, Any]
+        if isinstance(mapping, dict):
+            normalized = mapping.copy()
+        else:
+            normalized = {key: value for key, value in mapping.items()}
+        normalized["pattern_type"] = pattern_type
+        return normalized
 
     @staticmethod
     def _select_pattern_key(pattern: Mapping[str, Any], key_hint: Optional[str]) -> str:

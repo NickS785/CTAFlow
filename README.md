@@ -26,7 +26,7 @@ params = OrderflowParams(
     tz="America/Chicago",
     bucket_size="auto",      # use per-asset auto-V bucket sizing
     vpin_window=50,
-    threshold_z=2.0,
+    threshold_z=2.0,       # retained for backward compatibility (no longer used)
     cadence_target=50,
 )
 results = orderflow_scan(tick_source, ["ZC_F", "ZS_F"], params)
@@ -36,9 +36,9 @@ Each symbol entry returns:
 
 - `df_buckets`: tidy bucket-level orderflow metrics (volume, shares, VPIN, pressure).
 - `df_intraday_pressure`: mean/median aggressor (ask) & quote pressure by bucket end-time.
-- `df_events`: merged runs where robust z-scores breach the configured threshold.
 - `df_weekly`: weekday seasonality with t-stats, two-sided p-values, and BH-FDR q-values.
 - `df_wom_weekday`: week-of-month × weekday seasonality table with the same statistics.
+- `df_weekly_peak_pressure`: intraday clock-time focus for significant weekday biases.
 - `metadata`: session window, timezone, bucket size, number of sessions, and bucket counts.
 
 ### Automatic bucket sizing
@@ -58,7 +58,7 @@ Parquet tick files (file names are resolved via `{symbol}` substitution):
 
 ```bash
 python -m screeners.orderflow_scan --symbols ZC_F ZS_F \
-    --session 08:30 13:20 --tz America/Chicago --bucket auto --z 2.0 \
+    --session 08:30 13:20 --tz America/Chicago --bucket auto \
     --ticks-path "data/{symbol}.csv"
 ```
 
