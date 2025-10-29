@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import numbers
 import re
+from collections.abc import Iterable as IterableABC, Sequence as SequenceABC
 from dataclasses import dataclass
 from datetime import time as time_cls
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
@@ -236,28 +237,57 @@ class ScreenerPipeline:
     @classmethod
     def _items_from_patterns(cls, patterns: Any) -> Iterable[Tuple[str, Mapping[str, Any]]]:
         if patterns is None:
-            return []
+            return ()
 
-        def _coerce_mapping(obj: Any) -> Optional[Mapping[str, Any]]:
+        def _iter(obj: Any, key_hint: Optional[str] = None) -> Iterable[Tuple[str, Mapping[str, Any]]]:
             if isinstance(obj, Mapping):
-                if "pattern_type" in obj:
+                if "pattern_type" in obj or "type" in obj:
                     key = cls._select_pattern_key(obj, key_hint)
                     yield key, obj
                     return
 
-                for child_key, value in mapping.items():
-                    if isinstance(value, Mapping):
-                        yield from _iter(value, str(child_key))
-                    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-                        for idx, item in enumerate(value):
-                            yield from _iter(item, str(child_key))
+                for child_key, value in obj.items():
+                    next_hint = str(child_key) if child_key is not None else key_hint
+                    yield from _iter(value, next_hint)
                 return
 
-            if isinstance(obj, Sequence) and not isinstance(obj, (str, bytes)):
-                for idx, item in enumerate(obj):
-                    yield from _iter(item, key_hint or f"pattern_{idx}")
+            if isinstance(obj, SequenceABC) and not isinstance(obj, (str, bytes, bytearray)):
+                if len(obj) == 2 and isinstance(obj[1], Mapping):
+                    first, second = obj
+                    hint = key_hint
+                    if isinstance(first, (str, numbers.Integral)):
+                        hint = str(first)
+                    elif first is not None:
+                        hint = str(first)
+                    yield from _iter(second, hint)
+                    return
 
-        return list(_iter(patterns))
+            if isinstance(obj, IterableABC) and not isinstance(obj, (str, bytes, bytearray)):
+                for idx, item in enumerate(obj):
+                    if isinstance(item, Mapping):
+                        yield from _iter(item, key_hint)
+                        continue
+
+                    if isinstance(item, SequenceABC) and not isinstance(item, (str, bytes, bytearray)):
+                        if len(item) == 2 and isinstance(item[1], Mapping):
+                            first, second = item
+                            hint = key_hint
+                            if isinstance(first, (str, numbers.Integral)):
+                                hint = str(first)
+                            elif first is not None:
+                                hint = str(first)
+                            yield from _iter(second, hint)
+                            continue
+
+                        yield from _iter(item, key_hint)
+                        continue
+
+                    next_hint = key_hint or f"pattern_{idx}"
+                    yield from _iter(item, next_hint)
+
+            return
+
+        return tuple(_iter(patterns))
 
     @staticmethod
     def _select_pattern_key(pattern: Mapping[str, Any], key_hint: Optional[str]) -> str:
