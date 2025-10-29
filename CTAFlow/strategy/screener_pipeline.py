@@ -15,13 +15,90 @@ from __future__ import annotations
 
 import numbers
 import re
+from dataclasses import dataclass
 from datetime import time as time_cls
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
-__all__ = ["ScreenerPipeline"]
+if TYPE_CHECKING:  # pragma: no cover - import for type checking only
+    from CTAFlow.screeners.pattern_extractor import PatternExtractor
+
+__all__ = ["ScreenerPipeline", "extract_ticker_patterns", "HorizonMapper", "HorizonSpec"]
+
+
+def extract_ticker_patterns(
+    ticker: str,
+    data: Mapping[str, pd.DataFrame],
+    extractors: Sequence["PatternExtractor"],
+    *,
+    pattern_types: Optional[Iterable[str]] = None,
+    screen_names: Optional[Iterable[str]] = None,
+    pipeline: Optional["ScreenerPipeline"] = None,
+) -> pd.DataFrame:
+    """Extract screener pattern columns for ``ticker`` without bar data duplicates.
+
+    The helper consolidates patterns from multiple :class:`PatternExtractor`
+    instances, materialises the corresponding features once via
+    :class:`ScreenerPipeline`, and returns only the resulting pattern columns.
+
+    Parameters
+    ----------
+    ticker:
+        The symbol whose patterns should be extracted.
+    data:
+        Mapping of ticker symbols to their bar data.
+    extractors:
+        Sequence of :class:`PatternExtractor` instances supplying pattern
+        payloads.
+    pattern_types:
+        Optional iterable of pattern types to include. When provided the
+        extractor output is filtered accordingly.
+    screen_names:
+        Optional iterable of screen identifiers to include.
+    pipeline:
+        Optional :class:`ScreenerPipeline` instance. When omitted a fresh
+        instance is created with default settings.
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame containing only the pattern columns generated for
+        ``ticker``. When no patterns are available an empty DataFrame with the
+        same index as the source bar data is returned.
+    """
+
+    if ticker not in data:
+        raise KeyError(f"Ticker '{ticker}' is not present in the provided data mapping")
+
+    bars = data[ticker]
+    if pipeline is None:
+        pipeline = ScreenerPipeline()
+
+    baseline = pipeline.build_features(bars, [])
+    baseline_columns = set(baseline.columns)
+
+    combined_patterns: Dict[str, Mapping[str, Any]] = {}
+    for extractor in extractors:
+        filtered = extractor.filter_patterns(
+            ticker,
+            pattern_types=pattern_types,
+            screen_names=screen_names,
+        )
+        for key, pattern in filtered.items():
+            combined_patterns.setdefault(key, pattern)
+
+    if not combined_patterns:
+        return pd.DataFrame(index=bars.index.copy())
+
+    enriched = pipeline.build_features(bars, combined_patterns)
+    pattern_columns = [col for col in enriched.columns if col not in baseline_columns]
+
+    if not pattern_columns:
+        return pd.DataFrame(index=enriched.index.copy())
+
+    return enriched.loc[:, pattern_columns].copy()
 
 
 class ScreenerPipeline:
@@ -112,10 +189,15 @@ class ScreenerPipeline:
     def _validate_bars(self, bars: pd.DataFrame) -> pd.DataFrame:
         if not isinstance(bars, pd.DataFrame):
             raise TypeError("bars must be a pandas DataFrame")
-        if "ts" not in bars.columns:
-            raise ValueError("bars must contain a 'ts' column")
 
-        df = bars.copy()
+        if "ts" in bars.columns:
+            df = bars.copy()
+        elif isinstance(bars.index, pd.DatetimeIndex):
+            df = bars.copy()
+            df["ts"] = bars.index
+        else:
+            raise ValueError("bars must contain a 'ts' column or a DatetimeIndex")
+
         df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
         if df["ts"].isna().any():
             raise ValueError("bars['ts'] contains non-coercible timestamps")
@@ -151,14 +233,15 @@ class ScreenerPipeline:
 
         return out
 
-    def _items_from_patterns(self, patterns: Any) -> Iterable[Tuple[str, Mapping[str, Any]]]:
+    @classmethod
+    def _items_from_patterns(cls, patterns: Any) -> Iterable[Tuple[str, Mapping[str, Any]]]:
         if patterns is None:
             return []
 
         def _iter(obj: Any, key_hint: Optional[str] = None) -> Iterable[Tuple[str, Mapping[str, Any]]]:
             if isinstance(obj, Mapping):
                 if "pattern_type" in obj:
-                    key = self._select_pattern_key(obj, key_hint)
+                    key = cls._select_pattern_key(obj, key_hint)
                     yield key, obj
                     return
 
@@ -186,10 +269,11 @@ class ScreenerPipeline:
     # ------------------------------------------------------------------
     # Column helpers
     # ------------------------------------------------------------------
-    def _feature_base_name(self, key: Optional[str], fallback: str) -> str:
+    @classmethod
+    def _feature_base_name(cls, key: Optional[str], fallback: str) -> str:
         raw = key or fallback
-        slug = self._slugify(raw)
-        return slug or self._slugify(fallback) or "pattern"
+        slug = cls._slugify(raw)
+        return slug or cls._slugify(fallback) or "pattern"
 
     @staticmethod
     def _slugify(value: str) -> str:
@@ -566,7 +650,8 @@ class ScreenerPipeline:
     # ------------------------------------------------------------------
     # Time utilities
     # ------------------------------------------------------------------
-    def _time_to_strings(self, value: Any) -> Tuple[Optional[str], Optional[str]]:
+    @staticmethod
+    def _time_to_strings(value: Any) -> Tuple[Optional[str], Optional[str]]:
         if value is None:
             return None, None
 
@@ -619,4 +704,266 @@ class ScreenerPipeline:
         if normalized in {"sell", "negative", "short"}:
             return "sell"
         return "na"
+
+
+@dataclass(frozen=True)
+class HorizonSpec:
+    """Description of the realised return horizon for a pattern."""
+
+    name: str
+    delta_minutes: Optional[int] = None
+
+
+class HorizonMapper:
+    """Derive (returns_x, returns_y) pairs for screener pattern gates."""
+
+    def __init__(self, tz: str = "America/Chicago") -> None:
+        self.tz = tz
+
+    # ------------------------------------------------------------------
+    # Horizon selection
+    # ------------------------------------------------------------------
+    def pattern_horizon(self, pattern_type: str, default_intraday_minutes: int = 10) -> HorizonSpec:
+        if pattern_type in {"weekday_mean", "orderflow_weekly", "orderflow_week_of_month"}:
+            return HorizonSpec(name="same_day_oc")
+        if pattern_type == "time_predictive_nextday":
+            return HorizonSpec(name="next_day_cc")
+        if pattern_type == "time_predictive_nextweek":
+            return HorizonSpec(name="next_week_cc")
+        if pattern_type == "orderflow_peak_pressure":
+            return HorizonSpec(name="intraday_delta", delta_minutes=default_intraday_minutes)
+        return HorizonSpec(name="same_day_oc")
+
+    # ------------------------------------------------------------------
+    # Target calculators
+    # ------------------------------------------------------------------
+    def _same_day_open_to_close(self, df: pd.DataFrame) -> pd.Series:
+        opens = df.groupby("session_id")["open"].first()
+        closes = df.groupby("session_id")["close"].last()
+        returns = np.log(closes / opens)
+        return df["session_id"].map(returns)
+
+    def _next_day_close_to_close(self, df: pd.DataFrame) -> pd.Series:
+        closes = df.groupby("session_id")["close"].last()
+        returns = np.log(closes.shift(-1) / closes)
+        return df["session_id"].map(returns)
+
+    def _next_week_close_to_close(self, df: pd.DataFrame, days: int = 5) -> pd.Series:
+        closes = df.groupby("session_id")["close"].last()
+        returns = np.log(closes.shift(-days) / closes)
+        return df["session_id"].map(returns)
+
+    def _intraday_delta_minutes(self, df: pd.DataFrame, minutes: int) -> pd.Series:
+        if minutes <= 0:
+            raise ValueError("minutes must be positive for intraday horizons")
+
+        ts = pd.to_datetime(df["ts"]).dt.tz_convert(self.tz)
+        close = pd.Series(df["close"].values, index=ts)
+        close = close.sort_index()
+        delta = pd.Timedelta(minutes=minutes)
+        future = pd.Series(close.values, index=close.index - delta)
+        returns = np.log(future / close)
+        aligned = returns.reindex(close.index)
+        mapped = aligned.reindex(ts)
+        return pd.Series(mapped.values, index=df.index)
+
+    # ------------------------------------------------------------------
+    # Predictor extraction
+    # ------------------------------------------------------------------
+    def _predictor_from_payload(
+        self,
+        pattern: Mapping[str, Any],
+        pattern_type: str,
+        mode: str,
+    ) -> Tuple[float, int]:
+        payload = pattern.get("pattern_payload", {}) or {}
+        metadata = pattern.get("metadata", {}) or {}
+        bias_value = metadata.get("orderflow_bias") or payload.get("pressure_bias")
+        bias_normalized = str(bias_value).lower() if bias_value is not None else ""
+        side_hint = 1 if bias_normalized == "buy" else (-1 if bias_normalized == "sell" else 0)
+
+        if mode == "mean":
+            if pattern_type in {"weekday_mean", "orderflow_weekly", "orderflow_week_of_month"}:
+                value = payload.get("mean")
+            elif pattern_type == "orderflow_peak_pressure":
+                value = payload.get("intraday_mean")
+            else:
+                value = payload.get("mean")
+            return float(value) if value is not None else np.nan, side_hint
+
+        if mode == "corr":
+            value = payload.get("correlation")
+            return float(value) if value is not None else np.nan, side_hint
+
+        if mode == "strength":
+            value = pattern.get("strength")
+            if value is None:
+                value = payload.get("t_stat")
+            return float(value) if value is not None else np.nan, side_hint
+
+        if mode == "bias":
+            return float(side_hint), side_hint
+
+        value = payload.get("mean")
+        return float(value) if value is not None else np.nan, side_hint
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def build_xy(
+        self,
+        bars_with_features: pd.DataFrame,
+        patterns: Any,
+        *,
+        default_intraday_minutes: int = 10,
+        predictor_mode: str = "mean",
+    ) -> pd.DataFrame:
+        if patterns is None:
+            return pd.DataFrame(
+                columns=["ts_decision", "gate", "pattern_type", "returns_x", "returns_y", "side_hint"]
+            )
+
+        required_columns = {"ts", "open", "close", "session_id"}
+        missing = required_columns.difference(bars_with_features.columns)
+        if missing:
+            missing_cols = ", ".join(sorted(missing))
+            raise KeyError(f"bars_with_features is missing required columns: {missing_cols}")
+
+        df = bars_with_features.copy()
+        df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+        if df["ts"].isna().any():
+            raise ValueError("bars_with_features['ts'] contains non-coercible timestamps")
+        ts = df["ts"]
+        if ts.dt.tz is None:
+            df["ts"] = ts.dt.tz_localize(self.tz)
+        else:
+            df["ts"] = ts.dt.tz_convert(self.tz)
+
+        horizon_cache: Dict[Tuple[str, Optional[int]], pd.Series] = {}
+        rows: List[pd.DataFrame] = []
+
+        for key, pattern in ScreenerPipeline._items_from_patterns(patterns):
+            pattern_type = pattern.get("pattern_type")
+            if not pattern_type:
+                continue
+
+            gate_col = self._infer_gate_column_name(df.columns, key, pattern)
+            if gate_col is None:
+                continue
+
+            spec = self.pattern_horizon(pattern_type, default_intraday_minutes=default_intraday_minutes)
+            cache_key = (spec.name, spec.delta_minutes if spec.name == "intraday_delta" else None)
+            if cache_key not in horizon_cache:
+                if spec.name == "same_day_oc":
+                    horizon_cache[cache_key] = self._same_day_open_to_close(df)
+                elif spec.name == "next_day_cc":
+                    horizon_cache[cache_key] = self._next_day_close_to_close(df)
+                elif spec.name == "next_week_cc":
+                    horizon_cache[cache_key] = self._next_week_close_to_close(df, days=5)
+                elif spec.name == "intraday_delta":
+                    horizon_cache[cache_key] = self._intraday_delta_minutes(
+                        df, minutes=spec.delta_minutes or default_intraday_minutes
+                    )
+                else:
+                    horizon_cache[cache_key] = self._same_day_open_to_close(df)
+
+            returns_y = horizon_cache[cache_key]
+            active_mask = (df[gate_col] == 1) & returns_y.notna()
+            if not active_mask.any():
+                continue
+
+            returns_x, side_hint = self._predictor_from_payload(pattern, pattern_type, predictor_mode)
+            subset = df.loc[active_mask, ["ts"]].copy()
+            subset["ts_decision"] = subset["ts"]
+            subset["gate"] = gate_col
+            subset["pattern_type"] = pattern_type
+            subset["returns_x"] = returns_x
+            subset["returns_y"] = returns_y.loc[active_mask].values
+            subset["side_hint"] = side_hint
+            rows.append(subset[["ts_decision", "gate", "pattern_type", "returns_x", "returns_y", "side_hint"]])
+
+        if not rows:
+            return pd.DataFrame(
+                columns=["ts_decision", "gate", "pattern_type", "returns_x", "returns_y", "side_hint"]
+            )
+
+        result = pd.concat(rows, axis=0, ignore_index=True)
+        return result
+
+    # ------------------------------------------------------------------
+    # Gate helpers
+    # ------------------------------------------------------------------
+    def _infer_gate_column_name(
+        self,
+        all_columns: pd.Index,
+        key: str,
+        pattern: Mapping[str, Any],
+    ) -> Optional[str]:
+        slug_key = ScreenerPipeline._slugify(key)
+        if slug_key:
+            candidate = f"{slug_key}_gate"
+            if candidate in all_columns:
+                return candidate
+
+        for candidate in self._fallback_gate_candidates(pattern):
+            if candidate in all_columns:
+                return candidate
+        return None
+
+    def _fallback_gate_candidates(self, pattern: Mapping[str, Any]) -> List[str]:
+        pattern_type = pattern.get("pattern_type")
+        payload = pattern.get("pattern_payload", {}) or {}
+        metadata = pattern.get("metadata", {}) or {}
+
+        candidates: List[str] = []
+        if pattern_type == "weekday_mean":
+            weekday = payload.get("day") or payload.get("weekday")
+            weekday_norm = ScreenerPipeline._normalize_weekday(weekday)
+            if weekday_norm:
+                candidates.append(f"weekday_mean_{weekday_norm}_gate")
+
+        elif pattern_type == "time_predictive_nextday":
+            hms, hmsf = ScreenerPipeline._time_to_strings(payload.get("time"))
+            for suffix in filter(None, [hmsf, hms]):
+                candidates.append(f"time_nextday_{suffix}_gate")
+
+        elif pattern_type == "time_predictive_nextweek":
+            hms, hmsf = ScreenerPipeline._time_to_strings(payload.get("time"))
+            for suffix in filter(None, [hmsf, hms]):
+                candidates.append(f"time_nextweek_{suffix}_gate")
+
+        elif pattern_type == "orderflow_weekly":
+            weekday_norm = ScreenerPipeline._normalize_weekday(payload.get("weekday"))
+            metric = payload.get("metric", "net_pressure")
+            bias = ScreenerPipeline._format_bias(
+                metadata.get("orderflow_bias") or payload.get("pressure_bias")
+            )
+            if weekday_norm:
+                candidates.append(f"oflow_weekly_{weekday_norm}_{metric}_{bias}_gate")
+
+        elif pattern_type == "orderflow_week_of_month":
+            weekday_norm = ScreenerPipeline._normalize_weekday(payload.get("weekday"))
+            metric = payload.get("metric", "net_pressure")
+            bias = ScreenerPipeline._format_bias(
+                metadata.get("orderflow_bias") or payload.get("pressure_bias")
+            )
+            try:
+                wom = int(payload.get("week_of_month"))
+            except (TypeError, ValueError):
+                wom = None
+            if weekday_norm and wom is not None:
+                candidates.append(f"oflow_wom_{weekday_norm}_w{wom}_{metric}_{bias}_gate")
+
+        elif pattern_type == "orderflow_peak_pressure":
+            weekday_norm = ScreenerPipeline._normalize_weekday(payload.get("weekday"))
+            metric = payload.get("metric", "net_pressure")
+            bias = ScreenerPipeline._format_bias(
+                metadata.get("orderflow_bias") or payload.get("pressure_bias")
+            )
+            hms, hmsf = ScreenerPipeline._time_to_strings(payload.get("clock_time"))
+            for suffix in filter(None, [hmsf, hms]):
+                if weekday_norm:
+                    candidates.append(f"oflow_peak_{weekday_norm}_{suffix}_{metric}_{bias}_gate")
+
+        return candidates
 
