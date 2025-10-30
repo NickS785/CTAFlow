@@ -815,6 +815,65 @@ class HorizonMapper:
         mapped = aligned.reindex(ts)
         return pd.Series(mapped.values, index=df.index)
 
+    def _backward_window_return_minutes(self, df: pd.DataFrame, minutes: int) -> pd.Series:
+        """Log-close return from ``t-Δ`` to ``t`` using irregular timestamps."""
+
+        if minutes <= 0:
+            raise ValueError("predictor minutes must be positive")
+
+        ts = pd.to_datetime(df["ts"]).dt.tz_convert(self.tz)
+        close = pd.Series(df["close"].values, index=ts).astype(float)
+        close = close.sort_index()
+
+        delta = pd.Timedelta(minutes=minutes)
+        past = close.copy()
+        past.index = past.index + delta
+        ratio = close / past
+        invalid = (close <= 0) | (past <= 0)
+        if invalid.any():
+            ratio = ratio.mask(invalid)
+
+        returns = np.log(ratio).replace([np.inf, -np.inf], np.nan)
+        return pd.Series(returns.reindex(ts).values, index=df.index)
+
+    def _weekly_mean_scalar(self, df: pd.DataFrame, gate_mask: pd.Series) -> float:
+        """Same-day open→close mean for sessions flagged by ``gate_mask``."""
+
+        if gate_mask is None or not gate_mask.any():
+            return np.nan
+
+        session_ids = pd.Index(df.loc[gate_mask, "session_id"].unique())
+        if session_ids.empty:
+            return np.nan
+
+        opens = df.groupby("session_id")["open"].first().astype(float)
+        closes = df.groupby("session_id")["close"].last().astype(float)
+        ratio = closes / opens
+        invalid = (opens <= 0) | (closes <= 0)
+        if invalid.any():
+            ratio = ratio.mask(invalid)
+
+        returns = np.log(ratio).replace([np.inf, -np.inf], np.nan)
+        subset = returns.loc[returns.index.isin(session_ids)]
+        if subset.empty:
+            return np.nan
+
+        mean_value = subset.mean()
+        return float(mean_value) if np.isfinite(mean_value) else np.nan
+
+    def _prev_week_return_same_session(self, df: pd.DataFrame) -> pd.Series:
+        """Log-close change between a session and the session five days prior."""
+
+        closes = df.groupby("session_id")["close"].last().astype(float)
+        past = closes.shift(5)
+        ratio = closes / past
+        invalid = (closes <= 0) | (past <= 0)
+        if invalid.any():
+            ratio = ratio.mask(invalid)
+
+        returns = np.log(ratio).replace([np.inf, -np.inf], np.nan)
+        return df["session_id"].map(returns)
+
     # ------------------------------------------------------------------
     # Predictor extraction
     # ------------------------------------------------------------------
@@ -868,20 +927,57 @@ class HorizonMapper:
         patterns: Any,
         *,
         default_intraday_minutes: int = 10,
-        predictor_mode: str = "mean",
+        predictor_minutes: int = 1,
+        weekly_x_policy: str = "mean",
     ) -> pd.DataFrame:
+        """Construct tidy decision rows for screener ``patterns``.
+
+        Parameters
+        ----------
+        bars_with_features:
+            Bar data containing at least ``ts``, ``open``, ``close``, and ``session_id`` columns.
+        patterns:
+            Pattern payloads produced by :class:`ScreenerPipeline` consumers.
+        default_intraday_minutes:
+            Horizon minutes used when a pattern requests ``intraday_delta`` without an explicit
+            ``delta_minutes`` value.
+        predictor_minutes:
+            Backward-looking window length (in minutes) for time-bearing predictors.
+        weekly_x_policy:
+            Strategy for weekly and week-of-month patterns. ``"mean"`` uses the payload ``mean``
+            when supplied, otherwise falls back to the historical same-day open→close mean for
+            sessions with an active gate. ``"prev_week"`` uses the realised return between the
+            session close and the close five sessions prior.
+        """
+
         if patterns is None:
             return pd.DataFrame(
                 columns=["ts_decision", "gate", "pattern_type", "returns_x", "returns_y", "side_hint"]
             )
 
+        if predictor_minutes <= 0:
+            raise ValueError("predictor_minutes must be positive")
+
+        if weekly_x_policy not in {"mean", "prev_week"}:
+            raise ValueError("weekly_x_policy must be one of {'mean', 'prev_week'}")
+
         required_columns = {"ts", "open", "close", "session_id"}
-        missing = required_columns.difference(bars_with_features.columns)
+        lower_map: Dict[str, str] = {}
+        for column in bars_with_features.columns:
+            key = column.lower()
+            if key not in lower_map:
+                lower_map[key] = column
+
+        missing = [col for col in required_columns if col not in lower_map]
         if missing:
             missing_cols = ", ".join(sorted(missing))
-            raise KeyError(f"bars_with_features is missing required columns: {missing_cols}")
+            raise KeyError(
+                "bars_with_features is missing required columns (case-insensitive): "
+                f"{missing_cols}"
+            )
 
-        df = bars_with_features.copy()
+        rename_map = {lower_map[name]: name for name in required_columns}
+        df = bars_with_features.rename(columns=rename_map).copy()
         df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
         if df["ts"].isna().any():
             raise ValueError("bars_with_features['ts'] contains non-coercible timestamps")
@@ -891,8 +987,13 @@ class HorizonMapper:
         else:
             df["ts"] = ts.dt.tz_convert(self.tz)
 
+        x_bw = self._backward_window_return_minutes(df, minutes=predictor_minutes)
+        prev_week_series: Optional[pd.Series] = None
         horizon_cache: Dict[Tuple[str, Optional[int]], pd.Series] = {}
         rows: List[pd.DataFrame] = []
+
+        time_bearing_types = {"time_predictive_nextday", "time_predictive_nextweek", "orderflow_peak_pressure"}
+        weekly_types = {"weekday_mean", "orderflow_weekly", "orderflow_week_of_month"}
 
         for key, pattern in ScreenerPipeline._items_from_patterns(patterns):
             pattern_type = pattern.get("pattern_type")
@@ -920,16 +1021,35 @@ class HorizonMapper:
                     horizon_cache[cache_key] = self._same_day_open_to_close(df)
 
             returns_y = horizon_cache[cache_key]
-            active_mask = (df[gate_col] == 1) & returns_y.notna()
+
+            if pattern_type in time_bearing_types:
+                returns_x_series = x_bw
+            elif pattern_type in weekly_types:
+                gate_mask = df[gate_col] == 1
+                if weekly_x_policy == "prev_week":
+                    if prev_week_series is None:
+                        prev_week_series = self._prev_week_return_same_session(df)
+                    returns_x_series = prev_week_series
+                else:
+                    payload_mean, _ = self._predictor_from_payload(pattern, pattern_type, "mean")
+                    scalar = payload_mean
+                    if not np.isfinite(scalar):
+                        scalar = self._weekly_mean_scalar(df, gate_mask)
+                    returns_x_series = pd.Series(scalar, index=df.index, dtype=float)
+            else:
+                payload_value, _ = self._predictor_from_payload(pattern, pattern_type, "mean")
+                returns_x_series = pd.Series(payload_value, index=df.index, dtype=float)
+
+            active_mask = (df[gate_col] == 1) & returns_y.notna() & returns_x_series.notna()
             if not active_mask.any():
                 continue
 
-            returns_x, side_hint = self._predictor_from_payload(pattern, pattern_type, predictor_mode)
+            _, side_hint = self._predictor_from_payload(pattern, pattern_type, mode="bias")
             subset = df.loc[active_mask, ["ts"]].copy()
             subset["ts_decision"] = subset["ts"]
             subset["gate"] = gate_col
             subset["pattern_type"] = pattern_type
-            subset["returns_x"] = returns_x
+            subset["returns_x"] = returns_x_series.loc[active_mask].values
             subset["returns_y"] = returns_y.loc[active_mask].values
             subset["side_hint"] = side_hint
             rows.append(subset[["ts_decision", "gate", "pattern_type", "returns_x", "returns_y", "side_hint"]])
