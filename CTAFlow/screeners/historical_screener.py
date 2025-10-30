@@ -1,10 +1,10 @@
 from ..utils.seasonal import last_year_predicts_this_year, intraday_lag_autocorr, abnormal_months, prewindow_feature, prewindow_predicts_month
-from typing import List, Dict, Optional, Union, Tuple
+from typing import Any, List, Dict, Optional, Union, Tuple
 import pandas as pd
 import numpy as np
 from datetime import datetime, date, timedelta, time
 from dataclasses import dataclass, field
-from ..data import IntradayFileManager, DataClient, SyntheticSymbol
+from ..data import IntradayFileManager, DataClient, SyntheticSymbol, ResultsClient
 from ..config import DLY_DATA_PATH, INTRADAY_ADB_PATH
 from ..utils.session import filter_session_bars
 from scipy import stats
@@ -145,7 +145,15 @@ class ScreenParams:
 class HistoricalScreener:
     """Screener created to find seasonal and momentum patterns in intraday and daily data"""
 
-    def __init__(self, ticker_data: Dict[str, Union[pd.DataFrame, SyntheticSymbol]], file_mgr:IntradayFileManager=None, verbose: bool = True):
+    def __init__(
+        self,
+        ticker_data: Dict[str, Union[pd.DataFrame, SyntheticSymbol]],
+        file_mgr: IntradayFileManager = None,
+        *,
+        results_client: Optional[ResultsClient] = None,
+        auto_write_results: bool = False,
+        verbose: bool = True,
+    ):
         """
         Initialize HistoricalScreener with ticker data.
 
@@ -163,6 +171,8 @@ class HistoricalScreener:
         self.mgr = file_mgr or IntradayFileManager(data_path=DLY_DATA_PATH, arctic_uri=INTRADAY_ADB_PATH)
         self.method = "arctic"
         self.verbose = verbose
+        self.results_client = results_client
+        self.auto_write_results = bool(auto_write_results and results_client is not None)
 
         # Setup logging
         self.logger = logging.getLogger(f"{__name__}.HistoricalScreener")
@@ -183,6 +193,94 @@ class HistoricalScreener:
             synth_count = sum(self.synthetic_tickers.values())
             if synth_count > 0:
                 self.logger.info(f"  - {synth_count} synthetic spreads, {len(self.tickers) - synth_count} regular tickers")
+            if self.results_client and self.auto_write_results:
+                self.logger.info("  - Automatic result persistence enabled")
+
+
+    # ------------------------------------------------------------------
+    # Results storage helpers
+    # ------------------------------------------------------------------
+    def set_results_client(
+        self,
+        results_client: Optional[ResultsClient],
+        *,
+        auto_write: Optional[bool] = None,
+    ) -> None:
+        """Attach or update the ResultsClient used for persistence."""
+
+        self.results_client = results_client
+        if auto_write is not None:
+            self.auto_write_results = bool(auto_write and results_client is not None)
+        else:
+            self.auto_write_results = bool(self.auto_write_results and results_client is not None)
+
+    @staticmethod
+    def _result_payload_to_frame(payload: Any) -> pd.DataFrame:
+        if isinstance(payload, pd.DataFrame):
+            return payload.copy()
+        if isinstance(payload, pd.Series):
+            return payload.to_frame().T
+        if isinstance(payload, dict):
+            try:
+                return pd.json_normalize(payload)
+            except Exception:
+                return pd.DataFrame([payload])
+        return pd.DataFrame([[payload]], columns=["value"])
+
+    def write_results_to_store(
+        self,
+        scan_type: str,
+        screen_name: str,
+        results: Dict[str, Any],
+        *,
+        replace: bool = True,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, str]:
+        """Persist ticker-level screen outputs via the configured ResultsClient."""
+
+        if not self.results_client:
+            raise RuntimeError("ResultsClient is not configured for this HistoricalScreener")
+
+        if not results:
+            return {}
+
+        writes: Dict[str, str] = {}
+        base_meta = {
+            "screen_name": screen_name,
+            "scan_type": scan_type,
+            "generated_at": pd.Timestamp.utcnow().isoformat(),
+        }
+        if metadata:
+            base_meta.update(metadata)
+
+        for ticker, payload in results.items():
+            df = self._result_payload_to_frame(payload)
+            if df.empty:
+                continue
+
+            df["ticker"] = ticker
+            df["screen_name"] = screen_name
+            df["scan_type"] = scan_type
+
+            try:
+                key = self.results_client.write_scan_results(
+                    scan_type,
+                    ticker,
+                    screen_name,
+                    df,
+                    replace=replace,
+                    metadata=base_meta,
+                )
+                writes[ticker] = key
+            except Exception as exc:
+                if self.logger:
+                    self.logger.warning(
+                        "Failed to persist results for %s/%s: %s",
+                        ticker,
+                        screen_name,
+                        exc,
+                    )
+        return writes
 
 
     def intraday_momentum_screen(
@@ -800,6 +898,22 @@ class HistoricalScreener:
             else:
                 # Parse parameters and run appropriate screen
                 screen_result = self._parse_params(params)
+
+            if self.auto_write_results and self.results_client:
+                try:
+                    self.write_results_to_store(
+                        params.screen_type,
+                        params.name,
+                        screen_result,
+                    )
+                except Exception as exc:
+                    if self.logger:
+                        self.logger.warning(
+                            "Automatic persistence failed for %s (%s): %s",
+                            params.name,
+                            params.screen_type,
+                            exc,
+                        )
 
             # Store results with the screen name as key
             composite_results[params.name] = screen_result
