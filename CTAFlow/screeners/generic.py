@@ -7,7 +7,7 @@ from CTAFlow.config import DLY_DATA_PATH
 
 two_h = timedelta(hours=2)
 energy_tickers = ["HO", "RB", "CL", "NG"]
-period_time = timedelta(hours=1, minutes=45)
+period_time = timedelta(hours=2, minutes=0)
 london_start, london_end = time(hour=2, minute=30), time(hour=11, minute=30)
 usa_start, usa_end = time(hour=8, minute=30), time(hour=15, minute=30)
 fall = {'month_filter':[9,10,11]}
@@ -18,8 +18,8 @@ usa_tgt_times = ["08:30", "10:30","9:00", "13:30"]
 session_starts = ["02:30", "08:30"]
 
 session_ends = ["10:30", "15:00"]
-default_london_settings = {"screen_type":"seasonality","target_times":london_tgt_times, "period_length":period_time}
-default_usa_settings = {"screen_type":"seasonality", "target_times":usa_tgt_times, "period_length":period_time}
+default_london_settings = {"screen_type":"seasonality","target_times":london_tgt_times, "period_length":period_time, "seasonality_session_start":london_start, "seasonality_session_end":london_end}
+default_usa_settings = {"screen_type":"seasonality", "target_times":usa_tgt_times, "period_length":period_time, "seasonality_session_start":usa_start, "seasonality_session_end":usa_end}
 london_winter_seasonality = ScreenParams("seasonality",name="london_winter", months=[12,1,2,3], target_times=london_tgt_times, period_length=period_time, seasonality_session_start=london_start, seasonality_session_end=london_end)
 
 london_spring_seasonality = ScreenParams("seasonality",name="london_spring" ,months=[3,4,5,], target_times=london_tgt_times, period_length=period_time, seasonality_session_start=london_start, seasonality_session_end=london_end)
@@ -29,11 +29,11 @@ london_fall_seasonality = ScreenParams("seasonality", name="london_fall", months
 london_summer_seasonality = ScreenParams("seasonality", name="london_summer", months=[5,6,7,8], target_times=london_tgt_times, period_length=period_time, seasonality_session_start=london_start, seasonality_session_end=london_end)
 
 usa_winter_seasonality = ScreenParams("seasonality", name="usa_winter", months=[12,1,2,3], target_times=usa_tgt_times, period_length=period_time, seasonality_session_start=usa_start, seasonality_session_end=usa_end)
-usa_q1 = ScreenParams("seasonality",name="usa_q1", months=[1,2,3], target_times=usa_tgt_times, period_length=period_time)
-usa_q2 = ScreenParams("seasonality", name="usa_q2", months=[4,5,6], target_times=usa_tgt_times, period_length=period_time)
-usa_q3 = ScreenParams("seasonality", name="usa_q3", months=[7,8,9], target_times=usa_tgt_times, period_length=period_time)
-usa_q4 = ScreenParams("seasonality", name="usa_q4", months=[10,11,12], target_times=usa_tgt_times, period_length=period_time)
-usa_all = ScreenParams("seasonality", target_times=usa_tgt_times, period_length=period_time)
+usa_q1 = ScreenParams(name="usa_q1", months=[1,2,3], **default_usa_settings)
+usa_q2 = ScreenParams(name="usa_q2", months=[4,5,6], **default_usa_settings)
+usa_q3 = ScreenParams(name="usa_q3", months=[7,8,9], **default_usa_settings)
+usa_q4 = ScreenParams(name="usa_q4", months=[10,11,12], **default_usa_settings)
+usa_all = ScreenParams(name="usa_all", **default_usa_settings)
 usa_quarterly_params = [usa_q1, usa_q2, usa_q3, usa_q4, usa_all]
 
 london_q1 = ScreenParams(**default_london_settings, name="london_q1", months=[1,2,3])
@@ -45,23 +45,23 @@ london_quarterly_params = [london_q1, london_q2, london_q3, london_q4, london_al
 
 usa_spring_seasonality = ScreenParams("seasonality",name="usa_spring", months=[3,4,5], target_times=usa_tgt_times, period_length=period_time, seasonality_session_start=usa_start, seasonality_session_end=usa_end)
 
-usa_fall_seasonality = ScreenParams("seasonality", months=[9,10,11], target_times=usa_tgt_times, period_length=period_time, seasonality_session_start=usa_start, seasonality_session_end=usa_end)
+usa_fall_seasonality = ScreenParams("seasonality",name="usa_fall" ,months=[9,10,11], target_times=usa_tgt_times, period_length=period_time, seasonality_session_start=usa_start, seasonality_session_end=usa_end)
 
-usa_summer_seasonality = ScreenParams("seasonality", months=[5,6,7,8], target_times=usa_tgt_times, period_length=period_time, seasonality_session_start=usa_start, seasonality_session_end=usa_end)
+usa_summer_seasonality = ScreenParams("seasonality",name="usa_summer" ,months=[5,6,7,8], target_times=usa_tgt_times, period_length=period_time, seasonality_session_start=usa_start, seasonality_session_end=usa_end)
 
-london_seasonality = ScreenParams("seasonality", target_times=london_tgt_times, period_length=period_time, seasonality_session_end=london_end, seasonality_session_start=london_start)
+london_seasonality = ScreenParams("seasonality", name="london_all",target_times=london_tgt_times, period_length=period_time, seasonality_session_end=london_end, seasonality_session_start=london_start)
 
-usa_seasonality = ScreenParams("seasonality", target_times=usa_tgt_times, period_length=period_time, seasonality_session_start=usa_start, seasonality_session_end=usa_end)
+usa_seasonality = ScreenParams("seasonality",name="usa_all", target_times=usa_tgt_times, period_length=period_time, seasonality_session_start=usa_start, seasonality_session_end=usa_end)
 
-summer_momentum = ScreenParams("momentum", months=[5,6,7,8], session_starts=session_starts, session_ends=session_ends, sess_start_hrs=1, sess_start_minutes=30)
+summer_momentum = ScreenParams("momentum",name="usa_summer_momentum", months=[5,6,7,8], session_starts=session_starts, session_ends=session_ends, sess_start_hrs=1, sess_start_minutes=30)
 
-spring_momentum = ScreenParams("momentum", months=[3,4,5], session_starts=session_starts, session_ends=session_ends, sess_start_hrs=1, sess_start_minutes=30)
+spring_momentum = ScreenParams("momentum",name="usa_spring_momentum", months=[3,4,5], session_starts=session_starts, session_ends=session_ends, sess_start_hrs=1, sess_start_minutes=30)
 
-fall_momentum = ScreenParams("momentum", months=[9, 10,11],session_starts=session_starts, session_ends=session_ends, sess_start_hrs=1, sess_start_minutes=30)
+fall_momentum = ScreenParams("momentum",name="usa_fall_momentum", months=[9, 10,11],session_starts=session_starts, session_ends=session_ends, sess_start_hrs=1, sess_start_minutes=30)
 
-winter_momentum = ScreenParams("momentum", months=[12,1,2,3], session_starts=session_starts, session_ends=session_ends, sess_start_hrs=1, sess_start_minutes=30)
+winter_momentum = ScreenParams("momentum",name="usa_winter_momentum", months=[12,1,2,3], session_starts=session_starts, session_ends=session_ends, sess_start_hrs=1, sess_start_minutes=30)
 
-momentum_generic = ScreenParams("momentum", session_starts=session_starts, session_ends=session_ends, sess_start_hrs=1, sess_start_minutes=30)
+momentum_generic = ScreenParams("momentum",name="momentum_generic", session_starts=session_starts, session_ends=session_ends, sess_start_hrs=1, sess_start_minutes=30)
 
 usa_seasonals = [usa_winter_seasonality, usa_summer_seasonality, usa_spring_seasonality, usa_fall_seasonality, usa_seasonality]
 
