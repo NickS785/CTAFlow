@@ -10,9 +10,10 @@ contain strings like ".", "-" or "—").
 from __future__ import annotations
 
 import os
+import re
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import pandas as pd
 
@@ -52,6 +53,7 @@ from ..config import (
     COT_ADB_PATH,
     INTRADAY_ADB_PATH,
     ENABLE_WEEKLY_UPDATES,
+    RESULTS_HDF_PATH,
 )
 from .update_management import (
     COT_REFRESH_EVENT,
@@ -4403,3 +4405,169 @@ class DataClient:
 
         return written
 
+
+class ResultsClient:
+    """Lightweight writer for screener results stored in an HDF5 file."""
+
+    def __init__(
+        self,
+        results_path: Optional[Union[str, os.PathLike]] = None,
+        *,
+        complib: str = "blosc",
+        complevel: int = 9,
+        create_dirs: bool = False,
+    ) -> None:
+        self.results_path = Path(results_path or RESULTS_HDF_PATH)
+        self.complib = complib
+        self.complevel = complevel
+
+        if create_dirs and self.results_path.parent:
+            self.results_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _slugify(value: str) -> str:
+        text = str(value).strip().lower()
+        text = re.sub(r"[^0-9a-zA-Z_/]+", "_", text)
+        text = re.sub(r"_+", "_", text)
+        return text.strip("_/")
+
+    @staticmethod
+    def _ensure_dataframe(payload: Any) -> pd.DataFrame:
+        if isinstance(payload, pd.DataFrame):
+            return payload.copy()
+        if isinstance(payload, pd.Series):
+            return payload.to_frame().T
+        if isinstance(payload, dict):
+            try:
+                return pd.json_normalize(payload)
+            except Exception:
+                return pd.DataFrame([payload])
+        return pd.DataFrame([[payload]], columns=["value"])
+
+    @staticmethod
+    def _sanitize_for_hdf(df: pd.DataFrame) -> pd.DataFrame:
+        sanitized = df.copy()
+        object_cols = sanitized.select_dtypes(include=["object", "string"])
+        if not object_cols.empty:
+            for col in object_cols.columns:
+                sanitized[col] = sanitized[col].apply(
+                    lambda x: x if isinstance(x, (str, bytes)) or pd.isna(x) else str(x)
+                )
+        return sanitized
+
+    def _format_key(self, scan_type: str, ticker: str, scan_name: str) -> str:
+        parts = [
+            self._slugify(scan_type),
+            self._slugify(ticker),
+            self._slugify(scan_name),
+        ]
+        if any(not part for part in parts):
+            raise ValueError("scan_type, ticker, and scan_name must all be non-empty strings")
+        return "/" + "/".join(parts)
+
+    def _write(
+        self,
+        key: str,
+        df: pd.DataFrame,
+        *,
+        replace: bool = True,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        df_sanitized = self._sanitize_for_hdf(df)
+
+        fmt: Dict[str, Any] = dict(
+            format="table",
+            data_columns=True,
+            complib=self.complib,
+            complevel=self.complevel,
+        )
+
+        with pd.HDFStore(self.results_path, mode="a") as store:
+            writer = store.put if replace else store.append
+            writer(key, df_sanitized, **fmt)
+
+            if metadata:
+                storer = store.get_storer(key)
+                existing = getattr(storer.attrs, "metadata", {})
+                merged = dict(existing)
+                merged.update(metadata)
+                storer.attrs.metadata = merged
+
+        return key
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def write_scan_results(
+        self,
+        scan_type: str,
+        ticker: str,
+        scan_name: str,
+        payload: Any,
+        *,
+        replace: bool = True,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        key = self._format_key(scan_type, ticker, scan_name)
+        df = self._ensure_dataframe(payload)
+        if df.empty:
+            raise ValueError("payload converted to an empty DataFrame")
+
+        return self._write(key, df, replace=replace, metadata=metadata)
+
+    def write_orderflow_results(
+        self,
+        ticker: str,
+        scan_name: str,
+        payload: Any,
+        *,
+        replace: bool = True,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        return self.write_scan_results(
+            "orderflow",
+            ticker,
+            scan_name,
+            payload,
+            replace=replace,
+            metadata=metadata,
+        )
+
+    def write_seasonal_results(
+        self,
+        ticker: str,
+        scan_name: str,
+        payload: Any,
+        *,
+        replace: bool = True,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        return self.write_scan_results(
+            "seasonal",
+            ticker,
+            scan_name,
+            payload,
+            replace=replace,
+            metadata=metadata,
+        )
+
+    def write_momentum_results(
+        self,
+        ticker: str,
+        scan_name: str,
+        payload: Any,
+        *,
+        replace: bool = True,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        return self.write_scan_results(
+            "momentum",
+            ticker,
+            scan_name,
+            payload,
+            replace=replace,
+            metadata=metadata,
+        )

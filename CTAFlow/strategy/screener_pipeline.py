@@ -16,9 +16,8 @@ from __future__ import annotations
 import numbers
 import re
 from collections.abc import Iterable as IterableABC, Sequence as SequenceABC
-from dataclasses import dataclass
 from datetime import time as time_cls
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -739,8 +738,7 @@ class ScreenerPipeline:
         return "na"
 
 
-@dataclass(frozen=True)
-class HorizonSpec:
+class HorizonSpec(NamedTuple):
     """Description of the realised return horizon for a pattern."""
 
     name: str
@@ -771,19 +769,36 @@ class HorizonMapper:
     # Target calculators
     # ------------------------------------------------------------------
     def _same_day_open_to_close(self, df: pd.DataFrame) -> pd.Series:
-        opens = df.groupby("session_id")["open"].first()
-        closes = df.groupby("session_id")["close"].last()
-        returns = np.log(closes / opens)
+        opens = df.groupby("session_id")["open"].first().astype(float)
+        closes = df.groupby("session_id")["close"].last().astype(float)
+        ratio = closes / opens
+        invalid = (opens <= 0) | (closes <= 0)
+        if invalid.any():
+            ratio = ratio.mask(invalid)
+        returns = np.log(ratio)
+        returns = returns.replace([np.inf, -np.inf], np.nan)
         return df["session_id"].map(returns)
 
     def _next_day_close_to_close(self, df: pd.DataFrame) -> pd.Series:
-        closes = df.groupby("session_id")["close"].last()
-        returns = np.log(closes.shift(-1) / closes)
+        closes = df.groupby("session_id")["close"].last().astype(float)
+        future = closes.shift(-1)
+        ratio = future / closes
+        invalid = (closes <= 0) | (future <= 0)
+        if invalid.any():
+            ratio = ratio.mask(invalid)
+        returns = np.log(ratio)
+        returns = returns.replace([np.inf, -np.inf], np.nan)
         return df["session_id"].map(returns)
 
     def _next_week_close_to_close(self, df: pd.DataFrame, days: int = 5) -> pd.Series:
-        closes = df.groupby("session_id")["close"].last()
-        returns = np.log(closes.shift(-days) / closes)
+        closes = df.groupby("session_id")["close"].last().astype(float)
+        future = closes.shift(-days)
+        ratio = future / closes
+        invalid = (closes <= 0) | (future <= 0)
+        if invalid.any():
+            ratio = ratio.mask(invalid)
+        returns = np.log(ratio)
+        returns = returns.replace([np.inf, -np.inf], np.nan)
         return df["session_id"].map(returns)
 
     def _intraday_delta_minutes(self, df: pd.DataFrame, minutes: int) -> pd.Series:
@@ -819,7 +834,11 @@ class HorizonMapper:
             if pattern_type in {"weekday_mean", "orderflow_weekly", "orderflow_week_of_month"}:
                 value = payload.get("mean")
             elif pattern_type == "orderflow_peak_pressure":
-                value = payload.get("intraday_mean")
+                value = payload.get("intraday_mean", payload.get("mean"))
+            elif pattern_type in {"time_predictive_nextday", "time_predictive_nextweek"}:
+                value = payload.get("mean")
+                if value is None:
+                    value = payload.get("correlation")
             else:
                 value = payload.get("mean")
             return float(value) if value is not None else np.nan, side_hint
