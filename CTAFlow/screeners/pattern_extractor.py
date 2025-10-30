@@ -1,6 +1,20 @@
-"""Utilities for organising and analysing screener pattern output."""
+"""Utilities for organising and analysing screener pattern output.
+
+The :class:`PatternExtractor` class restructures raw screener payloads and
+exposes convenience helpers for downstream analysis.  In addition to
+retrieving pattern series, it now supports composition and deterministic
+ranking::
+
+    >>> combined = extractor_a + extractor_b  # merge two extractions
+    >>> top_setups = combined.top_patterns("CL", n=3)
+    >>> global_leaders = combined.top_patterns_global(n=10)
+
+These helpers make it straightforward to surface the strongest statistical
+relationships discovered across multiple screener runs.
+"""
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import time
@@ -72,7 +86,21 @@ class PatternSummary:
 
 
 class PatternExtractor:
-    """Restructure screener output and expose analysis helpers."""
+    """Restructure screener output and expose analysis helpers.
+
+    Examples
+    --------
+    Combine extractions from multiple screener runs::
+
+        >>> combined = extractor_a.concat(extractor_b)
+        >>> list(combined.patterns)
+        ['CL', 'GC', ...]
+
+    Surface the strongest setups per ticker::
+
+        >>> combined.rank_patterns(top=5)
+        {'CL': [('scan|pattern', summary, 0.78), ...], ...}
+    """
 
     SUMMARY_COLUMNS: Tuple[str, ...] = (
         "pattern_type",
@@ -111,6 +139,19 @@ class PatternExtractor:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    def _copy_like(self) -> "PatternExtractor":
+        """Create a shallow copy preserving loaded summaries without rebuilding."""
+
+        clone = object.__new__(self.__class__)
+        clone._screener = self._screener
+        clone._results = dict(self._results)
+        clone._screen_params = dict(self._screen_params)
+        clone._pattern_index = {
+            symbol: dict(entries)
+            for symbol, entries in self._pattern_index.items()
+        }
+        return clone
+
     @property
     def patterns(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
         """Return patterns grouped by symbol and keyed by pattern identifier."""
@@ -119,6 +160,117 @@ class PatternExtractor:
             symbol: {key: summary.as_dict() for key, summary in entries.items()}
             for symbol, entries in self._pattern_index.items()
         }
+
+    # ------------------------------------------------------------------
+    # Concatenation helpers
+    # ------------------------------------------------------------------
+    def concat(
+        self,
+        other: "PatternExtractor",
+        *,
+        conflict: str = "prefer_strong",
+        inplace: bool = False,
+    ) -> "PatternExtractor":
+        """Merge the pattern inventory from ``other`` into this extractor.
+
+        Parameters
+        ----------
+        other : PatternExtractor
+            The extractor providing additional pattern summaries.
+        conflict : {"prefer_strong", "prefer_left", "prefer_right", "keep_both"}, optional
+            Strategy for handling collisions on ``(ticker, pattern_key)``.
+            ``"prefer_strong"`` (default) keeps whichever summary has the higher
+            :meth:`significance_score` with deterministic fallbacks.  The
+            ``"keep_both"`` strategy preserves both entries by suffixing the new
+            key with ``"#2"``, ``"#3"`` and so on.
+        inplace : bool, optional
+            If ``True`` the merge mutates ``self`` and returns it.  Otherwise a
+            shallow copy is returned, leaving the originals untouched.
+
+        Returns
+        -------
+        PatternExtractor
+            Extractor containing the merged pattern index.
+        """
+
+        if not isinstance(other, PatternExtractor):
+            raise TypeError("PatternExtractor.concat expects another PatternExtractor")
+
+        strategy = conflict.lower()
+        valid_strategies = {
+            "prefer_strong",
+            "prefer_left",
+            "prefer_right",
+            "keep_both",
+        }
+        if strategy not in valid_strategies:
+            raise ValueError(f"Unsupported conflict strategy '{conflict}'")
+
+        target = self if inplace else self._copy_like()
+
+        for symbol, summaries in other._pattern_index.items():
+            target_entries = target._pattern_index.setdefault(symbol, {})
+            for key, summary in summaries.items():
+                if key not in target_entries:
+                    target_entries[key] = summary
+                    continue
+
+                if strategy == "prefer_left":
+                    continue
+                if strategy == "prefer_right":
+                    target_entries[key] = summary
+                    continue
+                if strategy == "keep_both":
+                    suffix = 2
+                    new_key = f"{key}#{suffix}"
+                    while new_key in target_entries:
+                        suffix += 1
+                        new_key = f"{key}#{suffix}"
+                    target_entries[new_key] = summary
+                    continue
+
+                chosen = self._choose_stronger_summary(target_entries[key], summary)
+                target_entries[key] = chosen
+
+        merged_results = dict(target._results)
+        merged_results.update(other._results)
+        target._results = merged_results
+
+        merged_params = dict(target._screen_params)
+        merged_params.update(other._screen_params)
+        target._screen_params = merged_params
+
+        return target
+
+    def __add__(self, other: "PatternExtractor") -> "PatternExtractor":
+        """Return a new extractor containing patterns from both operands."""
+
+        return self.concat(other, conflict="prefer_strong", inplace=False)
+
+    def __iadd__(self, other: "PatternExtractor") -> "PatternExtractor":
+        """Merge patterns from ``other`` into ``self`` in-place."""
+
+        return self.concat(other, conflict="prefer_strong", inplace=True)
+
+    @classmethod
+    def concat_many(
+        cls,
+        extractors: Iterable["PatternExtractor"],
+        *,
+        conflict: str = "prefer_strong",
+    ) -> "PatternExtractor":
+        """Fold an iterable of extractors into a single combined instance."""
+
+        iterator = iter(extractors)
+        try:
+            first = next(iterator)
+        except StopIteration as exc:
+            raise ValueError("concat_many requires at least one extractor") from exc
+
+        result = first._copy_like()
+        for extractor in iterator:
+            result = result.concat(extractor, conflict=conflict, inplace=True)
+        return result
 
     def filter_patterns(
         self,
@@ -152,6 +304,253 @@ class PatternExtractor:
             filtered[key] = summary.as_dict()
 
         return filtered
+
+    # ------------------------------------------------------------------
+    # Ranking helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _coerce_optional_float(value: Any) -> Optional[float]:
+        try:
+            if value is None:
+                return None
+            coerced = float(value)
+        except (TypeError, ValueError):
+            return None
+        if math.isnan(coerced):
+            return None
+        return coerced
+
+    @classmethod
+    def _extract_payload_first(cls, summary: PatternSummary, keys: Sequence[str]) -> Optional[float]:
+        payload = summary.payload or {}
+        for key in keys:
+            if key in payload:
+                value = cls._coerce_optional_float(payload.get(key))
+                if value is not None:
+                    return value
+        return None
+
+    @classmethod
+    def _extract_support(cls, summary: PatternSummary) -> float:
+        value = cls._extract_payload_first(
+            summary,
+            ("support", "n", "n_obs", "seasonality_n"),
+        )
+        return float(value) if value is not None and value > 0 else 0.0
+
+    @classmethod
+    def _extract_t_stat(cls, summary: PatternSummary) -> float:
+        value = cls._extract_payload_first(summary, ("t_stat", "seasonality_t_stat"))
+        return float(value) if value is not None else 0.0
+
+    @classmethod
+    def _extract_correlation(cls, summary: PatternSummary) -> float:
+        value = cls._extract_payload_first(summary, ("correlation", "seasonality_correlation"))
+        return float(value) if value is not None else 0.0
+
+    @classmethod
+    def _strength_raw(cls, summary: PatternSummary) -> float:
+        value = cls._coerce_optional_float(summary.strength)
+        return float(value) if value is not None else 0.0
+
+    @staticmethod
+    def significance_score(summary: PatternSummary) -> float:
+        """Return a deterministic significance score for ``summary``.
+
+        The score combines multiple stability indicators with fixed weights::
+
+            score = 0.30*n + 0.25*t + 0.20*c + 0.15*p + 0.10*h + 0.10*norm_strength
+
+        where ``n`` encodes support, ``t`` the absolute *t*-statistic,
+        ``c`` correlation, ``p`` tail probability, and ``h`` hit-rate style
+        measures.  Missing values contribute ``0`` ensuring robustness.
+
+        Returns
+        -------
+        float
+            Weighted composite score in ``[0, 1]``.
+
+        Notes
+        -----
+        TODO: expose scoring weights via ``PatternExtractor`` configuration.
+        """
+
+        support = PatternExtractor._extract_support(summary)
+        n_component = math.log10(1.0 + support) / 4.0 if support > 0 else 0.0
+
+        t_stat = abs(PatternExtractor._extract_t_stat(summary))
+        t_component = min(t_stat, 10.0) / 10.0
+
+        correlation = abs(PatternExtractor._extract_correlation(summary))
+        c_component = min(max(correlation, 0.0), 1.0)
+
+        hit_rate = PatternExtractor._extract_payload_first(summary, ("hit_rate",))
+        h_component = min(max(hit_rate or 0.0, 0.0), 1.0)
+
+        p_value = PatternExtractor._extract_payload_first(
+            summary,
+            ("p_value", "q_value", "seasonality_q_value"),
+        )
+        p_component = 1.0 - min(max(p_value or 0.0, 0.0), 1.0)
+
+        raw_strength = PatternExtractor._strength_raw(summary)
+        strength = max(raw_strength, 0.0)
+        norm_strength = strength / (1.0 + strength)
+
+        score = (
+            0.30 * n_component
+            + 0.25 * t_component
+            + 0.20 * c_component
+            + 0.15 * p_component
+            + 0.10 * h_component
+            + 0.10 * norm_strength
+        )
+        return float(score)
+
+    def _choose_stronger_summary(
+        self,
+        left: PatternSummary,
+        right: PatternSummary,
+    ) -> PatternSummary:
+        left_score = self.significance_score(left)
+        right_score = self.significance_score(right)
+        if right_score > left_score:
+            return right
+        if left_score > right_score:
+            return left
+
+        left_strength = PatternExtractor._strength_raw(left)
+        right_strength = PatternExtractor._strength_raw(right)
+        if right_strength > left_strength:
+            return right
+        if left_strength > right_strength:
+            return left
+
+        left_t = abs(PatternExtractor._extract_t_stat(left))
+        right_t = abs(PatternExtractor._extract_t_stat(right))
+        if right_t > left_t:
+            return right
+        if left_t > right_t:
+            return left
+
+        left_corr = abs(PatternExtractor._extract_correlation(left))
+        right_corr = abs(PatternExtractor._extract_correlation(right))
+        if right_corr > left_corr:
+            return right
+        if left_corr > right_corr:
+            return left
+
+        return left
+
+    def rank_patterns(
+        self,
+        *,
+        by: str = "score",
+        ascending: bool = False,
+        per_ticker: bool = True,
+        top: Optional[int] = None,
+    ) -> Union[
+        Dict[str, List[Tuple[str, PatternSummary, float]]],
+        List[Tuple[str, str, PatternSummary, float]],
+    ]:
+        """Return ranked pattern summaries by ticker or globally.
+
+        Parameters
+        ----------
+        by : {"score", "t_stat", "support", "strength"}, optional
+            Metric used for sorting.  ``"score"`` (default) uses
+            :meth:`significance_score`.
+        ascending : bool, optional
+            Sort direction.  Defaults to descending (strongest first).
+        per_ticker : bool, optional
+            When ``True`` the result is grouped by ticker.  Otherwise a global
+            ranking is returned.
+        top : int, optional
+            Limit the number of entries per ticker (or overall when
+            ``per_ticker=False``).
+
+        Returns
+        -------
+        dict or list
+            Structured ranking containing ``(pattern_key, summary, score)``
+            tuples.
+        """
+
+        metric = by.lower()
+        allowed = {"score", "t_stat", "support", "strength"}
+        if metric not in allowed:
+            raise ValueError(f"Unsupported ranking metric '{by}'")
+
+        def _metric_value(summary: PatternSummary) -> float:
+            if metric == "score":
+                return self.significance_score(summary)
+            if metric == "t_stat":
+                return abs(PatternExtractor._extract_t_stat(summary))
+            if metric == "support":
+                return PatternExtractor._extract_support(summary)
+            return PatternExtractor._strength_raw(summary)
+
+        def _sort_key(
+            ticker: str,
+            pattern_key: str,
+            metric_value: float,
+            support_value: float,
+            t_stat_value: float,
+        ) -> Tuple[float, float, float, str, str]:
+            primary = metric_value if ascending else -metric_value
+            support_component = support_value if ascending else -support_value
+            t_component = abs(t_stat_value) if ascending else -abs(t_stat_value)
+            return (primary, support_component, t_component, ticker, pattern_key)
+
+        ranked: Dict[str, List[Tuple[str, PatternSummary, float]]] = {}
+        global_entries: List[Tuple[Tuple[float, float, float, str, str], str, str, PatternSummary, float]] = []
+
+        for ticker, patterns in self._pattern_index.items():
+            ticker_entries: List[
+                Tuple[Tuple[float, float, float, str, str], str, PatternSummary, float]
+            ] = []
+            for pattern_key, summary in patterns.items():
+                score = self.significance_score(summary)
+                metric_value = _metric_value(summary)
+                support_value = PatternExtractor._extract_support(summary)
+                t_stat_value = PatternExtractor._extract_t_stat(summary)
+                sort_key = _sort_key(
+                    ticker,
+                    pattern_key,
+                    metric_value,
+                    support_value,
+                    t_stat_value,
+                )
+                entry = (sort_key, pattern_key, summary, score)
+                ticker_entries.append(entry)
+                global_entries.append((sort_key, ticker, pattern_key, summary, score))
+
+            ticker_entries.sort(key=lambda item: item[0])
+            if top is not None:
+                ticker_entries = ticker_entries[: top if top >= 0 else 0]
+            ranked[ticker] = [(key, summary, score) for _, key, summary, score in ticker_entries]
+
+        if per_ticker:
+            return ranked
+
+        global_entries.sort(key=lambda item: item[0])
+        if top is not None:
+            global_entries = global_entries[: top if top >= 0 else 0]
+        return [
+            (ticker, pattern_key, summary, score)
+            for _, ticker, pattern_key, summary, score in global_entries
+        ]
+
+    def top_patterns(self, ticker: str, n: int = 10) -> List[Tuple[str, PatternSummary, float]]:
+        """Return the ``n`` strongest patterns for ``ticker``."""
+
+        ranked = self.rank_patterns(per_ticker=True, top=n)
+        return ranked.get(ticker, [])
+
+    def top_patterns_global(self, n: int = 50) -> List[Tuple[str, str, PatternSummary, float]]:
+        """Return the top ``n`` patterns across all tickers."""
+
+        return self.rank_patterns(per_ticker=False, top=n)
 
     def get_pattern_keys(self, symbol: str) -> List[str]:
         """Return all pattern identifiers for ``symbol``."""
