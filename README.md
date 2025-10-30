@@ -125,3 +125,44 @@ python -m screens.run_session_first_hours --symbols CL NG ZC \
 
 The CLI prints the latest rows and optionally saves the entire result set to CSV or
 Parquet when `--out` is provided.
+
+## Pattern extraction and strategy pipelines
+
+Screeners surface dozens of candidate patterns, so the repository bundles tooling to
+normalise their payloads and wire them into downstream research workflows:
+
+- `CTAFlow.screeners.PatternExtractor` restructures raw screener output into tidy
+  `PatternSummary` frames, exposes helpers such as `concat_many`, `filter_patterns`,
+  and `significance_score`, and persists the canonical column layout used across the
+  notebooks.
+- `CTAFlow.strategy.screener_pipeline.ScreenerPipeline` consumes `PatternExtractor`
+  summaries and materialises sparse boolean "gate" columns alongside the bar data
+  (each gate carries directional metadata, pattern strength, and provenance fields).
+- `CTAFlow.strategy.screener_pipeline.HorizonMapper` selects realised-return targets
+  that correspond to each gate, ensuring same-day, next-day, next-week, and intraday
+  horizons all line up on timezone-aware timestamps.
+
+```python
+from CTAFlow.screeners import PatternExtractor
+from CTAFlow.strategy.screener_pipeline import HorizonMapper, ScreenerPipeline
+
+# Combine seasonal and orderflow screeners that have already produced pattern payloads
+seasonal_extractor = PatternExtractor(seasonal_screener, seasonal_results, [seasonal_params])
+orderflow_extractor = PatternExtractor(orderflow_screener, orderflow_results, [orderflow_params])
+combined = PatternExtractor.concat_many([seasonal_extractor, orderflow_extractor])
+
+cl_patterns = combined.filter_patterns("CL")
+bars = load_minute_bars("CL")  # user-supplied helper returning a DataFrame
+
+pipeline = ScreenerPipeline(tz="America/Chicago")
+features = pipeline.build_features(bars, cl_patterns)
+
+mapper = HorizonMapper(tz="America/Chicago")
+decisions = mapper.build_xy(features, cl_patterns, predictor_minutes=5)
+```
+
+`PatternExtractor.load_summaries_from_results` and
+`PatternExtractor.load_summaries_from_results_async` remain available for loading persisted
+summary tables, while `ScreenerPipeline.extract_ticker_patterns` provides a convenience
+wrapper for fetching only the generated gate columns when you already have a price/volume
+DataFrame in memory.

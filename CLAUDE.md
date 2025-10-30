@@ -88,6 +88,15 @@ The codebase follows a modular pipeline architecture with four main components:
 
 ### Strategy Layer (`CTAFlow/strategy/`)
 - **`strategy.py`**: `RegimeStrategy` class implementing trading strategies using forecasting framework
+- **`screener_pipeline.py`**:
+  - `ScreenerPipeline`: normalises screener payloads into sparse gate columns. Keep `_items_from_patterns` compatible with nested mappings, `(key, pattern)` tuples, generator inputs, and `PatternExtractor.concat_many` outputs because both the screener pipeline and notebooks rely on those shapes.
+  - `HorizonMapper`: aligns realised returns with generated gates. `build_xy` requires timezone-aware `ts`, `open`, `close`, and `session_id` columns so horizon calculations remain stable. Expect `PatternExtractor` summaries with canonical column names when wiring horizons.
+
+### Screeners (`CTAFlow/screeners/`)
+- **`pattern_extractor.py`**:
+  - `PatternExtractor`: restructures screener payloads into canonical `PatternSummary` frames, supports arithmetic/concatenation helpers, and persists ranked signals. Preserve `SUMMARY_COLUMNS`, `_strength_raw`, and async loaders (`load_summaries_from_results_async`) because downstream notebooks and the pipeline consume those exact shapes.
+  - Utility helpers compute significance scores, merge seasonal/orderflow frames, and serialise outputs. Keep scoring weights configurable via keyword arguments even though defaults live in `_strength_raw`.
+- **`__init__.py`**: re-exports `PatternExtractor` and `PatternSummary` for external import paths (used by strategy notebooks and tests).
 
 ### Data Pipeline (`CTAFlow/data/`)
 **Simplified Processing Pipeline (Post-Phase 3):**
