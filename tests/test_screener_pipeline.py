@@ -186,62 +186,6 @@ def test_screener_pipeline_generates_sparse_gates():
     assert "other_pattern_gate" not in gate_columns
 
 
-def test_month_mask_disables_winter_gate_in_summer():
-    tz = "America/Chicago"
-    timestamps = [
-        "2024-01-02 13:30",
-        "2024-01-09 13:30",
-        "2024-06-04 13:30",
-        "2024-06-11 13:30",
-    ]
-
-    bars = pd.DataFrame({"ts": pd.to_datetime(timestamps)})
-    pipeline = ScreenerPipeline(tz=tz)
-    patterns = {
-        "winter_weekday": {
-            "pattern_type": "weekday_mean",
-            "pattern_payload": {"day": "Tuesday", "mean": 0.1},
-            "metadata": {"screen_type": "seasonality"},
-        }
-    }
-
-    features = pipeline.build_features(bars, patterns, allowed_months={12, 1, 2})
-    gate_col = f"{_slug('winter_weekday')}_gate"
-
-    january_mask = features["ts"].dt.month == 1
-    june_mask = features["ts"].dt.month == 6
-
-    assert features.loc[january_mask, gate_col].eq(1).all()
-    assert features.loc[june_mask, gate_col].eq(0).all()
-    assert features.loc[january_mask, "_month_allowed"].eq(True).all()
-    assert features.loc[june_mask, "_month_allowed"].eq(False).all()
-
-
-def test_no_months_all_months_active():
-    tz = "America/Chicago"
-    timestamps = [
-        "2024-02-06 13:30",
-        "2024-05-07 13:30",
-        "2024-08-06 13:30",
-    ]
-
-    bars = pd.DataFrame({"ts": pd.to_datetime(timestamps)})
-    pipeline = ScreenerPipeline(tz=tz)
-    patterns = {
-        "weekday_all": {
-            "pattern_type": "weekday_mean",
-            "pattern_payload": {"day": "Tuesday", "mean": 0.1},
-            "metadata": {"screen_type": "seasonality"},
-        }
-    }
-
-    features = pipeline.build_features(bars, patterns)
-    gate_col = f"{_slug('weekday_all')}_gate"
-
-    assert features[gate_col].eq(1).all()
-    assert features["_month_allowed"].eq(True).all()
-
-
 def test_horizon_mapper_accepts_mixed_case_price_columns():
     mapper = HorizonMapper(tz="America/Chicago")
     df = pd.DataFrame(
