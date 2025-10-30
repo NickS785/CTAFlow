@@ -510,7 +510,6 @@ class ScreenerPipeline:
         sidecars: Dict[str, Any] = {
             "weekday": weekday_norm,
             "mean": payload.get("mean"),
-            "t": payload.get("t_stat"),
             "p": payload.get("p_value"),
             "strength": payload.get("strength"),
         }
@@ -605,8 +604,6 @@ class ScreenerPipeline:
             "weekday": weekday_norm,
             "week_of_month": week_of_month,
             "metric": metric,
-            "t": payload.get("t_stat"),
-            "q": payload.get("q_value"),
             "mean": payload.get("mean"),
             "n": payload.get("n"),
             "bias": bias,
@@ -633,8 +630,6 @@ class ScreenerPipeline:
         sidecars = {
             "weekday": weekday_norm,
             "metric": metric,
-            "t": payload.get("t_stat"),
-            "q": payload.get("q_value"),
             "mean": payload.get("mean"),
             "n": payload.get("n"),
             "bias": bias,
@@ -672,8 +667,6 @@ class ScreenerPipeline:
             "metric": metric,
             "bias": bias,
             "seasonality_mean": payload.get("seasonality_mean"),
-            "seasonality_t": payload.get("seasonality_t_stat"),
-            "seasonality_q": payload.get("seasonality_q_value"),
             "intraday_mean": payload.get("intraday_mean"),
             "intraday_n": payload.get("intraday_n"),
         }
@@ -875,6 +868,39 @@ class HorizonMapper:
         return df["session_id"].map(returns)
 
     # ------------------------------------------------------------------
+    # Data preparation helpers
+    # ------------------------------------------------------------------
+    def _prepare_bars_frame(self, bars_with_features: pd.DataFrame) -> pd.DataFrame:
+        required_columns = {"ts", "open", "close", "session_id"}
+        lower_map: Dict[str, str] = {}
+        for column in bars_with_features.columns:
+            key = column.lower()
+            if key not in lower_map:
+                lower_map[key] = column
+
+        missing = [col for col in required_columns if col not in lower_map]
+        if missing:
+            missing_cols = ", ".join(sorted(missing))
+            raise KeyError(
+                "bars_with_features is missing required columns (case-insensitive): "
+                f"{missing_cols}"
+            )
+
+        rename_map = {lower_map[name]: name for name in required_columns}
+        df = bars_with_features.rename(columns=rename_map).copy()
+        df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+        if df["ts"].isna().any():
+            raise ValueError("bars_with_features['ts'] contains non-coercible timestamps")
+
+        ts = df["ts"]
+        if ts.dt.tz is None:
+            df["ts"] = ts.dt.tz_localize(self.tz)
+        else:
+            df["ts"] = ts.dt.tz_convert(self.tz)
+
+        return df
+
+    # ------------------------------------------------------------------
     # Predictor extraction
     # ------------------------------------------------------------------
     def _predictor_from_payload(
@@ -918,42 +944,17 @@ class HorizonMapper:
         value = payload.get("mean")
         return float(value) if value is not None else np.nan, side_hint
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-    def build_xy(
+    def _iter_pattern_returns(
         self,
-        bars_with_features: pd.DataFrame,
+        df: pd.DataFrame,
         patterns: Any,
         *,
-        default_intraday_minutes: int = 10,
-        predictor_minutes: int = 1,
-        weekly_x_policy: str = "mean",
-    ) -> pd.DataFrame:
-        """Construct tidy decision rows for screener ``patterns``.
-
-        Parameters
-        ----------
-        bars_with_features:
-            Bar data containing at least ``ts``, ``open``, ``close``, and ``session_id`` columns.
-        patterns:
-            Pattern payloads produced by :class:`ScreenerPipeline` consumers.
-        default_intraday_minutes:
-            Horizon minutes used when a pattern requests ``intraday_delta`` without an explicit
-            ``delta_minutes`` value.
-        predictor_minutes:
-            Backward-looking window length (in minutes) for time-bearing predictors.
-        weekly_x_policy:
-            Strategy for weekly and week-of-month patterns. ``"mean"`` uses the payload ``mean``
-            when supplied, otherwise falls back to the historical same-day open→close mean for
-            sessions with an active gate. ``"prev_week"`` uses the realised return between the
-            session close and the close five sessions prior.
-        """
-
+        default_intraday_minutes: int,
+        predictor_minutes: int,
+        weekly_x_policy: str,
+    ) -> Iterable[Tuple[str, str, pd.Series, pd.Series, int]]:
         if patterns is None:
-            return pd.DataFrame(
-                columns=["ts_decision", "gate", "pattern_type", "returns_x", "returns_y", "side_hint"]
-            )
+            return
 
         if predictor_minutes <= 0:
             raise ValueError("predictor_minutes must be positive")
@@ -961,37 +962,9 @@ class HorizonMapper:
         if weekly_x_policy not in {"mean", "prev_week"}:
             raise ValueError("weekly_x_policy must be one of {'mean', 'prev_week'}")
 
-        required_columns = {"ts", "open", "close", "session_id"}
-        lower_map: Dict[str, str] = {}
-        for column in bars_with_features.columns:
-            key = column.lower()
-            if key not in lower_map:
-                lower_map[key] = column
-
-        missing = [col for col in required_columns if col not in lower_map]
-        if missing:
-            missing_cols = ", ".join(sorted(missing))
-            raise KeyError(
-                "bars_with_features is missing required columns (case-insensitive): "
-                f"{missing_cols}"
-            )
-
-        rename_map = {lower_map[name]: name for name in required_columns}
-        df = bars_with_features.rename(columns=rename_map).copy()
-        df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
-        if df["ts"].isna().any():
-            raise ValueError("bars_with_features['ts'] contains non-coercible timestamps")
-        ts = df["ts"]
-        if ts.dt.tz is None:
-            df["ts"] = ts.dt.tz_localize(self.tz)
-        else:
-            df["ts"] = ts.dt.tz_convert(self.tz)
-
         x_bw = self._backward_window_return_minutes(df, minutes=predictor_minutes)
         prev_week_series: Optional[pd.Series] = None
         horizon_cache: Dict[Tuple[str, Optional[int]], pd.Series] = {}
-        rows: List[pd.DataFrame] = []
-
         time_bearing_types = {"time_predictive_nextday", "time_predictive_nextweek", "orderflow_peak_pressure"}
         weekly_types = {"weekday_mean", "orderflow_weekly", "orderflow_week_of_month"}
 
@@ -1001,10 +974,12 @@ class HorizonMapper:
                 continue
 
             gate_col = self._infer_gate_column_name(df.columns, key, pattern)
-            if gate_col is None:
+            if gate_col is None or gate_col not in df.columns:
                 continue
 
-            spec = self.pattern_horizon(pattern_type, default_intraday_minutes=default_intraday_minutes)
+            spec = self.pattern_horizon(
+                pattern_type, default_intraday_minutes=default_intraday_minutes
+            )
             cache_key = (spec.name, spec.delta_minutes if spec.name == "intraday_delta" else None)
             if cache_key not in horizon_cache:
                 if spec.name == "same_day_oc":
@@ -1040,11 +1015,102 @@ class HorizonMapper:
                 payload_value, _ = self._predictor_from_payload(pattern, pattern_type, "mean")
                 returns_x_series = pd.Series(payload_value, index=df.index, dtype=float)
 
+            _, side_hint = self._predictor_from_payload(pattern, pattern_type, mode="bias")
+            yield gate_col, pattern_type, returns_x_series, returns_y, side_hint
+
+    @staticmethod
+    def _signal_column_name(gate_col: str) -> str:
+        if gate_col.endswith("_gate"):
+            return f"{gate_col[:-5]}_signal"
+        return f"{gate_col}_signal"
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def add_predictor_columns(
+        self,
+        bars_with_features: pd.DataFrame,
+        patterns: Any,
+        *,
+        default_intraday_minutes: int = 10,
+        predictor_minutes: int = 1,
+        weekly_x_policy: str = "mean",
+    ) -> pd.DataFrame:
+        """Return ``bars_with_features`` with per-pattern predictor columns appended."""
+
+        if patterns is None:
+            return bars_with_features.copy()
+
+        df = self._prepare_bars_frame(bars_with_features)
+        result = bars_with_features.copy()
+
+        for gate_col, _, returns_x_series, _, _ in self._iter_pattern_returns(
+            df,
+            patterns,
+            default_intraday_minutes=default_intraday_minutes,
+            predictor_minutes=predictor_minutes,
+            weekly_x_policy=weekly_x_policy,
+        ):
+            signal_col = self._signal_column_name(gate_col)
+            signal = pd.Series(np.nan, index=df.index, dtype=float)
+            gate_mask = df[gate_col] == 1
+            if gate_mask.any():
+                aligned = returns_x_series.reindex(df.index)
+                valid_mask = gate_mask & aligned.notna()
+                if valid_mask.any():
+                    signal.loc[valid_mask] = aligned.loc[valid_mask]
+            result[signal_col] = signal
+
+        return result
+
+    def build_xy(
+        self,
+        bars_with_features: pd.DataFrame,
+        patterns: Any,
+        *,
+        default_intraday_minutes: int = 10,
+        predictor_minutes: int = 1,
+        weekly_x_policy: str = "mean",
+    ) -> pd.DataFrame:
+        """Construct tidy decision rows for screener ``patterns``.
+
+        Parameters
+        ----------
+        bars_with_features:
+            Bar data containing at least ``ts``, ``open``, ``close``, and ``session_id`` columns.
+        patterns:
+            Pattern payloads produced by :class:`ScreenerPipeline` consumers.
+        default_intraday_minutes:
+            Horizon minutes used when a pattern requests ``intraday_delta`` without an explicit
+            ``delta_minutes`` value.
+        predictor_minutes:
+            Backward-looking window length (in minutes) for time-bearing predictors.
+        weekly_x_policy:
+            Strategy for weekly and week-of-month patterns. ``"mean"`` uses the payload ``mean``
+            when supplied, otherwise falls back to the historical same-day open→close mean for
+            sessions with an active gate. ``"prev_week"`` uses the realised return between the
+            session close and the close five sessions prior.
+        """
+
+        if patterns is None:
+            return pd.DataFrame(
+                columns=["ts_decision", "gate", "pattern_type", "returns_x", "returns_y", "side_hint"]
+            )
+
+        df = self._prepare_bars_frame(bars_with_features)
+        rows: List[pd.DataFrame] = []
+
+        for gate_col, pattern_type, returns_x_series, returns_y, side_hint in self._iter_pattern_returns(
+            df,
+            patterns,
+            default_intraday_minutes=default_intraday_minutes,
+            predictor_minutes=predictor_minutes,
+            weekly_x_policy=weekly_x_policy,
+        ):
             active_mask = (df[gate_col] == 1) & returns_y.notna() & returns_x_series.notna()
             if not active_mask.any():
                 continue
 
-            _, side_hint = self._predictor_from_payload(pattern, pattern_type, mode="bias")
             subset = df.loc[active_mask, ["ts"]].copy()
             subset["ts_decision"] = subset["ts"]
             subset["gate"] = gate_col
