@@ -1,10 +1,11 @@
 """Utilities for organising and analysing screener pattern output."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import time
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, TYPE_CHECKING, Union
 
 import pandas as pd
 
@@ -19,6 +20,9 @@ from ..utils.session import filter_session_bars
 
 
 ScreenParamLike = Union[ScreenParams, OrderflowParams, SimpleNamespace]
+
+if TYPE_CHECKING:  # pragma: no cover - typing aid only
+    from ..data.data_client import ResultsClient
 
 
 @dataclass
@@ -68,6 +72,23 @@ class PatternSummary:
 
 class PatternExtractor:
     """Restructure screener output and expose analysis helpers."""
+
+    SUMMARY_COLUMNS: Tuple[str, ...] = (
+        "pattern_type",
+        "strength",
+        "correlation",
+        "time",
+        "weekday",
+        "week_of_month",
+        "q_value",
+        "t_stat",
+        "n",
+        "source_screen",
+        "scan_type",
+        "scan_name",
+        "description",
+        "created_at",
+    )
 
     def __init__(
         self,
@@ -203,6 +224,179 @@ class PatternExtractor:
                 "rebased": rebased,
             }
         )
+
+    # ------------------------------------------------------------------
+    # Persistence helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _sanitize_key_component(value: str, *, uppercase: bool = False) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        text = re.sub(r"[\s/]+", "_", text)
+        text = re.sub(r"[^0-9A-Za-z_]+", "", text)
+        return text.upper() if uppercase else text.lower()
+
+    @classmethod
+    def _build_results_key(cls, scan_type: str, ticker: str, scan_name: str) -> str:
+        scan_type_part = cls._sanitize_key_component(scan_type)
+        ticker_part = cls._sanitize_key_component(ticker, uppercase=True)
+        scan_name_part = cls._sanitize_key_component(scan_name)
+        if not all([scan_type_part, ticker_part, scan_name_part]):
+            raise ValueError("scan_type, ticker, and scan_name must all be non-empty")
+        return f"results/{scan_type_part}/{ticker_part}/{scan_name_part}"
+
+    @staticmethod
+    def _coerce_summary_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+        string_columns = [
+            "pattern_type",
+            "time",
+            "weekday",
+            "source_screen",
+            "scan_type",
+            "scan_name",
+            "description",
+            "created_at",
+        ]
+        float_columns = ["strength", "correlation", "q_value", "t_stat"]
+        int_like_columns = ["week_of_month", "n"]
+
+        for column in string_columns:
+            if column in df.columns:
+                df[column] = df[column].astype("string")
+
+        for column in float_columns:
+            if column in df.columns:
+                df[column] = pd.to_numeric(df[column], errors="coerce")
+
+        for column in int_like_columns:
+            if column in df.columns:
+                df[column] = pd.to_numeric(df[column], errors="coerce")
+
+        return df
+
+    @staticmethod
+    def _infer_scan_type_from_results(by_ticker: Mapping[str, Any]) -> str:
+        orderflow_keys = {
+            "df_weekly",
+            "df_wom_weekday",
+            "df_weekly_peak_pressure",
+            "df_intraday_pressure",
+            "df_buckets",
+        }
+        for result in by_ticker.values():
+            if isinstance(result, Mapping) and orderflow_keys.intersection(result.keys()):
+                return "orderflow"
+        for result in by_ticker.values():
+            if isinstance(result, Mapping) and "strongest_patterns" in result:
+                return "seasonality"
+        return "seasonality"
+
+    def _summarize_patterns_for_ticker(
+        self,
+        *,
+        symbol: str,
+        scan_name: str,
+        scan_type: str,
+        entries: Mapping[str, PatternSummary],
+        created_at: str,
+    ) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for summary in entries.values():
+            if summary.source_screen != scan_name:
+                continue
+
+            payload = summary.payload or {}
+            time_value = payload.get("time") or payload.get("clock_time")
+            time_str = None
+            if time_value not in (None, ""):
+                time_str = str(time_value)
+
+            row = {
+                "pattern_type": summary.pattern_type,
+                "strength": summary.strength,
+                "correlation": payload.get("correlation"),
+                "time": time_str,
+                "weekday": payload.get("day") or payload.get("weekday"),
+                "week_of_month": payload.get("week_of_month"),
+                "q_value": payload.get("q_value") or payload.get("seasonality_q_value"),
+                "t_stat": payload.get("t_stat") or payload.get("seasonality_t_stat"),
+                "n": payload.get("n") or payload.get("seasonality_n"),
+                "source_screen": summary.source_screen,
+                "scan_type": scan_type,
+                "scan_name": scan_name,
+                "description": summary.description,
+                "created_at": created_at,
+            }
+            rows.append(row)
+
+        return rows
+
+    def persist_to_results(
+        self,
+        results_client: "ResultsClient",
+        *,
+        created_at: Optional[str] = None,
+    ) -> Dict[str, int]:
+        """Persist pattern summaries to the results HDF store.
+
+        Parameters
+        ----------
+        results_client : ResultsClient
+            Client used to write summary DataFrames into ``RESULTS_HDF_PATH``.
+        created_at : str, optional
+            Optional ISO 8601 timestamp string to stamp each summary row.
+
+        Returns
+        -------
+        Dict[str, int]
+            Mapping of ``"results/{scan_type}/{ticker}/{scan_name}"`` keys to the
+            number of rows written for that combination.
+
+        Notes
+        -----
+        Each key is overwritten on every call (``replace=True``).  Downstream code
+        can later query the stored summaries via::
+
+            with pd.HDFStore(RESULTS_HDF_PATH, "r") as store:
+                df = store.select("results/orderflow/RB/us_winter")
+        """
+
+        timestamp = created_at or pd.Timestamp.utcnow().isoformat()
+        counts: Dict[str, int] = {}
+
+        for scan_name, by_ticker in self._results.items():
+            if not isinstance(by_ticker, Mapping):
+                continue
+
+            params = self._screen_params.get(scan_name)
+            scan_type = getattr(params, "screen_type", None)
+            if not scan_type:
+                scan_type = self._infer_scan_type_from_results(by_ticker)
+
+            scan_type = str(scan_type or "seasonality")
+
+            for ticker in by_ticker.keys():
+                entries = self._pattern_index.get(ticker, {})
+                rows = self._summarize_patterns_for_ticker(
+                    symbol=ticker,
+                    scan_name=scan_name,
+                    scan_type=scan_type,
+                    entries=entries,
+                    created_at=timestamp,
+                )
+
+                if not rows:
+                    continue
+
+                df = pd.DataFrame(rows, columns=self.SUMMARY_COLUMNS)
+                df = self._coerce_summary_dtypes(df)
+                key = self._build_results_key(scan_type, ticker, scan_name)
+                results_client.write_results_df(key, df, replace=True)
+                counts[key] = len(df)
+                print(f"[PatternExtractor] wrote {len(df)} rows to {key}")
+
+        return counts
 
     # ------------------------------------------------------------------
     # Index construction

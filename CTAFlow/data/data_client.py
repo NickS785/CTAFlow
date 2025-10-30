@@ -4449,24 +4449,38 @@ class ResultsClient:
 
     @staticmethod
     def _sanitize_for_hdf(df: pd.DataFrame) -> pd.DataFrame:
-        sanitized = df.copy()
-        object_cols = sanitized.select_dtypes(include=["object", "string"])
-        if not object_cols.empty:
-            for col in object_cols.columns:
-                sanitized[col] = sanitized[col].apply(
-                    lambda x: x if isinstance(x, (str, bytes)) or pd.isna(x) else str(x)
-                )
-        return sanitized
+        """Proxy to :meth:`DataClient._sanitize_for_hdf` for consistency."""
+
+        return DataClient._sanitize_for_hdf(df)
+
+    def write_results_df(self, key: str, df: pd.DataFrame, *, replace: bool = True) -> None:
+        """Write a prepared results DataFrame to ``key`` in the results store."""
+
+        df_sanitized = self._sanitize_for_hdf(df)
+        min_itemsize = DataClient._min_itemsize_for_str_cols(df_sanitized)
+
+        fmt: Dict[str, Any] = dict(
+            format="table",
+            data_columns=True,
+            complib=self.complib,
+            complevel=self.complevel,
+            min_itemsize=min_itemsize or None,
+        )
+
+        with pd.HDFStore(self.results_path, mode="a") as store:
+            writer = store.put if replace else store.append
+            writer(key, df_sanitized, **fmt)
 
     def _format_key(self, scan_type: str, ticker: str, scan_name: str) -> str:
         parts = [
+            "results",
             self._slugify(scan_type),
-            self._slugify(ticker),
+            self._slugify(ticker).upper(),
             self._slugify(scan_name),
         ]
         if any(not part for part in parts):
             raise ValueError("scan_type, ticker, and scan_name must all be non-empty strings")
-        return "/" + "/".join(parts)
+        return "/".join(parts)
 
     def _write(
         self,
@@ -4476,20 +4490,10 @@ class ResultsClient:
         replace: bool = True,
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> str:
-        df_sanitized = self._sanitize_for_hdf(df)
+        self.write_results_df(key, df, replace=replace)
 
-        fmt: Dict[str, Any] = dict(
-            format="table",
-            data_columns=True,
-            complib=self.complib,
-            complevel=self.complevel,
-        )
-
-        with pd.HDFStore(self.results_path, mode="a") as store:
-            writer = store.put if replace else store.append
-            writer(key, df_sanitized, **fmt)
-
-            if metadata:
+        if metadata:
+            with pd.HDFStore(self.results_path, mode="a") as store:
                 storer = store.get_storer(key)
                 existing = getattr(storer.attrs, "metadata", {})
                 merged = dict(existing)
