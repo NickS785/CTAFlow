@@ -13,19 +13,25 @@ loops so that millions of rows can be processed quickly.
 
 from __future__ import annotations
 
+import logging
 import numbers
 import re
 from collections.abc import Iterable as IterableABC, Sequence as SequenceABC
 from datetime import time as time_cls
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, NamedTuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple, NamedTuple
 
 import numpy as np
 import pandas as pd
 
+from CTAFlow.CTAFlow.screeners.pattern_extractor import validate_filtered_months
+
 if TYPE_CHECKING:  # pragma: no cover - import for type checking only
-    from CTAFlow.screeners.pattern_extractor import PatternExtractor
+    from CTAFlow.CTAFlow.screeners.pattern_extractor import PatternExtractor
 
 __all__ = ["ScreenerPipeline", "extract_ticker_patterns", "HorizonMapper", "HorizonSpec"]
+
+
+_PIPELINE_LOG = logging.getLogger(__name__)
 
 
 def extract_ticker_patterns(
@@ -142,11 +148,19 @@ class ScreenerPipeline:
         self.tz = tz
         self.time_match = time_match
         self.log = log
+        self._active_month_mask: Optional[pd.Series] = None
+        self._current_month_stats: Optional[Dict[str, Dict[str, int]]] = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def build_features(self, bars: pd.DataFrame, patterns: Any) -> pd.DataFrame:
+    def build_features(
+        self,
+        bars: pd.DataFrame,
+        patterns: Any,
+        *,
+        allowed_months: Optional[Iterable[int]] = None,
+    ) -> pd.DataFrame:
         """Return a copy of ``bars`` with pattern gates appended.
 
         Parameters
@@ -159,27 +173,57 @@ class ScreenerPipeline:
             Seasonality and orderflow pattern payloads. This can be the mapping
             returned by :class:`~CTAFlow.screeners.pattern_extractor.PatternExtractor`,
             a list of pattern dictionaries, or a single pattern dictionary.
+        allowed_months:
+            Optional iterable restricting gate activation to the provided months
+            (1–12). When ``None`` gates are active year-round.
         """
 
         df = self._validate_bars(bars)
         df = self._ensure_time_cols(df)
 
+        allowed_set = validate_filtered_months(
+            allowed_months,
+            logger=_PIPELINE_LOG,
+            context="pipeline.allowed_months",
+        )
+        month_mask = self._prepare_month_mask(df, allowed_set)
+
+        previous_mask = self._active_month_mask
+        previous_stats = self._current_month_stats
+        stats_bucket: Dict[str, Dict[str, int]] = {}
+        self._active_month_mask = month_mask
+        self._current_month_stats = stats_bucket
+
         gate_columns: List[str] = []
-        for key, pattern in self._items_from_patterns(patterns):
-            try:
-                created = self._dispatch(df, pattern, key)
-            except Exception as exc:  # pragma: no cover - defensive logging path
-                if self.log is not None and hasattr(self.log, "warning"):
-                    self.log.warning("[screener_pipeline] skipping '%s': %s", key, exc)
-                continue
+        try:
+            for key, pattern in self._items_from_patterns(patterns):
+                try:
+                    created = self._dispatch(df, pattern, key)
+                except Exception as exc:  # pragma: no cover - defensive logging path
+                    if self.log is not None and hasattr(self.log, "warning"):
+                        self.log.warning("[screener_pipeline] skipping '%s': %s", key, exc)
+                    continue
 
-            gate_columns.extend(created)
+                gate_columns.extend(created)
 
-        if gate_columns:
-            any_active = df[gate_columns].any(axis=1)
-            df["any_pattern_active"] = any_active.astype(np.int8)
-        else:
-            df["any_pattern_active"] = 0
+            if gate_columns:
+                any_active = df[gate_columns].any(axis=1)
+                df["any_pattern_active"] = any_active.astype(np.int8)
+            else:
+                df["any_pattern_active"] = 0
+        finally:
+            if allowed_set and stats_bucket and self.log is not None and hasattr(self.log, "debug"):
+                summary = {key: value for key, value in stats_bucket.items()}
+                try:
+                    self.log.debug("[screener_pipeline] month gating summary %s", summary)
+                except TypeError:  # pragma: no cover - defensive for custom loggers
+                    try:
+                        self.log.debug(f"[screener_pipeline] month gating summary {summary}")
+                    except Exception:
+                        pass
+
+            self._active_month_mask = previous_mask
+            self._current_month_stats = previous_stats
 
         return df
 
@@ -355,11 +399,12 @@ class ScreenerPipeline:
 
         clean_mask = mask.fillna(False).astype(bool)
         gate_name = f"{base_name}_gate"
-        df[gate_name] = clean_mask.astype(np.int8)
+        final_mask = self._apply_month_mask(df, clean_mask, gate_name)
+        df[gate_name] = final_mask.astype(np.int8)
 
         for key, value in sidecars.items():
             col_name = f"{base_name}_{self._slugify(key)}"
-            df[col_name] = self._broadcast_sidecar(df, clean_mask, value)
+            df[col_name] = self._broadcast_sidecar(df, final_mask, value)
 
         return [gate_name]
 
@@ -434,6 +479,49 @@ class ScreenerPipeline:
         if not months:
             return pd.Series(True, index=df.index, dtype=bool)
         return df["month"].isin(months)
+
+    def _prepare_month_mask(
+        self, df: pd.DataFrame, allowed_months: Optional[Set[int]]
+    ) -> pd.Series:
+        column = "_month_allowed"
+        if not allowed_months:
+            mask = pd.Series(True, index=df.index, dtype=bool)
+            df[column] = mask
+            return mask
+
+        month_list = sorted(allowed_months)
+        mask = df["month"].isin(month_list)
+        bool_mask = mask.fillna(False).astype(bool)
+        df[column] = bool_mask
+        return bool_mask
+
+    def _apply_month_mask(self, df: pd.DataFrame, mask: pd.Series, gate_name: str) -> pd.Series:
+        month_mask = self._active_month_mask
+        if month_mask is None:
+            raw_count = int(mask.sum())
+            self._record_month_stats(gate_name, raw_count, raw_count)
+            return mask
+
+        aligned = month_mask.reindex(df.index).fillna(False)
+        combined = mask & aligned
+        raw_count = int(mask.sum())
+        after_count = int(combined.sum())
+        self._record_month_stats(gate_name, raw_count, after_count)
+        return combined
+
+    def _record_month_stats(self, gate_name: str, raw: int, after: int) -> None:
+        stats = self._current_month_stats
+        if isinstance(stats, dict):
+            stats[gate_name] = {"raw": raw, "after_month_mask": after}
+        if self.log is not None and hasattr(self.log, "debug") and raw != after:
+            message = f"[screener_pipeline] month mask trimmed gate={gate_name} raw={raw} after={after}"
+            try:
+                self.log.debug(message)
+            except TypeError:  # pragma: no cover - defensive for custom loggers
+                try:
+                    self.log.debug("%s", message)
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Pattern dispatch
@@ -826,6 +914,55 @@ class HorizonMapper:
                 self.log.warning("[HorizonMapper] %s | %s", message, context)
             else:
                 self.log.warning("[HorizonMapper] %s", message)
+
+    @staticmethod
+    def _month_mask(ts: pd.Series, allowed: Optional[Set[int]]) -> pd.Series:
+        if not isinstance(ts, pd.Series):
+            ts = pd.Series(ts)
+
+        if not allowed:
+            return pd.Series(True, index=ts.index, dtype=bool)
+
+        timestamp = pd.to_datetime(ts, errors="coerce")
+        mask = timestamp.dt.month.isin(sorted(allowed))
+        return mask.fillna(False).astype(bool)
+
+    def _enforce_month_mask(
+        self,
+        df: pd.DataFrame,
+        allowed: Optional[Set[int]],
+    ) -> None:
+        mask = self._month_mask(df.get("ts"), allowed)
+        df["_month_allowed"] = mask
+
+        if not allowed:
+            return
+
+        gate_columns = [col for col in df.columns if col.endswith("_gate") and col != "any_pattern_active"]
+        if not gate_columns:
+            return
+
+        for gate in gate_columns:
+            series = df.get(gate)
+            if series is None:
+                continue
+            numeric = pd.to_numeric(series, errors="coerce").fillna(0)
+            active_mask = numeric.astype(int) == 1
+            raw_active = int(active_mask.sum())
+            updated = (active_mask & mask).astype(np.int8)
+            df[gate] = updated
+            after_active = int(updated.sum())
+            if self.log is not None and hasattr(self.log, "debug"):
+                message = f"[HorizonMapper] month mask gate={gate} raw={raw_active} after={after_active}"
+                try:
+                    self.log.debug(message)
+                except TypeError:  # pragma: no cover - defensive for custom loggers
+                    try:
+                        self.log.debug("%s", message)
+                    except Exception:
+                        pass
+
+        df["any_pattern_active"] = df[gate_columns].any(axis=1).astype(np.int8)
 
     # ------------------------------------------------------------------
     # Configuration helpers
@@ -1303,6 +1440,8 @@ class HorizonMapper:
         predictor_minutes: int = 1,
         weekly_x_policy: str = "mean",
         ensure_gates: bool = True,
+        allowed_months: Optional[Iterable[int]] = None,
+        extractor: Optional["PatternExtractor"] = None,
         nan_policy: Optional[str] = None,
         time_match: Optional[str] = None,
         asof_tolerance: Optional[str] = None,
@@ -1329,6 +1468,12 @@ class HorizonMapper:
         ensure_gates:
             When ``True`` the screener pipeline is re-run to materialise missing gates before
             constructing outputs.
+        allowed_months:
+            Optional iterable limiting gate activation to the supplied months.
+            When omitted the method falls back to any attached
+            :class:`~CTAFlow.screeners.pattern_extractor.PatternExtractor`.
+        extractor:
+            Optional :class:`PatternExtractor` providing ``filtered_months`` metadata.
         nan_policy:
             Overrides the instance-level NaN handling policy. See ``__init__`` for options.
         time_match:
@@ -1357,6 +1502,18 @@ class HorizonMapper:
         effective_tolerance = asof_tolerance or self.asof_tolerance
 
         base_df = self._prepare_bars_frame(bars_with_features)
+        explicit_allowed = validate_filtered_months(
+            allowed_months,
+            logger=_PIPELINE_LOG,
+            context="horizon.allowed_months",
+        )
+        extractor_months: Optional[Set[int]] = None
+        if extractor is not None and hasattr(extractor, "get_filtered_months"):
+            try:
+                extractor_months = extractor.get_filtered_months()
+            except Exception:  # pragma: no cover - defensive for custom extractors
+                extractor_months = None
+        effective_allowed = explicit_allowed or extractor_months
 
         source_bars = base_df
         if ensure_gates:
@@ -1365,8 +1522,13 @@ class HorizonMapper:
                 time_match=self._translate_time_match(effective_time_match),
                 log=self.log,
             )
-            source_bars = builder.build_features(base_df, patterns)
+            source_bars = builder.build_features(
+                base_df,
+                patterns,
+                allowed_months=effective_allowed,
+            )
 
+        self._enforce_month_mask(source_bars, effective_allowed)
         df = self._prepare_bars_frame(source_bars)
         rows: List[pd.DataFrame] = []
         pre_row_count = len(df)
