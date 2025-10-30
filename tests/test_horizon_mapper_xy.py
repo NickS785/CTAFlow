@@ -189,3 +189,61 @@ def test_weekly_prev_week_policy_uses_realised_return():
     # Ensure the surviving row corresponds to the second Tuesday (session 6)
     surviving_session = df[df["ts"] == result.loc[0, "ts_decision"]]["session_id"].iloc[0]
     assert surviving_session == 6
+
+
+def _make_month_mask_bars() -> pd.DataFrame:
+    tz = "America/Chicago"
+    sessions = [
+        pd.Timestamp("2024-01-31 07:00", tz=tz),
+        pd.Timestamp("2024-02-01 07:00", tz=tz),
+        pd.Timestamp("2024-02-02 07:00", tz=tz),
+        pd.Timestamp("2024-02-05 07:00", tz=tz),
+    ]
+
+    rows: list[dict[str, object]] = []
+    for idx, decision_ts in enumerate(sessions):
+        open_price = 100.0 + idx
+        close_price = open_price + 1.0
+        rows.append(
+            {
+                "ts": decision_ts - pd.Timedelta(minutes=5),
+                "open": open_price,
+                "close": open_price + 0.5,
+                "session_id": idx,
+                "time_nextday_070000_gate": 0,
+            }
+        )
+        rows.append(
+            {
+                "ts": decision_ts,
+                "open": open_price,
+                "close": close_price,
+                "session_id": idx,
+                "time_nextday_070000_gate": 1,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def test_build_xy_with_allowed_months_filters_decisions():
+    df = _make_month_mask_bars()
+    mapper = HorizonMapper(tz="America/Chicago")
+    patterns = [
+        {
+            "pattern_type": "time_predictive_nextday",
+            "pattern_payload": {"time": "07:00"},
+            "key": "time_nextday_070000",
+        }
+    ]
+
+    result = mapper.build_xy(
+        df,
+        patterns,
+        predictor_minutes=5,
+        ensure_gates=False,
+        allowed_months={2},
+    )
+
+    assert not result.empty
+    assert set(result["ts_decision"].dt.month) == {2}

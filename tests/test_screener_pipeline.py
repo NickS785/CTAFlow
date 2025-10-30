@@ -248,3 +248,57 @@ def test_horizon_mapper_adds_predictor_columns():
     assert np.isclose(enriched.loc[active_mask, signal_col].iloc[0], expected)
     assert enriched.loc[~active_mask, signal_col].isna().all()
 
+
+def test_month_mask_disables_winter_gate_in_summer():
+    tz = "America/Chicago"
+    timestamps = pd.date_range("2023-06-01", periods=7, freq="D", tz=tz)
+    bars = pd.DataFrame({"ts": timestamps})
+
+    pipeline = ScreenerPipeline(tz=tz)
+    patterns = {
+        "orderflow|weekly": {
+            "pattern_type": "orderflow_weekly",
+            "pattern_payload": {
+                "weekday": "friday",
+                "metric": "net_pressure",
+                "mean": 0.1,
+                "t_stat": 2.5,
+                "n": 15,
+            },
+            "metadata": {"orderflow_bias": "buy"},
+        }
+    }
+
+    features = pipeline.build_features(bars, patterns, allowed_months={1, 2})
+    gate_cols = [col for col in features.columns if col.endswith("_gate") and col != "any_pattern_active"]
+    assert len(gate_cols) == 1
+    assert features[gate_cols[0]].sum() == 0
+
+
+def test_pipeline_allows_gates_when_months_unspecified():
+    tz = "America/Chicago"
+    timestamps = pd.date_range("2023-06-01", periods=7, freq="D", tz=tz)
+    bars = pd.DataFrame({"ts": timestamps})
+
+    pipeline = ScreenerPipeline(tz=tz)
+    patterns = {
+        "orderflow|weekly": {
+            "pattern_type": "orderflow_weekly",
+            "pattern_payload": {
+                "weekday": "friday",
+                "metric": "net_pressure",
+                "mean": 0.1,
+                "t_stat": 2.5,
+                "n": 15,
+            },
+            "metadata": {"orderflow_bias": "buy"},
+        }
+    }
+
+    baseline = pipeline.build_features(bars, patterns)
+    unrestricted = pipeline.build_features(bars, patterns, allowed_months=None)
+    gate_cols = [col for col in baseline.columns if col.endswith("_gate") and col != "any_pattern_active"]
+    assert len(gate_cols) == 1
+
+    pd.testing.assert_series_equal(baseline[gate_cols[0]], unrestricted[gate_cols[0]])
+

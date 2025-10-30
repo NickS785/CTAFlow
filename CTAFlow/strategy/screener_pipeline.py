@@ -13,11 +13,29 @@ loops so that millions of rows can be processed quickly.
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import numbers
 import re
+import sys
 from collections.abc import Iterable as IterableABC, Sequence as SequenceABC
 from datetime import time as time_cls
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, NamedTuple
+from pathlib import Path
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    NamedTuple,
+)
 
 import numpy as np
 import pandas as pd
@@ -26,6 +44,64 @@ if TYPE_CHECKING:  # pragma: no cover - import for type checking only
     from CTAFlow.screeners.pattern_extractor import PatternExtractor
 
 __all__ = ["ScreenerPipeline", "extract_ticker_patterns", "HorizonMapper", "HorizonSpec"]
+
+
+_ROOT = Path(__file__).resolve().parents[1].parent
+sys_path_root = str(_ROOT)
+if sys_path_root not in sys.path:
+    sys.path.insert(0, sys_path_root)
+
+package_path = _ROOT / "CTAFlow"
+if "CTAFlow" not in sys.modules:
+    package_spec = importlib.util.spec_from_file_location(
+        "CTAFlow",
+        package_path / "__init__.py",
+        submodule_search_locations=[str(package_path)],
+    )
+    assert package_spec is not None and package_spec.loader is not None
+    package_module = importlib.util.module_from_spec(package_spec)
+    package_module.__path__ = [str(package_path)]  # type: ignore[attr-defined]
+    sys.modules["CTAFlow"] = package_module
+    package_spec.loader.exec_module(package_module)
+
+screeners_path = package_path / "screeners"
+if "CTAFlow.screeners" not in sys.modules:
+    screeners_spec = importlib.util.spec_from_file_location(
+        "CTAFlow.screeners",
+        screeners_path / "__init__.py",
+        submodule_search_locations=[str(screeners_path)],
+    )
+    assert screeners_spec is not None and screeners_spec.loader is not None
+    screeners_module = importlib.util.module_from_spec(screeners_spec)
+    screeners_module.__path__ = [str(screeners_path)]  # type: ignore[attr-defined]
+    sys.modules["CTAFlow.screeners"] = screeners_module
+    screeners_spec.loader.exec_module(screeners_module)
+
+utils_path = package_path / "utils"
+if "CTAFlow.utils" not in sys.modules:
+    utils_spec = importlib.util.spec_from_file_location(
+        "CTAFlow.utils",
+        utils_path / "__init__.py",
+        submodule_search_locations=[str(utils_path)],
+    )
+    assert utils_spec is not None and utils_spec.loader is not None
+    utils_module = importlib.util.module_from_spec(utils_spec)
+    utils_module.__path__ = [str(utils_path)]  # type: ignore[attr-defined]
+    sys.modules["CTAFlow.utils"] = utils_module
+    utils_spec.loader.exec_module(utils_module)
+
+pattern_path = screeners_path / "pattern_extractor.py"
+pattern_spec = importlib.util.spec_from_file_location(
+    "CTAFlow.screeners.pattern_extractor",
+    pattern_path,
+)
+assert pattern_spec is not None and pattern_spec.loader is not None
+pattern_module = importlib.util.module_from_spec(pattern_spec)
+pattern_module.__package__ = "CTAFlow.screeners"
+sys.modules["CTAFlow.screeners.pattern_extractor"] = pattern_module
+pattern_spec.loader.exec_module(pattern_module)
+
+validate_filtered_months = pattern_module.validate_filtered_months  # type: ignore[attr-defined]
 
 
 def extract_ticker_patterns(
@@ -76,7 +152,17 @@ def extract_ticker_patterns(
     if pipeline is None:
         pipeline = ScreenerPipeline()
 
-    baseline = pipeline.build_features(bars, [])
+    allowed_months: Optional[Set[int]] = None
+    for extractor in extractors:
+        months = extractor.get_filtered_months()
+        if months is None:
+            continue
+        if allowed_months is None:
+            allowed_months = set(months)
+        else:
+            allowed_months = allowed_months & set(months)
+
+    baseline = pipeline.build_features(bars, [], allowed_months=allowed_months)
     baseline_columns = set(baseline.columns)
 
     combined_patterns: Dict[str, Mapping[str, Any]] = {}
@@ -92,7 +178,11 @@ def extract_ticker_patterns(
     if not combined_patterns:
         return pd.DataFrame(index=bars.index.copy())
 
-    enriched = pipeline.build_features(bars, combined_patterns)
+    enriched = pipeline.build_features(
+        bars,
+        combined_patterns,
+        allowed_months=allowed_months,
+    )
     pattern_columns = [col for col in enriched.columns if col not in baseline_columns]
 
     if not pattern_columns:
@@ -146,7 +236,14 @@ class ScreenerPipeline:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def build_features(self, bars: pd.DataFrame, patterns: Any) -> pd.DataFrame:
+    def build_features(
+        self,
+        bars: pd.DataFrame,
+        patterns: Any,
+        *,
+        allowed_months: Optional[Iterable[int]] = None,
+        extractor: Optional["PatternExtractor"] = None,
+    ) -> pd.DataFrame:
         """Return a copy of ``bars`` with pattern gates appended.
 
         Parameters
@@ -159,15 +256,33 @@ class ScreenerPipeline:
             Seasonality and orderflow pattern payloads. This can be the mapping
             returned by :class:`~CTAFlow.screeners.pattern_extractor.PatternExtractor`,
             a list of pattern dictionaries, or a single pattern dictionary.
+        allowed_months:
+            Optional iterable of allowed calendar months. When provided all
+            generated gates are constrained to rows whose timestamp month falls
+            within this set. ``None`` disables the screen-level month filter.
+        extractor:
+            Optional :class:`PatternExtractor` instance used to backfill
+            ``allowed_months`` from ``metadata['filtered_months']`` when the
+            explicit argument is omitted.
         """
 
         df = self._validate_bars(bars)
         df = self._ensure_time_cols(df)
 
+        resolved_allowed = validate_filtered_months(allowed_months)
+        if resolved_allowed is None and extractor is not None:
+            resolved_allowed = extractor.get_filtered_months()
+        if resolved_allowed is not None:
+            resolved_allowed = set(resolved_allowed)
+
+        resolve_month_mask = self._build_month_mask_resolver(
+            df["ts"], resolved_allowed
+        )
+
         gate_columns: List[str] = []
         for key, pattern in self._items_from_patterns(patterns):
             try:
-                created = self._dispatch(df, pattern, key)
+                created = self._dispatch(df, pattern, key, resolve_month_mask)
             except Exception as exc:  # pragma: no cover - defensive logging path
                 if self.log is not None and hasattr(self.log, "warning"):
                     self.log.warning("[screener_pipeline] skipping '%s': %s", key, exc)
@@ -343,23 +458,89 @@ class ScreenerPipeline:
             series.loc[mask] = value
         return series
 
+    def _log_gate_counts(self, gate: str, raw: int, masked: int) -> None:
+        if self.log is None:
+            return
+
+        context = {"gate": gate, "raw": int(raw), "after_month_mask": int(masked)}
+        for level in ("debug", "info", "warning"):
+            logger_fn = getattr(self.log, level, None)
+            if logger_fn is None:
+                continue
+            try:
+                logger_fn("[screener_pipeline] gate mask counts | %s", context)
+            except TypeError:
+                logger_fn(f"[screener_pipeline] gate mask counts | {context}")
+            break
+
+    def _intersect_months(
+        self,
+        screen_months: Optional[Set[int]],
+        pattern_months: Optional[Set[int]],
+    ) -> Optional[Set[int]]:
+        if screen_months is None:
+            return set(pattern_months) if pattern_months is not None else None
+        if pattern_months is None:
+            return set(screen_months)
+        return set(screen_months) & set(pattern_months)
+
+    def _build_month_mask_resolver(
+        self, ts: pd.Series, screen_months: Optional[Set[int]]
+    ) -> Callable[[Optional[Iterable[int]]], pd.Series]:
+        cache: Dict[Optional[frozenset[int]], pd.Series] = {}
+
+        def resolve(pattern_months: Optional[Iterable[int]]) -> pd.Series:
+            months_set = (
+                set(validate_filtered_months(pattern_months) or [])
+                if pattern_months is not None
+                else None
+            )
+            effective = self._intersect_months(screen_months, months_set)
+            key: Optional[frozenset[int]]
+            if effective is None:
+                key = None
+            else:
+                key = frozenset(effective)
+            if key not in cache:
+                cache[key] = self._month_mask(ts, effective)
+            return cache[key]
+
+        return resolve
+
+    @staticmethod
+    def _month_mask(ts: pd.Series, months: Optional[Set[int]]) -> pd.Series:
+        if months is None:
+            return pd.Series(True, index=ts.index, dtype=bool)
+        if len(months) == 0:
+            return pd.Series(False, index=ts.index, dtype=bool)
+        mask = ts.dt.month.isin(sorted(months))
+        return mask.fillna(False)
+
     def _add_feature(
         self,
         df: pd.DataFrame,
         base_name: str,
         mask: pd.Series,
         sidecars: MutableMapping[str, Any],
+        *,
+        resolve_month_mask: Callable[[Optional[Iterable[int]]], pd.Series],
+        pattern_months: Optional[Iterable[int]] = None,
     ) -> List[str]:
         if mask.empty:
             return []
 
-        clean_mask = mask.fillna(False).astype(bool)
+        raw_mask = mask.fillna(False).astype(bool)
+        month_mask = resolve_month_mask(pattern_months)
+        combined = (raw_mask & month_mask.fillna(False)).astype(bool)
+
         gate_name = f"{base_name}_gate"
-        df[gate_name] = clean_mask.astype(np.int8)
+        df[gate_name] = combined.astype(np.int8)
 
         for key, value in sidecars.items():
             col_name = f"{base_name}_{self._slugify(key)}"
-            df[col_name] = self._broadcast_sidecar(df, clean_mask, value)
+            df[col_name] = self._broadcast_sidecar(df, combined, value)
+
+        self._log_gate_counts(gate_name, int(raw_mask.sum()), int(combined.sum()))
 
         return [gate_name]
 
@@ -430,23 +611,36 @@ class ScreenerPipeline:
             return None
         return months
 
-    def _months_mask(self, df: pd.DataFrame, months: Optional[List[int]]) -> pd.Series:
-        if not months:
-            return pd.Series(True, index=df.index, dtype=bool)
-        return df["month"].isin(months)
-
     # ------------------------------------------------------------------
     # Pattern dispatch
     # ------------------------------------------------------------------
-    def _dispatch(self, df: pd.DataFrame, pattern: Mapping[str, Any], key: Optional[str]) -> List[str]:
+    def _dispatch(
+        self,
+        df: pd.DataFrame,
+        pattern: Mapping[str, Any],
+        key: Optional[str],
+        resolve_month_mask: Callable[[Optional[Iterable[int]]], pd.Series],
+    ) -> List[str]:
         pattern_type = str(pattern.get("pattern_type") or pattern.get("type") or "").strip()
         if not pattern_type:
             return []
 
         if pattern_type in self._SEASONAL_TYPES:
-            return self._dispatch_seasonal(df, pattern, key, pattern_type)
+            return self._dispatch_seasonal(
+                df,
+                pattern,
+                key,
+                pattern_type,
+                resolve_month_mask,
+            )
         if pattern_type in self._ORDERFLOW_TYPES:
-            return self._dispatch_orderflow(df, pattern, key, pattern_type)
+            return self._dispatch_orderflow(
+                df,
+                pattern,
+                key,
+                pattern_type,
+                resolve_month_mask,
+            )
 
         return []
 
@@ -456,16 +650,35 @@ class ScreenerPipeline:
         pattern: Mapping[str, Any],
         key: Optional[str],
         pattern_type: str,
+        resolve_month_mask: Callable[[Optional[Iterable[int]]], pd.Series],
     ) -> List[str]:
         months = self._resolve_months(key, pattern)
         payload = pattern.get("pattern_payload", {})
 
         if pattern_type in {"weekday_mean", "weekday_returns"}:
-            return self._extract_weekday_mean(df, payload, key, months)
+            return self._extract_weekday_mean(
+                df,
+                payload,
+                key,
+                months,
+                resolve_month_mask,
+            )
         if pattern_type == "time_predictive_nextday":
-            return self._extract_time_nextday(df, payload, key, months)
+            return self._extract_time_nextday(
+                df,
+                payload,
+                key,
+                months,
+                resolve_month_mask,
+            )
         if pattern_type == "time_predictive_nextweek":
-            return self._extract_time_nextweek(df, payload, key, months)
+            return self._extract_time_nextweek(
+                df,
+                payload,
+                key,
+                months,
+                resolve_month_mask,
+            )
 
         return []
 
@@ -475,16 +688,35 @@ class ScreenerPipeline:
         pattern: Mapping[str, Any],
         key: Optional[str],
         pattern_type: str,
+        resolve_month_mask: Callable[[Optional[Iterable[int]]], pd.Series],
     ) -> List[str]:
         payload = pattern.get("pattern_payload", {})
         metadata = pattern.get("metadata", {})
 
         if pattern_type == "orderflow_week_of_month":
-            return self._extract_oflow_wom(df, payload, metadata, key)
+            return self._extract_oflow_wom(
+                df,
+                payload,
+                metadata,
+                key,
+                resolve_month_mask,
+            )
         if pattern_type == "orderflow_weekly":
-            return self._extract_oflow_weekly(df, payload, metadata, key)
+            return self._extract_oflow_weekly(
+                df,
+                payload,
+                metadata,
+                key,
+                resolve_month_mask,
+            )
         if pattern_type == "orderflow_peak_pressure":
-            return self._extract_oflow_peak(df, payload, metadata, key)
+            return self._extract_oflow_peak(
+                df,
+                payload,
+                metadata,
+                key,
+                resolve_month_mask,
+            )
 
         return []
 
@@ -497,6 +729,7 @@ class ScreenerPipeline:
         payload: Mapping[str, Any],
         key: Optional[str],
         months: Optional[List[int]],
+        resolve_month_mask: Callable[[Optional[Iterable[int]]], pd.Series],
     ) -> List[str]:
         weekday = payload.get("day") or payload.get("weekday")
         weekday_norm = self._normalize_weekday(weekday)
@@ -504,7 +737,6 @@ class ScreenerPipeline:
             return []
 
         mask = df["weekday_lower"] == weekday_norm
-        mask &= self._months_mask(df, months)
 
         base = self._feature_base_name(key, f"weekday_mean_{weekday_norm}")
         sidecars: Dict[str, Any] = {
@@ -513,7 +745,14 @@ class ScreenerPipeline:
             "p": payload.get("p_value"),
             "strength": payload.get("strength"),
         }
-        return self._add_feature(df, base, mask, sidecars)
+        return self._add_feature(
+            df,
+            base,
+            mask,
+            sidecars,
+            resolve_month_mask=resolve_month_mask,
+            pattern_months=months,
+        )
 
     def _extract_time_nextday(
         self,
@@ -521,6 +760,7 @@ class ScreenerPipeline:
         payload: Mapping[str, Any],
         key: Optional[str],
         months: Optional[List[int]],
+        resolve_month_mask: Callable[[Optional[Iterable[int]]], pd.Series],
     ) -> List[str]:
         hms, hmsf = self._time_to_strings(payload.get("time"))
         if hms is None:
@@ -531,7 +771,6 @@ class ScreenerPipeline:
         target = hmsf if use_us else hms
 
         mask = df[column] == target
-        mask &= self._months_mask(df, months)
 
         base = self._feature_base_name(key, f"time_nextday_{target}")
         sidecars = {
@@ -539,7 +778,14 @@ class ScreenerPipeline:
             "correlation": payload.get("correlation"),
             "p": payload.get("p_value"),
         }
-        return self._add_feature(df, base, mask, sidecars)
+        return self._add_feature(
+            df,
+            base,
+            mask,
+            sidecars,
+            resolve_month_mask=resolve_month_mask,
+            pattern_months=months,
+        )
 
     def _extract_time_nextweek(
         self,
@@ -547,6 +793,7 @@ class ScreenerPipeline:
         payload: Mapping[str, Any],
         key: Optional[str],
         months: Optional[List[int]],
+        resolve_month_mask: Callable[[Optional[Iterable[int]]], pd.Series],
     ) -> List[str]:
         hms, hmsf = self._time_to_strings(payload.get("time"))
         if hms is None:
@@ -557,7 +804,6 @@ class ScreenerPipeline:
         target = hmsf if use_us else hms
 
         mask = df[column] == target
-        mask &= self._months_mask(df, months)
 
         strongest_days = payload.get("strongest_days") or []
         if strongest_days:
@@ -573,7 +819,14 @@ class ScreenerPipeline:
             "p": payload.get("p_value"),
             "strongest_days": list(strongest_days) if strongest_days else None,
         }
-        return self._add_feature(df, base, mask, sidecars)
+        return self._add_feature(
+            df,
+            base,
+            mask,
+            sidecars,
+            resolve_month_mask=resolve_month_mask,
+            pattern_months=months,
+        )
 
     # ------------------------------------------------------------------
     # Orderflow extractors
@@ -584,6 +837,7 @@ class ScreenerPipeline:
         payload: Mapping[str, Any],
         metadata: Mapping[str, Any],
         key: Optional[str],
+        resolve_month_mask: Callable[[Optional[Iterable[int]]], pd.Series],
     ) -> List[str]:
         weekday_norm = self._normalize_weekday(payload.get("weekday"))
         if weekday_norm is None:
@@ -608,7 +862,13 @@ class ScreenerPipeline:
             "n": payload.get("n"),
             "bias": bias,
         }
-        return self._add_feature(df, base, mask, sidecars)
+        return self._add_feature(
+            df,
+            base,
+            mask,
+            sidecars,
+            resolve_month_mask=resolve_month_mask,
+        )
 
     def _extract_oflow_weekly(
         self,
@@ -616,6 +876,7 @@ class ScreenerPipeline:
         payload: Mapping[str, Any],
         metadata: Mapping[str, Any],
         key: Optional[str],
+        resolve_month_mask: Callable[[Optional[Iterable[int]]], pd.Series],
     ) -> List[str]:
         weekday_norm = self._normalize_weekday(payload.get("weekday"))
         if weekday_norm is None:
@@ -634,7 +895,13 @@ class ScreenerPipeline:
             "n": payload.get("n"),
             "bias": bias,
         }
-        return self._add_feature(df, base, mask, sidecars)
+        return self._add_feature(
+            df,
+            base,
+            mask,
+            sidecars,
+            resolve_month_mask=resolve_month_mask,
+        )
 
     def _extract_oflow_peak(
         self,
@@ -642,6 +909,7 @@ class ScreenerPipeline:
         payload: Mapping[str, Any],
         metadata: Mapping[str, Any],
         key: Optional[str],
+        resolve_month_mask: Callable[[Optional[Iterable[int]]], pd.Series],
     ) -> List[str]:
         weekday_norm = self._normalize_weekday(payload.get("weekday"))
         if weekday_norm is None:
@@ -670,7 +938,13 @@ class ScreenerPipeline:
             "intraday_mean": payload.get("intraday_mean"),
             "intraday_n": payload.get("intraday_n"),
         }
-        return self._add_feature(df, base, mask, sidecars)
+        return self._add_feature(
+            df,
+            base,
+            mask,
+            sidecars,
+            resolve_month_mask=resolve_month_mask,
+        )
 
     # ------------------------------------------------------------------
     # Time utilities
@@ -827,6 +1101,22 @@ class HorizonMapper:
             else:
                 self.log.warning("[HorizonMapper] %s", message)
 
+    def _log_debug(self, message: str, **context: Any) -> None:
+        if self.log is None:
+            return
+        for level in ("debug", "info", "warning"):
+            logger_fn = getattr(self.log, level, None)
+            if logger_fn is None:
+                continue
+            if context:
+                try:
+                    logger_fn("[HorizonMapper] %s | %s", message, context)
+                except TypeError:
+                    logger_fn(f"[HorizonMapper] {message} | {context}")
+            else:
+                logger_fn("[HorizonMapper] %s", message)
+            break
+
     # ------------------------------------------------------------------
     # Configuration helpers
     # ------------------------------------------------------------------
@@ -893,6 +1183,15 @@ class HorizonMapper:
             if not out["ts"].is_monotonic_increasing:
                 raise HorizonInputError("ts must be strictly increasing after deduplication")
         return out
+
+    @staticmethod
+    def _month_mask(ts: pd.Series, months: Optional[Set[int]]) -> pd.Series:
+        if months is None:
+            return pd.Series(True, index=ts.index, dtype=bool)
+        if len(months) == 0:
+            return pd.Series(False, index=ts.index, dtype=bool)
+        mask = ts.dt.month.isin(sorted(months))
+        return mask.fillna(False)
 
     # ------------------------------------------------------------------
     # Return helpers
@@ -1169,6 +1468,7 @@ class HorizonMapper:
         weekly_x_policy: str,
         time_match: str,
         tolerance: Optional[str],
+        allowed_months: Optional[Set[int]] = None,
     ) -> Iterable[Tuple[str, str, pd.Series, pd.Series, int, List[str]]]:
         if patterns is None:
             return
@@ -1186,6 +1486,12 @@ class HorizonMapper:
         horizon_cache: Dict[Tuple[str, Optional[int]], pd.Series] = {}
         time_bearing_types = {"time_predictive_nextday", "time_predictive_nextweek", "orderflow_peak_pressure"}
         weekly_types = {"weekday_mean", "orderflow_weekly", "orderflow_week_of_month"}
+
+        month_mask = (
+            self._month_mask(df["ts"], allowed_months)
+            if allowed_months is not None
+            else None
+        )
 
         for key, pattern in ScreenerPipeline._items_from_patterns(patterns):
             pattern_type = pattern.get("pattern_type")
@@ -1230,6 +1536,8 @@ class HorizonMapper:
                 returns_x_series = x_bw
             elif pattern_type in weekly_types:
                 gate_mask = df[gate_col] == 1
+                if month_mask is not None:
+                    gate_mask &= month_mask
                 if weekly_x_policy == "prev_week":
                     if prev_week_series is None:
                         prev_week_series = self._prev_week_return_same_session(df)
@@ -1264,6 +1572,7 @@ class HorizonMapper:
         default_intraday_minutes: int = 10,
         predictor_minutes: int = 1,
         weekly_x_policy: str = "mean",
+        allowed_months: Optional[Iterable[int]] = None,
     ) -> pd.DataFrame:
         """Return ``bars_with_features`` with per-pattern predictor columns appended."""
 
@@ -1273,6 +1582,15 @@ class HorizonMapper:
         df = self._prepare_bars_frame(bars_with_features)
         result = bars_with_features.copy()
 
+        resolved_allowed = validate_filtered_months(allowed_months)
+        if resolved_allowed is not None:
+            resolved_allowed = set(resolved_allowed)
+        month_mask_series = (
+            self._month_mask(df["ts"], resolved_allowed)
+            if resolved_allowed is not None
+            else None
+        )
+
         for gate_col, _, returns_x_series, _, _, _ in self._iter_pattern_returns(
             df,
             patterns,
@@ -1281,10 +1599,13 @@ class HorizonMapper:
             weekly_x_policy=weekly_x_policy,
             time_match=self.time_match,
             tolerance=self.asof_tolerance,
+            allowed_months=resolved_allowed,
         ):
             signal_col = self._signal_column_name(gate_col)
             signal = pd.Series(np.nan, index=df.index, dtype=float)
             gate_mask = df[gate_col] == 1
+            if month_mask_series is not None:
+                gate_mask &= month_mask_series
             if gate_mask.any():
                 aligned = returns_x_series.reindex(df.index)
                 valid_mask = gate_mask & aligned.notna()
@@ -1306,6 +1627,8 @@ class HorizonMapper:
         nan_policy: Optional[str] = None,
         time_match: Optional[str] = None,
         asof_tolerance: Optional[str] = None,
+        allowed_months: Optional[Iterable[int]] = None,
+        extractor: Optional["PatternExtractor"] = None,
         debug: bool = False,
     ) -> pd.DataFrame:
         """Construct tidy decision rows for screener ``patterns``.
@@ -1335,6 +1658,13 @@ class HorizonMapper:
             Override time gate resolution policy (``"auto"``, ``"second"``, or ``"microsecond"``).
         asof_tolerance:
             Override merge-asof tolerance expressed as a pandas offset string.
+        allowed_months:
+            Optional iterable constraining gates to the supplied calendar months.
+            When omitted the method falls back to ``extractor.get_filtered_months()``
+            when an extractor instance is provided.
+        extractor:
+            Optional :class:`PatternExtractor` instance used to backfill
+            ``allowed_months`` from its metadata when ``allowed_months`` is ``None``.
         debug:
             Emit detailed diagnostics via the configured logger when ``True``.
         """
@@ -1354,6 +1684,12 @@ class HorizonMapper:
                 "time_match must be one of {'auto', 'second', 'microsecond'}"
             )
 
+        resolved_allowed = validate_filtered_months(allowed_months)
+        if resolved_allowed is None and extractor is not None:
+            resolved_allowed = extractor.get_filtered_months()
+        if resolved_allowed is not None:
+            resolved_allowed = set(resolved_allowed)
+
         effective_tolerance = asof_tolerance or self.asof_tolerance
 
         base_df = self._prepare_bars_frame(bars_with_features)
@@ -1365,11 +1701,21 @@ class HorizonMapper:
                 time_match=self._translate_time_match(effective_time_match),
                 log=self.log,
             )
-            source_bars = builder.build_features(base_df, patterns)
+            source_bars = builder.build_features(
+                base_df,
+                patterns,
+                allowed_months=resolved_allowed,
+            )
 
         df = self._prepare_bars_frame(source_bars)
         rows: List[pd.DataFrame] = []
         pre_row_count = len(df)
+
+        month_mask_series = (
+            self._month_mask(df["ts"], resolved_allowed)
+            if resolved_allowed is not None
+            else None
+        )
 
         for (
             gate_col,
@@ -1386,6 +1732,7 @@ class HorizonMapper:
             weekly_x_policy=weekly_x_policy,
             time_match=effective_time_match,
             tolerance=effective_tolerance,
+            allowed_months=resolved_allowed,
         ):
             gate_series = df.get(gate_col)
             if gate_series is None:
@@ -1396,13 +1743,26 @@ class HorizonMapper:
                 )
                 continue
 
+            gate_filtered = gate_series.copy()
+            raw_active = int((gate_filtered == 1).sum())
+            if month_mask_series is not None:
+                gate_filtered = gate_filtered.where(month_mask_series, other=0)
+            gate_filtered = gate_filtered.fillna(0)
+            masked_active = int((gate_filtered == 1).sum())
+            self._log_debug(
+                "Gate activation counts",
+                gate=gate_col,
+                raw=raw_active,
+                after_month_mask=masked_active,
+            )
+
             returns_x_clean = self._clean_return(returns_x_series, policy)
             returns_y_clean = self._clean_return(returns_y, policy)
             finite_x = pd.Series(np.isfinite(returns_x_clean), index=returns_x_clean.index)
             finite_y = pd.Series(np.isfinite(returns_y_clean), index=returns_y_clean.index)
 
             active_mask = (
-                (gate_series == 1)
+                (gate_filtered == 1)
                 & returns_y_clean.notna()
                 & returns_x_clean.notna()
                 & finite_x
