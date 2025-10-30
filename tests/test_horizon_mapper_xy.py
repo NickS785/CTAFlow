@@ -80,7 +80,7 @@ def test_time_predictive_nextday_returns_x_and_y():
         }
     ]
 
-    result = mapper.build_xy(df, patterns, predictor_minutes=5)
+    result = mapper.build_xy(df, patterns, predictor_minutes=5, ensure_gates=False)
 
     # All sessions except the last have a next-day close
     assert len(result) == len(df["session_id"].unique()) - 1
@@ -108,7 +108,7 @@ def test_time_predictive_nextweek_returns():
         }
     ]
 
-    result = mapper.build_xy(df, patterns, predictor_minutes=5)
+    result = mapper.build_xy(df, patterns, predictor_minutes=5, ensure_gates=False)
 
     assert len(result) == 3
 
@@ -133,7 +133,7 @@ def test_weekly_mean_policy_uses_payload_value():
         }
     ]
 
-    result = mapper.build_xy(df, patterns)
+    result = mapper.build_xy(df, patterns, ensure_gates=False)
 
     assert not result.empty
     assert result["returns_x"].tolist() == pytest.approx([0.0123] * len(result))
@@ -155,7 +155,7 @@ def test_weekly_mean_policy_falls_back_to_historical_mean():
         }
     ]
 
-    result = mapper.build_xy(df, patterns)
+    result = mapper.build_xy(df, patterns, ensure_gates=False)
 
     session_one = df[df["session_id"] == 1]
     session_open = float(session_one["open"].iloc[0])
@@ -178,7 +178,7 @@ def test_weekly_prev_week_policy_uses_realised_return():
         }
     ]
 
-    result = mapper.build_xy(df, patterns, weekly_x_policy="prev_week")
+    result = mapper.build_xy(df, patterns, weekly_x_policy="prev_week", ensure_gates=False)
 
     # First Tuesday lacks a prior-week observation and should be excluded
     assert len(result) == 1

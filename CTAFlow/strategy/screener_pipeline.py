@@ -693,12 +693,17 @@ class ScreenerPipeline:
         if not text:
             return None, None
 
-        if "." in text:
-            head, frac = text.split(".", 1)
-            frac = (frac + "000000")[:6]
-            return head, f"{head}.{frac}"
+        try:
+            parsed = pd.to_datetime(text).time()
+        except Exception:
+            if "." in text:
+                head, frac = text.split(".", 1)
+                frac = (frac + "000000")[:6]
+                return head, f"{head}.{frac}"
+            return text, f"{text}.000000"
 
-        return text, f"{text}.000000"
+        hms = parsed.strftime("%H:%M:%S")
+        return hms, parsed.strftime("%H:%M:%S.%f")
 
     def _use_microseconds(self, df: pd.DataFrame, time_value: Any) -> bool:
         if self.time_match == "hmsf":
@@ -738,11 +743,197 @@ class HorizonSpec(NamedTuple):
     delta_minutes: Optional[int] = None
 
 
-class HorizonMapper:
-    """Derive (returns_x, returns_y) pairs for screener pattern gates."""
+class HorizonError(Exception):
+    """Base exception for horizon mapping failures."""
 
-    def __init__(self, tz: str = "America/Chicago") -> None:
+
+class HorizonInputError(HorizonError):
+    """Raised when bar inputs fail validation or sanitation."""
+
+
+class HorizonGateError(HorizonError):
+    """Raised when gate realisation fails for a requested pattern."""
+
+
+class HorizonMapper:
+    """Derive (returns_x, returns_y) pairs for screener pattern gates.
+
+    Parameters
+    ----------
+    tz:
+        Target timezone used to normalise timestamp columns. Defaults to ``"UTC"``.
+    allow_naive_ts:
+        When ``False`` (default) timezone-naive timestamps result in a
+        :class:`HorizonInputError`. Set to ``True`` to localise naive timestamps
+        into ``tz``.
+    time_match:
+        Default policy for resolving time-bearing gate names. Accepted values are
+        ``"auto"``, ``"second"``, and ``"microsecond"``.
+    nan_policy:
+        Strategy used by :meth:`build_xy` when cleaning realised returns. The
+        default ``"drop"`` removes rows containing non-finite values. ``"zero"``
+        replaces them with zero while ``"ffill"`` forward-fills from the most
+        recent finite observation.
+    return_clip:
+        Tuple ``(lower, upper)`` used to clip extreme realised returns. Defaults
+        to ``(-0.5, 0.5)``.
+    asof_tolerance:
+        Default tolerance for merge-asof alignment expressed as a pandas
+        offset string (for example ``"1s"``). ``None`` disables tolerance
+        checking.
+    log:
+        Optional logger exposing ``warning`` and ``info`` methods. When
+        provided, structured diagnostics are emitted for missing or empty gates.
+    """
+
+    def __init__(
+        self,
+        *,
+        tz: str = "UTC",
+        allow_naive_ts: bool = False,
+        time_match: str = "auto",
+        nan_policy: str = "drop",
+        return_clip: Tuple[float, float] = (-0.5, 0.5),
+        asof_tolerance: Optional[str] = None,
+        log: Any = None,
+    ) -> None:
+        if time_match not in {"auto", "second", "microsecond"}:
+            raise HorizonInputError(
+                "time_match must be one of {'auto', 'second', 'microsecond'}"
+            )
+
+        if nan_policy not in {"drop", "zero", "ffill"}:
+            raise HorizonInputError("nan_policy must be one of {'drop', 'zero', 'ffill'}")
+
+        lower, upper = return_clip
+        if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
+            raise HorizonInputError("return_clip must be a finite (lower, upper) tuple")
+
         self.tz = tz
+        self.allow_naive_ts = allow_naive_ts
+        self.time_match = time_match
+        self.nan_policy = nan_policy
+        self.return_clip = (float(lower), float(upper))
+        self.asof_tolerance = asof_tolerance
+        self.log = log
+
+    # ------------------------------------------------------------------
+    # Logging helpers
+    # ------------------------------------------------------------------
+    def _log_warn(self, message: str, **context: Any) -> None:
+        if self.log is not None and hasattr(self.log, "warning"):
+            if context:
+                self.log.warning("[HorizonMapper] %s | %s", message, context)
+            else:
+                self.log.warning("[HorizonMapper] %s", message)
+
+    # ------------------------------------------------------------------
+    # Configuration helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _translate_time_match(policy: str) -> str:
+        mapping = {"auto": "auto", "second": "hms", "microsecond": "hmsf"}
+        return mapping.get(policy, "auto")
+
+    def _resolve_time_match(self, df: pd.DataFrame, policy: str, time_value: Any) -> str:
+        if policy == "auto":
+            has_microseconds = df["ts"].dt.microsecond.ne(0).any()
+            if has_microseconds:
+                return "microsecond"
+            text = str(time_value) if time_value is not None else ""
+            if "." in text and not text.endswith(".000000"):
+                return "microsecond"
+            return "second"
+        return policy
+
+    # ------------------------------------------------------------------
+    # Input sanitation helpers
+    # ------------------------------------------------------------------
+    def _require_columns(self, df: pd.DataFrame, required: Iterable[str]) -> None:
+        missing = [col for col in required if col not in df.columns]
+        if missing:
+            raise HorizonInputError(
+                "bars_with_features is missing required columns: "
+                + ", ".join(sorted(missing))
+            )
+
+    def _sanitize_ts(self, df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        ts = pd.to_datetime(out["ts"], errors="coerce", utc=False)
+        if ts.isna().any():
+            sample = out.loc[ts.isna()].head(5)
+            raise HorizonInputError(
+                "bars_with_features['ts'] contains non-coercible timestamps. "
+                f"Sample: {sample.to_dict(orient='records')}"
+            )
+
+        if ts.dt.tz is None:
+            if not self.allow_naive_ts:
+                raise HorizonInputError(
+                    "Received timezone-naive 'ts' values. Pass allow_naive_ts=True "
+                    "or localise timestamps (e.g. df['ts'] = df['ts'].dt.tz_localize('UTC')).",
+                )
+            out["ts"] = ts.dt.tz_localize(self.tz)
+        else:
+            out["ts"] = ts.dt.tz_convert(self.tz)
+        return out
+
+    @staticmethod
+    def _sanitize_numeric(df: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
+        out = df.copy()
+        for column in columns:
+            if column in out.columns:
+                out[column] = pd.to_numeric(out[column], errors="coerce", downcast=None)
+        return out
+
+    def _dedupe_and_sort(self, df: pd.DataFrame) -> pd.DataFrame:
+        out = df.drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
+        if not out["ts"].is_monotonic_increasing:
+            out = out.loc[~out["ts"].duplicated()].sort_values("ts").reset_index(drop=True)
+            if not out["ts"].is_monotonic_increasing:
+                raise HorizonInputError("ts must be strictly increasing after deduplication")
+        return out
+
+    # ------------------------------------------------------------------
+    # Return helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _log_return(series: pd.Series, lag: int = 1) -> pd.Series:
+        values = pd.Series(series, copy=True).astype(float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            logged = np.log(values)
+        return pd.Series(logged).diff(lag)
+
+    def _clip_returns(self, series: pd.Series) -> pd.Series:
+        lower, upper = self.return_clip
+        return series.clip(lower=lower, upper=upper)
+
+    def _clean_return(self, series: pd.Series, policy: str) -> pd.Series:
+        cleaned = pd.Series(series, copy=True).astype(float)
+        cleaned = cleaned.replace([np.inf, -np.inf], np.nan)
+        cleaned = self._clip_returns(cleaned)
+
+        if policy == "drop":
+            return cleaned
+        if policy == "zero":
+            return cleaned.fillna(0.0)
+        if policy == "ffill":
+            return cleaned.ffill()
+        return cleaned
+
+    @staticmethod
+    def _format_time_suffix(time_value: Any, policy: str) -> Optional[str]:
+        if time_value is None:
+            return None
+
+        try:
+            parsed = pd.to_datetime(str(time_value)).time()
+        except Exception:
+            return None
+
+        if policy == "microsecond":
+            return parsed.strftime("%H%M%S.%f")
+        return parsed.strftime("%H%M%S")
 
     # ------------------------------------------------------------------
     # Horizon selection
@@ -768,8 +959,7 @@ class HorizonMapper:
         invalid = (opens <= 0) | (closes <= 0)
         if invalid.any():
             ratio = ratio.mask(invalid)
-        returns = np.log(ratio)
-        returns = returns.replace([np.inf, -np.inf], np.nan)
+        returns = self._clean_return(np.log(ratio), policy="drop")
         return df["session_id"].map(returns)
 
     def _next_day_close_to_close(self, df: pd.DataFrame) -> pd.Series:
@@ -779,8 +969,7 @@ class HorizonMapper:
         invalid = (closes <= 0) | (future <= 0)
         if invalid.any():
             ratio = ratio.mask(invalid)
-        returns = np.log(ratio)
-        returns = returns.replace([np.inf, -np.inf], np.nan)
+        returns = self._clean_return(np.log(ratio), policy="drop")
         return df["session_id"].map(returns)
 
     def _next_week_close_to_close(self, df: pd.DataFrame, days: int = 5) -> pd.Series:
@@ -790,8 +979,7 @@ class HorizonMapper:
         invalid = (closes <= 0) | (future <= 0)
         if invalid.any():
             ratio = ratio.mask(invalid)
-        returns = np.log(ratio)
-        returns = returns.replace([np.inf, -np.inf], np.nan)
+        returns = self._clean_return(np.log(ratio), policy="drop")
         return df["session_id"].map(returns)
 
     def _intraday_delta_minutes(self, df: pd.DataFrame, minutes: int) -> pd.Series:
@@ -803,12 +991,18 @@ class HorizonMapper:
         close = close.sort_index()
         delta = pd.Timedelta(minutes=minutes)
         future = pd.Series(close.values, index=close.index - delta)
-        returns = np.log(future / close)
+        returns = self._clean_return(np.log(future / close), policy="drop")
         aligned = returns.reindex(close.index)
         mapped = aligned.reindex(ts)
         return pd.Series(mapped.values, index=df.index)
 
-    def _backward_window_return_minutes(self, df: pd.DataFrame, minutes: int) -> pd.Series:
+    def _backward_window_return_minutes(
+        self,
+        df: pd.DataFrame,
+        minutes: int,
+        *,
+        tolerance: Optional[str] = None,
+    ) -> pd.Series:
         """Log-close return from ``t-Δ`` to ``t`` using irregular timestamps."""
 
         if minutes <= 0:
@@ -819,15 +1013,31 @@ class HorizonMapper:
         close = close.sort_index()
 
         delta = pd.Timedelta(minutes=minutes)
-        past = close.copy()
-        past.index = past.index + delta
-        ratio = close / past
-        invalid = (close <= 0) | (past <= 0)
+        shifted = pd.Series(close.values, index=close.index + delta)
+        tol = tolerance or self.asof_tolerance
+        tolerance_delta = pd.Timedelta(tol) if tol else delta
+        merged = pd.merge_asof(
+            close.sort_index().to_frame(name="close"),
+            shifted.sort_index().to_frame(name="past"),
+            left_index=True,
+            right_index=True,
+            direction="backward",
+            tolerance=tolerance_delta,
+        )
+        ratio = merged["close"] / merged["past"]
+        invalid = (merged["close"] <= 0) | (merged["past"] <= 0)
         if invalid.any():
             ratio = ratio.mask(invalid)
+        returns = self._clean_return(np.log(ratio), policy="drop")
 
-        returns = np.log(ratio).replace([np.inf, -np.inf], np.nan)
-        return pd.Series(returns.reindex(ts).values, index=df.index)
+        if merged["past"].isna().mean() > 0.25:
+            self._log_warn(
+                "merge_asof dropped more than 25% of rows", tolerance=str(tolerance_delta)
+            )
+
+        aligned = returns.reindex(close.sort_index().index)
+        mapped = aligned.reindex(ts)
+        return pd.Series(mapped.values, index=df.index)
 
     def _weekly_mean_scalar(self, df: pd.DataFrame, gate_mask: pd.Series) -> float:
         """Same-day open→close mean for sessions flagged by ``gate_mask``."""
@@ -846,7 +1056,7 @@ class HorizonMapper:
         if invalid.any():
             ratio = ratio.mask(invalid)
 
-        returns = np.log(ratio).replace([np.inf, -np.inf], np.nan)
+        returns = self._clean_return(np.log(ratio), policy="drop")
         subset = returns.loc[returns.index.isin(session_ids)]
         if subset.empty:
             return np.nan
@@ -864,39 +1074,44 @@ class HorizonMapper:
         if invalid.any():
             ratio = ratio.mask(invalid)
 
-        returns = np.log(ratio).replace([np.inf, -np.inf], np.nan)
+        returns = self._clean_return(np.log(ratio), policy="drop")
         return df["session_id"].map(returns)
 
     # ------------------------------------------------------------------
     # Data preparation helpers
     # ------------------------------------------------------------------
     def _prepare_bars_frame(self, bars_with_features: pd.DataFrame) -> pd.DataFrame:
-        required_columns = {"ts", "open", "close", "session_id"}
+        if not isinstance(bars_with_features, pd.DataFrame):
+            raise HorizonInputError("bars_with_features must be a pandas DataFrame")
+
         lower_map: Dict[str, str] = {}
         for column in bars_with_features.columns:
-            key = column.lower()
-            if key not in lower_map:
-                lower_map[key] = column
+            lower = column.lower()
+            if lower not in lower_map:
+                lower_map[lower] = column
 
-        missing = [col for col in required_columns if col not in lower_map]
+        required = ["ts", "close", "session_id", "open"]
+        missing = [col for col in required if col not in lower_map]
         if missing:
-            missing_cols = ", ".join(sorted(missing))
-            raise KeyError(
-                "bars_with_features is missing required columns (case-insensitive): "
-                f"{missing_cols}"
+            raise HorizonInputError(
+                "bars_with_features is missing required columns: "
+                + ", ".join(sorted(missing))
             )
 
-        rename_map = {lower_map[name]: name for name in required_columns}
+        rename_map = {lower_map[name]: name for name in required}
         df = bars_with_features.rename(columns=rename_map).copy()
-        df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
-        if df["ts"].isna().any():
-            raise ValueError("bars_with_features['ts'] contains non-coercible timestamps")
+        self._require_columns(df, required)
+        df = self._sanitize_ts(df)
+        df = self._sanitize_numeric(df, ["open", "close"])
+        df = self._dedupe_and_sort(df)
 
-        ts = df["ts"]
-        if ts.dt.tz is None:
-            df["ts"] = ts.dt.tz_localize(self.tz)
-        else:
-            df["ts"] = ts.dt.tz_convert(self.tz)
+        non_numeric = df[["open", "close"]].isna().any(axis=1)
+        if non_numeric.any():
+            sample = df.loc[non_numeric, ["ts", "open", "close"]].head(5)
+            raise HorizonInputError(
+                "Encountered non-numeric open/close values after coercion. "
+                f"Sample: {sample.to_dict(orient='records')}"
+            )
 
         return df
 
@@ -952,17 +1167,21 @@ class HorizonMapper:
         default_intraday_minutes: int,
         predictor_minutes: int,
         weekly_x_policy: str,
-    ) -> Iterable[Tuple[str, str, pd.Series, pd.Series, int]]:
+        time_match: str,
+        tolerance: Optional[str],
+    ) -> Iterable[Tuple[str, str, pd.Series, pd.Series, int, List[str]]]:
         if patterns is None:
             return
 
         if predictor_minutes <= 0:
-            raise ValueError("predictor_minutes must be positive")
+            raise HorizonInputError("predictor_minutes must be positive")
 
         if weekly_x_policy not in {"mean", "prev_week"}:
-            raise ValueError("weekly_x_policy must be one of {'mean', 'prev_week'}")
+            raise HorizonInputError("weekly_x_policy must be one of {'mean', 'prev_week'}")
 
-        x_bw = self._backward_window_return_minutes(df, minutes=predictor_minutes)
+        x_bw = self._backward_window_return_minutes(
+            df, minutes=predictor_minutes, tolerance=tolerance
+        )
         prev_week_series: Optional[pd.Series] = None
         horizon_cache: Dict[Tuple[str, Optional[int]], pd.Series] = {}
         time_bearing_types = {"time_predictive_nextday", "time_predictive_nextweek", "orderflow_peak_pressure"}
@@ -973,8 +1192,18 @@ class HorizonMapper:
             if not pattern_type:
                 continue
 
-            gate_col = self._infer_gate_column_name(df.columns, key, pattern)
-            if gate_col is None or gate_col not in df.columns:
+            gate_col, candidates = self._infer_gate_column_name(
+                df, key, pattern, time_match=time_match
+            )
+            if gate_col is None:
+                expected = candidates[0] if candidates else None
+                self._log_warn(
+                    "Gate column missing",
+                    key=key,
+                    pattern_type=pattern_type,
+                    expected=expected,
+                    candidates=candidates,
+                )
                 continue
 
             spec = self.pattern_horizon(
@@ -1016,7 +1245,7 @@ class HorizonMapper:
                 returns_x_series = pd.Series(payload_value, index=df.index, dtype=float)
 
             _, side_hint = self._predictor_from_payload(pattern, pattern_type, mode="bias")
-            yield gate_col, pattern_type, returns_x_series, returns_y, side_hint
+            yield gate_col, pattern_type, returns_x_series, returns_y, side_hint, candidates
 
     @staticmethod
     def _signal_column_name(gate_col: str) -> str:
@@ -1044,12 +1273,14 @@ class HorizonMapper:
         df = self._prepare_bars_frame(bars_with_features)
         result = bars_with_features.copy()
 
-        for gate_col, _, returns_x_series, _, _ in self._iter_pattern_returns(
+        for gate_col, _, returns_x_series, _, _, _ in self._iter_pattern_returns(
             df,
             patterns,
             default_intraday_minutes=default_intraday_minutes,
             predictor_minutes=predictor_minutes,
             weekly_x_policy=weekly_x_policy,
+            time_match=self.time_match,
+            tolerance=self.asof_tolerance,
         ):
             signal_col = self._signal_column_name(gate_col)
             signal = pd.Series(np.nan, index=df.index, dtype=float)
@@ -1071,6 +1302,11 @@ class HorizonMapper:
         default_intraday_minutes: int = 10,
         predictor_minutes: int = 1,
         weekly_x_policy: str = "mean",
+        ensure_gates: bool = True,
+        nan_policy: Optional[str] = None,
+        time_match: Optional[str] = None,
+        asof_tolerance: Optional[str] = None,
+        debug: bool = False,
     ) -> pd.DataFrame:
         """Construct tidy decision rows for screener ``patterns``.
 
@@ -1090,6 +1326,17 @@ class HorizonMapper:
             when supplied, otherwise falls back to the historical same-day open→close mean for
             sessions with an active gate. ``"prev_week"`` uses the realised return between the
             session close and the close five sessions prior.
+        ensure_gates:
+            When ``True`` the screener pipeline is re-run to materialise missing gates before
+            constructing outputs.
+        nan_policy:
+            Overrides the instance-level NaN handling policy. See ``__init__`` for options.
+        time_match:
+            Override time gate resolution policy (``"auto"``, ``"second"``, or ``"microsecond"``).
+        asof_tolerance:
+            Override merge-asof tolerance expressed as a pandas offset string.
+        debug:
+            Emit detailed diagnostics via the configured logger when ``True``.
         """
 
         if patterns is None:
@@ -1097,35 +1344,115 @@ class HorizonMapper:
                 columns=["ts_decision", "gate", "pattern_type", "returns_x", "returns_y", "side_hint"]
             )
 
-        df = self._prepare_bars_frame(bars_with_features)
-        rows: List[pd.DataFrame] = []
+        policy = nan_policy or self.nan_policy
+        if policy not in {"drop", "zero", "ffill"}:
+            raise HorizonInputError("nan_policy must be one of {'drop', 'zero', 'ffill'}")
 
-        for gate_col, pattern_type, returns_x_series, returns_y, side_hint in self._iter_pattern_returns(
+        effective_time_match = time_match or self.time_match
+        if effective_time_match not in {"auto", "second", "microsecond"}:
+            raise HorizonInputError(
+                "time_match must be one of {'auto', 'second', 'microsecond'}"
+            )
+
+        effective_tolerance = asof_tolerance or self.asof_tolerance
+
+        base_df = self._prepare_bars_frame(bars_with_features)
+
+        source_bars = base_df
+        if ensure_gates:
+            builder = ScreenerPipeline(
+                tz=self.tz,
+                time_match=self._translate_time_match(effective_time_match),
+                log=self.log,
+            )
+            source_bars = builder.build_features(base_df, patterns)
+
+        df = self._prepare_bars_frame(source_bars)
+        rows: List[pd.DataFrame] = []
+        pre_row_count = len(df)
+
+        for (
+            gate_col,
+            pattern_type,
+            returns_x_series,
+            returns_y,
+            side_hint,
+            candidates,
+        ) in self._iter_pattern_returns(
             df,
             patterns,
             default_intraday_minutes=default_intraday_minutes,
             predictor_minutes=predictor_minutes,
             weekly_x_policy=weekly_x_policy,
+            time_match=effective_time_match,
+            tolerance=effective_tolerance,
         ):
-            active_mask = (df[gate_col] == 1) & returns_y.notna() & returns_x_series.notna()
+            gate_series = df.get(gate_col)
+            if gate_series is None:
+                self._log_warn(
+                    "Gate column disappeared between iteration and emission",
+                    gate=gate_col,
+                    candidates=candidates,
+                )
+                continue
+
+            returns_x_clean = self._clean_return(returns_x_series, policy)
+            returns_y_clean = self._clean_return(returns_y, policy)
+            finite_x = pd.Series(np.isfinite(returns_x_clean), index=returns_x_clean.index)
+            finite_y = pd.Series(np.isfinite(returns_y_clean), index=returns_y_clean.index)
+
+            active_mask = (
+                (gate_series == 1)
+                & returns_y_clean.notna()
+                & returns_x_clean.notna()
+                & finite_x
+                & finite_y
+            )
             if not active_mask.any():
+                self._log_warn(
+                    "Gate column has no active, finite rows",
+                    gate=gate_col,
+                    candidates=candidates,
+                )
                 continue
 
             subset = df.loc[active_mask, ["ts"]].copy()
             subset["ts_decision"] = subset["ts"]
             subset["gate"] = gate_col
             subset["pattern_type"] = pattern_type
-            subset["returns_x"] = returns_x_series.loc[active_mask].values
-            subset["returns_y"] = returns_y.loc[active_mask].values
+            subset["returns_x"] = returns_x_clean.loc[active_mask].values
+            subset["returns_y"] = returns_y_clean.loc[active_mask].values
             subset["side_hint"] = side_hint
             rows.append(subset[["ts_decision", "gate", "pattern_type", "returns_x", "returns_y", "side_hint"]])
 
+            if debug:
+                self._log_warn(
+                    "Appended decision rows",
+                    gate=gate_col,
+                    count=int(active_mask.sum()),
+                )
+
         if not rows:
+            if debug:
+                self._log_warn(
+                    "No rows produced after gate filtering",
+                    pre_rows=pre_row_count,
+                    policy=policy,
+                    time_match=effective_time_match,
+                )
             return pd.DataFrame(
                 columns=["ts_decision", "gate", "pattern_type", "returns_x", "returns_y", "side_hint"]
             )
 
         result = pd.concat(rows, axis=0, ignore_index=True)
+        if debug:
+            self._log_warn(
+                "HorizonMapper build complete",
+                rows=len(result),
+                pre_rows=pre_row_count,
+                policy=policy,
+                time_match=effective_time_match,
+            )
         return result
 
     # ------------------------------------------------------------------
@@ -1133,27 +1460,52 @@ class HorizonMapper:
     # ------------------------------------------------------------------
     def _infer_gate_column_name(
         self,
-        all_columns: pd.Index,
+        df: pd.DataFrame,
         key: str,
         pattern: Mapping[str, Any],
-    ) -> Optional[str]:
+        *,
+        time_match: str,
+    ) -> Tuple[Optional[str], List[str]]:
         slug_key = ScreenerPipeline._slugify(key)
+        candidates: List[str] = []
+
         if slug_key:
-            candidate = f"{slug_key}_gate"
-            if candidate in all_columns:
-                return candidate
+            candidates.append(f"{slug_key}_gate")
 
-        for candidate in self._fallback_gate_candidates(pattern):
-            if candidate in all_columns:
-                return candidate
-        return None
+        fallback = self._fallback_gate_candidates(
+            df, pattern, slug_key=slug_key, time_match=time_match
+        )
+        candidates.extend([cand for cand in fallback if cand not in candidates])
 
-    def _fallback_gate_candidates(self, pattern: Mapping[str, Any]) -> List[str]:
+        available = [cand for cand in candidates if cand in df.columns]
+        if not available:
+            return None, candidates
+
+        if len(available) > 1:
+            chosen = available[0]
+            self._log_warn(
+                "Multiple gate columns matched; selecting first",
+                chosen=chosen,
+                options=available,
+            )
+            return chosen, candidates
+
+        return available[0], candidates
+
+    def _fallback_gate_candidates(
+        self,
+        df: pd.DataFrame,
+        pattern: Mapping[str, Any],
+        *,
+        slug_key: Optional[str],
+        time_match: str,
+    ) -> List[str]:
         pattern_type = pattern.get("pattern_type")
         payload = pattern.get("pattern_payload", {}) or {}
         metadata = pattern.get("metadata", {}) or {}
 
         candidates: List[str] = []
+
         if pattern_type == "weekday_mean":
             weekday = payload.get("day") or payload.get("weekday")
             weekday_norm = ScreenerPipeline._normalize_weekday(weekday)
@@ -1161,14 +1513,24 @@ class HorizonMapper:
                 candidates.append(f"weekday_mean_{weekday_norm}_gate")
 
         elif pattern_type == "time_predictive_nextday":
-            hms, hmsf = ScreenerPipeline._time_to_strings(payload.get("time"))
-            for suffix in filter(None, [hmsf, hms]):
-                candidates.append(f"time_nextday_{suffix}_gate")
+            time_value = payload.get("time")
+            effective = self._resolve_time_match(df, time_match, time_value)
+            suffix_second = self._format_time_suffix(time_value, "second")
+            suffix_micro = self._format_time_suffix(time_value, "microsecond")
+            order = [suffix_micro, suffix_second] if effective == "microsecond" else [suffix_second, suffix_micro]
+            for suffix in order:
+                if suffix:
+                    candidates.append(f"time_nextday_{suffix}_gate")
 
         elif pattern_type == "time_predictive_nextweek":
-            hms, hmsf = ScreenerPipeline._time_to_strings(payload.get("time"))
-            for suffix in filter(None, [hmsf, hms]):
-                candidates.append(f"time_nextweek_{suffix}_gate")
+            time_value = payload.get("time")
+            effective = self._resolve_time_match(df, time_match, time_value)
+            suffix_second = self._format_time_suffix(time_value, "second")
+            suffix_micro = self._format_time_suffix(time_value, "microsecond")
+            order = [suffix_micro, suffix_second] if effective == "microsecond" else [suffix_second, suffix_micro]
+            for suffix in order:
+                if suffix:
+                    candidates.append(f"time_nextweek_{suffix}_gate")
 
         elif pattern_type == "orderflow_weekly":
             weekday_norm = ScreenerPipeline._normalize_weekday(payload.get("weekday"))
@@ -1198,10 +1560,19 @@ class HorizonMapper:
             bias = ScreenerPipeline._format_bias(
                 metadata.get("orderflow_bias") or payload.get("pressure_bias")
             )
-            hms, hmsf = ScreenerPipeline._time_to_strings(payload.get("clock_time"))
-            for suffix in filter(None, [hmsf, hms]):
-                if weekday_norm:
+            time_value = payload.get("clock_time")
+            effective = self._resolve_time_match(df, time_match, time_value)
+            suffix_second = self._format_time_suffix(time_value, "second")
+            suffix_micro = self._format_time_suffix(time_value, "microsecond")
+            order = [suffix_micro, suffix_second] if effective == "microsecond" else [suffix_second, suffix_micro]
+            for suffix in order:
+                if weekday_norm and suffix:
                     candidates.append(f"oflow_peak_{weekday_norm}_{suffix}_{metric}_{bias}_gate")
+
+        explicit = payload.get("gate") or metadata.get("gate")
+        if isinstance(explicit, str) and explicit:
+            normalized = explicit if explicit.endswith("_gate") else f"{explicit}_gate"
+            candidates.append(normalized)
 
         return candidates
 
