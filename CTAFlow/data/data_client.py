@@ -9,23 +9,29 @@ contain strings like ".", "-" or "—").
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import pandas as pd
 
 # Optional dependency used by `download_cot`
 # pip install cot_reports
-from CTAFlow.features.signals_processing import COTAnalyzer
 from .ticker_classifier import (
     get_cot_report_type,
     get_cot_storage_path,
     get_ticker_classifier,
     is_financial_ticker,
 )
+
+
+if TYPE_CHECKING:
+    from CTAFlow.features.signals_processing import COTAnalyzer
+else:  # pragma: no cover - runtime fallback when optional deps missing
+    COTAnalyzer = Any  # type: ignore[assignment]
 
 
 try:
@@ -55,6 +61,7 @@ from ..config import (
     ENABLE_WEEKLY_UPDATES,
     RESULTS_HDF_PATH,
 )
+from ..utils import aio
 from .update_management import (
     COT_REFRESH_EVENT,
     WEEKLY_MARKET_UPDATE_EVENT,
@@ -229,9 +236,11 @@ class DataClient:
         if fp.parent and not fp.parent.exists():
             fp.parent.mkdir(parents=True, exist_ok=True)
 
-    def _get_cot_processor(self) -> COTAnalyzer:
+    def _get_cot_processor(self) -> "COTAnalyzer":
         if self._cot_processor is None:
-            self._cot_processor = COTAnalyzer()
+            from CTAFlow.features.signals_processing import COTAnalyzer as _COTAnalyzer
+
+            self._cot_processor = _COTAnalyzer()
         return self._cot_processor
 
     def _ensure_weekly_updates(self) -> None:
@@ -4449,24 +4458,43 @@ class ResultsClient:
 
     @staticmethod
     def _sanitize_for_hdf(df: pd.DataFrame) -> pd.DataFrame:
-        sanitized = df.copy()
-        object_cols = sanitized.select_dtypes(include=["object", "string"])
-        if not object_cols.empty:
-            for col in object_cols.columns:
-                sanitized[col] = sanitized[col].apply(
-                    lambda x: x if isinstance(x, (str, bytes)) or pd.isna(x) else str(x)
-                )
-        return sanitized
+        """Proxy to :meth:`DataClient._sanitize_for_hdf` for consistency."""
+
+        return DataClient._sanitize_for_hdf(df)
+
+    def write_results_df(self, key: str, df: pd.DataFrame, *, replace: bool = True) -> None:
+        """Write a prepared results DataFrame to ``key`` in the results store."""
+
+        df_sanitized = self._sanitize_for_hdf(df)
+        min_itemsize = DataClient._min_itemsize_for_str_cols(df_sanitized)
+
+        fmt: Dict[str, Any] = dict(
+            format="table",
+            data_columns=True,
+            complib=self.complib,
+            complevel=self.complevel,
+            min_itemsize=min_itemsize or None,
+        )
+
+        with pd.HDFStore(self.results_path, mode="a") as store:
+            writer = store.put if replace else store.append
+            writer(key, df_sanitized, **fmt)
 
     def _format_key(self, scan_type: str, ticker: str, scan_name: str) -> str:
         parts = [
+            "results",
             self._slugify(scan_type),
-            self._slugify(ticker),
+            self._slugify(ticker).upper(),
             self._slugify(scan_name),
         ]
         if any(not part for part in parts):
             raise ValueError("scan_type, ticker, and scan_name must all be non-empty strings")
-        return "/" + "/".join(parts)
+        return "/".join(parts)
+
+    def make_key(self, scan_type: str, ticker: str, scan_name: str) -> str:
+        """Public helper returning the canonical results key."""
+
+        return self._format_key(scan_type, ticker, scan_name)
 
     def _write(
         self,
@@ -4476,20 +4504,10 @@ class ResultsClient:
         replace: bool = True,
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> str:
-        df_sanitized = self._sanitize_for_hdf(df)
+        self.write_results_df(key, df, replace=replace)
 
-        fmt: Dict[str, Any] = dict(
-            format="table",
-            data_columns=True,
-            complib=self.complib,
-            complevel=self.complevel,
-        )
-
-        with pd.HDFStore(self.results_path, mode="a") as store:
-            writer = store.put if replace else store.append
-            writer(key, df_sanitized, **fmt)
-
-            if metadata:
+        if metadata:
+            with pd.HDFStore(self.results_path, mode="a") as store:
                 storer = store.get_storer(key)
                 existing = getattr(storer.attrs, "metadata", {})
                 merged = dict(existing)
@@ -4553,6 +4571,108 @@ class ResultsClient:
             replace=replace,
             metadata=metadata,
         )
+
+    # ------------------------------------------------------------------
+    # Reading helpers
+    # ------------------------------------------------------------------
+    def load_results_df(self, key: str, **select_kwargs: Any) -> pd.DataFrame:
+        """Load and return the DataFrame stored at ``key``."""
+
+        with pd.HDFStore(self.results_path, mode="r") as store:
+            if key not in store:
+                raise KeyError(f"No results stored under key '{key}'")
+            return store.select(key, **select_kwargs)
+
+    def load_scan_results(
+        self,
+        scan_type: str,
+        ticker: str,
+        scan_name: str,
+        *,
+        errors: str = "raise",
+        **select_kwargs: Any,
+    ) -> pd.DataFrame:
+        """Synchronously load a single ticker's scan results."""
+
+        return aio.run(
+            self.load_scan_results_async(
+                scan_type=scan_type,
+                tickers=[ticker],
+                scan_name=scan_name,
+                errors=errors,
+                _return_single=True,
+                **select_kwargs,
+            )
+        )
+
+    async def load_results_df_async(self, key: str, **select_kwargs: Any) -> pd.DataFrame:
+        """Asynchronously load a stored DataFrame via ``asyncio.to_thread``."""
+
+        return await asyncio.to_thread(self.load_results_df, key, **select_kwargs)
+
+    async def load_many_results_async(
+        self,
+        keys: Union[Sequence[str], Mapping[str, str]],
+        *,
+        errors: str = "raise",
+        **select_kwargs: Any,
+    ) -> Dict[str, pd.DataFrame]:
+        """Load many keys asynchronously returning a mapping of aliases to DataFrames."""
+
+        if isinstance(keys, Mapping):
+            alias_to_key = dict(keys)
+        else:
+            alias_to_key = {key: key for key in keys}
+
+        results: Dict[str, pd.DataFrame] = {}
+        for alias, key in alias_to_key.items():
+            try:
+                results[alias] = await self.load_results_df_async(key, **select_kwargs)
+            except Exception as exc:
+                if errors == "ignore":
+                    continue
+                raise exc
+
+        return results
+
+    async def load_scan_results_async(
+        self,
+        scan_type: str,
+        tickers: Sequence[str],
+        scan_name: str,
+        *,
+        errors: str = "raise",
+        _return_single: bool = False,
+        **select_kwargs: Any,
+    ) -> Union[pd.DataFrame, Dict[str, pd.DataFrame]]:
+        """Convenience async loader returning DataFrames keyed by ticker symbol.
+
+        When ``_return_single`` is True the first ticker's DataFrame is returned
+        directly.  The flag is primarily used by :meth:`load_scan_results` to
+        provide parity with the legacy synchronous behaviour.
+        """
+
+        alias_to_key = {
+            str(ticker).upper(): self.make_key(scan_type, ticker, scan_name)
+            for ticker in tickers
+        }
+        loaded = await self.load_many_results_async(alias_to_key, errors=errors, **select_kwargs)
+
+        if not _return_single:
+            return loaded
+
+        alias = next(iter(alias_to_key.keys()), None)
+        key = next(iter(alias_to_key.values()), None)
+
+        if alias is None:
+            return pd.DataFrame()
+
+        if alias not in loaded:
+            if errors == "ignore":
+                return pd.DataFrame()
+            raise KeyError(f"No results stored under key '{key}'")
+
+        return loaded[alias]
 
     def write_momentum_results(
         self,
