@@ -189,3 +189,33 @@ def test_weekly_prev_week_policy_uses_realised_return():
     # Ensure the surviving row corresponds to the second Tuesday (session 6)
     surviving_session = df[df["ts"] == result.loc[0, "ts_decision"]]["session_id"].iloc[0]
     assert surviving_session == 6
+
+
+def test_build_xy_with_allowed_months_produces_nonempty_only_in_allowed_months():
+    tz = "America/Chicago"
+    bars = pd.DataFrame(
+        {
+            "ts": pd.to_datetime(["2024-01-02 13:30", "2024-06-04 13:30"]).tz_localize(tz),
+            "open": [100.0, 105.0],
+            "close": [101.0, 104.0],
+            "session_id": [0, 1],
+        }
+    )
+    patterns = [
+        {
+            "pattern_type": "weekday_mean",
+            "pattern_payload": {"day": "tuesday", "mean": 0.02},
+            "key": "weekday_mean_tuesday",
+        }
+    ]
+
+    mapper = HorizonMapper(tz=tz)
+    result = mapper.build_xy(
+        bars,
+        patterns,
+        ensure_gates=True,
+        allowed_months={1},
+    )
+
+    assert not result.empty
+    assert result["ts_decision"].dt.month.eq(1).all()

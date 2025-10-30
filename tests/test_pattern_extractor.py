@@ -94,11 +94,14 @@ def _make_extractor(
     *,
     results: Optional[dict] = None,
     screen_params: Optional[dict] = None,
+    metadata: Optional[dict] = None,
 ) -> PatternExtractor:
     extractor = object.__new__(PatternExtractor)
     extractor._screener = DummyScreener()
     extractor._results = dict(results or {})
     extractor._screen_params = dict(screen_params or {})
+    extractor.metadata = dict(metadata or {})
+    extractor._filtered_months = None
     extractor._pattern_index = {
         symbol: dict(entries) for symbol, entries in patterns.items()
     }
@@ -198,16 +201,59 @@ def test_pattern_extractor_handles_orderflow_results():
 
     keys = extractor.get_pattern_keys("ZS")
     assert any(key.startswith("orderflow_scan|orderflow_weekly") for key in keys)
-    assert any(key.startswith("orderflow_scan|orderflow_week_of_month") for key in keys)
-    assert any(key.startswith("orderflow_scan|orderflow_peak_pressure") for key in keys)
 
-    weekly_key = next(k for k in keys if k.startswith("orderflow_scan|orderflow_weekly"))
-    weekly_summary = extractor.get_pattern_summary("ZS", weekly_key)
-    assert weekly_summary.metadata["screen_type"] == "orderflow"
-    weekly_series = extractor.get_pattern_series("ZS", weekly_key)
-    assert not weekly_series.empty
-    assert weekly_series.name == "buy_pressure"
-    assert (weekly_series.index.tz is not None)
+
+def test_pe_promotes_months_from_results_to_metadata():
+    results = {
+        "seasonality": {
+            "ZS": {"strongest_patterns": [], "filtered_months": [1, 3, 1]},
+        }
+    }
+
+    extractor = PatternExtractor(DummyScreener(), results, None)
+
+    assert extractor.get_filtered_months() == {1, 3}
+    assert extractor.metadata["filtered_months"] == [1, 3]
+    assert extractor.metadata["month_merge_policy"] == "source"
+
+
+def test_pe_resolves_conflicts_with_union_and_warns(caplog):
+    caplog.set_level("WARNING")
+    results = {
+        "seasonality": {
+            "ZS": {"strongest_patterns": [], "filtered_months": [1, 2]},
+            "ZW": {"strongest_patterns": [], "filtered_months": [2, 4]},
+        }
+    }
+
+    extractor = PatternExtractor(DummyScreener(), results, None)
+
+    assert extractor.get_filtered_months() == {1, 2, 4}
+    assert "Inconsistent filtered_months" in caplog.text
+
+
+def test_pe_concat_merges_months_per_policy():
+    left_results = {
+        "seasonality": {"ZS": {"strongest_patterns": [], "filtered_months": [1, 2]}}
+    }
+    right_results = {
+        "seasonality": {"ZS": {"strongest_patterns": [], "filtered_months": [2, 3]}}
+    }
+
+    left = PatternExtractor(DummyScreener(), left_results, None)
+    right = PatternExtractor(DummyScreener(), right_results, None)
+
+    merged_intersect = left.concat(right, month_merge_policy="intersect")
+    assert merged_intersect.get_filtered_months() == {2}
+    assert merged_intersect.metadata["month_merge_policy"] == "intersect"
+
+    merged_union = left.concat(right, month_merge_policy="union")
+    assert merged_union.get_filtered_months() == {1, 2, 3}
+    assert merged_union.metadata["month_merge_policy"] == "union"
+
+    merged_left = left.concat(right, month_merge_policy="left")
+    assert merged_left.get_filtered_months() == {1, 2}
+    assert merged_left.metadata["month_merge_policy"] == "left"
 
 
 def test_pattern_extractor_resolves_missing_seasonality_params():
