@@ -163,6 +163,7 @@ def _orderflow_result_fixture(ticker: str = "ZS") -> dict:
             "seasonality_mean": [0.12],
             "seasonality_t_stat": [3.1],
             "seasonality_q_value": [0.02],
+            "seasonality_p_value": [0.02],
             "seasonality_n": [len(ts_end)],
             "seasonality_sig_fdr_5pct": [True],
             "intraday_mean": [0.2],
@@ -523,7 +524,9 @@ def test_persist_to_results_writes_hdf_keys(tmp_path):
                         "strength": 1.2,
                         "correlation": 0.65,
                         "q_value": 0.015,
+                        "p_value": 0.01,
                         "t_stat": 2.8,
+                        "f_stat": 5.2,
                         "n": 45,
                     },
                     {
@@ -533,7 +536,9 @@ def test_persist_to_results_writes_hdf_keys(tmp_path):
                         "strength": 0.75,
                         "correlation": 0.42,
                         "q_value": 0.02,
+                        "p_value": 0.03,
                         "t_stat": 2.1,
+                        "f_stat": 4.8,
                         "n": 38,
                     },
                 ],
@@ -578,10 +583,18 @@ def test_persist_to_results_writes_hdf_keys(tmp_path):
 
     assert set(seasonal_df["pattern_type"]) == {"weekday_returns", "time_predictive_nextday"}
     assert (seasonal_df["created_at"] == "2023-10-01T00:00:00Z").all()
-    assert pytest.approx(orderflow_df.loc[orderflow_df["pattern_type"] == "orderflow_peak_pressure", "t_stat"].iloc[0]) == 3.1
-    assert "08:30:00.123456" in orderflow_df.loc[
-        orderflow_df["pattern_type"] == "orderflow_peak_pressure", "time"
-    ].iloc[0]
+
+    weekday_row = seasonal_df.loc[seasonal_df["pattern_type"] == "weekday_returns"].iloc[0]
+    assert pytest.approx(weekday_row["t_stat"]) == 2.8
+    assert pytest.approx(weekday_row["p_value"]) == 0.01
+    assert pytest.approx(weekday_row["f_stat"]) == 5.2
+    assert pytest.approx(weekday_row["q_value"]) == 0.015
+
+    orderflow_peak = orderflow_df.loc[orderflow_df["pattern_type"] == "orderflow_peak_pressure"].iloc[0]
+    assert pytest.approx(orderflow_peak["t_stat"]) == 3.1
+    assert pytest.approx(orderflow_peak["p_value"]) == 0.02
+    assert pd.isna(orderflow_peak["f_stat"])
+    assert "08:30:00.123456" in orderflow_peak["time"]
 
 
 def test_load_summaries_from_results_async(tmp_path):
@@ -599,7 +612,9 @@ def test_load_summaries_from_results_async(tmp_path):
             "weekday": "Monday",
             "week_of_month": 1,
             "q_value": 0.01,
+            "p_value": 0.02,
             "t_stat": 2.5,
+            "f_stat": 4.0,
             "n": 30,
             "source_screen": scan_name,
             "scan_type": scan_type,

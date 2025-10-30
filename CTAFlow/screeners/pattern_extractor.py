@@ -110,7 +110,9 @@ class PatternExtractor:
         "weekday",
         "week_of_month",
         "q_value",
+        "p_value",
         "t_stat",
+        "f_stat",
         "n",
         "source_screen",
         "scan_type",
@@ -658,7 +660,7 @@ class PatternExtractor:
             "description",
             "created_at",
         ]
-        float_columns = ["strength", "correlation", "q_value", "t_stat"]
+        float_columns = ["strength", "correlation", "q_value", "p_value", "t_stat", "f_stat"]
         int_like_columns = ["week_of_month", "n"]
 
         for column in string_columns:
@@ -720,8 +722,12 @@ class PatternExtractor:
                 "weekday": payload.get("day") or payload.get("weekday"),
                 "week_of_month": payload.get("week_of_month"),
                 "q_value": payload.get("q_value") or payload.get("seasonality_q_value"),
+                "p_value": payload.get("p_value") or payload.get("seasonality_p_value"),
                 "t_stat": payload.get("t_stat") or payload.get("seasonality_t_stat"),
-                "n": payload.get("n") or payload.get("seasonality_n"),
+                "f_stat": payload.get("f_stat") or payload.get("seasonality_f_stat"),
+                "n": payload.get("n")
+                or payload.get("seasonality_n")
+                or payload.get("support"),
                 "source_screen": summary.source_screen,
                 "scan_type": scan_type,
                 "scan_name": scan_name,
