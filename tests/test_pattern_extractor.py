@@ -1,3 +1,4 @@
+import asyncio
 import pandas as pd
 import numpy as np
 import pytest
@@ -5,6 +6,7 @@ from datetime import time
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
+from CTAFlow.CTAFlow.data.data_client import ResultsClient
 from CTAFlow.CTAFlow.screeners.orderflow_scan import OrderflowParams
 from CTAFlow.CTAFlow.screeners.pattern_extractor import PatternExtractor
 import CTAFlow.CTAFlow.screeners.pattern_extractor as pattern_module
@@ -324,3 +326,71 @@ def test_persist_to_results_writes_hdf_keys(tmp_path):
     assert "08:30:00.123456" in orderflow_df.loc[
         orderflow_df["pattern_type"] == "orderflow_peak_pressure", "time"
     ].iloc[0]
+
+
+def test_load_summaries_from_results_async(tmp_path):
+    scan_type = "seasonality"
+    scan_name = "months_9_10_11_seasonality"
+    results_path = tmp_path / "results_async.h5"
+    client = ResultsClient(results_path)
+
+    base_rows = [
+        {
+            "pattern_type": "weekday_returns",
+            "strength": 1.0,
+            "correlation": 0.5,
+            "time": "",
+            "weekday": "Monday",
+            "week_of_month": 1,
+            "q_value": 0.01,
+            "t_stat": 2.5,
+            "n": 30,
+            "source_screen": scan_name,
+            "scan_type": scan_type,
+            "scan_name": scan_name,
+            "description": "Test summary",
+            "created_at": "2023-10-01T00:00:00Z",
+        }
+    ]
+    ng_df = pd.DataFrame(base_rows, columns=PatternExtractor.SUMMARY_COLUMNS)
+    rb_df = ng_df.copy()
+    rb_df["pattern_type"] = "time_predictive_nextday"
+
+    client.write_results_df(client.make_key(scan_type, "NG", scan_name), ng_df, replace=True)
+    client.write_results_df(client.make_key(scan_type, "RB", scan_name), rb_df, replace=True)
+
+    loaded = asyncio.run(
+        PatternExtractor.load_summaries_from_results(
+            client,
+            scan_type=scan_type,
+            scan_name=scan_name,
+            tickers=["NG", "rb"],
+        )
+    )
+
+    assert set(loaded.keys()) == {"NG", "RB"}
+    assert list(loaded["NG"].columns) == list(PatternExtractor.SUMMARY_COLUMNS)
+    assert list(loaded["RB"].columns) == list(PatternExtractor.SUMMARY_COLUMNS)
+    assert loaded["NG"].loc[0, "pattern_type"] == "weekday_returns"
+    assert loaded["RB"].loc[0, "pattern_type"] == "time_predictive_nextday"
+
+    with pytest.raises(KeyError):
+        asyncio.run(
+            PatternExtractor.load_summaries_from_results(
+                client,
+                scan_type=scan_type,
+                scan_name=scan_name,
+                tickers=["CL"],
+            )
+        )
+
+    loaded_ignore = asyncio.run(
+        PatternExtractor.load_summaries_from_results(
+            client,
+            scan_type=scan_type,
+            scan_name=scan_name,
+            tickers=["NG", "CL"],
+            errors="ignore",
+        )
+    )
+    assert set(loaded_ignore.keys()) == {"NG"}

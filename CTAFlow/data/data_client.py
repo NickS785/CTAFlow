@@ -9,23 +9,29 @@ contain strings like ".", "-" or "—").
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import pandas as pd
 
 # Optional dependency used by `download_cot`
 # pip install cot_reports
-from CTAFlow.features.signals_processing import COTAnalyzer
 from .ticker_classifier import (
     get_cot_report_type,
     get_cot_storage_path,
     get_ticker_classifier,
     is_financial_ticker,
 )
+
+
+if TYPE_CHECKING:
+    from CTAFlow.features.signals_processing import COTAnalyzer
+else:  # pragma: no cover - runtime fallback when optional deps missing
+    COTAnalyzer = Any  # type: ignore[assignment]
 
 
 try:
@@ -229,9 +235,11 @@ class DataClient:
         if fp.parent and not fp.parent.exists():
             fp.parent.mkdir(parents=True, exist_ok=True)
 
-    def _get_cot_processor(self) -> COTAnalyzer:
+    def _get_cot_processor(self) -> "COTAnalyzer":
         if self._cot_processor is None:
-            self._cot_processor = COTAnalyzer()
+            from CTAFlow.features.signals_processing import COTAnalyzer as _COTAnalyzer
+
+            self._cot_processor = _COTAnalyzer()
         return self._cot_processor
 
     def _ensure_weekly_updates(self) -> None:
@@ -4482,6 +4490,11 @@ class ResultsClient:
             raise ValueError("scan_type, ticker, and scan_name must all be non-empty strings")
         return "/".join(parts)
 
+    def make_key(self, scan_type: str, ticker: str, scan_name: str) -> str:
+        """Public helper returning the canonical results key."""
+
+        return self._format_key(scan_type, ticker, scan_name)
+
     def _write(
         self,
         key: str,
@@ -4557,6 +4570,70 @@ class ResultsClient:
             replace=replace,
             metadata=metadata,
         )
+
+    # ------------------------------------------------------------------
+    # Reading helpers
+    # ------------------------------------------------------------------
+    def load_results_df(self, key: str, **select_kwargs: Any) -> pd.DataFrame:
+        """Load and return the DataFrame stored at ``key``."""
+
+        with pd.HDFStore(self.results_path, mode="r") as store:
+            if key not in store:
+                raise KeyError(f"No results stored under key '{key}'")
+            return store.select(key, **select_kwargs)
+
+    def load_scan_results(self, scan_type: str, ticker: str, scan_name: str, **select_kwargs: Any) -> pd.DataFrame:
+        """Load results for a specific ``scan_type``/``ticker``/``scan_name`` combination."""
+
+        key = self.make_key(scan_type, ticker, scan_name)
+        return self.load_results_df(key, **select_kwargs)
+
+    async def load_results_df_async(self, key: str, **select_kwargs: Any) -> pd.DataFrame:
+        """Asynchronously load a stored DataFrame via ``asyncio.to_thread``."""
+
+        return await asyncio.to_thread(self.load_results_df, key, **select_kwargs)
+
+    async def load_many_results_async(
+        self,
+        keys: Union[Sequence[str], Mapping[str, str]],
+        *,
+        errors: str = "raise",
+        **select_kwargs: Any,
+    ) -> Dict[str, pd.DataFrame]:
+        """Load many keys asynchronously returning a mapping of aliases to DataFrames."""
+
+        if isinstance(keys, Mapping):
+            alias_to_key = dict(keys)
+        else:
+            alias_to_key = {key: key for key in keys}
+
+        results: Dict[str, pd.DataFrame] = {}
+        for alias, key in alias_to_key.items():
+            try:
+                results[alias] = await self.load_results_df_async(key, **select_kwargs)
+            except Exception as exc:
+                if errors == "ignore":
+                    continue
+                raise exc
+
+        return results
+
+    async def load_scan_results_async(
+        self,
+        scan_type: str,
+        tickers: Sequence[str],
+        scan_name: str,
+        *,
+        errors: str = "raise",
+        **select_kwargs: Any,
+    ) -> Dict[str, pd.DataFrame]:
+        """Convenience async loader returning DataFrames keyed by ticker symbol."""
+
+        alias_to_key = {
+            str(ticker).upper(): self.make_key(scan_type, ticker, scan_name)
+            for ticker in tickers
+        }
+        return await self.load_many_results_async(alias_to_key, errors=errors, **select_kwargs)
 
     def write_momentum_results(
         self,

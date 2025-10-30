@@ -398,6 +398,62 @@ class PatternExtractor:
 
         return counts
 
+    @classmethod
+    async def load_summaries_from_results(
+        cls,
+        results_client: "ResultsClient",
+        *,
+        scan_type: str,
+        scan_name: str,
+        tickers: Sequence[str],
+        errors: str = "raise",
+        **select_kwargs: Any,
+    ) -> Dict[str, pd.DataFrame]:
+        """Asynchronously load summary rows for ``tickers`` from ``results_client``.
+
+        Parameters
+        ----------
+        results_client : ResultsClient
+            Client used to read stored summary frames.
+        scan_type : str
+            Screener category (``"seasonality"`` or ``"orderflow"``).
+        scan_name : str
+            Specific scan identifier.
+        tickers : Sequence[str]
+            Iterable of ticker symbols to load.
+        errors : {"raise", "ignore"}, optional
+            Behaviour when a key is missing.  Defaults to raising.
+        **select_kwargs
+            Additional keyword arguments forwarded to :meth:`pandas.HDFStore.select`.
+
+        Returns
+        -------
+        Dict[str, pandas.DataFrame]
+            Mapping of normalised ticker symbols to DataFrames containing the
+            persisted summary schema (:attr:`SUMMARY_COLUMNS`).
+        """
+
+        if not tickers:
+            return {}
+
+        alias_to_key = {
+            str(ticker).upper(): results_client.make_key(scan_type, ticker, scan_name)
+            for ticker in tickers
+        }
+        loaded = await results_client.load_many_results_async(
+            alias_to_key,
+            errors=errors,
+            **select_kwargs,
+        )
+
+        summaries: Dict[str, pd.DataFrame] = {}
+        for alias, df in loaded.items():
+            if not isinstance(df, pd.DataFrame):
+                continue
+            summaries[alias] = df.reindex(columns=cls.SUMMARY_COLUMNS)
+
+        return summaries
+
     # ------------------------------------------------------------------
     # Index construction
     # ------------------------------------------------------------------
