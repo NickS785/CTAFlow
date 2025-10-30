@@ -8,7 +8,7 @@ from typing import Any, List, Optional
 
 from CTAFlow.CTAFlow.data.data_client import ResultsClient
 from CTAFlow.CTAFlow.screeners.orderflow_scan import OrderflowParams
-from CTAFlow.CTAFlow.screeners.pattern_extractor import PatternExtractor
+from CTAFlow.CTAFlow.screeners.pattern_extractor import PatternExtractor, PatternSummary
 import CTAFlow.CTAFlow.screeners.pattern_extractor as pattern_module
 
 
@@ -64,6 +64,45 @@ class SeasonalityDummyScreener:
         if not months:
             return data
         return data[data.index.month.isin(months)]
+
+
+def _make_summary(
+    *,
+    key: str,
+    symbol: str,
+    strength: Optional[float] = None,
+    payload: Optional[dict] = None,
+    pattern_type: str = "demo",
+    source_screen: str = "test",
+    description: str = "demo pattern",
+) -> PatternSummary:
+    return PatternSummary(
+        key=key,
+        symbol=symbol,
+        source_screen=source_screen,
+        screen_params=None,
+        pattern_type=pattern_type,
+        description=description,
+        strength=strength,
+        payload=payload or {},
+        metadata={},
+    )
+
+
+def _make_extractor(
+    patterns: dict,
+    *,
+    results: Optional[dict] = None,
+    screen_params: Optional[dict] = None,
+) -> PatternExtractor:
+    extractor = object.__new__(PatternExtractor)
+    extractor._screener = DummyScreener()
+    extractor._results = dict(results or {})
+    extractor._screen_params = dict(screen_params or {})
+    extractor._pattern_index = {
+        symbol: dict(entries) for symbol, entries in patterns.items()
+    }
+    return extractor
 
 
 def _orderflow_result_fixture(ticker: str = "ZS") -> dict:
@@ -237,6 +276,223 @@ def test_pattern_extractor_resolves_missing_seasonality_params():
     assert extractor.get_pattern_summary("GC", weekday_key).screen_params is params[0]
     assert extractor.get_pattern_summary("GC", tod_key).screen_params is params[0]
 
+
+def test_concat_disjoint_tickers():
+    left_summary = _make_summary(
+        key="scan|left",
+        symbol="CL",
+        strength=1.0,
+        payload={"t_stat": 2.0, "support": 15},
+    )
+    right_summary = _make_summary(
+        key="scan|right",
+        symbol="NG",
+        strength=0.5,
+        payload={"t_stat": 1.5, "support": 8},
+    )
+    left = _make_extractor({"CL": {left_summary.key: left_summary}})
+    right = _make_extractor({"NG": {right_summary.key: right_summary}})
+
+    merged = left.concat(right)
+
+    assert set(merged._pattern_index) == {"CL", "NG"}
+    assert "NG" not in left._pattern_index
+    assert merged.get_pattern_summary("NG", right_summary.key) is right_summary
+
+
+def test_concat_overlap_prefer_strong():
+    weaker = _make_summary(
+        key="scan|pattern",
+        symbol="CL",
+        strength=0.6,
+        payload={"t_stat": 2.1, "support": 15, "correlation": 0.2},
+    )
+    stronger = _make_summary(
+        key="scan|pattern",
+        symbol="CL",
+        strength=0.5,
+        payload={"t_stat": 4.4, "support": 40, "correlation": 0.25},
+    )
+    left = _make_extractor({"CL": {weaker.key: weaker}})
+    right = _make_extractor({"CL": {stronger.key: stronger}})
+
+    merged = left.concat(right, conflict="prefer_strong")
+
+    assert merged.get_pattern_summary("CL", weaker.key) is stronger
+
+
+def test_concat_overlap_prefer_left_right():
+    left_summary = _make_summary(
+        key="scan|pattern",
+        symbol="CL",
+        strength=0.4,
+        payload={"support": 5},
+    )
+    right_summary = _make_summary(
+        key="scan|pattern",
+        symbol="CL",
+        strength=1.2,
+        payload={"support": 10},
+    )
+    left = _make_extractor({"CL": {left_summary.key: left_summary}})
+    right = _make_extractor({"CL": {right_summary.key: right_summary}})
+
+    prefer_left = left.concat(right, conflict="prefer_left")
+    prefer_right = left.concat(right, conflict="prefer_right")
+
+    assert prefer_left.get_pattern_summary("CL", left_summary.key) is left_summary
+    assert prefer_right.get_pattern_summary("CL", left_summary.key) is right_summary
+
+
+def test_concat_keep_both_suffixing():
+    base = _make_summary(key="scan|pattern", symbol="CL", strength=0.3)
+    existing_suffix = _make_summary(key="scan|pattern#2", symbol="CL", strength=0.2)
+    newcomer = _make_summary(
+        key="scan|pattern",
+        symbol="CL",
+        strength=0.9,
+        payload={"support": 20},
+    )
+    left = _make_extractor({"CL": {base.key: base, existing_suffix.key: existing_suffix}})
+    right = _make_extractor({"CL": {newcomer.key: newcomer}})
+
+    merged = left.concat(right, conflict="keep_both")
+
+    keys = set(merged.get_pattern_keys("CL"))
+    assert keys == {"scan|pattern", "scan|pattern#2", "scan|pattern#3"}
+    assert merged.get_pattern_summary("CL", "scan|pattern#3") is newcomer
+
+
+def test_concat_many_chain_associativity():
+    s1 = _make_summary(key="scan|p1", symbol="CL", strength=0.5)
+    s2 = _make_summary(key="scan|p2", symbol="NG", strength=0.4)
+    s3 = _make_summary(key="scan|p3", symbol="CL", strength=0.7)
+
+    a = _make_extractor({"CL": {s1.key: s1}}, results={"r1": {"CL": 1}})
+    b = _make_extractor({"NG": {s2.key: s2}})
+    c = _make_extractor({"CL": {s3.key: s3}}, results={"r2": {"CL": 2}})
+
+    chained = PatternExtractor.concat_many([a, b, c])
+    sequential = a.concat(b).concat(c)
+
+    assert chained.patterns == sequential.patterns
+
+
+def test_concat_preserves_other_state():
+    left_summary = _make_summary(key="scan|left", symbol="CL", strength=0.5)
+    right_summary = _make_summary(key="scan|right", symbol="NG", strength=0.9)
+
+    left = _make_extractor(
+        {"CL": {left_summary.key: left_summary}},
+        results={"left": {"CL": 1}, "shared": {"CL": "left"}},
+        screen_params={"left": "params", "shared": "left_param"},
+    )
+    right = _make_extractor(
+        {"NG": {right_summary.key: right_summary}},
+        results={"shared": {"CL": "right"}, "new": {"NG": 2}},
+        screen_params={"shared": "right_param", "new": "param"},
+    )
+
+    merged = left.concat(right, conflict="prefer_right")
+
+    assert merged._results["shared"] == {"CL": "right"}
+    assert merged._results["left"] == {"CL": 1}
+    assert merged._results["new"] == {"NG": 2}
+    assert left._results.get("new") is None
+
+    assert merged._screen_params["shared"] == "right_param"
+    assert merged._screen_params["left"] == "params"
+
+
+def test_rank_handles_missing_fields():
+    summary = _make_summary(key="scan|missing", symbol="CL")
+    extractor = _make_extractor({"CL": {summary.key: summary}})
+
+    score = PatternExtractor.significance_score(summary)
+    assert isinstance(score, float)
+
+    ranked = extractor.rank_patterns()
+    assert ranked["CL"] == [(summary.key, summary, score)]
+
+
+def test_rank_tie_breakers_deterministic():
+    low_support = _make_summary(
+        key="scan|a",
+        symbol="CL",
+        payload={"support": 10, "t_stat": 1.0},
+    )
+    high_support_first = _make_summary(
+        key="scan|b",
+        symbol="CL",
+        payload={"support": 30, "t_stat": 1.5},
+    )
+    high_support_second = _make_summary(
+        key="scan|c",
+        symbol="CL",
+        payload={"support": 30, "t_stat": 1.5},
+    )
+    extractor = _make_extractor(
+        {
+            "CL": {
+                low_support.key: low_support,
+                high_support_second.key: high_support_second,
+                high_support_first.key: high_support_first,
+            }
+        }
+    )
+
+    ranked = extractor.rank_patterns(by="strength")
+    ordered_keys = [entry[0] for entry in ranked["CL"]]
+    assert ordered_keys == ["scan|b", "scan|c", "scan|a"]
+
+
+def test_rank_per_ticker_top_n():
+    s1 = _make_summary(key="scan|a", symbol="CL", payload={"support": 20, "t_stat": 3.0})
+    s2 = _make_summary(key="scan|b", symbol="CL", payload={"support": 10, "t_stat": 2.0})
+    s3 = _make_summary(key="scan|c", symbol="NG", payload={"support": 5, "t_stat": 1.0})
+
+    extractor = _make_extractor({"CL": {s1.key: s1, s2.key: s2}, "NG": {s3.key: s3}})
+
+    ranked = extractor.rank_patterns(top=1)
+
+    assert len(ranked["CL"]) == 1
+    assert ranked["NG"][0][0] == s3.key
+
+
+def test_rank_global_sorted_desc():
+    s1 = _make_summary(key="scan|a", symbol="CL", payload={"support": 50, "t_stat": 4.0})
+    s2 = _make_summary(key="scan|b", symbol="NG", payload={"support": 10, "t_stat": 1.0})
+
+    extractor = _make_extractor({"CL": {s1.key: s1}, "NG": {s2.key: s2}})
+
+    ranked = extractor.rank_patterns(per_ticker=False)
+    scores = [entry[3] for entry in ranked]
+
+    assert scores == sorted(scores, reverse=True)
+    assert ranked[0][0] == "CL"
+
+
+def test_significance_weight_sensitivity():
+    weak = _make_summary(key="scan|weak", symbol="CL", payload={"support": 20, "t_stat": 1.0})
+    strong = _make_summary(key="scan|strong", symbol="CL", payload={"support": 20, "t_stat": 4.0})
+
+    assert PatternExtractor.significance_score(strong) > PatternExtractor.significance_score(weak)
+
+
+def test_rank_with_negative_strength_or_corr():
+    summary = _make_summary(
+        key="scan|neg",
+        symbol="CL",
+        strength=-2.0,
+        payload={"correlation": -0.9, "support": 12, "t_stat": 2.5},
+    )
+    extractor = _make_extractor({"CL": {summary.key: summary}})
+
+    score = PatternExtractor.significance_score(summary)
+    assert 0.0 <= score <= 1.0
+
+    ranked = extractor.rank_patterns()
+    assert ranked["CL"][0][0] == summary.key
 
 def test_persist_to_results_writes_hdf_keys(tmp_path):
     from pathlib import Path
