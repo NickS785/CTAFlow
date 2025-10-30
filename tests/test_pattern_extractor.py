@@ -1,11 +1,15 @@
+import asyncio
 import pandas as pd
 import numpy as np
+import pytest
 from datetime import time
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, List, Optional
 
+from CTAFlow.CTAFlow.data.data_client import ResultsClient
 from CTAFlow.CTAFlow.screeners.orderflow_scan import OrderflowParams
 from CTAFlow.CTAFlow.screeners.pattern_extractor import PatternExtractor
+import CTAFlow.CTAFlow.screeners.pattern_extractor as pattern_module
 
 
 @dataclass
@@ -21,6 +25,10 @@ class FakeScreenParams:
     season: Optional[str] = None
     session_starts: Optional[List[str]] = None
     session_ends: Optional[List[str]] = None
+
+
+if getattr(pattern_module, "ScreenParams", None) is Any:  # pragma: no cover - optional dependency fallback
+    pattern_module.ScreenParams = FakeScreenParams
 
 
 class DummyScreener:
@@ -58,12 +66,12 @@ class SeasonalityDummyScreener:
         return data[data.index.month.isin(months)]
 
 
-def _orderflow_result_fixture() -> dict:
+def _orderflow_result_fixture(ticker: str = "ZS") -> dict:
     tz = "America/Chicago"
     ts_end = pd.date_range("2023-09-01 08:30", periods=6, freq="1h", tz=tz)
     df_buckets = pd.DataFrame(
         {
-            "ticker": ["ZS"] * len(ts_end),
+            "ticker": [ticker] * len(ts_end),
             "bucket": range(len(ts_end)),
             "ts_start": ts_end - pd.Timedelta(minutes=30),
             "ts_end": ts_end,
@@ -78,7 +86,7 @@ def _orderflow_result_fixture() -> dict:
     df_weekly = pd.DataFrame(
         {
             "weekday": ["Friday"],
-            "ticker": ["ZS"],
+            "ticker": [ticker],
             "metric": ["buy_pressure"],
             "mean": [0.12],
             "t_stat": [3.1],
@@ -94,7 +102,7 @@ def _orderflow_result_fixture() -> dict:
         {
             "week_of_month": [1],
             "weekday": ["Friday"],
-            "ticker": ["ZS"],
+            "ticker": [ticker],
             "metric": ["buy_pressure"],
             "mean": [0.15],
             "t_stat": [2.8],
@@ -108,10 +116,10 @@ def _orderflow_result_fixture() -> dict:
 
     df_weekly_peak_pressure = pd.DataFrame(
         {
-            "ticker": ["ZS"],
+            "ticker": [ticker],
             "metric": ["buy_pressure"],
             "weekday": ["Friday"],
-            "clock_time": [ts_end[0].time()],
+            "clock_time": [ts_end[0].time().replace(microsecond=123456)],
             "pressure_bias": ["buy"],
             "seasonality_mean": [0.12],
             "seasonality_t_stat": [3.1],
@@ -228,3 +236,169 @@ def test_pattern_extractor_resolves_missing_seasonality_params():
 
     assert extractor.get_pattern_summary("GC", weekday_key).screen_params is params[0]
     assert extractor.get_pattern_summary("GC", tod_key).screen_params is params[0]
+
+
+def test_persist_to_results_writes_hdf_keys(tmp_path):
+    from pathlib import Path
+
+    class StubResultsClient:
+        def __init__(self, results_path: Path, *, complib: str = "blosc", complevel: int = 9) -> None:
+            self.results_path = Path(results_path)
+            self.complib = complib
+            self.complevel = complevel
+
+        def write_results_df(self, key: str, df: pd.DataFrame, *, replace: bool = True) -> None:
+            fmt = dict(format="table", data_columns=True, complib=self.complib, complevel=self.complevel)
+            with pd.HDFStore(self.results_path, mode="a") as store:
+                writer = store.put if replace else store.append
+                writer(key, df, **fmt)
+
+    seasonality_name = "months_9_10_11_seasonality"
+    orderflow_name = "us_winter"
+
+    results = {
+        seasonality_name: {
+            "NG": {
+                "strongest_patterns": [
+                    {
+                        "type": "weekday_returns",
+                        "day": "Monday",
+                        "description": "Monday edge",
+                        "strength": 1.2,
+                        "correlation": 0.65,
+                        "q_value": 0.015,
+                        "t_stat": 2.8,
+                        "n": 45,
+                    },
+                    {
+                        "type": "time_predictive_nextday",
+                        "time": "10:30:00.500000",
+                        "description": "10:30 predicts next day",
+                        "strength": 0.75,
+                        "correlation": 0.42,
+                        "q_value": 0.02,
+                        "t_stat": 2.1,
+                        "n": 38,
+                    },
+                ],
+                "metadata": {},
+            }
+        },
+        orderflow_name: {
+            "RB": _orderflow_result_fixture("RB"),
+        },
+    }
+
+    params = [
+        FakeScreenParams(
+            screen_type="seasonality",
+            name=seasonality_name,
+            months=[9, 10, 11],
+            target_times=["10:30"],
+            period_length=30,
+        ),
+        OrderflowParams(session_start="08:30", session_end="15:30", name=orderflow_name),
+    ]
+
+    extractor = PatternExtractor(DummyScreener(), results, params)
+    results_path = tmp_path / "results.h5"
+    client = StubResultsClient(results_path)
+
+    counts = extractor.persist_to_results(client, created_at="2023-10-01T00:00:00Z")
+
+    expected_keys = {
+        "results/seasonality/NG/months_9_10_11_seasonality": 2,
+        "results/orderflow/RB/us_winter": 3,
+    }
+
+    assert counts == expected_keys
+
+    with pd.HDFStore(results_path, "r") as store:
+        seasonal_df = store.select("results/seasonality/NG/months_9_10_11_seasonality")
+        orderflow_df = store.select("results/orderflow/RB/us_winter")
+
+    assert list(seasonal_df.columns) == list(PatternExtractor.SUMMARY_COLUMNS)
+    assert list(orderflow_df.columns) == list(PatternExtractor.SUMMARY_COLUMNS)
+
+    assert set(seasonal_df["pattern_type"]) == {"weekday_returns", "time_predictive_nextday"}
+    assert (seasonal_df["created_at"] == "2023-10-01T00:00:00Z").all()
+    assert pytest.approx(orderflow_df.loc[orderflow_df["pattern_type"] == "orderflow_peak_pressure", "t_stat"].iloc[0]) == 3.1
+    assert "08:30:00.123456" in orderflow_df.loc[
+        orderflow_df["pattern_type"] == "orderflow_peak_pressure", "time"
+    ].iloc[0]
+
+
+def test_load_summaries_from_results_async(tmp_path):
+    scan_type = "seasonality"
+    scan_name = "months_9_10_11_seasonality"
+    results_path = tmp_path / "results_async.h5"
+    client = ResultsClient(results_path)
+
+    base_rows = [
+        {
+            "pattern_type": "weekday_returns",
+            "strength": 1.0,
+            "correlation": 0.5,
+            "time": "",
+            "weekday": "Monday",
+            "week_of_month": 1,
+            "q_value": 0.01,
+            "t_stat": 2.5,
+            "n": 30,
+            "source_screen": scan_name,
+            "scan_type": scan_type,
+            "scan_name": scan_name,
+            "description": "Test summary",
+            "created_at": "2023-10-01T00:00:00Z",
+        }
+    ]
+    ng_df = pd.DataFrame(base_rows, columns=PatternExtractor.SUMMARY_COLUMNS)
+    rb_df = ng_df.copy()
+    rb_df["pattern_type"] = "time_predictive_nextday"
+
+    client.write_results_df(client.make_key(scan_type, "NG", scan_name), ng_df, replace=True)
+    client.write_results_df(client.make_key(scan_type, "RB", scan_name), rb_df, replace=True)
+
+    loaded = asyncio.run(
+        PatternExtractor.load_summaries_from_results_async(
+            client,
+            scan_type=scan_type,
+            scan_name=scan_name,
+            tickers=["NG", "rb"],
+        )
+    )
+
+    assert set(loaded.keys()) == {"NG", "RB"}
+    assert list(loaded["NG"].columns) == list(PatternExtractor.SUMMARY_COLUMNS)
+    assert list(loaded["RB"].columns) == list(PatternExtractor.SUMMARY_COLUMNS)
+    assert loaded["NG"].loc[0, "pattern_type"] == "weekday_returns"
+    assert loaded["RB"].loc[0, "pattern_type"] == "time_predictive_nextday"
+
+    with pytest.raises(KeyError):
+        asyncio.run(
+            PatternExtractor.load_summaries_from_results_async(
+                client,
+                scan_type=scan_type,
+                scan_name=scan_name,
+                tickers=["CL"],
+            )
+        )
+
+    loaded_ignore = asyncio.run(
+        PatternExtractor.load_summaries_from_results_async(
+            client,
+            scan_type=scan_type,
+            scan_name=scan_name,
+            tickers=["NG", "CL"],
+            errors="ignore",
+        )
+    )
+    assert set(loaded_ignore.keys()) == {"NG"}
+
+    sync_loaded = PatternExtractor.load_summaries_from_results(
+        client,
+        scan_type=scan_type,
+        scan_name=scan_name,
+        tickers=["NG", "rb"],
+    )
+    assert set(sync_loaded.keys()) == {"NG", "RB"}
