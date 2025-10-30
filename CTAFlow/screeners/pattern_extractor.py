@@ -11,11 +11,21 @@ ranking::
 
 These helpers make it straightforward to surface the strongest statistical
 relationships discovered across multiple screener runs.
+
+The extractor exposes a ``metadata`` dictionary for screen-level metadata.
+When available the ``metadata['filtered_months']`` key contains the canonical
+set of allowed months (``{1, ..., 12}``) for the screen.  Historical screener
+runs may instead annotate per-ticker ``filtered_months``; the extractor
+promotes consistent ticker-level values into ``metadata`` automatically and
+keeps the canonical value sanitised for downstream consumers such as the
+``ScreenerPipeline`` and ``HorizonMapper``.
 """
 from __future__ import annotations
 
 import math
 import re
+import logging
+from collections.abc import Iterable as IterableABC
 from dataclasses import dataclass, field
 from datetime import time
 from types import SimpleNamespace
@@ -35,6 +45,72 @@ from ..utils.session import filter_session_bars
 
 
 ScreenParamLike = Union[ScreenParams, OrderflowParams, SimpleNamespace]
+
+
+logger = logging.getLogger(__name__)
+
+
+def _coerce_month_iterable(values: Any) -> Iterable[Any]:
+    """Yield individual month candidates from ``values``.
+
+    Strings are split on non-numeric characters so that payloads such as
+    ``"1,2,3"`` or ``"Jan-Feb"`` degrade gracefully.  Non-iterables are wrapped
+    in a single-item iterable.
+    """
+
+    if values is None:
+        return []
+    if isinstance(values, str):
+        parts = re.split(r"[^0-9]+", values)
+        return [part for part in parts if part]
+    if isinstance(values, IterableABC) and not isinstance(values, (bytes, bytearray)):
+        return values
+    return [values]
+
+
+def validate_filtered_months(months: Any) -> Optional[Set[int]]:
+    """Return a sanitised month set from ``months`` or ``None``.
+
+    Invalid or out-of-range entries are discarded with a warning.  The string
+    ``"all"`` (case-insensitive) is treated as ``None`` for backwards
+    compatibility with earlier screener payloads.
+    """
+
+    if months is None:
+        return None
+
+    if isinstance(months, str) and months.strip().lower() == "all":
+        return None
+
+    if isinstance(months, (set, frozenset)) and len(months) == 0:
+        return set()
+    if isinstance(months, (list, tuple)) and len(months) == 0:
+        return set()
+
+    candidate_iter = _coerce_month_iterable(months)
+    cleaned: Set[int] = set()
+    discarded: List[Any] = []
+
+    for item in candidate_iter:
+        try:
+            value = int(item)
+        except (TypeError, ValueError):
+            discarded.append(item)
+            continue
+        if 1 <= value <= 12:
+            cleaned.add(value)
+        else:
+            discarded.append(item)
+
+    if discarded:
+        logger.warning(
+            "Discarding invalid filtered_months entries",
+            extra={"invalid": discarded},
+        )
+
+    if not cleaned:
+        return None
+    return cleaned
 
 if TYPE_CHECKING:  # pragma: no cover - typing aid only
     from ..data.data_client import ResultsClient
@@ -126,6 +202,7 @@ class PatternExtractor:
         screener: HistoricalScreener,
         results: Mapping[str, Mapping[str, Dict[str, Any]]],
         screen_params: Optional[Sequence[ScreenParamLike]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self._screener = screener
         self._results = results
@@ -135,8 +212,10 @@ class PatternExtractor:
             else {}
         )
 
+        self.metadata: Dict[str, Any] = dict(metadata or {})
         self._pattern_index: Dict[str, Dict[str, PatternSummary]] = {}
         self._build_index()
+        self._initialise_metadata()
 
     # ------------------------------------------------------------------
     # Public API
@@ -152,7 +231,100 @@ class PatternExtractor:
             symbol: dict(entries)
             for symbol, entries in self._pattern_index.items()
         }
+        clone.metadata = dict(self.metadata)
         return clone
+
+    # ------------------------------------------------------------------
+    # Metadata helpers
+    # ------------------------------------------------------------------
+    def _initialise_metadata(self) -> None:
+        """Normalise ``self.metadata`` with canonical filtered months."""
+
+        raw_metadata_months = self.metadata.get("filtered_months")
+        metadata_months = validate_filtered_months(raw_metadata_months)
+        if metadata_months is not None:
+            self.metadata["filtered_months"] = sorted(metadata_months)
+        else:
+            self.metadata.pop("filtered_months", None)
+
+        if "filtered_months" not in self.metadata:
+            promoted = self._extract_filtered_months_from_results(self._results)
+            if promoted:
+                self.metadata["filtered_months"] = sorted(promoted)
+
+    def _extract_filtered_months_from_results(
+        self, results: Mapping[str, Mapping[str, Any]]
+    ) -> Optional[Set[int]]:
+        """Return canonical months from ticker-level result payloads."""
+
+        observed: List[Set[int]] = []
+
+        for screen_result in results.values():
+            if not isinstance(screen_result, Mapping):
+                continue
+            for ticker_result in screen_result.values():
+                if not isinstance(ticker_result, Mapping):
+                    continue
+                months_raw = ticker_result.get("filtered_months")
+                months = validate_filtered_months(months_raw)
+                if months:
+                    observed.append(months)
+
+        if not observed:
+            return None
+
+        canonical = observed[0]
+        unique_sets = {frozenset(months) for months in observed}
+        if len(unique_sets) == 1:
+            return set(canonical)
+
+        union_months: Set[int] = set().union(*observed)
+        logger.warning(
+            "Inconsistent filtered_months across tickers; using union",
+            extra={"observed": [sorted(months) for months in observed]},
+        )
+        return union_months
+
+    @staticmethod
+    def _merge_month_sets(
+        left: Optional[Set[int]],
+        right: Optional[Set[int]],
+        policy: str,
+    ) -> Optional[Set[int]]:
+        """Merge two month sets according to ``policy``."""
+
+        if policy == "left":
+            return set(left) if left else None
+        if policy == "right":
+            return set(right) if right else None
+
+        if policy == "union":
+            combined: Set[int] = set()
+            if left:
+                combined.update(left)
+            if right:
+                combined.update(right)
+            return combined or None
+
+        # Default to intersection semantics
+        if left is None:
+            return set(right) if right else None
+        if right is None:
+            return set(left) if left else None
+
+        intersection = set(left) & set(right)
+        return intersection if intersection else set()
+
+    def get_filtered_months(self) -> Optional[Set[int]]:
+        """Return the canonical filtered months as a set of integers."""
+
+        value = self.metadata.get("filtered_months")
+        months = validate_filtered_months(value)
+        if months is None:
+            return None
+        # Keep the metadata representation sorted for serialisation round-trips
+        self.metadata["filtered_months"] = sorted(months)
+        return set(months)
 
     @property
     def patterns(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
@@ -171,6 +343,7 @@ class PatternExtractor:
         other: "PatternExtractor",
         *,
         conflict: str = "prefer_strong",
+        month_merge_policy: str = "intersect",
         inplace: bool = False,
     ) -> "PatternExtractor":
         """Merge the pattern inventory from ``other`` into this extractor.
@@ -208,6 +381,13 @@ class PatternExtractor:
         if strategy not in valid_strategies:
             raise ValueError(f"Unsupported conflict strategy '{conflict}'")
 
+        month_policy = month_merge_policy.lower()
+        valid_month_policies = {"union", "intersect", "left", "right"}
+        if month_policy not in valid_month_policies:
+            raise ValueError(
+                "Unsupported month_merge_policy '{policy}'".format(policy=month_merge_policy)
+            )
+
         target = self if inplace else self._copy_like()
 
         for symbol, summaries in other._pattern_index.items():
@@ -242,17 +422,46 @@ class PatternExtractor:
         merged_params.update(other._screen_params)
         target._screen_params = merged_params
 
+        left_months = validate_filtered_months(target.metadata.get("filtered_months"))
+        right_months = validate_filtered_months(other.metadata.get("filtered_months"))
+        merged_months = self._merge_month_sets(left_months, right_months, month_policy)
+
+        merged_metadata = dict(target.metadata)
+        if merged_months is None:
+            merged_metadata.pop("filtered_months", None)
+        else:
+            merged_metadata["filtered_months"] = sorted(merged_months)
+
+        other_metadata = {
+            key: value
+            for key, value in other.metadata.items()
+            if key not in {"filtered_months", "month_merge_policy"}
+        }
+        merged_metadata.update(other_metadata)
+        merged_metadata["month_merge_policy"] = month_policy
+        target.metadata = merged_metadata
+
         return target
 
     def __add__(self, other: "PatternExtractor") -> "PatternExtractor":
         """Return a new extractor containing patterns from both operands."""
 
-        return self.concat(other, conflict="prefer_strong", inplace=False)
+        return self.concat(
+            other,
+            conflict="prefer_strong",
+            month_merge_policy="intersect",
+            inplace=False,
+        )
 
     def __iadd__(self, other: "PatternExtractor") -> "PatternExtractor":
         """Merge patterns from ``other`` into ``self`` in-place."""
 
-        return self.concat(other, conflict="prefer_strong", inplace=True)
+        return self.concat(
+            other,
+            conflict="prefer_strong",
+            month_merge_policy="intersect",
+            inplace=True,
+        )
 
     @classmethod
     def concat_many(
@@ -260,6 +469,7 @@ class PatternExtractor:
         extractors: Iterable["PatternExtractor"],
         *,
         conflict: str = "prefer_strong",
+        month_merge_policy: str = "intersect",
     ) -> "PatternExtractor":
         """Fold an iterable of extractors into a single combined instance."""
 
@@ -271,7 +481,12 @@ class PatternExtractor:
 
         result = first._copy_like()
         for extractor in iterator:
-            result = result.concat(extractor, conflict=conflict, inplace=True)
+            result = result.concat(
+                extractor,
+                conflict=conflict,
+                month_merge_policy=month_merge_policy,
+                inplace=True,
+            )
         return result
 
     def filter_patterns(
@@ -1533,4 +1748,4 @@ class PatternExtractor:
             detail_str = " (" + ", ".join(details) + ")"
         return f"{metric} peak {bias} on {weekday} at {time_display}{detail_str}"
 
-__all__ = ["PatternExtractor", "PatternSummary"]
+__all__ = ["PatternExtractor", "PatternSummary", "validate_filtered_months"]
