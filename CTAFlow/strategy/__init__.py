@@ -9,7 +9,7 @@ This module contains:
 - Strategy backtesting and performance evaluation
 """
 
-from .screener_pipeline import ScreenerPipeline
+from .screener_pipeline import ScreenerPipeline, HorizonMapper
 
 __all__ = [
     'ScreenerPipeline',
