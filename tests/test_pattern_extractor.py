@@ -360,7 +360,7 @@ def test_load_summaries_from_results_async(tmp_path):
     client.write_results_df(client.make_key(scan_type, "RB", scan_name), rb_df, replace=True)
 
     loaded = asyncio.run(
-        PatternExtractor.load_summaries_from_results(
+        PatternExtractor.load_summaries_from_results_async(
             client,
             scan_type=scan_type,
             scan_name=scan_name,
@@ -376,7 +376,7 @@ def test_load_summaries_from_results_async(tmp_path):
 
     with pytest.raises(KeyError):
         asyncio.run(
-            PatternExtractor.load_summaries_from_results(
+            PatternExtractor.load_summaries_from_results_async(
                 client,
                 scan_type=scan_type,
                 scan_name=scan_name,
@@ -385,7 +385,7 @@ def test_load_summaries_from_results_async(tmp_path):
         )
 
     loaded_ignore = asyncio.run(
-        PatternExtractor.load_summaries_from_results(
+        PatternExtractor.load_summaries_from_results_async(
             client,
             scan_type=scan_type,
             scan_name=scan_name,
@@ -394,3 +394,11 @@ def test_load_summaries_from_results_async(tmp_path):
         )
     )
     assert set(loaded_ignore.keys()) == {"NG"}
+
+    sync_loaded = PatternExtractor.load_summaries_from_results(
+        client,
+        scan_type=scan_type,
+        scan_name=scan_name,
+        tickers=["NG", "rb"],
+    )
+    assert set(sync_loaded.keys()) == {"NG", "RB"}

@@ -61,6 +61,7 @@ from ..config import (
     ENABLE_WEEKLY_UPDATES,
     RESULTS_HDF_PATH,
 )
+from ..utils import aio
 from .update_management import (
     COT_REFRESH_EVENT,
     WEEKLY_MARKET_UPDATE_EVENT,
@@ -4582,11 +4583,39 @@ class ResultsClient:
                 raise KeyError(f"No results stored under key '{key}'")
             return store.select(key, **select_kwargs)
 
-    def load_scan_results(self, scan_type: str, ticker: str, scan_name: str, **select_kwargs: Any) -> pd.DataFrame:
-        """Load results for a specific ``scan_type``/``ticker``/``scan_name`` combination."""
+    def load_scan_results(
+        self,
+        scan_type: str,
+        ticker: str,
+        scan_name: str,
+        *,
+        errors: str = "raise",
+        **select_kwargs: Any,
+    ) -> pd.DataFrame:
+        """Synchronously load a single ticker's scan results.
 
-        key = self.make_key(scan_type, ticker, scan_name)
-        return self.load_results_df(key, **select_kwargs)
+        This wrapper delegates to :meth:`load_scan_results_async` via
+        :func:`CTAFlow.utils.aio.run` to avoid duplicating the asynchronous
+        implementation.
+        """
+
+        normalized = str(ticker).upper()
+        results = aio.run(
+            self.load_scan_results_async(
+                scan_type=scan_type,
+                tickers=[ticker],
+                scan_name=scan_name,
+                errors=errors,
+                **select_kwargs,
+            )
+        )
+
+        if normalized not in results:
+            if errors == "ignore":
+                return pd.DataFrame()
+            raise KeyError(f"No results stored under key '{self.make_key(scan_type, ticker, scan_name)}'")
+
+        return results[normalized]
 
     async def load_results_df_async(self, key: str, **select_kwargs: Any) -> pd.DataFrame:
         """Asynchronously load a stored DataFrame via ``asyncio.to_thread``."""

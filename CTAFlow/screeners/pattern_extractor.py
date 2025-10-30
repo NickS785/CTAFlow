@@ -15,6 +15,7 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for minimal environme
     HistoricalScreener = Any  # type: ignore[assignment]
     ScreenParams = Any  # type: ignore[assignment]
 from .orderflow_scan import OrderflowParams
+from ..utils import aio
 from ..utils.seasonal import aggregate_window, log_returns, monthly_returns, tod_mask
 from ..utils.session import filter_session_bars
 
@@ -399,7 +400,36 @@ class PatternExtractor:
         return counts
 
     @classmethod
-    async def load_summaries_from_results(
+    def load_summaries_from_results(
+        cls,
+        results_client: "ResultsClient",
+        *,
+        scan_type: str,
+        scan_name: str,
+        tickers: Sequence[str],
+        errors: str = "raise",
+        **select_kwargs: Any,
+    ) -> Dict[str, pd.DataFrame]:
+        """Synchronously load summary rows for ``tickers`` from ``results_client``.
+
+        This convenience method simply wraps
+        :meth:`load_summaries_from_results_async` using
+        :func:`CTAFlow.utils.aio.run`.
+        """
+
+        return aio.run(
+            cls.load_summaries_from_results_async(
+                results_client,
+                scan_type=scan_type,
+                scan_name=scan_name,
+                tickers=tickers,
+                errors=errors,
+                **select_kwargs,
+            )
+        )
+
+    @classmethod
+    async def load_summaries_from_results_async(
         cls,
         results_client: "ResultsClient",
         *,
