@@ -12,6 +12,7 @@ module = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(module)
 ScreenerPipeline = module.ScreenerPipeline
+HorizonMapper = module.HorizonMapper
 
 
 def _slug(value: str) -> str:
@@ -174,4 +175,29 @@ def test_screener_pipeline_generates_sparse_gates():
     gate_columns = [col for col in features.columns if col.endswith("_gate") and col != "any_pattern_active"]
     assert peak_gate in gate_columns
     assert "other_pattern_gate" not in gate_columns
+
+
+def test_horizon_mapper_accepts_mixed_case_price_columns():
+    mapper = HorizonMapper(tz="America/Chicago")
+    df = pd.DataFrame(
+        {
+            "TS": pd.date_range("2023-09-01", periods=2, freq="D", tz="America/Chicago"),
+            "Open": [100.0, 101.0],
+            "Close": [102.0, 101.5],
+            "session_id": ["2023-09-01", "2023-09-02"],
+            "example_pattern_gate": [1, 0],
+        }
+    )
+    patterns = {
+        "Example Pattern": {
+            "pattern_type": "weekday_mean",
+            "pattern_payload": {"mean": 0.2},
+        }
+    }
+
+    result = mapper.build_xy(df, patterns)
+
+    assert not result.empty
+    assert result["returns_y"].notna().all()
+    assert result["returns_x"].iloc[0] == 0.2
 
