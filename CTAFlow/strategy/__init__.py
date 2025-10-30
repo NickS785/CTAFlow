@@ -13,6 +13,7 @@ from .screener_pipeline import ScreenerPipeline
 
 __all__ = [
     'ScreenerPipeline',
+    "HorizonMapper"
 ]
 
 try:
