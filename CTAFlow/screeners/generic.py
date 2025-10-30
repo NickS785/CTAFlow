@@ -18,18 +18,32 @@ usa_tgt_times = ["08:30", "10:30","9:00", "13:30"]
 session_starts = ["02:30", "08:30"]
 
 session_ends = ["10:30", "15:00"]
+default_london_settings = {"screen_type":"seasonality","target_times":london_tgt_times, "period_length":period_time}
+default_usa_settings = {"screen_type":"seasonality", "target_times":usa_tgt_times, "period_length":period_time}
+london_winter_seasonality = ScreenParams("seasonality",name="london_winter", months=[12,1,2,3], target_times=london_tgt_times, period_length=period_time, seasonality_session_start=london_start, seasonality_session_end=london_end)
 
-london_winter_seasonality = ScreenParams("seasonality", months=[12,1,2,3], target_times=london_tgt_times, period_length=period_time, seasonality_session_start=london_start, seasonality_session_end=london_end)
+london_spring_seasonality = ScreenParams("seasonality",name="london_spring" ,months=[3,4,5,], target_times=london_tgt_times, period_length=period_time, seasonality_session_start=london_start, seasonality_session_end=london_end)
 
-london_spring_seasonality = ScreenParams("seasonality", months=[3,4,5,], target_times=london_tgt_times, period_length=period_time, seasonality_session_start=london_start, seasonality_session_end=london_end)
+london_fall_seasonality = ScreenParams("seasonality", name="london_fall", months=[9,10,11], target_times=london_tgt_times, period_length=period_time, seasonality_session_start=london_start, seasonality_session_end=london_end)
 
-london_fall_seasonality = ScreenParams("seasonality", months=[9,10,11], target_times=london_tgt_times, period_length=period_time, seasonality_session_start=london_start, seasonality_session_end=london_end)
+london_summer_seasonality = ScreenParams("seasonality", name="london_summer", months=[5,6,7,8], target_times=london_tgt_times, period_length=period_time, seasonality_session_start=london_start, seasonality_session_end=london_end)
 
-london_summer_seasonality = ScreenParams("seasonality", months=[5,6,7,8], target_times=london_tgt_times, period_length=period_time, seasonality_session_start=london_start, seasonality_session_end=london_end)
+usa_winter_seasonality = ScreenParams("seasonality", name="usa_winter", months=[12,1,2,3], target_times=usa_tgt_times, period_length=period_time, seasonality_session_start=usa_start, seasonality_session_end=usa_end)
+usa_q1 = ScreenParams("seasonality",name="usa_q1", months=[1,2,3], target_times=usa_tgt_times, period_length=period_time)
+usa_q2 = ScreenParams("seasonality", name="usa_q2", months=[4,5,6], target_times=usa_tgt_times, period_length=period_time)
+usa_q3 = ScreenParams("seasonality", name="usa_q3", months=[7,8,9], target_times=usa_tgt_times, period_length=period_time)
+usa_q4 = ScreenParams("seasonality", name="usa_q4", months=[10,11,12], target_times=usa_tgt_times, period_length=period_time)
+usa_all = ScreenParams("seasonality", target_times=usa_tgt_times, period_length=period_time)
+usa_quarterly_params = [usa_q1, usa_q2, usa_q3, usa_q4, usa_all]
 
-usa_winter_seasonality = ScreenParams("seasonality", months=[12,1,2,3], target_times=usa_tgt_times, period_length=period_time, seasonality_session_start=usa_start, seasonality_session_end=usa_end)
+london_q1 = ScreenParams(**default_london_settings, name="london_q1", months=[1,2,3])
+london_q2 = ScreenParams(**default_london_settings, name="london_q2", months=[4,5,6])
+london_q3 = ScreenParams(**default_london_settings, name="london_q3", months=[7,8,9])
+london_q4 = ScreenParams(**default_london_settings, name="london_q4", months=[10,11,12])
+london_all = ScreenParams(**default_london_settings)
+london_quarterly_params = [london_q1, london_q2, london_q3, london_q4, london_all]
 
-usa_spring_seasonality = ScreenParams("seasonality", months=[3,4,5], target_times=usa_tgt_times, period_length=period_time, seasonality_session_start=usa_start, seasonality_session_end=usa_end)
+usa_spring_seasonality = ScreenParams("seasonality",name="usa_spring", months=[3,4,5], target_times=usa_tgt_times, period_length=period_time, seasonality_session_start=usa_start, seasonality_session_end=usa_end)
 
 usa_fall_seasonality = ScreenParams("seasonality", months=[9,10,11], target_times=usa_tgt_times, period_length=period_time, seasonality_session_start=usa_start, seasonality_session_end=usa_end)
 
