@@ -19,6 +19,7 @@ toml>=0.10.0   # For configuration files
 
 # Utilities
 tqdm>=4.60.0   # Progress bars
+exchange-calendars>=4.2
 
 # Optional: Financial data libraries (uncomment if needed)
 # yfinance>=0.1.70
