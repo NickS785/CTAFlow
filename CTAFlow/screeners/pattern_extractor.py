@@ -90,9 +90,11 @@ def validate_filtered_months(
         else:
             rejected.append(value)
 
+    logger = logger or _LOG
+
     if rejected and logger is not None and hasattr(logger, "warning"):
         logger.warning(
-            "[PatternExtractor] Dropped invalid filtered_month entries",
+            "Discarding invalid filtered_months",
             extra={"context": context, "invalid": rejected},
         )
 
@@ -189,6 +191,8 @@ class PatternExtractor:
         "scan_name",
         "description",
         "created_at",
+        "period_length",
+        "month_filter",
     )
 
     def __init__(
@@ -224,7 +228,8 @@ class PatternExtractor:
         clone._results = dict(self._results)
         clone._screen_params = dict(self._screen_params)
         clone.metadata = dict(self.metadata)
-        clone._filtered_months = set(self._filtered_months) if self._filtered_months else None
+        existing_months = getattr(self, "_filtered_months", None)
+        clone._filtered_months = set(existing_months) if existing_months else None
         clone._pattern_index = {
             symbol: dict(entries)
             for symbol, entries in self._pattern_index.items()
@@ -351,9 +356,16 @@ class PatternExtractor:
     def get_filtered_months(self) -> Optional[Set[int]]:
         """Return the canonical set of months allowed by the extractor."""
 
-        if self._filtered_months is None:
-            return None
-        return set(self._filtered_months)
+        current = getattr(self, "_filtered_months", None)
+        if current is None:
+            metadata_months = validate_filtered_months(
+                self.metadata.get("filtered_months"), logger=_LOG, context="PatternExtractor"
+            )
+            if metadata_months:
+                current = set(metadata_months)
+                self._filtered_months = current
+
+        return set(current) if current else None
 
     @property
     def patterns(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
@@ -928,8 +940,10 @@ class PatternExtractor:
         scan_type: str,
         entries: Mapping[str, PatternSummary],
         created_at: str,
+        metadata: Optional[Mapping[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
+        metadata = dict(metadata or {})
         for summary in entries.values():
             if summary.source_screen != scan_name:
                 continue
@@ -959,6 +973,8 @@ class PatternExtractor:
                 "scan_name": scan_name,
                 "description": summary.description,
                 "created_at": created_at,
+                "period_length": metadata.get("period_length"),
+                "month_filter": metadata.get("month_filter"),
             }
             rows.append(row)
 
@@ -1010,12 +1026,19 @@ class PatternExtractor:
 
             for ticker in by_ticker.keys():
                 entries = self._pattern_index.get(ticker, {})
+                ticker_result = by_ticker.get(ticker, {})
+                metadata = {}
+                if isinstance(ticker_result, Mapping):
+                    meta_candidate = ticker_result.get("metadata")
+                    if isinstance(meta_candidate, Mapping):
+                        metadata = dict(meta_candidate)
                 rows = self._summarize_patterns_for_ticker(
                     symbol=ticker,
                     scan_name=scan_name,
                     scan_type=scan_type,
                     entries=entries,
                     created_at=timestamp,
+                    metadata=metadata,
                 )
 
                 if not rows:

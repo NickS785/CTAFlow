@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
-from datetime import time as time_cls
+from datetime import date as date_cls, time as time_cls
 
 import numpy as np
 import pandas as pd
@@ -16,6 +17,15 @@ module = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(module)
 HorizonMapper = module.HorizonMapper
+
+SESSIONIZER_PATH = ROOT / "CTAFlow" / "strategy" / "sessionizer.py"
+SESSIONIZER_NAME = "CTAFlow.strategy.sessionizer"
+sessionizer_spec = importlib.util.spec_from_file_location(SESSIONIZER_NAME, SESSIONIZER_PATH)
+sessionizer_module = importlib.util.module_from_spec(sessionizer_spec)
+assert sessionizer_spec.loader is not None
+sys.modules[SESSIONIZER_NAME] = sessionizer_module
+sessionizer_spec.loader.exec_module(sessionizer_module)
+Sessionizer = sessionizer_module.Sessionizer
 
 
 def _make_sample_bars() -> pd.DataFrame:
@@ -69,6 +79,33 @@ def _session_close(df: pd.DataFrame, session_id: int) -> float:
     return float(session_rows["close"].iloc[-1])
 
 
+def _make_dst_transition_bars() -> pd.DataFrame:
+    tz = "America/Chicago"
+    session_dates = pd.bdate_range("2024-03-08", periods=5, tz=tz)
+
+    rows: list[dict[str, object]] = []
+    for idx, session_start in enumerate(session_dates):
+        open_price = 150.0 + idx
+        closes = [open_price + 0.5, open_price + 1.0, open_price + 2.0]
+        times = [
+            session_start + pd.Timedelta(hours=6, minutes=55),
+            session_start + pd.Timedelta(hours=7),
+            session_start + pd.Timedelta(hours=7, minutes=5),
+        ]
+        for ts, close_price in zip(times, closes, strict=True):
+            rows.append(
+                {
+                    "ts": ts,
+                    "open": open_price,
+                    "close": close_price,
+                }
+            )
+
+    df = pd.DataFrame(rows)
+    df["time_nextday_070000_gate"] = (df["ts"].dt.time == time_cls(7, 0)).astype(np.int8)
+    return df
+
+
 def test_time_predictive_nextday_returns_x_and_y():
     df = _make_sample_bars()
     mapper = HorizonMapper(tz="America/Chicago")
@@ -85,11 +122,11 @@ def test_time_predictive_nextday_returns_x_and_y():
     # All sessions except the last have a next-day close
     assert len(result) == len(df["session_id"].unique()) - 1
 
-    # returns_x uses the 5-minute window ending at the decision bar
+    # returns_x uses the 5-minute window starting at the decision bar
     first_session = df[df["session_id"] == 0]
     decision_close = float(first_session.loc[first_session["ts"].dt.time == time_cls(7, 0), "close"].iloc[0])
-    prior_close = float(first_session.loc[first_session["ts"].dt.time == time_cls(6, 55), "close"].iloc[0])
-    expected_x = np.log(decision_close / prior_close)
+    future_close = float(first_session.loc[first_session["ts"].dt.time == time_cls(7, 5), "close"].iloc[0])
+    expected_x = np.log(future_close / decision_close)
     assert result.loc[0, "returns_x"] == pytest.approx(expected_x)
 
     # returns_y uses next-day close→close
@@ -114,12 +151,56 @@ def test_time_predictive_nextweek_returns():
 
     first_session = df[df["session_id"] == 0]
     decision_close = float(first_session.loc[first_session["ts"].dt.time == time_cls(7, 0), "close"].iloc[0])
-    prior_close = float(first_session.loc[first_session["ts"].dt.time == time_cls(6, 55), "close"].iloc[0])
-    expected_x = np.log(decision_close / prior_close)
+    future_close = float(first_session.loc[first_session["ts"].dt.time == time_cls(7, 5), "close"].iloc[0])
+    expected_x = np.log(future_close / decision_close)
     assert result.loc[0, "returns_x"] == pytest.approx(expected_x)
 
     expected_y = np.log(_session_close(df, 5) / _session_close(df, 0))
     assert result.loc[0, "returns_y"] == pytest.approx(expected_y)
+
+
+def test_orderflow_peak_pressure_forward_returns():
+    df = _make_sample_bars()
+    peak_mask = (
+        (df["ts"].dt.day_name().str.lower() == "tuesday")
+        & (df["ts"].dt.time == time_cls(7, 0))
+    )
+    df["peak_tuesday_gate"] = peak_mask.astype(np.int8)
+
+    patterns = [
+        {
+            "pattern_type": "orderflow_peak_pressure",
+            "pattern_payload": {
+                "weekday": "tuesday",
+                "clock_time": "07:00",
+                "metric": "net_pressure",
+                "pressure_bias": "buy",
+            },
+            "metadata": {"orderflow_bias": "buy"},
+            "key": "peak_tuesday",
+        }
+    ]
+
+    mapper = HorizonMapper(tz="America/Chicago")
+    result = mapper.build_xy(
+        df,
+        patterns,
+        predictor_minutes=5,
+        default_intraday_minutes=5,
+        ensure_gates=False,
+    )
+
+    assert len(result) == 2
+
+    decision_ts = result.loc[0, "ts_decision"]
+    decision_close = float(df.loc[df["ts"] == decision_ts, "close"].iloc[0])
+    future_close = float(
+        df.loc[df["ts"] == decision_ts + pd.Timedelta(minutes=5), "close"].iloc[0]
+    )
+    expected = np.log(future_close / decision_close)
+
+    assert result.loc[0, "returns_x"] == pytest.approx(expected)
+    assert result.loc[0, "returns_y"] == pytest.approx(expected)
 
 
 def test_weekly_mean_policy_uses_payload_value():
@@ -191,6 +272,57 @@ def test_weekly_prev_week_policy_uses_realised_return():
     assert surviving_session == 6
 
 
+def test_sessionizer_handles_dst_transition_without_time_shift():
+    df = _make_dst_transition_bars()
+    sessionizer = Sessionizer()
+    mapper = HorizonMapper(tz="America/Chicago", sessionizer=sessionizer)
+    patterns = [
+        {
+            "pattern_type": "time_predictive_nextday",
+            "pattern_payload": {"time": "07:00"},
+            "key": "time_nextday_070000",
+        }
+    ]
+
+    result = mapper.build_xy(df, patterns, predictor_minutes=5, ensure_gates=False)
+
+    expected_rows = df["time_nextday_070000_gate"].sum() - 1
+    assert len(result) == expected_rows
+
+    first_decision = result.iloc[0]["ts_decision"]
+    decision_close = float(df.loc[df["ts"] == first_decision, "close"].iloc[0])
+    future_close = float(
+        df.loc[df["ts"] == first_decision + pd.Timedelta(minutes=5), "close"].iloc[0]
+    )
+    assert result.iloc[0]["returns_x"] == pytest.approx(np.log(future_close / decision_close))
+
+    dst_date = date_cls(2024, 3, 11)
+    assert dst_date in set(result["ts_decision"].dt.date)
+
+
+def test_forward_predictor_trims_tail_without_future_data():
+    df = _make_sample_bars()
+    session_to_trim = df["session_id"].max() - 1
+    mask = (df["session_id"] == session_to_trim) & (df["ts"].dt.time == time_cls(7, 5))
+    df = df.loc[~mask].copy()
+
+    mapper = HorizonMapper(tz="America/Chicago")
+    patterns = [
+        {
+            "pattern_type": "time_predictive_nextday",
+            "pattern_payload": {"time": "07:00"},
+            "key": "time_nextday_070000",
+        }
+    ]
+
+    result = mapper.build_xy(df, patterns, predictor_minutes=5, ensure_gates=False)
+
+    expected_rows = len(df["session_id"].unique()) - 2
+    assert len(result) == expected_rows
+    trimmed_date = df.loc[df["session_id"] == session_to_trim, "ts"].dt.date.iloc[0]
+    assert trimmed_date not in set(result["ts_decision"].dt.date)
+
+
 def _make_month_mask_bars() -> pd.DataFrame:
     tz = "America/Chicago"
     sessions = [
@@ -220,6 +352,15 @@ def _make_month_mask_bars() -> pd.DataFrame:
                 "close": close_price,
                 "session_id": idx,
                 "time_nextday_070000_gate": 1,
+            }
+        )
+        rows.append(
+            {
+                "ts": decision_ts + pd.Timedelta(minutes=5),
+                "open": open_price,
+                "close": close_price + 0.5,
+                "session_id": idx,
+                "time_nextday_070000_gate": 0,
             }
         )
 
