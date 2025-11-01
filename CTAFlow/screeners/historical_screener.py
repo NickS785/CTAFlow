@@ -198,6 +198,41 @@ class HistoricalScreener:
 
 
     # ------------------------------------------------------------------
+    # Metadata helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _serialize_period_length(value: Optional[Union[int, float, str, timedelta]]) -> Optional[str]:
+        if value is None:
+            return None
+
+        if isinstance(value, str):
+            return value
+
+        if isinstance(value, (int, float)):
+            return str(value)
+
+        try:
+            delta = pd.to_timedelta(value)
+        except Exception:
+            return str(value)
+
+        total_minutes = int(delta.total_seconds() // 60)
+        if total_minutes == 0:
+            return "0min"
+
+        minutes_per_day = 24 * 60
+        if total_minutes % minutes_per_day == 0:
+            days = total_minutes // minutes_per_day
+            return f"{days}d"
+
+        if total_minutes % 60 == 0:
+            hours = total_minutes // 60
+            return f"{hours}h"
+
+        return f"{total_minutes}min"
+
+
+    # ------------------------------------------------------------------
     # Results storage helpers
     # ------------------------------------------------------------------
     def set_results_client(
@@ -688,6 +723,8 @@ class HistoricalScreener:
                     'session_end': session_end_time.strftime("%H:%M:%S"),
                     'tz': tz,
                     'n_sessions': int(session_dates.nunique()),
+                    'period_length': self._serialize_period_length(period_length),
+                    'month_filter': ",".join(str(m) for m in sorted(selected_months)) if selected_months else None,
                 }
 
                 # Day-of-week analysis

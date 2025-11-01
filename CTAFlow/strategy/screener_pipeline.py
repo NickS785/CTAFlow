@@ -24,6 +24,7 @@ import pandas as pd
 
 if TYPE_CHECKING:  # pragma: no cover - import for type checking only
     from CTAFlow.screeners.pattern_extractor import PatternExtractor
+    from .sessionizer import Sessionizer
 
 __all__ = ["ScreenerPipeline", "extract_ticker_patterns", "HorizonMapper", "HorizonSpec"]
 
@@ -796,6 +797,7 @@ class HorizonMapper:
         return_clip: Tuple[float, float] = (-0.5, 0.5),
         asof_tolerance: Optional[str] = None,
         log: Any = None,
+        sessionizer: Optional["Sessionizer"] = None,
     ) -> None:
         if time_match not in {"auto", "second", "microsecond"}:
             raise HorizonInputError(
@@ -816,6 +818,7 @@ class HorizonMapper:
         self.return_clip = (float(lower), float(upper))
         self.asof_tolerance = asof_tolerance
         self.log = log
+        self.sessionizer = sessionizer
 
     # ------------------------------------------------------------------
     # Logging helpers
@@ -877,6 +880,38 @@ class HorizonMapper:
         else:
             out["ts"] = ts.dt.tz_convert(self.tz)
         return out
+
+    def _ensure_session_ids(self, df: pd.DataFrame) -> pd.DataFrame:
+        needs_session = "session_id" not in df.columns or df["session_id"].isna().any()
+        if not needs_session:
+            return df
+
+        if self.sessionizer is None:
+            raise HorizonInputError(
+                "session_id missing; provide a Sessionizer to HorizonMapper to auto-sessionize"
+            )
+
+        symbol = df.attrs.get("symbol") or df.attrs.get("ticker")
+        if symbol is None:
+            for candidate in ("symbol", "ticker", "root"):
+                if candidate in df.columns:
+                    series = df[candidate].dropna()
+                    if not series.empty:
+                        symbol = series.iloc[0]
+                        break
+
+        calendar = df.attrs.get("calendar")
+        sessionized = self.sessionizer.attach(
+            df, ts_col="ts", symbol=symbol, calendar=calendar
+        )
+        return sessionized
+
+    def _rebuild_clock_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        ts = pd.to_datetime(df["ts"]).dt.tz_convert(self.tz)
+        df = df.copy()
+        df["clock_time"] = ts.dt.strftime("%H:%M:%S")
+        df["clock_time_us"] = ts.dt.strftime("%H:%M:%S.%f")
+        return df
 
     @staticmethod
     def _sanitize_numeric(df: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
@@ -987,23 +1022,24 @@ class HorizonMapper:
             raise ValueError("minutes must be positive for intraday horizons")
 
         ts = pd.to_datetime(df["ts"]).dt.tz_convert(self.tz)
-        close = pd.Series(df["close"].values, index=ts)
+        close = pd.Series(df["close"].values, index=ts).astype(float)
         close = close.sort_index()
         delta = pd.Timedelta(minutes=minutes)
-        future = pd.Series(close.values, index=close.index - delta)
-        returns = self._clean_return(np.log(future / close), policy="drop")
-        aligned = returns.reindex(close.index)
-        mapped = aligned.reindex(ts)
-        return pd.Series(mapped.values, index=df.index)
+        future = close.reindex(close.index + delta)
+        future.index = future.index - delta
+        with np.errstate(divide="ignore", invalid="ignore"):
+            raw = np.log(future / close)
+        cleaned = self._clean_return(pd.Series(raw, index=close.index), policy="drop")
+        aligned = cleaned.reindex(ts)
+        return pd.Series(aligned.values, index=df.index)
 
-    def _backward_window_return_minutes(
-        self,
-        df: pd.DataFrame,
-        minutes: int,
-        *,
-        tolerance: Optional[str] = None,
+    def _forward_window_return_minutes(
+        self, df: pd.DataFrame, minutes: int
     ) -> pd.Series:
-        """Log-close return from ``t-Δ`` to ``t`` using irregular timestamps."""
+        """Forward log-close return from ``t`` to ``t+Δ``.
+
+        NEVER use iloc-based slices for time horizons; always reindex by ``ts + Δ``.
+        """
 
         if minutes <= 0:
             raise ValueError("predictor minutes must be positive")
@@ -1011,33 +1047,17 @@ class HorizonMapper:
         ts = pd.to_datetime(df["ts"]).dt.tz_convert(self.tz)
         close = pd.Series(df["close"].values, index=ts).astype(float)
         close = close.sort_index()
-
         delta = pd.Timedelta(minutes=minutes)
-        shifted = pd.Series(close.values, index=close.index + delta)
-        tol = tolerance or self.asof_tolerance
-        tolerance_delta = pd.Timedelta(tol) if tol else delta
-        merged = pd.merge_asof(
-            close.sort_index().to_frame(name="close"),
-            shifted.sort_index().to_frame(name="past"),
-            left_index=True,
-            right_index=True,
-            direction="backward",
-            tolerance=tolerance_delta,
-        )
-        ratio = merged["close"] / merged["past"]
-        invalid = (merged["close"] <= 0) | (merged["past"] <= 0)
-        if invalid.any():
-            ratio = ratio.mask(invalid)
-        returns = self._clean_return(np.log(ratio), policy="drop")
-
-        if merged["past"].isna().mean() > 0.25:
-            self._log_warn(
-                "merge_asof dropped more than 25% of rows", tolerance=str(tolerance_delta)
-            )
-
-        aligned = returns.reindex(close.sort_index().index)
-        mapped = aligned.reindex(ts)
-        return pd.Series(mapped.values, index=df.index)
+        future = close.reindex(close.index + delta)
+        future.index = future.index - delta
+        with np.errstate(divide="ignore", invalid="ignore"):
+            raw = np.log(future / close)
+        series = pd.Series(raw, index=close.index)
+        cleaned = self._clean_return(series, policy="drop")
+        aligned = cleaned.reindex(ts)
+        result = pd.Series(aligned.values, index=df.index)
+        result.replace([np.inf, -np.inf], np.nan, inplace=True)
+        return result
 
     def _weekly_mean_scalar(self, df: pd.DataFrame, gate_mask: pd.Series) -> float:
         """Same-day open→close mean for sessions flagged by ``gate_mask``."""
@@ -1090,7 +1110,7 @@ class HorizonMapper:
             if lower not in lower_map:
                 lower_map[lower] = column
 
-        required = ["ts", "close", "session_id", "open"]
+        required = ["ts", "close", "open"]
         missing = [col for col in required if col not in lower_map]
         if missing:
             raise HorizonInputError(
@@ -1102,8 +1122,15 @@ class HorizonMapper:
         df = bars_with_features.rename(columns=rename_map).copy()
         self._require_columns(df, required)
         df = self._sanitize_ts(df)
+        df = self._ensure_session_ids(df)
+        if "session_id" not in df.columns:
+            raise HorizonInputError("session_id missing after sessionization; cannot proceed")
+        if df["session_id"].isna().any():
+            raise HorizonInputError("sessionizer produced NaN session identifiers")
+        df["ts"] = pd.to_datetime(df["ts"]).dt.tz_convert(self.tz)
         df = self._sanitize_numeric(df, ["open", "close"])
         df = self._dedupe_and_sort(df)
+        df = self._rebuild_clock_columns(df)
 
         non_numeric = df[["open", "close"]].isna().any(axis=1)
         if non_numeric.any():
@@ -1179,9 +1206,7 @@ class HorizonMapper:
         if weekly_x_policy not in {"mean", "prev_week"}:
             raise HorizonInputError("weekly_x_policy must be one of {'mean', 'prev_week'}")
 
-        x_bw = self._backward_window_return_minutes(
-            df, minutes=predictor_minutes, tolerance=tolerance
-        )
+        x_fw = self._forward_window_return_minutes(df, minutes=predictor_minutes)
         prev_week_series: Optional[pd.Series] = None
         horizon_cache: Dict[Tuple[str, Optional[int]], pd.Series] = {}
         time_bearing_types = {"time_predictive_nextday", "time_predictive_nextweek", "orderflow_peak_pressure"}
@@ -1227,7 +1252,7 @@ class HorizonMapper:
             returns_y = horizon_cache[cache_key]
 
             if pattern_type in time_bearing_types:
-                returns_x_series = x_bw
+                returns_x_series = x_fw
             elif pattern_type in weekly_types:
                 gate_mask = df[gate_col] == 1
                 if weekly_x_policy == "prev_week":
@@ -1262,7 +1287,7 @@ class HorizonMapper:
         patterns: Any,
         *,
         default_intraday_minutes: int = 10,
-        predictor_minutes: int = 1,
+        predictor_minutes: int = 5,
         weekly_x_policy: str = "mean",
     ) -> pd.DataFrame:
         """Return ``bars_with_features`` with per-pattern predictor columns appended."""
@@ -1300,8 +1325,9 @@ class HorizonMapper:
         patterns: Any,
         *,
         default_intraday_minutes: int = 10,
-        predictor_minutes: int = 1,
+        predictor_minutes: int = 5,
         weekly_x_policy: str = "mean",
+        allowed_months: Optional[Iterable[int]] = None,
         ensure_gates: bool = True,
         nan_policy: Optional[str] = None,
         time_match: Optional[str] = None,
@@ -1326,6 +1352,8 @@ class HorizonMapper:
             when supplied, otherwise falls back to the historical same-day open→close mean for
             sessions with an active gate. ``"prev_week"`` uses the realised return between the
             session close and the close five sessions prior.
+        allowed_months:
+            Optional set of calendar months to retain when emitting decision rows.
         ensure_gates:
             When ``True`` the screener pipeline is re-run to materialise missing gates before
             constructing outputs.
@@ -1368,6 +1396,20 @@ class HorizonMapper:
             source_bars = builder.build_features(base_df, patterns)
 
         df = self._prepare_bars_frame(source_bars)
+        if allowed_months is not None:
+            allowed_set = {int(month) for month in allowed_months}
+            month_mask = df["ts"].dt.month.isin(sorted(allowed_set))
+        else:
+            month_mask = pd.Series(True, index=df.index)
+        if debug:
+            sessions = df["session_id"].dropna()
+            if not sessions.empty:
+                self._log_warn(
+                    "Session coverage",
+                    first_session=str(sessions.iloc[0]),
+                    last_session=str(sessions.iloc[-1]),
+                    total_sessions=int(sessions.nunique()),
+                )
         rows: List[pd.DataFrame] = []
         pre_row_count = len(df)
 
@@ -1407,6 +1449,8 @@ class HorizonMapper:
                 & returns_x_clean.notna()
                 & finite_x
                 & finite_y
+                & df["session_id"].notna()
+                & month_mask
             )
             if not active_mask.any():
                 self._log_warn(
@@ -1426,10 +1470,12 @@ class HorizonMapper:
             rows.append(subset[["ts_decision", "gate", "pattern_type", "returns_x", "returns_y", "side_hint"]])
 
             if debug:
+                dropped = int(((gate_series == 1) & ~active_mask).sum())
                 self._log_warn(
                     "Appended decision rows",
                     gate=gate_col,
                     count=int(active_mask.sum()),
+                    dropped_due_to_filters=dropped,
                 )
 
         if not rows:

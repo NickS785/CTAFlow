@@ -208,33 +208,58 @@ class AsyncParquetWriter:
             }
 
         file_path = self._get_file_path(symbol, timeframe, volume_bucket_size)
+        df_to_write = df.copy()
+
+        try:
+            if timeframe:
+                if not isinstance(df_to_write.index, pd.DatetimeIndex):
+                    raise ValueError("DataFrame index must be a DatetimeIndex when specifying timeframe")
+
+                df_resampled = resample_ohlcv(df_to_write, rule=timeframe)
+
+                close_source_col = next((col for col in ("Close", "close") if col in df.columns), None)
+                if close_source_col is not None:
+                    first_close = df[close_source_col].resample(timeframe).first()
+                    open_target_col = next((col for col in ("Open", "open") if col in df_resampled.columns), None)
+                    aligned = first_close.reindex(df_resampled.index)
+                    if open_target_col is not None:
+                        df_resampled[open_target_col] = aligned
+                    else:
+                        df_resampled.insert(0, "Open", aligned)
+
+                df_to_write = df_resampled
+        except Exception as exc:
+            if self.logger:
+                self.logger.error(f"[Async] Error formatting dataframe for {symbol}: {exc}")
+            return {
+                'success': False,
+                'symbol': symbol,
+                'records_written': 0,
+                'error': str(exc)
+            }
 
         try:
             # Run blocking I/O in executor to avoid blocking event loop
             loop = asyncio.get_event_loop()
 
             if mode == 'replace' or not file_path.exists():
-                # Direct write
                 await loop.run_in_executor(
                     None,
-                    lambda: df.to_parquet(file_path, compression=self.compression, index=True)
+                    lambda: df_to_write.to_parquet(file_path, compression=self.compression, index=True)
                 )
-                records_written = len(df)
+                records_written = len(df_to_write)
                 write_mode = 'replace' if file_path.exists() else 'create'
 
             elif mode == 'append':
-                # Read existing, merge, write
                 existing_df = await loop.run_in_executor(
                     None,
                     pd.read_parquet,
                     file_path
                 )
 
-                # Combine and deduplicate
-                combined_df = pd.concat([existing_df, df])
+                combined_df = pd.concat([existing_df, df_to_write])
                 combined_df = combined_df[~combined_df.index.duplicated(keep='last')].sort_index()
 
-                # Write combined
                 await loop.run_in_executor(
                     None,
                     lambda: combined_df.to_parquet(file_path, compression=self.compression, index=True)
@@ -252,9 +277,9 @@ class AsyncParquetWriter:
                     }
                 await loop.run_in_executor(
                     None,
-                    lambda: df.to_parquet(file_path, compression=self.compression, index=True)
+                    lambda: df_to_write.to_parquet(file_path, compression=self.compression, index=True)
                 )
-                records_written = len(df)
+                records_written = len(df_to_write)
                 write_mode = 'create'
 
             if self.logger:
@@ -270,9 +295,9 @@ class AsyncParquetWriter:
                 'records_written': records_written,
                 'mode': write_mode,
                 'date_range': {
-                    'start': df.index[0],
-                    'end': df.index[-1]
-                } if not df.empty else None,
+                    'start': df_to_write.index[0],
+                    'end': df_to_write.index[-1]
+                } if not df_to_write.empty else None,
                 'timeframe': timeframe,
                 'volume_bucket_size': volume_bucket_size
             }

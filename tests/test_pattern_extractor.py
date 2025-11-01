@@ -108,6 +108,7 @@ def _make_extractor(
         symbol: dict(entries) for symbol, entries in patterns.items()
     }
     extractor.metadata = dict(metadata or {})
+    extractor._filtered_months = None
     return extractor
 
 
@@ -598,7 +599,13 @@ def test_persist_to_results_writes_hdf_keys(tmp_path):
                         "n": 38,
                     },
                 ],
-                "metadata": {},
+                "metadata": {
+                    "session_start": "08:00",
+                    "session_end": "16:00",
+                    "tz": "America/Chicago",
+                    "period_length": "30min",
+                    "month_filter": "9,10,11",
+                },
             }
         },
         orderflow_name: {
@@ -639,6 +646,10 @@ def test_persist_to_results_writes_hdf_keys(tmp_path):
 
     assert set(seasonal_df["pattern_type"]) == {"weekday_returns", "time_predictive_nextday"}
     assert (seasonal_df["created_at"] == "2023-10-01T00:00:00Z").all()
+    assert seasonal_df["period_length"].dropna().unique().tolist() == ["30min"]
+    assert seasonal_df["month_filter"].dropna().unique().tolist() == ["9,10,11"]
+    assert orderflow_df["period_length"].isna().all()
+    assert orderflow_df["month_filter"].isna().all()
 
     weekday_row = seasonal_df.loc[seasonal_df["pattern_type"] == "weekday_returns"].iloc[0]
     assert pytest.approx(weekday_row["t_stat"]) == 2.8

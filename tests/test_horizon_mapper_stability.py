@@ -96,10 +96,17 @@ def test_missing_gate_becomes_warning_not_error(clean_bars: pd.DataFrame) -> Non
 
 def test_dtype_coercion_and_tz_localization() -> None:
     data = pd.DataFrame({
-        "ts": ["2024-01-02 13:25", "2024-01-02 13:30", "2024-01-03 13:25", "2024-01-03 13:30"],
-        "open": ["100", "100", "101", "101"],
-        "close": ["100.6", "100.8", "101.6", "101.9"],
-        "session_id": ["A", "A", "B", "B"],
+        "ts": [
+            "2024-01-02 13:25",
+            "2024-01-02 13:30",
+            "2024-01-02 13:35",
+            "2024-01-03 13:25",
+            "2024-01-03 13:30",
+            "2024-01-03 13:35",
+        ],
+        "open": ["100", "100", "100", "101", "101", "101"],
+        "close": ["100.6", "100.8", "100.9", "101.6", "101.9", "102.0"],
+        "session_id": ["A", "A", "A", "B", "B", "B"],
     })
 
     mapper = HorizonMapper(allow_naive_ts=True, tz="UTC")
@@ -149,11 +156,12 @@ def test_time_match_auto_picks_microsecond_suffix() -> None:
                 ts_base - pd.Timedelta(days=1) + pd.Timedelta(minutes=1),
                 ts_base - pd.Timedelta(minutes=1) + pd.Timedelta(microseconds=500000),
                 ts_base + pd.Timedelta(microseconds=500000),
+                ts_base + pd.Timedelta(minutes=1) + pd.Timedelta(microseconds=500000),
                 ts_base + pd.Timedelta(days=1),
             ],
-            "open": [100.0, 100.0, 101.0, 101.0, 102.0],
-            "close": [100.4, 100.6, 101.2, 101.4, 102.5],
-            "session_id": ["A", "A", "B", "B", "C"],
+            "open": [100.0, 100.0, 101.0, 101.0, 101.0, 102.0],
+            "close": [100.4, 100.6, 101.2, 101.4, 101.8, 102.5],
+            "session_id": ["A", "A", "B", "B", "B", "C"],
         }
     )
 
@@ -171,14 +179,23 @@ def test_sessionized_next_day_vs_calendar_day() -> None:
         "ts": [
             pd.Timestamp("2024-01-02 20:55", tz=tz),
             pd.Timestamp("2024-01-02 21:00", tz=tz),
+            pd.Timestamp("2024-01-02 21:05", tz=tz),
             pd.Timestamp("2024-01-02 23:00", tz=tz),
             pd.Timestamp("2024-01-02 23:30", tz=tz),
             pd.Timestamp("2024-01-03 00:25", tz=tz),
             pd.Timestamp("2024-01-03 00:30", tz=tz),
         ],
-        "open": [100.0, 100.0, 100.0, 101.0, 101.0, 101.0],
-        "close": [100.3, 100.5, 100.6, 101.2, 101.3, 101.6],
-        "session_id": ["session_0", "session_0", "session_0", "session_1", "session_1", "session_1"],
+        "open": [100.0, 100.0, 100.0, 100.0, 101.0, 101.0, 101.0],
+        "close": [100.3, 100.5, 100.55, 100.6, 101.2, 101.3, 101.6],
+        "session_id": [
+            "session_0",
+            "session_0",
+            "session_0",
+            "session_0",
+            "session_1",
+            "session_1",
+            "session_1",
+        ],
     })
     pattern = _time_pattern("21:00:00", key="overnight-test")
 
@@ -210,7 +227,7 @@ def test_asof_alignment_with_tolerance_and_warning(clean_bars: pd.DataFrame) -> 
     )
 
     assert not result.empty
-    assert any("merge_asof" in msg for msg in logger.records)
+    assert any("dropped_due_to_filters" in msg for msg in logger.records)
 
 
 def test_gate_inference_slug_over_time_fallback(clean_bars: pd.DataFrame) -> None:

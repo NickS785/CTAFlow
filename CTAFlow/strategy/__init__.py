@@ -10,10 +10,13 @@ This module contains:
 """
 
 from .screener_pipeline import ScreenerPipeline, HorizonMapper
+from .sessionizer import Sessionizer, SessionizerConfig
 
 __all__ = [
     'ScreenerPipeline',
-    "HorizonMapper"
+    "HorizonMapper",
+    "Sessionizer",
+    "SessionizerConfig",
 ]
 
 try:
