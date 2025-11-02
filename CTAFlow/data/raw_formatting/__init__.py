@@ -12,7 +12,7 @@ from .intraday_manager import (
 )
 from .dly_contract_manager import DLYContractManager, DLYFolderUpdater
 from .synthetic import CrossProductEngine, CrossSpreadLeg, IntradayLeg, IntradaySpreadEngine, SyntheticSymbol
-
+from .contract_specs import ContractSpecs
 __all__ = [
     "CrossProductEngine",
     "CrossSpreadLeg",
@@ -28,5 +28,6 @@ __all__ = [
     "DLYContractManager",
     "DLYFolderUpdater",
     "Contract",
+    "ContractSpecs",
     "SpreadReturns"
 ]

@@ -4,8 +4,9 @@ import fnmatch
 import time
 import threading
 import concurrent.futures
-from dataclasses import dataclass
 from pathlib import Path
+
+from .contract_specs import ContractInfo
 from ..data_client import DataClient
 from ..update_management import (
     DLY_UPDATE_EVENT,
@@ -18,19 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple, Sequence
 import numpy as np
 import pandas as pd
 
-from CTAFlow.config import MARKET_DATA_PATH, RAW_MARKET_DATA_PATH, DLY_DATA_PATH, MONTH_CODE_MAP
-
-
-@dataclass(frozen=True)
-class ContractInfo:
-    ticker: str
-    month: str
-    year: int
-    exchange: str
-
-    @property
-    def contract_id(self) -> str:
-        return f"{self.month}{str(self.year)[-2:]}"
+from CTAFlow.config import MARKET_DATA_PATH, DLY_DATA_PATH, MONTH_CODE_MAP
 
 
 def calculate_contract_expiry(month_code: str, year: int, ticker: Optional[str] = None) -> pd.Timestamp:

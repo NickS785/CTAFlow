@@ -2791,7 +2791,7 @@ class DataClient:
                     categorized.update(cat_cols)
                 column_categories['other'] = [col for col in columns if col not in categorized]
                 
-                # Remove empty categories
+                # Remove empty ticker_categories
                 column_categories = {k: v for k, v in column_categories.items() if v}
                 
                 return {
@@ -2898,7 +2898,7 @@ class DataClient:
             if 'start' in date_range and 'end' in date_range:
                 print(f"Date Range: {date_range['start']} to {date_range['end']}")
             
-            # Column categories
+            # Column ticker_categories
             print(f"\n" + "-" * 80)
             print("COLUMN CATEGORIES")
             print("-" * 80)
@@ -3542,7 +3542,7 @@ class DataClient:
         min_open_interest : float, optional
             Minimum open interest threshold
         trader_categories : sequence of str, optional
-            Focus on specific trader categories ('NonComm', 'Comm', 'NonRept', etc.)
+            Focus on specific trader ticker_categories ('NonComm', 'Comm', 'NonRept', etc.)
         custom_where : str, optional
             Custom HDF5 where clause for advanced filtering
         limit : int, optional
@@ -3646,7 +3646,7 @@ class DataClient:
                     df = df[pd.to_numeric(df[oi_col], errors='coerce') >= min_open_interest]
             
             if trader_categories:
-                # Filter columns to focus on specific trader categories
+                # Filter columns to focus on specific trader ticker_categories
                 category_cols = []
                 for category in trader_categories:
                     matching_cols = [c for c in df.columns if category.lower() in c.lower()]

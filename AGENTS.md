@@ -212,7 +212,7 @@ tech_features = forecaster.get_technical_features_only(df,
 CTAFlow.get_version()                    # Returns package version
 CTAFlow.get_supported_models()           # Lists all supported ML models  
 CTAFlow.get_supported_indicators()       # Lists technical indicator groups
-CTAFlow.get_supported_cot_features()     # Lists COT feature categories
+CTAFlow.get_supported_cot_features()     # Lists COT feature ticker_categories
 
 # Configuration access (from config.py)
 CTAFlow.MARKET_DATA_PATH                 # HDF5 market data location

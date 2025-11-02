@@ -26,7 +26,7 @@ class ReportType(Enum):
 
 
 class TickerCategory(Enum):
-    """Ticker categories for COT classification"""
+    """Ticker ticker_categories for COT classification"""
     COMMODITY = "symbol"
     FINANCIAL = "financial"
 

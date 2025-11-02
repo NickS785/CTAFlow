@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union, Any, Sequence
 from datetime import datetime
-from CTAFlow.config import DLY_DATA_PATH
+from CTAFlow.config import DLY_DATA_PATH, INTRADAY_DATA_PATH
 
 import numpy as np
 import pandas as pd
@@ -1761,6 +1761,21 @@ class SyntheticSymbol:
             full_name=full_name,
             intraday=True  # Always True since we're loading from SCID files
         )
+
+    @classmethod
+    def load_from_parquets(cls, weights_map:Dict[str, float], path:str, start_date:Optional[str] = None, resample='1s'):
+        from CTAFlow.data import AsyncParquetWriter
+        symbols = [*weights_map.keys()]
+        pq_reader = AsyncParquetWriter()
+        price_data = pq_reader.batch_read_to_dict_sync(symbols)
+        legs = []
+        for s in symbols:
+            legs.append(
+            IntradayLeg(s, price_data[s], weights_map[s])
+
+            )
+
+        return cls()
 
     def _generate_legs_data(self) -> pd.DataFrame:
         """
