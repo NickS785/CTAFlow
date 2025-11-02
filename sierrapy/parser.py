@@ -17,20 +17,6 @@ class AsyncScidReader(ScidReader):
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         return False
 
-    async def export_scid_files_to_parquet(self, **kwargs):  # pragma: no cover - simple stub
-        """Minimal stub for async export helper.
-
-        The real implementation in SierraPy performs asynchronous SCID to
-        Parquet exports.  Tests in this repository only need a predictable
-        return payload, so we echo back the arguments.
-        """
-
-        return {
-            "success": True,
-            "arguments": kwargs,
-            "records_written": kwargs.get("records_written", 0),
-        }
-
 
 def bucket_by_volume(*args, **kwargs):
     return []
