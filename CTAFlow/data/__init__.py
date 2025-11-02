@@ -25,6 +25,7 @@ from .classifications_reference import (
     get_all_classifications
 )
 from .raw_formatting.synthetic import CrossProductEngine, IntradaySpreadEngine , CrossSpreadLeg, IntradayLeg
+
 # Data processing utilities
 try:
     from .data_processor import DataProcessor
@@ -48,13 +49,16 @@ __all__ = [
     'IntradaySpreadEngine',
     'CrossSpreadLeg',
     "SyntheticSymbol",
+    "ContractSpecs",
+    "Contract",
+    "ContractInfo",
 
     # Data retrieval functions
     'fetch_market_cot_data',
     'fetch_data_sync',
     'convert_cot_date_to_datetime',
     "DLYFolderUpdater",
-    "DLYContractManager"
+    "DLYContractManager",
 
     # Classification mappings
     'COMMODITY_TICKERS',

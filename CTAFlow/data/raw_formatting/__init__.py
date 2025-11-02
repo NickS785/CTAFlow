@@ -10,7 +10,7 @@ from .intraday_manager import (
     clear_arctic_cache,
     get_cached_arctic_uris,
 )
-from .dly_contract_manager import DLYContractManager, DLYFolderUpdater
+from .dly_contract_manager import DLYContractManager, DLYFolderUpdater, ContractInfo
 from .synthetic import CrossProductEngine, CrossSpreadLeg, IntradayLeg, IntradaySpreadEngine, SyntheticSymbol
 from .contract_specs import ContractSpecs
 __all__ = [
@@ -28,6 +28,7 @@ __all__ = [
     "DLYContractManager",
     "DLYFolderUpdater",
     "Contract",
+    'ContractInfo',
     "ContractSpecs",
     "SpreadReturns"
 ]
