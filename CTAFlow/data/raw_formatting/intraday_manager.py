@@ -6,7 +6,8 @@ This module provides a streamlined IntradayFileManager for efficient loading
 of continuous front month data with built-in gap detection.
 """
 
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Tuple, Set
+import inspect
 from pathlib import Path
 from datetime import datetime, timedelta
 import pandas as pd
@@ -34,6 +35,14 @@ try:
 except ImportError:
     Arctic = None
     HAS_ARCTICDB = False
+
+try:
+    import pyarrow.parquet as pq
+
+    HAS_PYARROW = True
+except ImportError:  # pragma: no cover - optional dependency
+    pq = None
+    HAS_PYARROW = False
 
 
 # Arctic instance cache (singleton pattern to prevent LMDB reopen)
@@ -179,6 +188,243 @@ class AsyncParquetWriter:
             filename = f"{symbol}_raw.parquet"
 
         return symbol_dir / filename
+
+    def _build_export_kwargs(self,
+                              export_func: Any,
+                              symbol: str,
+                              file_path: Path,
+                              timeframe: Optional[str],
+                              volume_bucket_size: Optional[int],
+                              start: Optional[datetime],
+                              end: Optional[datetime],
+                              mode: str) -> Optional[Dict[str, Any]]:
+        """Dynamically map keyword arguments for export_scid_files_to_parquet."""
+
+        try:
+            signature = inspect.signature(export_func)
+        except (TypeError, ValueError):  # pragma: no cover - fallback for C extensions
+            return None
+
+        params = signature.parameters
+        kwargs: Dict[str, Any] = {}
+        normalized_symbol = symbol.replace('_F', '')
+
+        def _set_first_available(names: Tuple[str, ...], value: Any) -> None:
+            for name in names:
+                if name in params and value is not None:
+                    kwargs[name] = value
+                    return
+
+        # Symbol/ticker arguments
+        _set_first_available(('ticker', 'symbol', 'base_symbol'), normalized_symbol)
+
+        if 'tickers' in params:
+            kwargs['tickers'] = [normalized_symbol]
+        if 'symbols' in params and 'tickers' not in kwargs:
+            kwargs['symbols'] = [normalized_symbol]
+
+        # Output path arguments
+        path_mappings: Tuple[Tuple[str, Any], ...] = (
+            ('export_path', str(file_path)),
+            ('output_path', str(file_path)),
+            ('destination_path', str(file_path)),
+            ('parquet_path', str(file_path)),
+            ('parquet_file', str(file_path)),
+            ('path', str(file_path)),
+            ('output_directory', str(file_path.parent)),
+            ('destination', str(file_path.parent)),
+            ('parquet_directory', str(file_path.parent)),
+            ('directory', str(file_path.parent)),
+        )
+        for candidate, value in path_mappings:
+            if candidate in params:
+                kwargs[candidate] = value
+                break
+
+        # Resampling / timeframe arguments
+        if timeframe is not None:
+            _set_first_available(('timeframe', 'resample_rule', 'rule'), timeframe)
+
+        # Volume bucket arguments
+        if volume_bucket_size is not None:
+            _set_first_available(('volume_per_bar', 'volume_bucket_size', 'volume'), volume_bucket_size)
+
+        # Temporal bounds
+        if start is not None:
+            _set_first_available(('start', 'start_time', 'start_dt'), start)
+        if end is not None:
+            _set_first_available(('end', 'end_time', 'end_dt'), end)
+
+        # Mode/compression flags
+        if 'mode' in params:
+            kwargs['mode'] = mode
+        elif 'write_mode' in params:
+            kwargs['write_mode'] = mode
+
+        if 'compression' in params:
+            kwargs['compression'] = self.compression
+
+        # Ensure we satisfied all required parameters (except 'self')
+        missing_required = [
+            name for name, param in params.items()
+            if name != 'self' and param.default is inspect._empty and name not in kwargs
+        ]
+
+        if missing_required:
+            return None
+
+        return kwargs
+
+    def _summarize_export_result(self,
+                                 symbol: str,
+                                 file_path: Path,
+                                 timeframe: Optional[str],
+                                 volume_bucket_size: Optional[int],
+                                 mode: str,
+                                 raw_result: Any) -> Dict[str, Any]:
+        """Normalize export results into AsyncParquetWriter response format."""
+
+        metadata: Dict[str, Any] = {}
+        records_written: Optional[int] = None
+        success = True
+        error_message: Optional[str] = None
+
+        if isinstance(raw_result, dict):
+            metadata = {k: v for k, v in raw_result.items() if k not in {'success', 'records_written', 'error'}}
+            if 'success' in raw_result:
+                success = bool(raw_result['success'])
+            if 'records_written' in raw_result and raw_result['records_written'] is not None:
+                try:
+                    records_written = int(raw_result['records_written'])
+                except (TypeError, ValueError):
+                    records_written = None
+            if 'error' in raw_result:
+                error_message = str(raw_result['error'])
+        elif raw_result is not None:
+            metadata['result'] = raw_result
+
+        if records_written is None and HAS_PYARROW and file_path.exists():
+            try:
+                parquet_file = pq.ParquetFile(str(file_path))
+                records_written = parquet_file.metadata.num_rows
+            except Exception:  # pragma: no cover - diagnostic only
+                records_written = None
+
+        summary: Dict[str, Any] = {
+            'success': success,
+            'symbol': symbol,
+            'file_path': str(file_path),
+            'records_written': int(records_written) if isinstance(records_written, int) else 0,
+            'mode': mode,
+            'timeframe': timeframe,
+            'volume_bucket_size': volume_bucket_size,
+        }
+
+        if metadata:
+            summary['metadata'] = metadata
+        if error_message:
+            summary['error'] = error_message
+
+        return summary
+
+    async def _legacy_export_symbol(self,
+                                    reader: AsyncScidReader,
+                                    symbol: str,
+                                    timeframe: Optional[str],
+                                    volume_bucket_size: Optional[int],
+                                    start: Optional[datetime],
+                                    end: Optional[datetime],
+                                    mode: str) -> Dict[str, Any]:
+        """Fallback export implementation using pandas for compatibility."""
+
+        df = await reader.load_front_month_series(
+            ticker=symbol.replace('_F', ''),
+            start=start,
+            end=end,
+            resample_rule=timeframe,
+            volume_per_bar=volume_bucket_size
+        )
+
+        if df.empty:
+            return {
+                'success': False,
+                'symbol': symbol,
+                'records_written': 0,
+                'error': 'No data loaded from reader'
+            }
+
+        return await self.write_dataframe(
+            df=df,
+            symbol=symbol,
+            timeframe=timeframe,
+            volume_bucket_size=volume_bucket_size,
+            mode=mode
+        )
+
+    async def _export_symbol_with_reader(self,
+                                         reader: AsyncScidReader,
+                                         symbol: str,
+                                         timeframe: Optional[str],
+                                         volume_bucket_size: Optional[int],
+                                         start: Optional[datetime],
+                                         end: Optional[datetime],
+                                         mode: str) -> Dict[str, Any]:
+        """Export helper that prefers AsyncScidReader's native Parquet export."""
+
+        export_func = getattr(reader, 'export_scid_files_to_parquet', None)
+        file_path = self._get_file_path(symbol, timeframe, volume_bucket_size)
+
+        if callable(export_func):
+            kwargs = self._build_export_kwargs(export_func, symbol, file_path, timeframe, volume_bucket_size, start, end, mode)
+
+            if kwargs is not None:
+                try:
+                    raw_result = await export_func(**kwargs)
+                    summary = self._summarize_export_result(symbol, file_path, timeframe, volume_bucket_size, mode, raw_result)
+
+                    if self.logger:
+                        self.logger.info(
+                            "[Async] Exported %s using AsyncScidReader -> %s",
+                            symbol,
+                            file_path.name
+                        )
+
+                    return summary
+                except TypeError as exc:
+                    # The signature may not match expected parameters – fall back gracefully
+                    if self.logger:
+                        self.logger.debug(
+                            "[Async] export_scid_files_to_parquet signature mismatch for %s: %s",
+                            symbol,
+                            exc
+                        )
+                except Exception as exc:  # pragma: no cover - relies on external library
+                    if self.logger:
+                        self.logger.error(
+                            "[Async] SierraPy export failed for %s: %s",
+                            symbol,
+                            exc
+                        )
+                    return {
+                        'success': False,
+                        'symbol': symbol,
+                        'file_path': str(file_path),
+                        'records_written': 0,
+                        'error': str(exc),
+                        'timeframe': timeframe,
+                        'volume_bucket_size': volume_bucket_size,
+                    }
+
+        # Fall back to legacy pandas-based export
+        return await self._legacy_export_symbol(
+            reader=reader,
+            symbol=symbol,
+            timeframe=timeframe,
+            volume_bucket_size=volume_bucket_size,
+            start=start,
+            end=end,
+            mode=mode
+        )
 
     async def write_dataframe(self,
                              df: pd.DataFrame,
@@ -401,32 +647,15 @@ class AsyncParquetWriter:
         async def process_symbol(symbol: str) -> Dict[str, any]:
             async with semaphore:
                 try:
-                    # Load data from reader
-                    df = await reader.load_front_month_series(
-                        ticker=symbol.replace('_F', ''),
-                        start=start,
-                        end=end,
-                        resample_rule=timeframe,
-                        volume_per_bar=volume_bucket_size
-                    )
-
-                    if df.empty:
-                        return {
-                            'success': False,
-                            'symbol': symbol,
-                            'records_written': 0,
-                            'error': 'No data loaded from reader'
-                        }
-
-                    # Write to Parquet
-                    return await self.write_dataframe(
-                        df=df,
+                    return await self._export_symbol_with_reader(
+                        reader=reader,
                         symbol=symbol,
                         timeframe=timeframe,
                         volume_bucket_size=volume_bucket_size,
+                        start=start,
+                        end=end,
                         mode=mode
                     )
-
                 except Exception as e:
                     if self.logger:
                         self.logger.error(f"[Async] Error processing {symbol}: {e}")
