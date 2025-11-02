@@ -104,7 +104,7 @@ class Sessionizer:
             intervals.sort_values("open"),
             left_on=ts_col,
             right_on="open",
-            direction="forward",
+            direction="backward",
         )
 
         valid = merged[ts_col] < merged["close"]
