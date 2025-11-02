@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import logging
-
+from ..d
 import numpy as np
 import pandas as pd
 
@@ -97,6 +97,7 @@ class SymbolSynthesizer:
         self.base_path.mkdir(parents=True, exist_ok=True)
         self.compression = compression
         self.logger = logger if logger is not None else LOGGER
+        self.writer = As
 
     # ------------------------------------------------------------------
     # Public API
@@ -117,10 +118,12 @@ class SymbolSynthesizer:
         """Create a synthetic symbol and store it as a Parquet file."""
 
         definition = self._resolve_definition(symbol_name)
-        legs = [
-            self._build_leg(component, base_resample=base_resample)
-            for component in definition.components
+        d
+        leg_symbols = [
+            component for component in definition.components
         ]
+
+
 
         synthetic = SyntheticSymbol(
             legs=legs,
