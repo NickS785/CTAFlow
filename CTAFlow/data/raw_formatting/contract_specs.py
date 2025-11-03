@@ -1,6 +1,6 @@
+from __future__ import annotations
 import pandas as pd
 from typing import Dict, List, Union, Optional
-from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 from copy import deepcopy
