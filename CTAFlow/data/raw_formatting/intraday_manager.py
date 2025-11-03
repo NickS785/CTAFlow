@@ -617,6 +617,113 @@ class AsyncParquetWriter:
                 self.logger.error(f"[Async] Error reading {symbol}: {e}")
             return pd.DataFrame()
 
+    async def update_from_reader(self,
+                                 reader: AsyncScidReader,
+                                 symbol: str,
+                                 timeframe: Optional[str] = None,
+                                 volume_bucket_size: Optional[int] = None,
+                                 lookback_months: int = 2) -> Dict[str, Any]:
+        """Update an existing Parquet file with new data from ``AsyncScidReader``.
+
+        This helper inspects the tail of the current Parquet file (defaulting to the
+        last ``lookback_months`` of data) to determine the most recent timestamp that
+        has already been written. It then requests fresh front-month data from
+        ``AsyncScidReader`` starting immediately after that timestamp and appends any
+        newly returned records to the Parquet store.
+
+        Args:
+            reader: Active ``AsyncScidReader`` instance.
+            symbol: Trading symbol (e.g. ``'CL_F'``).
+            timeframe: Optional resampling rule (``None`` targets the raw parquet).
+            volume_bucket_size: Optional volume bucket size for bucketed parquet files.
+            lookback_months: Number of months to look back when loading the local tail.
+
+        Returns:
+            Dictionary summarising the update that occurred (or indicating that no
+            new data was available).
+        """
+
+        file_path = self._get_file_path(symbol, timeframe, volume_bucket_size)
+        last_timestamp: Optional[pd.Timestamp] = None
+        tail_start = pd.Timestamp.utcnow() - pd.DateOffset(months=lookback_months)
+
+        if file_path.exists():
+            try:
+                tail_df = await self.read_dataframe(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    volume_bucket_size=volume_bucket_size,
+                    start=tail_start.to_pydatetime()
+                )
+                if not tail_df.empty:
+                    last_timestamp = pd.Timestamp(tail_df.index[-1])
+            except Exception as exc:  # pragma: no cover - defensive logging only
+                if self.logger:
+                    self.logger.error(f"[Async] Failed to load tail for {symbol}: {exc}")
+
+        fetch_start: Optional[datetime] = None
+        if last_timestamp is not None:
+            fetch_start = (last_timestamp + pd.Timedelta(seconds=1)).to_pydatetime()
+        elif file_path.exists():
+            fetch_start = tail_start.to_pydatetime()
+
+        try:
+            new_df = await reader.load_front_month_series(
+                ticker=symbol.replace('_F', ''),
+                start=fetch_start,
+                end=None,
+                resample_rule=timeframe,
+                volume_per_bar=volume_bucket_size
+            )
+        except Exception as exc:  # pragma: no cover - relies on external library
+            if self.logger:
+                self.logger.error(f"[Async] Reader update failed for {symbol}: {exc}")
+            return {
+                'success': False,
+                'symbol': symbol,
+                'records_written': 0,
+                'error': str(exc),
+                'timeframe': timeframe,
+                'volume_bucket_size': volume_bucket_size
+            }
+
+        if not new_df.empty and last_timestamp is not None:
+            comparison_timestamp = last_timestamp
+            if new_df.index.tz is not None and comparison_timestamp.tzinfo is None:
+                comparison_timestamp = comparison_timestamp.tz_localize(new_df.index.tz)
+            elif new_df.index.tz is None and comparison_timestamp.tzinfo is not None:
+                comparison_timestamp = comparison_timestamp.tz_convert(None)
+
+            new_df = new_df[new_df.index > comparison_timestamp]
+
+        if new_df.empty:
+            if self.logger:
+                self.logger.info(
+                    f"[Async] No new records for {symbol} after {last_timestamp}"
+                )
+            return {
+                'success': True,
+                'symbol': symbol,
+                'records_written': 0,
+                'message': 'No new data to append',
+                'timeframe': timeframe,
+                'volume_bucket_size': volume_bucket_size,
+                'last_timestamp': str(last_timestamp) if last_timestamp is not None else None
+            }
+
+        write_result = await self.write_dataframe(
+            df=new_df,
+            symbol=symbol,
+            timeframe=timeframe,
+            volume_bucket_size=volume_bucket_size,
+            mode='append'
+        )
+
+        write_result['previous_end'] = str(last_timestamp) if last_timestamp is not None else None
+        write_result['fetch_start'] = fetch_start.isoformat() if fetch_start else None
+
+        return write_result
+
     async def batch_write_from_reader(self,
                                       reader: AsyncScidReader,
                                       symbols: List[str],
