@@ -71,11 +71,11 @@ class OrderflowPipeline:
                     return cols[kk]
             return None
         return dict(
-            ts  = pick("DateTime","datetime","timestamp","SCDateTime","StartDateTime","Datetime"),
-            px  = pick("Last","Close","Price","LastPrice","Settlement"),
-            buy = pick("AskVolume","Ask Trade Volume","AskTradeVol","UpVolume","UpTickVolume"),
-            sell= pick("BidVolume","Bid Trade Volume","BidTradeVol","DownVolume","DownTickVolume"),
-            ntr = pick("NumberOfTrades","Trades","NumTrades", "TradeCount","#Trades")
+            ts  = pick("DateTime","datetime","timestamp","SCDateTime","StartDateTime","Datetime","ts","time"),
+            px  = pick("Last","Close","Price","LastPrice","Settlement","Px","PX","px"),
+            buy = pick("AskVolume","Ask Trade Volume","AskTradeVol","UpVolume","UpTickVolume","BuyVolume","buy"),
+            sell= pick("BidVolume","Bid Trade Volume","BidTradeVol","DownVolume","DownTickVolume","SellVolume","sell"),
+            ntr = pick("NumberOfTrades","Trades","NumTrades", "TradeCount","#Trades","ntr")
         )
 
     def load(self, data: Union[str, pd.DataFrame], tz: str) -> pd.DataFrame:
@@ -119,7 +119,8 @@ class OrderflowPipeline:
                  (ts.dt.time <  pd.to_datetime(cfg.rth_end).time())
         t["is_rth"] = is_rth.astype(int)
         # increments at RTH/ON boundary
-        rth_block = (t["is_rth"].diff(fill_value=t["is_rth"].iloc[0]) != 0).cumsum()
+        prior = t["is_rth"].shift().fillna(t["is_rth"].iloc[0])
+        rth_block = t["is_rth"].ne(prior).cumsum()
         t["session_id"] = (t["date"].astype(str) + "_" + rth_block.astype(str)).astype("category").cat.codes
         return t
 
