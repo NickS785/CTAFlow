@@ -696,6 +696,7 @@ class AsyncParquetWriter:
 
             return dt_index
 
+        tail_df_timezone = None
         if file_path.exists():
             try:
                 tail_df = await self.read_dataframe(
@@ -704,6 +705,7 @@ class AsyncParquetWriter:
                     volume_bucket_size=volume_bucket_size,
                     start=tail_start.to_pydatetime()
                 )
+                tail_df_timezone = getattr(tail_df.index, "tz", None)
                 if not tail_df.empty:
                     last_timestamp = pd.Timestamp(tail_df.index[-1])
                     existing_tz = getattr(tail_df.index, "tz", None)
@@ -725,15 +727,8 @@ class AsyncParquetWriter:
             if fetch_start_ts is not None:
                 fetch_start = fetch_start_ts.to_pydatetime()
 
-        try:
-            new_df = await reader.load_front_month_series(
-                ticker=symbol.replace('_F', ''),
-                start=fetch_start,
-                end=None,
-                resample_rule=timeframe,
-                volume_per_bar=volume_bucket_size
-            )
-        except Exception as exc:  # pragma: no cover - relies on external library
+        if new_df is None:
+            exc = last_error or Exception("Failed to load data from AsyncScidReader")
             if self.logger:
                 self.logger.error(f"[Async] Reader update failed for {symbol}: {exc}")
             return {
