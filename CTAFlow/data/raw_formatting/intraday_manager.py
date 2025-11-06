@@ -662,10 +662,23 @@ class AsyncParquetWriter:
                     self.logger.error(f"[Async] Failed to load tail for {symbol}: {exc}")
 
         fetch_start: Optional[datetime] = None
+        fetch_start_ts: Optional[pd.Timestamp] = None
         if last_timestamp is not None:
-            fetch_start = (last_timestamp + pd.Timedelta(seconds=1)).to_pydatetime()
+            fetch_start_ts = pd.Timestamp(last_timestamp) + pd.Timedelta(seconds=1)
         elif file_path.exists():
-            fetch_start = tail_start.to_pydatetime()
+            fetch_start_ts = tail_start
+
+        if fetch_start_ts is not None:
+            # ``AsyncScidReader`` expects timezone-naive Python ``datetime`` objects.
+            # When our local parquet tail is timezone-aware we normalise by dropping
+            # the timezone information (preserving the wall-clock value) before
+            # passing the value to the reader. This prevents pandas from raising
+            # "Cannot compare tz-naive and tz-aware timestamps" when the reader
+            # filters its data.
+            if fetch_start_ts.tzinfo is not None:
+                fetch_start = fetch_start_ts.tz_localize(None).to_pydatetime()
+            else:
+                fetch_start = fetch_start_ts.to_pydatetime()
 
         try:
             new_df = await reader.load_front_month_series(
@@ -720,7 +733,7 @@ class AsyncParquetWriter:
         )
 
         write_result['previous_end'] = str(last_timestamp) if last_timestamp is not None else None
-        write_result['fetch_start'] = fetch_start.isoformat() if fetch_start else None
+        write_result['fetch_start'] = fetch_start_ts.isoformat() if fetch_start_ts is not None else None
 
         return write_result
 
