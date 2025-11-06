@@ -716,6 +716,7 @@ class AsyncParquetWriter:
         last_timestamp = _apply_timezone(last_timestamp, target_tz)
 
         fetch_start: Optional[datetime] = None
+        fetch_start_ts: Optional[pd.Timestamp] = None
         if last_timestamp is not None:
             fetch_start_ts = last_timestamp + pd.Timedelta(seconds=1)
             fetch_start = fetch_start_ts.to_pydatetime()
@@ -775,7 +776,7 @@ class AsyncParquetWriter:
         )
 
         write_result['previous_end'] = str(last_timestamp) if last_timestamp is not None else None
-        write_result['fetch_start'] = fetch_start.isoformat() if fetch_start else None
+        write_result['fetch_start'] = fetch_start_ts.isoformat() if fetch_start_ts is not None else None
 
         return write_result
 
