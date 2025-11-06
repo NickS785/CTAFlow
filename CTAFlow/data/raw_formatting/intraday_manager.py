@@ -647,6 +647,7 @@ class AsyncParquetWriter:
         last_timestamp: Optional[pd.Timestamp] = None
         tail_start = pd.Timestamp.utcnow() - pd.DateOffset(months=lookback_months)
 
+        tail_df_timezone = None
         if file_path.exists():
             try:
                 tail_df = await self.read_dataframe(
@@ -655,27 +656,76 @@ class AsyncParquetWriter:
                     volume_bucket_size=volume_bucket_size,
                     start=tail_start.to_pydatetime()
                 )
+                tail_df_timezone = getattr(tail_df.index, "tz", None)
                 if not tail_df.empty:
                     last_timestamp = pd.Timestamp(tail_df.index[-1])
             except Exception as exc:  # pragma: no cover - defensive logging only
                 if self.logger:
                     self.logger.error(f"[Async] Failed to load tail for {symbol}: {exc}")
 
-        fetch_start: Optional[datetime] = None
+        fetch_start_ts: Optional[pd.Timestamp] = None
+        target_tz = None
+        if last_timestamp is not None and last_timestamp.tzinfo is not None:
+            target_tz = last_timestamp.tzinfo
+        elif tail_df_timezone is not None:
+            target_tz = tail_df_timezone
         if last_timestamp is not None:
-            fetch_start = (last_timestamp + pd.Timedelta(seconds=1)).to_pydatetime()
+            fetch_start_ts = pd.Timestamp(last_timestamp) + pd.Timedelta(seconds=1)
         elif file_path.exists():
-            fetch_start = tail_start.to_pydatetime()
+            fetch_start_ts = tail_start
+            if target_tz is not None:
+                if fetch_start_ts.tzinfo is None:
+                    fetch_start_ts = fetch_start_ts.tz_localize(target_tz)
+                else:
+                    fetch_start_ts = fetch_start_ts.tz_convert(target_tz)
 
-        try:
-            new_df = await reader.load_front_month_series(
-                ticker=symbol.replace('_F', ''),
-                start=fetch_start,
-                end=None,
-                resample_rule=timeframe,
-                volume_per_bar=volume_bucket_size
-            )
-        except Exception as exc:  # pragma: no cover - relies on external library
+        tz_mismatch_msg = "Cannot compare tz-naive and tz-aware timestamps"
+        start_candidates: List[Tuple[Optional[datetime], Optional[pd.Timestamp]]] = []
+        start_candidate_keys: Set[str] = set()
+
+        def _add_candidate(dt_value: Optional[datetime], ts_value: Optional[pd.Timestamp]) -> None:
+            key = dt_value.isoformat() if dt_value is not None else "__none__"
+            if key not in start_candidate_keys:
+                start_candidates.append((dt_value, ts_value))
+                start_candidate_keys.add(key)
+        if fetch_start_ts is not None:
+            fetch_start_dt = fetch_start_ts.to_pydatetime()
+            _add_candidate(fetch_start_dt, fetch_start_ts)
+
+            if fetch_start_ts.tzinfo is not None:
+                naive_variant = fetch_start_ts.tz_localize(None)
+                _add_candidate(naive_variant.to_pydatetime(), naive_variant)
+            elif target_tz is not None:
+                aware_variant = fetch_start_ts.tz_localize(target_tz)
+                _add_candidate(aware_variant.to_pydatetime(), aware_variant)
+
+        _add_candidate(None, None)
+
+        new_df: Optional[pd.DataFrame] = None
+        effective_fetch_ts: Optional[pd.Timestamp] = None
+        last_error: Optional[Exception] = None
+
+        for candidate_start, candidate_ts in start_candidates:
+            try:
+                candidate_df = await reader.load_front_month_series(
+                    ticker=symbol.replace('_F', ''),
+                    start=candidate_start,
+                    end=None,
+                    resample_rule=timeframe,
+                    volume_per_bar=volume_bucket_size
+                )
+            except Exception as exc:  # pragma: no cover - relies on external library
+                if tz_mismatch_msg in str(exc):
+                    last_error = exc
+                    continue
+                raise
+            else:
+                new_df = candidate_df
+                effective_fetch_ts = candidate_ts
+                break
+
+        if new_df is None:
+            exc = last_error or Exception("Failed to load data from AsyncScidReader")
             if self.logger:
                 self.logger.error(f"[Async] Reader update failed for {symbol}: {exc}")
             return {
@@ -686,6 +736,8 @@ class AsyncParquetWriter:
                 'timeframe': timeframe,
                 'volume_bucket_size': volume_bucket_size
             }
+
+        fetch_start_ts = effective_fetch_ts
 
         if not new_df.empty and last_timestamp is not None:
             comparison_timestamp = last_timestamp
@@ -720,7 +772,7 @@ class AsyncParquetWriter:
         )
 
         write_result['previous_end'] = str(last_timestamp) if last_timestamp is not None else None
-        write_result['fetch_start'] = fetch_start.isoformat() if fetch_start else None
+        write_result['fetch_start'] = fetch_start_ts.isoformat() if fetch_start_ts is not None else None
 
         return write_result
 
