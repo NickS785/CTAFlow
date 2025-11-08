@@ -1181,7 +1181,7 @@ class IntradayFileManager:
     """
 
     # SCID filename pattern
-    SCID_PATTERN = re.compile(r'^([A-Z]{1,3})([FGHJKMNQUVXZ])(\d{2})-([A-Z]+)\.scid$', re.IGNORECASE)
+    SCID_PATTERN = re.compile(r'^([A-Z]{1,3})([FGHJKMNQUVXZ])(\d{1,2})-([A-Z]+)\.scid$', re.IGNORECASE)
 
     # Month code mapping
     MONTH_MAP = {
@@ -1258,8 +1258,8 @@ class IntradayFileManager:
             mapping.setdefault(full_symbol, []).append(entry)
 
         # Sort files by filename
-        for files in mapping.values():
-            files.sort()
+        for _, files in mapping.items():
+            files.sort(key=self._scid_sort_key)
 
         self._scid_files = mapping
 
@@ -1285,6 +1285,44 @@ class IntradayFileManager:
     def get_scid_files_for_symbol(self, symbol: str) -> List[Path]:
         """Get all SCID files for a given symbol."""
         return self._scid_files.get(symbol, [])
+
+    def _scid_sort_key(self, file_path: Path) -> Tuple[int, int, str]:
+        """Generate a chronological sort key for SCID filenames.
+
+        Sierra Chart historically emitted one-digit years for contracts prior to
+        2010 (e.g. ``PLF6-CME.scid`` for January 2006). Our original
+        ``SCID_PATTERN`` only recognised two-digit years which meant these
+        historical contracts were ignored entirely during discovery. We accept
+        both one and two digit years now and normalise them into a sortable
+        integer using a century heuristic that keeps pre- and post-2000
+        contracts in chronological order.
+        """
+
+        match = self.SCID_PATTERN.match(file_path.name)
+        if not match:
+            # Put unrecognised names at the end while maintaining deterministic order
+            return (10 ** 9, 99, file_path.name)
+
+        month_code = match.group(2).upper()
+        year_fragment = match.group(3)
+
+        try:
+            raw_year = int(year_fragment)
+        except ValueError:
+            raw_year = 0
+
+        if len(year_fragment) == 1:
+            year = 2000 + raw_year
+        else:
+            # Two digit years beyond 69 are assumed to be from the 1900s while
+            # the remainder fall into the 2000s. This mirrors common rollover
+            # logic for futures datasets and keeps ordering stable across
+            # centuries without needing explicit contract metadata.
+            year = (1900 + raw_year) if raw_year >= 70 else (2000 + raw_year)
+
+        month = self.MONTH_MAP.get(month_code, 0)
+
+        return (year, month, file_path.name)
 
     def load_front_month_series(self,
                                 symbol: str,
