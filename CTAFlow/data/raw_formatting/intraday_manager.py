@@ -145,7 +145,8 @@ class AsyncParquetWriter:
     def __init__(self,
                  parquet_base_path: Optional[Path] = None,
                  compression: str = 'snappy',
-                 enable_logging: bool = True):
+                 enable_logging: bool = True,
+                 service: str = 'sierra'):
         """
         Initialize async Parquet writer.
 
@@ -153,9 +154,11 @@ class AsyncParquetWriter:
             parquet_base_path: Base path for Parquet storage (default: INTRADAY_DATA_PATH)
             compression: Compression codec ('snappy', 'gzip', 'brotli', None)
             enable_logging: Enable logging
+            service: Sierra service name to forward to sierrapy readers/writers
         """
         self.base_path = Path(parquet_base_path) if parquet_base_path else INTRADAY_DATA_PATH
         self.compression = compression
+        self.service = service
 
         # Setup logging
         if enable_logging:
@@ -188,6 +191,22 @@ class AsyncParquetWriter:
             filename = f"{symbol}_raw.parquet"
 
         return symbol_dir / filename
+
+    def _maybe_add_service(self, func: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Add the configured ``service`` argument to ``kwargs`` when supported."""
+
+        if not self.service:
+            return kwargs
+
+        try:
+            params = inspect.signature(func).parameters
+        except (TypeError, ValueError):  # pragma: no cover - fallback for C extensions
+            return kwargs
+
+        if 'service' in params and 'service' not in kwargs:
+            kwargs['service'] = self.service
+
+        return kwargs
 
     def _build_export_kwargs(self,
                               export_func: Any,
@@ -273,7 +292,7 @@ class AsyncParquetWriter:
         if missing_required:
             return None
 
-        return kwargs
+        return self._maybe_add_service(export_func, kwargs)
 
     def _summarize_export_result(self,
                                  symbol: str,
@@ -337,13 +356,16 @@ class AsyncParquetWriter:
                                     mode: str) -> Dict[str, Any]:
         """Fallback export implementation using pandas for compatibility."""
 
-        df = await reader.load_front_month_series(
-            ticker=symbol.replace('_F', ''),
-            start=start,
-            end=end,
-            resample_rule=timeframe,
-            volume_per_bar=volume_bucket_size
-        )
+        load_kwargs: Dict[str, Any] = {
+            'ticker': symbol.replace('_F', ''),
+            'start': start,
+            'end': end,
+            'resample_rule': timeframe,
+            'volume_per_bar': volume_bucket_size,
+        }
+        load_kwargs = self._maybe_add_service(reader.load_front_month_series, load_kwargs)
+
+        df = await reader.load_front_month_series(**load_kwargs)
 
         if df.empty:
             return {
@@ -561,11 +583,11 @@ class AsyncParquetWriter:
             }
 
     async def read_dataframe(self,
-                            symbol: str,
-                            timeframe: Optional[str] = None,
-                            volume_bucket_size: Optional[int] = None,
-                            start: Optional[datetime] = None,
-                            end: Optional[datetime] = None) -> pd.DataFrame:
+                             symbol: str,
+                             timeframe: Optional[str] = None,
+                             volume_bucket_size: Optional[int] = None,
+                             start: Optional[datetime] = None,
+                             end: Optional[datetime] = None) -> pd.DataFrame:
         """
         Read DataFrame from Parquet file asynchronously.
 
@@ -616,6 +638,57 @@ class AsyncParquetWriter:
             if self.logger:
                 self.logger.error(f"[Async] Error reading {symbol}: {e}")
             return pd.DataFrame()
+
+    def _get_last_timestamp_from_parquet(self, file_path: Path) -> Optional[pd.Timestamp]:
+        """Return the last timestamp stored in ``file_path`` if available."""
+
+        if not file_path.exists():
+            return None
+
+        if HAS_PYARROW:
+            try:
+                parquet_file = pq.ParquetFile(str(file_path))
+                if parquet_file.num_row_groups == 0:
+                    return None
+
+                index_column = '__index_level_0__'
+                if index_column not in parquet_file.schema.names:
+                    index_column = parquet_file.schema.names[0]
+
+                table = parquet_file.read_row_group(
+                    parquet_file.num_row_groups - 1,
+                    columns=[index_column]
+                )
+
+                if table.num_rows == 0:
+                    return None
+
+                series = table.column(0).to_pandas()
+                series = series.dropna()
+                if series.empty:
+                    return None
+
+                return pd.Timestamp(series.iloc[-1])
+            except Exception:
+                # Fall back to pandas loading below if pyarrow inspection fails
+                pass
+
+        try:
+            df = pd.read_parquet(file_path)
+        except Exception:
+            return None
+
+        if df.empty:
+            return None
+
+        index = df.index
+        if isinstance(index, pd.MultiIndex):
+            index = index.get_level_values(0)
+
+        if len(index) == 0:
+            return None
+
+        return pd.Timestamp(index[-1])
 
     async def update_from_reader(self,
                                  reader: AsyncScidReader,
@@ -714,6 +787,13 @@ class AsyncParquetWriter:
                 if self.logger:
                     self.logger.error(f"[Async] Failed to load tail for {symbol}: {exc}")
 
+        if last_timestamp is None and file_path.exists():
+            fallback_timestamp = self._get_last_timestamp_from_parquet(file_path)
+            if fallback_timestamp is not None:
+                last_timestamp = pd.Timestamp(fallback_timestamp)
+                if existing_tz is None:
+                    existing_tz = getattr(last_timestamp, 'tzinfo', None)
+
         reader_tz = _extract_reader_timezone(reader)
         target_tz = existing_tz if existing_tz is not None else reader_tz
         last_timestamp = _apply_timezone(last_timestamp, target_tz)
@@ -766,13 +846,19 @@ class AsyncParquetWriter:
 
         for candidate_start, candidate_ts in start_candidates:
             try:
-                candidate_df = await reader.load_front_month_series(
-                    ticker=symbol.replace('_F', ''),
-                    start=candidate_start,
-                    end=None,
-                    resample_rule=timeframe,
-                    volume_per_bar=volume_bucket_size
+                candidate_kwargs: Dict[str, Any] = {
+                    'ticker': symbol.replace('_F', ''),
+                    'start': candidate_start,
+                    'end': None,
+                    'resample_rule': timeframe,
+                    'volume_per_bar': volume_bucket_size,
+                }
+                candidate_kwargs = self._maybe_add_service(
+                    reader.load_front_month_series,
+                    candidate_kwargs
                 )
+
+                candidate_df = await reader.load_front_month_series(**candidate_kwargs)
             except Exception as exc:  # pragma: no cover - relies on external library
                 if tz_mismatch_msg in str(exc):
                     last_error = exc
@@ -784,13 +870,19 @@ class AsyncParquetWriter:
                 break
 
         try:
-            new_df = await reader.load_front_month_series(
-                ticker=symbol.replace('_F', ''),
-                start=fetch_start,
-                end=None,
-                resample_rule=timeframe,
-                volume_per_bar=volume_bucket_size
+            load_kwargs = {
+                'ticker': symbol.replace('_F', ''),
+                'start': fetch_start,
+                'end': None,
+                'resample_rule': timeframe,
+                'volume_per_bar': volume_bucket_size,
+            }
+            load_kwargs = self._maybe_add_service(
+                reader.load_front_month_series,
+                load_kwargs
             )
+
+            new_df = await reader.load_front_month_series(**load_kwargs)
         except Exception as exc:  # pragma: no cover - relies on external library
             if new_df is None:
                 exc = last_error or Exception("Failed to load data from AsyncScidReader")
@@ -1089,7 +1181,7 @@ class IntradayFileManager:
     """
 
     # SCID filename pattern
-    SCID_PATTERN = re.compile(r'^([A-Z]{1,3})([FGHJKMNQUVXZ])(\d{2})-([A-Z]+)\.scid$', re.IGNORECASE)
+    SCID_PATTERN = re.compile(r'^([A-Z]{1,3})([FGHJKMNQUVXZ])(\d{1,2})-([A-Z]+)\.scid$', re.IGNORECASE)
 
     # Month code mapping
     MONTH_MAP = {
@@ -1166,8 +1258,8 @@ class IntradayFileManager:
             mapping.setdefault(full_symbol, []).append(entry)
 
         # Sort files by filename
-        for files in mapping.values():
-            files.sort()
+        for _, files in mapping.items():
+            files.sort(key=self._scid_sort_key)
 
         self._scid_files = mapping
 
@@ -1193,6 +1285,44 @@ class IntradayFileManager:
     def get_scid_files_for_symbol(self, symbol: str) -> List[Path]:
         """Get all SCID files for a given symbol."""
         return self._scid_files.get(symbol, [])
+
+    def _scid_sort_key(self, file_path: Path) -> Tuple[int, int, str]:
+        """Generate a chronological sort key for SCID filenames.
+
+        Sierra Chart historically emitted one-digit years for contracts prior to
+        2010 (e.g. ``PLF6-CME.scid`` for January 2006). Our original
+        ``SCID_PATTERN`` only recognised two-digit years which meant these
+        historical contracts were ignored entirely during discovery. We accept
+        both one and two digit years now and normalise them into a sortable
+        integer using a century heuristic that keeps pre- and post-2000
+        contracts in chronological order.
+        """
+
+        match = self.SCID_PATTERN.match(file_path.name)
+        if not match:
+            # Put unrecognised names at the end while maintaining deterministic order
+            return (10 ** 9, 99, file_path.name)
+
+        month_code = match.group(2).upper()
+        year_fragment = match.group(3)
+
+        try:
+            raw_year = int(year_fragment)
+        except ValueError:
+            raw_year = 0
+
+        if len(year_fragment) == 1:
+            year = 2000 + raw_year
+        else:
+            # Two digit years beyond 69 are assumed to be from the 1900s while
+            # the remainder fall into the 2000s. This mirrors common rollover
+            # logic for futures datasets and keeps ordering stable across
+            # centuries without needing explicit contract metadata.
+            year = (1900 + raw_year) if raw_year >= 70 else (2000 + raw_year)
+
+        month = self.MONTH_MAP.get(month_code, 0)
+
+        return (year, month, file_path.name)
 
     def load_front_month_series(self,
                                 symbol: str,
