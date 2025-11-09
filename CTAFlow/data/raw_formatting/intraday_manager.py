@@ -582,6 +582,110 @@ class AsyncParquetWriter:
                 'error': str(e)
             }
 
+    async def convert_csv(self,
+                          symbol: str,
+                          csv_directory: Optional[Path] = None,
+                          suffix: str = "_tick",
+                          timeframe: Optional[str] = None,
+                          mode: str = "replace",
+                          **read_csv_kwargs: Any) -> Dict[str, Any]:
+        """Convert CSV intraday data into the managed Parquet layout."""
+
+        directory = Path(csv_directory) if csv_directory else self.base_path
+        normalized_symbol = symbol.replace('_F', '')
+        file_stem = f"{normalized_symbol}{suffix or ''}"
+        csv_filename = f"{file_stem}.csv" if not file_stem.lower().endswith('.csv') else file_stem
+        csv_path = directory / csv_filename
+
+        if not csv_path.exists():
+            error_message = f"CSV file not found: {csv_path}"
+            if self.logger:
+                self.logger.error(f"[Async] {error_message}")
+            return {
+                'success': False,
+                'symbol': symbol,
+                'records_written': 0,
+                'error': error_message
+            }
+
+        loop = asyncio.get_event_loop()
+
+        try:
+            df = await loop.run_in_executor(
+                None,
+                lambda: pd.read_csv(csv_path, **read_csv_kwargs)
+            )
+        except Exception as exc:  # pragma: no cover - delegated to pandas
+            if self.logger:
+                self.logger.error(f"[Async] Failed reading {csv_path}: {exc}")
+            return {
+                'success': False,
+                'symbol': symbol,
+                'records_written': 0,
+                'error': str(exc)
+            }
+
+        if df.empty:
+            return {
+                'success': False,
+                'symbol': symbol,
+                'records_written': 0,
+                'error': f"CSV file empty: {csv_path}"
+            }
+
+        df.columns = [col.replace(' ', '') for col in df.columns]
+
+        def _find_column(target: str) -> Optional[str]:
+            for col in df.columns:
+                if col.lower() == target:
+                    return col
+            return None
+
+        date_col = _find_column('date')
+        time_col = _find_column('time')
+
+        if date_col is None or time_col is None:
+            error_message = "CSV must contain 'Date' and 'Time' columns"
+            if self.logger:
+                self.logger.error(f"[Async] {error_message}: {csv_path}")
+            return {
+                'success': False,
+                'symbol': symbol,
+                'records_written': 0,
+                'error': error_message
+            }
+
+        timestamp = pd.to_datetime(
+            df[date_col].astype(str).str.strip() + ' ' + df[time_col].astype(str).str.strip(),
+            errors='coerce'
+        )
+        df = df.assign(timestamp=timestamp).dropna(subset=['timestamp'])
+
+        if df.empty:
+            return {
+                'success': False,
+                'symbol': symbol,
+                'records_written': 0,
+                'error': 'No valid timestamps after combining Date and Time columns'
+            }
+
+        df = df.drop(columns=[date_col, time_col])
+        df = df.set_index('timestamp')
+        df.index.name = 'datetime'
+        df = df[~df.index.duplicated(keep='last')].sort_index()
+
+        if self.logger:
+            self.logger.info(
+                f"[Async] Loaded {len(df):,} rows from {csv_path.name} for {symbol}"
+            )
+
+        return await self.write_dataframe(
+            df=df,
+            symbol=symbol,
+            timeframe=timeframe,
+            mode=mode
+        )
+
     async def read_dataframe(self,
                              symbol: str,
                              timeframe: Optional[str] = None,
@@ -638,6 +742,71 @@ class AsyncParquetWriter:
             if self.logger:
                 self.logger.error(f"[Async] Error reading {symbol}: {e}")
             return pd.DataFrame()
+
+    async def resample_from_pq(self,
+                               symbol: str,
+                               target_timeframe: str,
+                               source_timeframe: Optional[str] = None,
+                               start: Optional[datetime] = None,
+                               end: Optional[datetime] = None,
+                               mode: str = 'replace',
+                               source_volume_bucket_size: Optional[int] = None) -> Dict[str, Any]:
+        """Create a new timeframe parquet by resampling an existing dataset."""
+
+        if not target_timeframe:
+            return {
+                'success': False,
+                'symbol': symbol,
+                'records_written': 0,
+                'error': 'target_timeframe must be provided'
+            }
+
+        df = await self.read_dataframe(
+            symbol=symbol,
+            timeframe=source_timeframe,
+            volume_bucket_size=source_volume_bucket_size,
+            start=start,
+            end=end
+        )
+
+        if df.empty:
+            error_message = 'Source parquet returned no data'
+            if self.logger:
+                self.logger.error(f"[Async] {error_message} for {symbol}")
+            return {
+                'success': False,
+                'symbol': symbol,
+                'records_written': 0,
+                'error': error_message
+            }
+
+        if not isinstance(df.index, pd.DatetimeIndex):
+            try:
+                df.index = pd.to_datetime(df.index)
+            except Exception as exc:
+                error_message = f'Unable to convert index to datetime: {exc}'
+                if self.logger:
+                    self.logger.error(f"[Async] {error_message}")
+                return {
+                    'success': False,
+                    'symbol': symbol,
+                    'records_written': 0,
+                    'error': error_message
+                }
+
+        df = df[~df.index.duplicated(keep='last')].sort_index()
+
+        if self.logger:
+            self.logger.info(
+                f"[Async] Resampling {len(df):,} rows for {symbol} -> {target_timeframe}"
+            )
+
+        return await self.write_dataframe(
+            df=df,
+            symbol=symbol,
+            timeframe=target_timeframe,
+            mode=mode
+        )
 
     def _get_last_timestamp_from_parquet(self, file_path: Path) -> Optional[pd.Timestamp]:
         """Return the last timestamp stored in ``file_path`` if available."""
