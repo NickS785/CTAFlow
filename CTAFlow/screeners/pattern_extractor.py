@@ -193,6 +193,12 @@ class PatternExtractor:
         "created_at",
         "period_length",
         "month_filter",
+        "months_active",
+        "months_mask_12",
+        "months_names",
+        "target_times_hhmm",
+        "period_length_min",
+        "regime_filter",
     )
 
     def __init__(
@@ -817,6 +823,9 @@ class PatternExtractor:
         if summary.pattern_type in {"time_predictive_nextday", "time_predictive_nextweek"}:
             return self._extract_time_of_day_series(symbol, summary)
 
+        if summary.pattern_type == "weekend_hedging":
+            return self._extract_weekend_hedging_series(symbol, summary)
+
         if summary.pattern_type in {
             "abnormal_month",
             "high_sharpe_month",
@@ -1311,6 +1320,8 @@ class PatternExtractor:
             "pattern_origin": origin,
             "screen_type": screen_type,
         }
+        payload_dict = dict(pattern)
+
         if screen_type == "seasonality" and isinstance(params, ScreenParams):
             metadata.update(
                 {
@@ -1318,6 +1329,15 @@ class PatternExtractor:
                     "most_prevalent_day": pattern.get("most_prevalent_day"),
                 }
             )
+
+        for key in ("months_active", "months_mask_12", "months_names", "target_times_hhmm", "period_length_min"):
+            value = payload_dict.get(key)
+            if value is not None:
+                metadata[key] = value
+
+        regime_meta = payload_dict.get("regime_filter") or pattern.get("metadata", {}).get("regime_filter")
+        if regime_meta is not None:
+            metadata["regime_filter"] = regime_meta
 
         return PatternSummary(
             key=key,
@@ -1376,6 +1396,44 @@ class PatternExtractor:
             period_length,
         )
         return returns
+
+    def _extract_weekend_hedging_series(self, symbol: str, summary: PatternSummary) -> pd.Series:
+        params = self._ensure_seasonality_params(summary, context="Weekend hedging")
+
+        session_data, price_col, is_synthetic = self._get_seasonality_session_data(symbol, params)
+        if session_data.empty:
+            return pd.Series(dtype=float)
+
+        session_start = self._screener._convert_times([params.seasonality_session_start or "00:00"])[0]
+        session_end = self._screener._convert_times([params.seasonality_session_end or "23:59:59"])[0]
+
+        full_returns = self._screener._calculate_full_session_returns(
+            session_data,
+            session_start,
+            session_end,
+            price_col,
+            is_synthetic,
+        )
+
+        if full_returns.empty:
+            return pd.Series(dtype=float)
+
+        returns = full_returns.sort_index()
+        returns.index = pd.to_datetime(returns.index)
+        friday_mask = returns.index.dayofweek == 4
+        if not friday_mask.any():
+            return pd.Series(dtype=float)
+
+        next_dates = returns.index.to_series().shift(-1)
+        monday_mask = next_dates.dt.dayofweek == 0
+        monday_returns = returns.shift(-1)
+        valid = friday_mask & monday_mask
+        if not valid.any():
+            return pd.Series(dtype=float)
+
+        series = monday_returns.loc[valid].copy()
+        series.name = "weekend_hedging_return"
+        return series
 
     def _extract_monthly_series(self, symbol: str, summary: PatternSummary) -> pd.Series:
         price_df = self._get_price_series(symbol, price_col="Close")
