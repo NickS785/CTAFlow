@@ -1,17 +1,29 @@
 import re
 import importlib.util
+import sys
+import types
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
-MODULE_PATH = ROOT / "CTAFlow" / "strategy" / "screener_pipeline.py"
+STRATEGY_DIR = ROOT / "CTAFlow" / "strategy"
+PACKAGE_NAME = "CTAFlow.strategy"
 
-spec = importlib.util.spec_from_file_location("screener_pipeline", MODULE_PATH)
-module = importlib.util.module_from_spec(spec)
-assert spec.loader is not None
-spec.loader.exec_module(module)
+if PACKAGE_NAME not in sys.modules:
+    strategy_pkg = types.ModuleType(PACKAGE_NAME)
+    strategy_pkg.__path__ = [str(STRATEGY_DIR)]
+    sys.modules[PACKAGE_NAME] = strategy_pkg
+
+SPEC = importlib.util.spec_from_file_location(
+    f"{PACKAGE_NAME}.screener_pipeline",
+    STRATEGY_DIR / "screener_pipeline.py",
+)
+module = importlib.util.module_from_spec(SPEC)
+assert SPEC.loader is not None
+sys.modules[f"{PACKAGE_NAME}.screener_pipeline"] = module
+SPEC.loader.exec_module(module)
 ScreenerPipeline = module.ScreenerPipeline
 HorizonMapper = module.HorizonMapper
 
