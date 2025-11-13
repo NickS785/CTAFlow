@@ -940,25 +940,13 @@ class HorizonMapper:
         payload = pattern.get("pattern_payload", {}) or {}
         metadata = pattern.get("metadata", {}) or {}
         collected: Dict[str, Any] = {}
-        aliases = {
-            "weekday": ("weekday", "day", "weekday_name"),
-        }
         for field in fields:
-            keys_to_try = aliases.get(field, (field,))
-            value: Any = None
-            for key in keys_to_try:
-                if key in payload:
-                    value = payload.get(key)
-                    break
-                if key in metadata:
-                    value = metadata.get(key)
-                    break
-                if key in pattern:
-                    value = pattern.get(key)
-                    break
-            if value is None:
-                value = pattern.get(field)
-            collected[field] = value
+            if field in payload:
+                collected[field] = payload.get(field)
+            elif field in metadata:
+                collected[field] = metadata.get(field)
+            else:
+                collected[field] = pattern.get(field)
         return collected
 
     @staticmethod
@@ -1505,21 +1493,6 @@ class HorizonMapper:
 
         df = self._prepare_bars_frame(bars_with_features)
         result = bars_with_features.copy()
-
-        if "ts" in result.columns:
-            ts_source = result["ts"]
-        elif isinstance(result.index, pd.DatetimeIndex):
-            ts_source = result.index
-        else:
-            raise HorizonInputError(
-                "bars_with_features must include a 'ts' column or DatetimeIndex for alignment"
-            )
-
-        ts_frame = pd.DataFrame({"ts": ts_source})
-        ts_aligned = self._sanitize_ts(ts_frame)["ts"]
-        ts_to_index: Dict[pd.Timestamp, List[Any]] = {}
-        for idx_label, ts_value in zip(result.index, ts_aligned):
-            ts_to_index.setdefault(ts_value, []).append(idx_label)
 
         for gate_col, _, returns_x_series, _, _, _, _ in self._iter_pattern_returns(
             df,
