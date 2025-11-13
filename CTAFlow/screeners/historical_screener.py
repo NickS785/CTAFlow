@@ -1,5 +1,6 @@
 from ..utils.seasonal import last_year_predicts_this_year, intraday_lag_autocorr, abnormal_months, prewindow_feature, prewindow_predicts_month
-from typing import Any, List, Dict, Optional, Union, Tuple
+from typing import Any, List, Dict, Optional, Sequence, Union, Tuple
+import calendar
 import pandas as pd
 import numpy as np
 from datetime import datetime, date, timedelta, time
@@ -96,6 +97,11 @@ class ScreenParams:
     season: Optional[str] = None
     months: Optional[List[int]] = None
 
+    # Regime filtering parameters
+    use_regime_filtering: bool = False
+    regime_col: Optional[str] = None
+    target_regimes: Optional[List[int]] = None
+
     # Momentum screen parameters
     session_starts: Optional[List[Union[str, time]]] = None
     session_ends: Optional[List[Union[str, time]]] = None
@@ -114,6 +120,9 @@ class ScreenParams:
     seasonality_session_end: Union[str, time] = "23:59:59"
     tz: str = "America/Chicago"
 
+    # Normalised derivatives (populated during validation)
+    target_times_hhmm: Optional[List[str]] = field(default=None, init=False)
+
     def __post_init__(self):
         """Validate parameters and auto-generate name if not provided."""
         # Validate screen_type
@@ -130,6 +139,33 @@ class ScreenParams:
         elif self.screen_type == 'seasonality':
             if self.target_times is None:
                 raise ValueError("Seasonality screens require target_times")
+
+        # Validate regime filtering parameters
+        if self.use_regime_filtering:
+            if not self.regime_col:
+                raise ValueError("regime_col must be provided when use_regime_filtering=True")
+            if not self.target_regimes:
+                raise ValueError("target_regimes must be provided when use_regime_filtering=True")
+
+        if self.target_regimes is not None:
+            try:
+                regimes = sorted({int(value) for value in self.target_regimes})
+            except (TypeError, ValueError) as exc:
+                raise ValueError("target_regimes must contain integers") from exc
+            self.target_regimes = regimes
+
+        if self.target_times:
+            normalised: List[str] = []
+            for raw in self.target_times:
+                if isinstance(raw, time):
+                    clock = raw
+                else:
+                    try:
+                        clock = pd.to_datetime(str(raw)).time()
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(f"Invalid target time value: {raw!r}") from exc
+                normalised.append(clock.strftime("%H:%M"))
+            self.target_times_hhmm = sorted(dict.fromkeys(normalised))
 
         # Auto-generate name if not provided
         if self.name is None:
@@ -332,6 +368,9 @@ class HistoricalScreener:
         season: Optional[str] = None,
         _selected_months: Optional[List[int]] = None,
         _precomputed_sessions: Optional[Dict[str, Dict[str, any]]] = None,
+        use_regime_filtering: bool = False,
+        regime_col: Optional[str] = None,
+        target_regimes: Optional[List[int]] = None,
         max_workers: Optional[int] = None,
         show_progress: bool = True
     ) -> Dict[str, Dict[str, any]]:
@@ -366,6 +405,13 @@ class HistoricalScreener:
             - spring: Mar, Apr, May (3, 4, 5)
             - summer: Jun, Jul, Aug (6, 7, 8)
             - fall: Sep, Oct, Nov (9, 10, 11)
+        use_regime_filtering : bool
+            Apply a discrete regime filter to the underlying dataset before computing
+            statistics.
+        regime_col : Optional[str]
+            Name of the regime column used when ``use_regime_filtering`` is True.
+        target_regimes : Optional[List[int]]
+            Regime states that must be present to include a row in the analysis.
         session_start : Optional[Union[str, time]]
             Local session start time for filtering intraday bars (default "00:00").
         session_end : Optional[Union[str, time]]
@@ -379,6 +425,12 @@ class HistoricalScreener:
             Internal override for month selection when using cached data.
         _precomputed_sessions : Optional[Dict[str, Dict[str, any]]]
             Pre-filtered session data keyed by ticker for performance.
+        use_regime_filtering : bool
+            Enable regime-based filtering before computing session statistics.
+        regime_col : Optional[str]
+            Name of the column containing discrete regime identifiers.
+        target_regimes : Optional[List[int]]
+            Regime states to include when ``use_regime_filtering`` is True.
         max_workers : Optional[int]
             Maximum number of parallel workers. If None, uses min(32, cpu_count + 4).
         show_progress : bool
@@ -434,6 +486,7 @@ class HistoricalScreener:
         def _process_single_ticker(t: str) -> Tuple[str, Dict[str, any]]:
             try:
                 cache_entry = precomputed_sessions.get(t)
+                regime_meta: Optional[Dict[str, Any]] = None
 
                 if cache_entry:
                     is_synthetic = cache_entry.get('is_synthetic', self.synthetic_tickers.get(t, False))
@@ -441,13 +494,15 @@ class HistoricalScreener:
                     price_col = cache_entry.get('price_col')
                     filtered_months_label = cache_entry.get('filtered_months', selected_months if selected_months else 'all')
                     n_observations = cache_entry.get('n_observations', len(ticker_data) if ticker_data is not None else 0)
+                    regime_meta = cache_entry.get('regime_filter')
 
                     if ticker_data is None or ticker_data.empty:
                         result = {
                             'error': cache_entry.get('error', 'No data available'),
                             'filtered_months': filtered_months_label,
                             'ticker': t,
-                            'is_synthetic': is_synthetic
+                            'is_synthetic': is_synthetic,
+                            'regime_filter': regime_meta,
                         }
                         if selected_months is not None:
                             result['selected_months'] = selected_months
@@ -463,7 +518,7 @@ class HistoricalScreener:
                         ticker_data = self.data[t]
 
                     if ticker_data.empty:
-                        return (t, {'error': 'No data available'})
+                        return (t, {'error': 'No data available', 'regime_filter': None})
 
                     # Filter by months/season if specified
                     if selected_months is not None:
@@ -471,8 +526,34 @@ class HistoricalScreener:
                         if ticker_data.empty:
                             return (t, {
                                 'error': 'No data available for selected months/season',
-                                'selected_months': selected_months
+                                'selected_months': selected_months,
+                                'regime_filter': None,
                             })
+
+                    if use_regime_filtering and regime_col and target_regimes:
+                        try:
+                            ticker_data = self._filter_by_regime(ticker_data, regime_col, target_regimes)
+                        except KeyError:
+                            return (
+                                t,
+                                {
+                                    'error': f"Regime column '{regime_col}' missing",
+                                    'selected_months': selected_months,
+                                    'regime_filter': {'column': regime_col, 'targets': target_regimes},
+                                },
+                            )
+
+                        if ticker_data.empty:
+                            return (
+                                t,
+                                {
+                                    'error': 'No data available for selected regimes',
+                                    'selected_months': selected_months,
+                                    'regime_filter': {'column': regime_col, 'targets': target_regimes},
+                                },
+                            )
+
+                        regime_meta = {'column': regime_col, 'targets': list(target_regimes)}
 
                     price_col = 'Close' if 'Close' in ticker_data.columns else ticker_data.columns[0]
                     filtered_months_label = selected_months if selected_months else 'all'
@@ -485,7 +566,8 @@ class HistoricalScreener:
                     'ticker': t,
                     'is_synthetic': is_synthetic,
                     'n_observations': n_observations,
-                    'filtered_months': filtered_months_label
+                    'filtered_months': filtered_months_label,
+                    'regime_filter': regime_meta,
                 }
 
                 for i, (start_time, end_time) in enumerate(zip(session_starts, session_ends)):
@@ -564,7 +646,10 @@ class HistoricalScreener:
         tz: str = "America/Chicago",
         include_volume: bool = False,
         max_workers: Optional[int] = None,
-        show_progress: bool = True
+        show_progress: bool = True,
+        use_regime_filtering: bool = False,
+        regime_col: Optional[str] = None,
+        target_regimes: Optional[List[int]] = None,
     ) -> Dict[str, Dict[str, any]]:
         """
         Screen for seasonality patterns in intraday data.
@@ -670,7 +755,7 @@ class HistoricalScreener:
                     data = self.data[ticker]
 
                 if data.empty:
-                    return (ticker, {'error': 'No data available'})
+                    return (ticker, {'error': 'No data available', 'regime_filter': None})
 
                 # Filter to session window in local timezone
                 session_data = filter_session_bars(
@@ -697,7 +782,40 @@ class HistoricalScreener:
                             'session_start': session_start_time.strftime("%H:%M:%S"),
                             'session_end': session_end_time.strftime("%H:%M:%S"),
                             'tz': tz,
+                            'regime_filter': None,
                         })
+
+                regime_meta: Optional[Dict[str, Any]] = None
+                if use_regime_filtering and regime_col and target_regimes:
+                    try:
+                        session_data = self._filter_by_regime(session_data, regime_col, target_regimes)
+                    except KeyError:
+                        return (
+                            ticker,
+                            {
+                                'error': f"Regime column '{regime_col}' missing",
+                                'selected_months': selected_months,
+                                'session_start': session_start_time.strftime("%H:%M:%S"),
+                                'session_end': session_end_time.strftime("%H:%M:%S"),
+                                'tz': tz,
+                                'regime_filter': {'column': regime_col, 'targets': target_regimes},
+                            },
+                        )
+
+                    if session_data.empty:
+                        return (
+                            ticker,
+                            {
+                                'error': 'No data available for selected regimes',
+                                'selected_months': selected_months,
+                                'session_start': session_start_time.strftime("%H:%M:%S"),
+                                'session_end': session_end_time.strftime("%H:%M:%S"),
+                                'tz': tz,
+                                'regime_filter': {'column': regime_col, 'targets': target_regimes},
+                            },
+                        )
+
+                    regime_meta = {'column': regime_col, 'targets': list(target_regimes)}
 
                 # Determine price column
                 price_col = 'Close' if 'Close' in session_data.columns else session_data.columns[0]
@@ -706,7 +824,8 @@ class HistoricalScreener:
                     'ticker': ticker,
                     'is_synthetic': is_synthetic,
                     'n_observations': len(session_data),
-                    'filtered_months': selected_months if selected_months else 'all'
+                    'filtered_months': selected_months if selected_months else 'all',
+                    'regime_filter': regime_meta,
                 }
 
                 if isinstance(session_data.index, pd.DatetimeIndex):
@@ -718,6 +837,8 @@ class HistoricalScreener:
                     session_dates = index_dt.normalize()
                 else:
                     session_dates = index_dt.tz_convert(tz).normalize()
+                months_meta = self._build_months_metadata(session_data.index, tz)
+
                 ticker_results['metadata'] = {
                     'session_start': session_start_time.strftime("%H:%M:%S"),
                     'session_end': session_end_time.strftime("%H:%M:%S"),
@@ -726,6 +847,34 @@ class HistoricalScreener:
                     'period_length': self._serialize_period_length(period_length),
                     'month_filter': ",".join(str(m) for m in sorted(selected_months)) if selected_months else None,
                 }
+                ticker_results['metadata'].update(months_meta)
+                ticker_results['metadata']['regime_filter'] = regime_meta
+
+                period_minutes: Optional[int]
+                if period_length is None:
+                    period_minutes = None
+                elif isinstance(period_length, timedelta):
+                    period_minutes = int(period_length.total_seconds() // 60)
+                else:
+                    try:
+                        period_minutes = int(period_length)
+                    except (TypeError, ValueError):
+                        period_minutes = None
+
+                normalized_times = [clock.strftime("%H:%M") for clock in converted_times]
+
+                pattern_context = {
+                    'period_length_min': period_minutes if period_minutes is not None else 0,
+                    'months_active': months_meta['months_active'],
+                    'months_mask_12': months_meta['months_mask_12'],
+                    'months_names': months_meta['months_names'],
+                    'regime_filter': regime_meta,
+                }
+                ticker_results['pattern_context'] = pattern_context
+                ticker_results['months_active'] = months_meta['months_active']
+                ticker_results['months_mask_12'] = months_meta['months_mask_12']
+                ticker_results['months_names'] = months_meta['months_names']
+                ticker_results['metadata']['target_times_hhmm'] = normalized_times
 
                 # Day-of-week analysis
                 if dayofweek_screen:
@@ -741,11 +890,28 @@ class HistoricalScreener:
                         price_col,
                         target_time,
                         is_synthetic,
-                        period_length
+                        period_length,
+                        tz,
                     )
-                    time_predictions[str(target_time)] = pred_stats
+                    time_key = str(target_time)
+                    time_label = target_time.strftime("%H:%M")
+                    enriched_stats = dict(pattern_context)
+                    enriched_stats['time'] = time_label
+                    enriched_stats['target_times_hhmm'] = [time_label]
+                    enriched_stats.update(pred_stats)
+                    time_predictions[time_key] = enriched_stats
 
                 ticker_results['time_predictability'] = time_predictions
+
+                weekend_pattern = self._compute_weekend_hedging_pattern(
+                    session_data,
+                    session_start_time,
+                    session_end_time,
+                    price_col,
+                    is_synthetic,
+                    tz,
+                    pattern_context,
+                )
 
                 # Month-by-month analysis if filtering is applied
                 if selected_months is not None:
@@ -754,6 +920,8 @@ class HistoricalScreener:
 
                 # Rank strongest patterns
                 strongest = self._rank_seasonal_strength(ticker_results)
+                if weekend_pattern is not None:
+                    strongest.append(weekend_pattern)
                 ticker_results['strongest_patterns'] = strongest
 
                 return (ticker, ticker_results)
@@ -793,7 +961,11 @@ class HistoricalScreener:
     def _prepare_momentum_session_cache(
         self,
         session_pairs: Tuple[Tuple[time, time], ...],
-        selected_months: Optional[List[int]]
+        selected_months: Optional[List[int]],
+        *,
+        use_regime_filtering: bool = False,
+        regime_col: Optional[str] = None,
+        target_regimes: Optional[List[int]] = None,
     ) -> Dict[str, Dict[str, any]]:
         """Pre-filter ticker data for momentum screens to avoid redundant work."""
         cache: Dict[str, Dict[str, any]] = {}
@@ -818,15 +990,42 @@ class HistoricalScreener:
 
             filtered_data = base_data
             if selected_months is not None:
-                filtered_data = self._filter_by_months(base_data, selected_months)
+                filtered_data = self._filter_by_months(filtered_data, selected_months)
                 if filtered_data.empty:
                     cache[ticker] = {
                         'data': None,
                         'is_synthetic': is_synthetic,
                         'filtered_months': selected_months,
+                        'regime_filter': None,
                         'error': 'No data available for selected months/season'
                     }
                     continue
+
+            regime_meta: Optional[Dict[str, Any]] = None
+            if use_regime_filtering and regime_col and target_regimes:
+                try:
+                    filtered_data = self._filter_by_regime(filtered_data, regime_col, target_regimes)
+                except KeyError:
+                    cache[ticker] = {
+                        'data': None,
+                        'is_synthetic': is_synthetic,
+                        'filtered_months': selected_months if selected_months else 'all',
+                        'regime_filter': {'column': regime_col, 'targets': target_regimes},
+                        'error': f"Regime column '{regime_col}' missing from data"
+                    }
+                    continue
+
+                if filtered_data.empty:
+                    cache[ticker] = {
+                        'data': None,
+                        'is_synthetic': is_synthetic,
+                        'filtered_months': selected_months if selected_months else 'all',
+                        'regime_filter': {'column': regime_col, 'targets': target_regimes},
+                        'error': 'No data available for selected regimes'
+                    }
+                    continue
+
+                regime_meta = {'column': regime_col, 'targets': list(target_regimes)}
 
             price_col = 'Close' if 'Close' in filtered_data.columns else filtered_data.columns[0]
 
@@ -845,7 +1044,8 @@ class HistoricalScreener:
                 'price_col': price_col,
                 'sessions': session_map,
                 'n_observations': len(filtered_data),
-                'filtered_months': selected_months if selected_months else 'all'
+                'filtered_months': selected_months if selected_months else 'all',
+                'regime_filter': regime_meta,
             }
 
         return cache
@@ -912,7 +1112,15 @@ class HistoricalScreener:
         >>> results = screener.run_screens(screens)
         """
         composite_results = {}
-        momentum_cache: Dict[Tuple[Tuple[time, time], Tuple[time, time], Optional[Tuple[int, ...]]], Dict[str, Dict[str, any]]] = {}
+        momentum_cache: Dict[
+            Tuple[
+                Tuple[time, ...],
+                Tuple[time, ...],
+                Optional[Tuple[int, ...]],
+                Optional[Tuple[str, Tuple[int, ...]]],
+            ],
+            Dict[str, Dict[str, Any]],
+        ] = {}
 
         for params in screen_params:
             if params.screen_type == 'momentum':
@@ -920,17 +1128,30 @@ class HistoricalScreener:
                 selected_months = self._parse_season_months(params.months, params.season)
                 session_pairs = tuple(zip(session_starts, session_ends))
                 months_key = tuple(selected_months) if selected_months else None
-                cache_key = (tuple(session_starts), tuple(session_ends), months_key)
+                regime_key = None
+                if params.use_regime_filtering and params.regime_col and params.target_regimes:
+                    regime_key = (params.regime_col, tuple(params.target_regimes))
+
+                cache_key = (tuple(session_starts), tuple(session_ends), months_key, regime_key)
 
                 if cache_key not in momentum_cache:
-                    momentum_cache[cache_key] = self._prepare_momentum_session_cache(session_pairs, selected_months)
+                    momentum_cache[cache_key] = self._prepare_momentum_session_cache(
+                        session_pairs,
+                        selected_months,
+                        use_regime_filtering=params.use_regime_filtering,
+                        regime_col=params.regime_col,
+                        target_regimes=params.target_regimes,
+                    )
 
                 screen_result = self._parse_params(
                     params,
                     session_starts=session_starts,
                     session_ends=session_ends,
                     _selected_months=selected_months,
-                    _precomputed_sessions=momentum_cache[cache_key]
+                    _precomputed_sessions=momentum_cache[cache_key],
+                    use_regime_filtering=params.use_regime_filtering,
+                    regime_col=params.regime_col,
+                    target_regimes=params.target_regimes,
                 )
             else:
                 # Parse parameters and run appropriate screen
@@ -1005,6 +1226,9 @@ class HistoricalScreener:
                 season=params.season,
                 _selected_months=selected_months_override,
                 _precomputed_sessions=precomputed_sessions,
+                use_regime_filtering=params.use_regime_filtering,
+                regime_col=params.regime_col,
+                target_regimes=params.target_regimes,
                 **momentum_kwargs
             )
 
@@ -1018,7 +1242,10 @@ class HistoricalScreener:
                 season=params.season,
                 session_start=params.seasonality_session_start,
                 session_end=params.seasonality_session_end,
-                tz=params.tz
+                tz=params.tz,
+                use_regime_filtering=params.use_regime_filtering,
+                regime_col=params.regime_col,
+                target_regimes=params.target_regimes,
             )
 
         else:
@@ -1254,7 +1481,8 @@ class HistoricalScreener:
         correlation_stats = self._calculate_momentum_correlations(
             opening_returns,
             closing_returns,
-            st_momentum
+            st_momentum,
+            full_session_returns,
         )
 
         # Day-of-week breakdown for momentum effects
@@ -1471,14 +1699,16 @@ class HistoricalScreener:
         self,
         opening_returns: pd.Series,
         closing_returns: pd.Series,
-        st_momentum: pd.Series
+        st_momentum: pd.Series,
+        full_session_returns: pd.Series,
     ) -> Dict[str, float]:
         """Calculate correlations between different momentum measures."""
         # Align series
         combined = pd.DataFrame({
             'open': opening_returns,
             'close': closing_returns,
-            'st_mom': st_momentum
+            'st_mom': st_momentum,
+            'full': full_session_returns,
         }).dropna()
 
         if len(combined) < 10:
@@ -1486,7 +1716,9 @@ class HistoricalScreener:
                 'open_close_corr': np.nan,
                 'open_close_pvalue': np.nan,
                 'open_st_mom_corr': np.nan,
-                'close_st_mom_corr': np.nan
+                'close_st_mom_corr': np.nan,
+                'close_vs_rest_corr': np.nan,
+                'close_vs_rest_pvalue': np.nan,
             }
 
         # Correlation between opening and closing momentum
@@ -1498,11 +1730,24 @@ class HistoricalScreener:
         # Correlation between closing momentum and short-term momentum
         close_st_corr, _ = stats.pearsonr(combined['close'], combined['st_mom'])
 
+        rest_of_session = combined['full'] - combined['close']
+        if len(rest_of_session.unique()) <= 1:
+            close_rest_corr = np.nan
+            close_rest_pval = np.nan
+        else:
+            try:
+                close_rest_corr, close_rest_pval = stats.pearsonr(combined['close'], rest_of_session)
+            except ValueError:
+                close_rest_corr = np.nan
+                close_rest_pval = np.nan
+
         return {
             'open_close_corr': float(open_close_corr),
             'open_close_pvalue': float(open_close_pval),
             'open_st_mom_corr': float(open_st_corr),
             'close_st_mom_corr': float(close_st_corr),
+            'close_vs_rest_corr': float(close_rest_corr) if not np.isnan(close_rest_corr) else np.nan,
+            'close_vs_rest_pvalue': float(close_rest_pval) if not np.isnan(close_rest_pval) else np.nan,
             'n_observations': len(combined)
         }
 
@@ -1592,6 +1837,8 @@ class HistoricalScreener:
                 # T-statistic against zero (testing if mean is significantly different from 0)
                 t_stat = mean_val / (std_val / np.sqrt(len(day_data))) if std_val > 0 else np.nan
 
+                months_meta = self._build_months_metadata(day_data.index, None)
+
                 weekday_stats[day_name] = {
                     'n': len(day_data),
                     'mean': float(mean_val),
@@ -1599,7 +1846,8 @@ class HistoricalScreener:
                     'sharpe': float(sharpe),
                     'skew': float(day_data.skew()),
                     'positive_pct': float((day_data > 0).sum() / len(day_data)),
-                    't_stat': float(t_stat) if not np.isnan(t_stat) else np.nan
+                    't_stat': float(t_stat) if not np.isnan(t_stat) else np.nan,
+                    **months_meta,
                 }
 
             # ANOVA test across weekdays for this momentum type
@@ -2018,7 +2266,8 @@ class HistoricalScreener:
         price_col: str,
         target_time: time,
         is_synthetic: bool,
-        period_length: Optional[timedelta] = None
+        period_length: Optional[timedelta] = None,
+        tz: Optional[str] = None,
     ) -> Dict[str, any]:
         """
         Test if returns at a specific time predict future returns.
@@ -2035,6 +2284,8 @@ class HistoricalScreener:
             Whether data is synthetic spread
         period_length : Optional[timedelta]
             Length of window to aggregate (if None, use single bar)
+        tz : Optional[str]
+            Timezone used for month derivation.
 
         Returns:
         --------
@@ -2067,6 +2318,9 @@ class HistoricalScreener:
 
         # Group by date
         daily_returns = daily_returns.groupby(daily_returns.index.date).sum()
+        daily_returns.index = pd.to_datetime(daily_returns.index)
+
+        months_meta = self._build_months_metadata(daily_returns.index, tz)
 
         if len(daily_returns) < 20:
             return {
@@ -2075,7 +2329,8 @@ class HistoricalScreener:
                 'next_day_pvalue': np.nan,
                 'next_week_corr': np.nan,
                 'next_week_pvalue': np.nan,
-                'error': 'Insufficient data'
+                'error': 'Insufficient data',
+                **months_meta,
             }
 
         # Next-day correlation
@@ -2109,7 +2364,8 @@ class HistoricalScreener:
             'next_day_significant': p_1d < 0.05 if not np.isnan(p_1d) else False,
             'next_week_corr': float(r_1w) if not np.isnan(r_1w) else np.nan,
             'next_week_pvalue': float(p_1w) if not np.isnan(p_1w) else np.nan,
-            'next_week_significant': p_1w < 0.05 if not np.isnan(p_1w) else False
+            'next_week_significant': p_1w < 0.05 if not np.isnan(p_1w) else False,
+            **months_meta,
         }
 
         # Add weekday prevalence if available
@@ -2117,6 +2373,86 @@ class HistoricalScreener:
             result['weekday_prevalence'] = weekday_analysis
 
         return result
+
+    def _compute_weekend_hedging_pattern(
+        self,
+        session_data: pd.DataFrame,
+        session_start: time,
+        session_end: time,
+        price_col: str,
+        is_synthetic: bool,
+        tz: str,
+        pattern_context: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Compute Friday→Monday weekend hedging relationship."""
+
+        full_session_returns = self._calculate_full_session_returns(
+            session_data,
+            session_start,
+            session_end,
+            price_col,
+            is_synthetic,
+        )
+
+        if full_session_returns.empty:
+            return None
+
+        returns = full_session_returns.sort_index()
+        returns.index = pd.to_datetime(returns.index)
+        friday_mask = returns.index.dayofweek == 4
+
+        if not friday_mask.any():
+            return None
+
+        next_dates = returns.index.to_series().shift(-1)
+        next_weekday = next_dates.dt.dayofweek
+        monday_values = returns.shift(-1)
+        valid_mask = friday_mask & (next_weekday == 0)
+
+        if valid_mask.sum() < 5:
+            return None
+
+        friday_returns = returns.loc[valid_mask]
+        monday_returns = monday_values.loc[valid_mask]
+
+        try:
+            corr, p_val = stats.pearsonr(friday_returns.values, monday_returns.values)
+        except ValueError:
+            corr, p_val = np.nan, np.nan
+
+        pos_mask = friday_returns > 0
+        neg_mask = friday_returns < 0
+        mean_monday_pos = float(monday_returns[pos_mask].mean()) if pos_mask.any() else np.nan
+        mean_monday_neg = float(monday_returns[neg_mask].mean()) if neg_mask.any() else np.nan
+
+        overall_mean = float(monday_returns.mean()) if len(monday_returns) else 0.0
+        if np.isnan(overall_mean) or overall_mean == 0:
+            bias = 'neutral'
+        else:
+            bias = 'long' if overall_mean > 0 else 'short'
+
+        months_meta = self._build_months_metadata(friday_returns.index, tz)
+
+        pattern = {
+            'type': 'weekend_hedging',
+            'pattern_type': 'weekend_hedging',
+            'weekday': 'Friday->Monday',
+            'n': int(valid_mask.sum()),
+            'corr_Fri_Mon': float(corr) if not np.isnan(corr) else np.nan,
+            'p_value': float(p_val) if not np.isnan(p_val) else np.nan,
+            'mean_Mon_given_Fri_pos': mean_monday_pos,
+            'mean_Mon_given_Fri_neg': mean_monday_neg,
+            'friday_mean_return': float(friday_returns.mean()),
+            'monday_mean_return': float(monday_returns.mean()),
+            'bias': bias,
+            'description': 'Friday return vs Monday session return linkage',
+            'strength': abs(corr) if not np.isnan(corr) else 0.0,
+        }
+
+        pattern.update(pattern_context)
+        pattern.update(months_meta)
+
+        return pattern
 
     def _analyze_weekday_prevalence(
         self,
@@ -2170,12 +2506,14 @@ class HistoricalScreener:
             if len(day_data) >= 5:
                 try:
                     corr, p_val = stats.pearsonr(day_data['lagged'], day_data['current'])
+                    months_meta = self._build_months_metadata(day_data.index, None)
                     weekday_correlations[weekday_names[dow]] = {
                         'correlation': float(corr),
                         'p_value': float(p_val),
                         'n': len(day_data),
                         'significant': p_val < 0.05,
-                        'abs_correlation': abs(corr)
+                        'abs_correlation': abs(corr),
+                        **months_meta,
                     }
                     weekday_counts[weekday_names[dow]] = len(day_data)
                 except:
@@ -2211,7 +2549,8 @@ class HistoricalScreener:
             'most_prevalent_correlation': sorted_days[0][1]['correlation'] if sorted_days else np.nan,
             'n_significant_days': sum(1 for stats in weekday_correlations.values() if stats['significant']),
             'mean_correlation_significant': float(np.mean(significant_correlations)) if significant_correlations else np.nan,
-            'total_observations': len(df)
+            'total_observations': len(df),
+            **self._build_months_metadata(df.index, None),
         }
 
 
@@ -2234,6 +2573,8 @@ class HistoricalScreener:
         List of strongest patterns sorted by significance
         """
         patterns = []
+        pattern_context = ticker_results.get('pattern_context', {}) or {}
+        regime_meta = pattern_context.get('regime_filter')
 
         # Check day-of-week return patterns
         if 'dayofweek_returns' in ticker_results:
@@ -2246,7 +2587,11 @@ class HistoricalScreener:
                     'description': 'Significant day-of-week return pattern',
                     'f_stat': dow_returns['anova']['f_stat'],
                     'p_value': dow_returns['anova']['p_value'],
-                    'strength': abs(dow_returns['anova']['f_stat'])
+                    'strength': abs(dow_returns['anova']['f_stat']),
+                    'months_active': ticker_results.get('months_active'),
+                    'months_mask_12': ticker_results.get('months_mask_12'),
+                    'months_names': ticker_results.get('months_names'),
+                    'regime_filter': regime_meta,
                 })
 
             # Check individual weekday t-stats
@@ -2255,39 +2600,58 @@ class HistoricalScreener:
                     day_stats = dow_returns[day]
                     t_stat = day_stats.get('t_stat', 0)
                     if abs(t_stat) > 1.96:  # ~95% confidence
-                        patterns.append({
+                        weekday_pattern = {
                             'type': 'weekday_mean',
                             'day': day,
                             'description': f'{day} has significant mean return',
                             'mean': day_stats['mean'],
                             't_stat': t_stat,
                             'p_value': 2 * (1 - stats.t.cdf(abs(t_stat), df=day_stats['n']-1)) if day_stats['n'] > 1 else 1.0,
-                            'strength': abs(t_stat)
-                        })
+                            'strength': abs(t_stat),
+                            'months_active': day_stats.get('months_active'),
+                            'months_mask_12': day_stats.get('months_mask_12'),
+                            'months_names': day_stats.get('months_names'),
+                            'regime_filter': regime_meta,
+                        }
+                        patterns.append(weekday_pattern)
 
         # Check time predictability
         if 'time_predictability' in ticker_results:
-            for time_str, pred_stats in ticker_results['time_predictability'].items():
+            for time_key, pred_stats in ticker_results['time_predictability'].items():
+                time_label = str(pred_stats.get('time') or time_key)
                 # Next-day prediction
                 if pred_stats.get('next_day_significant', False):
-                    patterns.append({
+                    pattern_entry = {
                         'type': 'time_predictive_nextday',
-                        'time': time_str,
-                        'description': f'{time_str} predicts next day return',
+                        'time': time_label,
+                        'description': f'{time_label} predicts next day return',
                         'correlation': pred_stats['next_day_corr'],
                         'p_value': pred_stats['next_day_pvalue'],
-                        'strength': abs(pred_stats['next_day_corr'])
-                    })
+                        'strength': abs(pred_stats['next_day_corr']),
+                        'months_active': pred_stats.get('months_active'),
+                        'months_mask_12': pred_stats.get('months_mask_12'),
+                        'months_names': pred_stats.get('months_names'),
+                        'target_times_hhmm': pred_stats.get('target_times_hhmm') or [time_label],
+                        'period_length_min': pred_stats.get('period_length_min'),
+                        'regime_filter': pred_stats.get('regime_filter', regime_meta),
+                    }
+                    patterns.append(pattern_entry)
 
                 # Next-week prediction
                 if pred_stats.get('next_week_significant', False):
                     pattern_entry = {
                         'type': 'time_predictive_nextweek',
-                        'time': time_str,
-                        'description': f'{time_str} predicts next week return',
+                        'time': time_label,
+                        'description': f'{time_label} predicts next week return',
                         'correlation': pred_stats['next_week_corr'],
                         'p_value': pred_stats['next_week_pvalue'],
-                        'strength': abs(pred_stats['next_week_corr'])
+                        'strength': abs(pred_stats['next_week_corr']),
+                        'months_active': pred_stats.get('months_active'),
+                        'months_mask_12': pred_stats.get('months_mask_12'),
+                        'months_names': pred_stats.get('months_names'),
+                        'target_times_hhmm': pred_stats.get('target_times_hhmm') or [time_label],
+                        'period_length_min': pred_stats.get('period_length_min'),
+                        'regime_filter': pred_stats.get('regime_filter', regime_meta),
                     }
 
                     # Add weekday prevalence information if available
@@ -2358,26 +2722,76 @@ class HistoricalScreener:
         data: pd.DataFrame,
         months: List[int]
     ) -> pd.DataFrame:
-        """
-        Filter DataFrame to only include data from specified months.
+        """Return ``data`` restricted to the supplied calendar ``months``."""
 
-        Parameters:
-        -----------
-        data : pd.DataFrame
-            Input data with DatetimeIndex
-        months : List[int]
-            Month numbers to include (1-12)
+        if data.empty:
+            return data
 
-        Returns:
-        --------
-        pd.DataFrame
-            Filtered data
-        """
         if not isinstance(data.index, pd.DatetimeIndex):
-            raise TypeError("Data must have a DatetimeIndex")
+            coerced = pd.to_datetime(data.index, errors='coerce')
+            data = data.copy()
+            data.index = coerced
 
         month_mask = data.index.month.isin(months)
-        return data[month_mask]
+        return data.loc[month_mask]
+
+    def _filter_by_regime(
+        self,
+        data: pd.DataFrame,
+        regime_col: str,
+        target_regimes: List[int],
+    ) -> pd.DataFrame:
+        """Return rows where ``regime_col`` belongs to ``target_regimes``."""
+
+        if data.empty:
+            return data
+
+        if regime_col not in data.columns:
+            raise KeyError(regime_col)
+
+        return data.loc[data[regime_col].isin(target_regimes)]
+
+    @staticmethod
+    def _months_mask_12(months: List[int]) -> str:
+        mask = ['0'] * 12
+        for month in months:
+            if 1 <= month <= 12:
+                mask[month - 1] = '1'
+        return ''.join(mask)
+
+    def _build_months_metadata(
+        self,
+        index: Union[pd.Index, pd.Series, Sequence],
+        tz: Optional[str],
+    ) -> Dict[str, Any]:
+        if isinstance(index, pd.Series):
+            base_index = index.index if isinstance(index.index, pd.DatetimeIndex) else pd.Index(index)
+        else:
+            base_index = pd.Index(index)
+
+        if not isinstance(base_index, pd.DatetimeIndex):
+            dt_index = pd.to_datetime(base_index, errors='coerce')
+        else:
+            dt_index = base_index
+
+        if tz:
+            try:
+                if dt_index.tz is None:
+                    dt_index = dt_index.tz_localize(tz)
+                else:
+                    dt_index = dt_index.tz_convert(tz)
+            except (TypeError, ValueError):
+                pass
+
+        months = sorted({int(month) for month in dt_index.month if not pd.isna(month)})
+        mask = self._months_mask_12(months) if months else '0' * 12
+        names = [calendar.month_abbr[m] for m in months]
+
+        return {
+            'months_active': months,
+            'months_mask_12': mask,
+            'months_names': names,
+        }
 
     def _analyze_by_month(
         self,
