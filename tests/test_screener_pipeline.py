@@ -261,6 +261,46 @@ def test_horizon_mapper_adds_predictor_columns():
     assert enriched.loc[~active_mask, signal_col].isna().all()
 
 
+def test_add_predictor_columns_aligns_with_datetime_index():
+    tz = "America/Chicago"
+    ts = pd.date_range("2023-09-05 09:00", periods=3, freq="h", tz=tz)
+    bars = pd.DataFrame(
+        {
+            "ts": ts,
+            "open": [99.0, 109.0, 120.0],
+            "close": [100.0, 110.0, 121.0],
+        }
+    )
+
+    patterns = {
+        "time_predictive_nextday|10:00:00": {
+            "pattern_type": "time_predictive_nextday",
+            "pattern_payload": {"time": "10:00:00"},
+        }
+    }
+
+    pipeline = ScreenerPipeline(tz=tz)
+    features = pipeline.build_features(bars, patterns)
+    features_indexed = features.copy()
+    features_indexed.index = pd.DatetimeIndex(features_indexed["ts"].values, name="ts_index")
+
+    mapper = HorizonMapper(tz=tz)
+    enriched = mapper.add_predictor_columns(
+        features_indexed,
+        patterns,
+        predictor_minutes=60,
+    )
+
+    gate_col = "time_predictive_nextday_10_00_00_gate"
+    signal_col = "time_predictive_nextday_10_00_00_signal"
+
+    active_mask = enriched[gate_col] == 1
+    assert active_mask.sum() == 1
+    assert enriched.loc[active_mask, signal_col].notna().all()
+    assert enriched.loc[~active_mask, signal_col].isna().all()
+    pd.testing.assert_index_equal(enriched.index, features_indexed.index)
+
+
 def test_month_mask_disables_winter_gate_in_summer():
     tz = "America/Chicago"
     timestamps = pd.date_range("2023-06-01", periods=7, freq="D", tz=tz)

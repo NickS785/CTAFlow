@@ -1504,13 +1504,17 @@ class HorizonMapper:
             tolerance=self.asof_tolerance,
         ):
             signal_col = self._signal_column_name(gate_col)
-            signal = pd.Series(np.nan, index=df.index, dtype=float)
+            signal = pd.Series(np.nan, index=result.index, dtype=float)
             gate_mask = df[gate_col] == 1
             if gate_mask.any():
                 aligned = returns_x_series.reindex(df.index)
                 valid_mask = gate_mask & aligned.notna()
                 if valid_mask.any():
-                    signal.loc[valid_mask] = aligned.loc[valid_mask]
+                    ts_active = df.loc[valid_mask, "ts"].to_numpy()
+                    values_active = aligned.loc[valid_mask].to_numpy()
+                    for ts_value, value in zip(ts_active, values_active):
+                        for label in ts_to_index.get(ts_value, []):
+                            signal.loc[label] = value
             result[signal_col] = signal
 
         return result
