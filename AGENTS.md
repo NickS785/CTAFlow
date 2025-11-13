@@ -512,6 +512,18 @@ cea = CurveEvolutionAnalyzer(spread_data)  # Analysis tools
 - **Fast generation**: Creates test data in milliseconds
 - **Consistent data**: Deterministic patterns for reliable testing
 
+### Crack-spread CSV for screener triage (NEW)
+
+- Real intraday sample stored at `docs/example.csv`.
+- Load **crack spread OHLC** bars via `CTAFlow.data.read_synthetic_csv("docs/example.csv")` – returns a dataframe keyed by `timestamp` with crack spread open/high/low/close columns.
+- Load **heating oil / RBOB + crack spread** data via `CTAFlow.data.read_exported_df("docs/example.csv")`; outright columns include the original name and the crack spread columns are suffixed with `.1`.
+- Useful when reproducing HistoricalScreener issues locally without HDF5 access.
+
+### Workflow reminders (UPDATED)
+
+- Always commit fixes locally and then use the `make_pr` tool to draft the PR message after running tests.
+- Preferred smoke tests: `pytest tests/test_historical_screener_regressions.py`, `pytest tests/test_screener_pipeline.py`, and any targeted screener tests touched by your change set.
+
 **Benefits:**
 - **No external dependencies**: Test functionality without HDF5 market data files
 - **Development friendly**: Quick setup for testing new features

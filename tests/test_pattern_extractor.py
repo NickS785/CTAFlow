@@ -207,6 +207,40 @@ def test_pattern_extractor_handles_orderflow_results():
     assert any(key.startswith("orderflow_scan|orderflow_weekly") for key in keys)
 
 
+def test_seasonality_pattern_keys_preserved_with_target_time():
+    results = {
+        "seasonality_scan": {
+            "CL": {
+                "strongest_patterns": [
+                    {
+                        "type": "time_predictive_nextday",
+                        "time": "07:00",
+                        "description": "07:00 predicts next day return",
+                        "strength": 0.5,
+                        "target_times_hhmm": ["07:00"],
+                        "period_length_min": 20,
+                    },
+                    {
+                        "type": "weekend_hedging",
+                        "pattern_type": "weekend_hedging",
+                        "weekday": "Friday->Monday",
+                        "strength": 0.3,
+                    },
+                ]
+            }
+        }
+    }
+
+    extractor = PatternExtractor(DummyScreener(), results, [])
+    patterns = extractor.patterns["CL"]
+
+    assert "seasonality_scan|time_predictive_nextday|07:00" in patterns
+    assert "seasonality_scan|weekend_hedging" in patterns
+
+    tod_summary = patterns["seasonality_scan|time_predictive_nextday|07:00"]
+    assert tod_summary["metadata"].get("target_times_hhmm") == ["07:00"]
+
+
 def test_pe_promotes_months_from_results_to_metadata():
     results = {
         "seasonality": {

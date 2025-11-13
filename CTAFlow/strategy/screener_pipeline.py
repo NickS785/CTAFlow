@@ -21,12 +21,25 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, MutableMap
 
 import numpy as np
 import pandas as pd
+from pandas.api.types import is_scalar
 
 if TYPE_CHECKING:  # pragma: no cover - import for type checking only
     from CTAFlow.screeners.pattern_extractor import PatternExtractor
     from .sessionizer import Sessionizer
 
-__all__ = ["ScreenerPipeline", "extract_ticker_patterns", "HorizonMapper", "HorizonSpec"]
+from .backtester import ScreenerBacktester
+
+__all__ = [
+    "ScreenerPipeline",
+    "extract_ticker_patterns",
+    "HorizonMapper",
+    "HorizonSpec",
+    "ScreenerBacktester",
+]
+
+
+def _is_numeric(value: Any) -> bool:
+    return isinstance(value, numbers.Number) and not isinstance(value, bool)
 
 
 def extract_ticker_patterns(
@@ -111,6 +124,7 @@ class ScreenerPipeline:
         "weekday_returns",
         "time_predictive_nextday",
         "time_predictive_nextweek",
+        "weekend_hedging",
     }
 
     #: Pattern types handled by the orderflow extractor branch
@@ -143,11 +157,22 @@ class ScreenerPipeline:
         self.tz = tz
         self.time_match = time_match
         self.log = log
+        self.allow_naive_ts = False
+        self.nan_policy = "drop"
+        self.asof_tolerance = None
+        self.return_clip = (-0.5, 0.5)
+        self.sessionizer = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def build_features(self, bars: pd.DataFrame, patterns: Any) -> pd.DataFrame:
+    def build_features(
+        self,
+        bars: pd.DataFrame,
+        patterns: Any,
+        *,
+        allowed_months: Optional[Iterable[int]] = None,
+    ) -> pd.DataFrame:
         """Return a copy of ``bars`` with pattern gates appended.
 
         Parameters
@@ -160,6 +185,9 @@ class ScreenerPipeline:
             Seasonality and orderflow pattern payloads. This can be the mapping
             returned by :class:`~CTAFlow.screeners.pattern_extractor.PatternExtractor`,
             a list of pattern dictionaries, or a single pattern dictionary.
+        allowed_months:
+            Optional iterable of calendar months. When provided the emitted gate
+            columns are zeroed outside of the specified months.
         """
 
         df = self._validate_bars(bars)
@@ -182,7 +210,62 @@ class ScreenerPipeline:
         else:
             df["any_pattern_active"] = 0
 
+        if allowed_months is not None:
+            allowed_set = {int(month) for month in allowed_months}
+            month_mask = df["ts"].dt.month.isin(sorted(allowed_set))
+            gate_cols = [col for col in df.columns if col.endswith("_gate")]
+            if gate_cols:
+                df.loc[~month_mask, gate_cols] = 0
+                df["any_pattern_active"] = df[gate_cols].any(axis=1).astype(np.int8)
+            else:
+                df["any_pattern_active"] = 0
+
         return df
+
+    def backtest_threshold(
+        self,
+        bars_with_features: pd.DataFrame,
+        patterns: Any,
+        *,
+        threshold: float = 0.0,
+        use_side_hint: bool = True,
+        annualisation: int = 252,
+        risk_free_rate: float = 0.0,
+        include_metadata: Optional[Iterable[str]] = None,
+        **build_xy_kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Materialise decision rows and run a threshold backtest."""
+
+        xy_kwargs = dict(build_xy_kwargs)
+        if include_metadata is not None:
+            xy_kwargs["include_metadata"] = include_metadata
+
+        tester = ScreenerBacktester(
+            annualisation=annualisation,
+            risk_free_rate=risk_free_rate,
+        )
+
+        policy_map = {"auto": "auto", "hms": "second", "hmsf": "microsecond"}
+        mapper_time_match = policy_map.get(self.time_match, "auto")
+
+        if "time_match" in xy_kwargs:
+            override = xy_kwargs["time_match"]
+            if override in policy_map:
+                xy_kwargs["time_match"] = policy_map[override]
+
+        mapper = HorizonMapper(
+            tz=self.tz,
+            allow_naive_ts=getattr(self, "allow_naive_ts", False),
+            time_match=mapper_time_match,
+            nan_policy=getattr(self, "nan_policy", "drop"),
+            return_clip=getattr(self, "return_clip", (-0.5, 0.5)),
+            asof_tolerance=getattr(self, "asof_tolerance", None),
+            log=self.log,
+            sessionizer=getattr(self, "sessionizer", None),
+        )
+
+        xy = mapper.build_xy(bars_with_features, patterns, **xy_kwargs)
+        return tester.threshold(xy, threshold=threshold, use_side_hint=use_side_hint)
 
     # ------------------------------------------------------------------
     # Normalisation helpers
@@ -323,10 +406,6 @@ class ScreenerPipeline:
             return names[int(value) % 7]
         return str(value).strip().lower() or None
 
-    @staticmethod
-    def _is_numeric(value: Any) -> bool:
-        return isinstance(value, numbers.Number) and not isinstance(value, bool)
-
     def _broadcast_sidecar(self, df: pd.DataFrame, mask: pd.Series, value: Any) -> pd.Series:
         if isinstance(value, pd.Series):
             series = value.reindex(df.index)
@@ -338,7 +417,7 @@ class ScreenerPipeline:
             series.loc[~mask] = np.nan
             return series
 
-        dtype = float if self._is_numeric(value) else object
+        dtype = float if _is_numeric(value) else object
         series = pd.Series(np.nan, index=df.index, dtype=dtype)
         if mask.any():
             series.loc[mask] = value
@@ -467,6 +546,8 @@ class ScreenerPipeline:
             return self._extract_time_nextday(df, payload, key, months)
         if pattern_type == "time_predictive_nextweek":
             return self._extract_time_nextweek(df, payload, key, months)
+        if pattern_type == "weekend_hedging":
+            return self._extract_weekend_hedging(df, payload, key, months)
 
         return []
 
@@ -573,6 +654,28 @@ class ScreenerPipeline:
             "correlation": payload.get("correlation"),
             "p": payload.get("p_value"),
             "strongest_days": list(strongest_days) if strongest_days else None,
+        }
+        return self._add_feature(df, base, mask, sidecars)
+
+    def _extract_weekend_hedging(
+        self,
+        df: pd.DataFrame,
+        payload: Mapping[str, Any],
+        key: Optional[str],
+        months: Optional[List[int]],
+    ) -> List[str]:
+        mask = df["weekday_lower"] == "friday"
+        mask &= self._months_mask(df, months)
+
+        base = self._feature_base_name(key, "weekend_hedging_friday")
+        sidecars = {
+            "weekday": "friday",
+            "n": payload.get("n"),
+            "corr": payload.get("corr_Fri_Mon"),
+            "p": payload.get("p_value"),
+            "mean_pos": payload.get("mean_Mon_given_Fri_pos"),
+            "mean_neg": payload.get("mean_Mon_given_Fri_neg"),
+            "bias": payload.get("bias"),
         }
         return self._add_feature(df, base, mask, sidecars)
 
@@ -830,6 +933,62 @@ class HorizonMapper:
             else:
                 self.log.warning("[HorizonMapper] %s", message)
 
+    @staticmethod
+    def _collect_metadata_fields(
+        pattern: Mapping[str, Any], fields: SequenceABC[str]
+    ) -> Dict[str, Any]:
+        payload = pattern.get("pattern_payload", {}) or {}
+        metadata = pattern.get("metadata", {}) or {}
+        collected: Dict[str, Any] = {}
+        aliases = {
+            "weekday": ("weekday", "day", "weekday_name"),
+        }
+        for field in fields:
+            keys_to_try = aliases.get(field, (field,))
+            value: Any = None
+            for key in keys_to_try:
+                if key in payload:
+                    value = payload.get(key)
+                    break
+                if key in metadata:
+                    value = metadata.get(key)
+                    break
+                if key in pattern:
+                    value = pattern.get(key)
+                    break
+            if value is None:
+                value = pattern.get(field)
+            collected[field] = value
+        return collected
+
+    @staticmethod
+    def _normalise_metadata_series(value: Any, index: pd.Index) -> pd.Series:
+        length = len(index)
+        if length == 0:
+            return pd.Series(index=index, dtype=object)
+
+        if isinstance(value, pd.Series):
+            return value.reindex(index)
+
+        if isinstance(value, pd.Index):
+            value = value.tolist()
+
+        if isinstance(value, np.ndarray):
+            value = value.tolist()
+
+        if isinstance(value, (list, tuple)):
+            repeated = list(value) if isinstance(value, list) else tuple(value)
+            return pd.Series([repeated] * length, index=index, dtype=object)
+
+        if value is None:
+            return pd.Series([np.nan] * length, index=index, dtype=float)
+
+        if is_scalar(value):
+            dtype = float if _is_numeric(value) else object
+            return pd.Series([value] * length, index=index, dtype=dtype)
+
+        return pd.Series([value] * length, index=index, dtype=object)
+
     # ------------------------------------------------------------------
     # Configuration helpers
     # ------------------------------------------------------------------
@@ -982,6 +1141,8 @@ class HorizonMapper:
             return HorizonSpec(name="next_week_cc")
         if pattern_type == "orderflow_peak_pressure":
             return HorizonSpec(name="intraday_delta", delta_minutes=default_intraday_minutes)
+        if pattern_type == "weekend_hedging":
+            return HorizonSpec(name="next_monday_oc")
         return HorizonSpec(name="same_day_oc")
 
     # ------------------------------------------------------------------
@@ -1017,6 +1178,16 @@ class HorizonMapper:
         returns = self._clean_return(np.log(ratio), policy="drop")
         return df["session_id"].map(returns)
 
+    def _next_monday_open_to_close(self, df: pd.DataFrame) -> pd.Series:
+        info = self._session_level_info(df)
+        friday_mask = info["weekday"] == 4
+        monday_mask = info["next_weekday"] == 0
+        valid = friday_mask & monday_mask
+
+        monday_returns = pd.Series(np.nan, index=info["session_id"], dtype=float)
+        monday_returns.loc[info.loc[valid, "session_id"]] = info.loc[valid, "next_oc"].astype(float)
+        return df["session_id"].map(monday_returns)
+
     def _intraday_delta_minutes(self, df: pd.DataFrame, minutes: int) -> pd.Series:
         if minutes <= 0:
             raise ValueError("minutes must be positive for intraday horizons")
@@ -1032,6 +1203,38 @@ class HorizonMapper:
         cleaned = self._clean_return(pd.Series(raw, index=close.index), policy="drop")
         aligned = cleaned.reindex(ts)
         return pd.Series(aligned.values, index=df.index)
+
+    def _session_level_info(self, df: pd.DataFrame) -> pd.DataFrame:
+        grouped = df.groupby("session_id")
+        first_ts = grouped["ts"].first().dt.tz_convert(self.tz)
+        oc_returns = self._same_day_open_to_close(df).groupby(df["session_id"]).first()
+        ordered = first_ts.sort_values()
+        oc_ordered = oc_returns.reindex(ordered.index)
+
+        info = pd.DataFrame({
+            "session_id": ordered.index,
+            "weekday": ordered.dt.weekday,
+            "oc_return": oc_ordered.astype(float),
+        })
+        info["next_weekday"] = info["weekday"].shift(-1)
+        info["next_oc"] = info["oc_return"].shift(-1)
+        return info
+
+    def _weekend_hedging_returns(self, df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+        info = self._session_level_info(df)
+        friday_mask = info["weekday"] == 4
+        monday_mask = info["next_weekday"] == 0
+        valid = friday_mask & monday_mask
+
+        friday_returns = pd.Series(np.nan, index=info["session_id"], dtype=float)
+        friday_returns.loc[info.loc[valid, "session_id"]] = info.loc[valid, "oc_return"].astype(float)
+
+        monday_returns = pd.Series(np.nan, index=info["session_id"], dtype=float)
+        monday_returns.loc[info.loc[valid, "session_id"]] = info.loc[valid, "next_oc"].astype(float)
+
+        x_series = df["session_id"].map(friday_returns)
+        y_series = df["session_id"].map(monday_returns)
+        return x_series, y_series
 
     def _forward_window_return_minutes(
         self, df: pd.DataFrame, minutes: int
@@ -1196,7 +1399,7 @@ class HorizonMapper:
         weekly_x_policy: str,
         time_match: str,
         tolerance: Optional[str],
-    ) -> Iterable[Tuple[str, str, pd.Series, pd.Series, int, List[str]]]:
+    ) -> Iterable[Tuple[str, str, pd.Series, pd.Series, int, List[str], Mapping[str, Any]]]:
         if patterns is None:
             return
 
@@ -1231,46 +1434,51 @@ class HorizonMapper:
                 )
                 continue
 
-            spec = self.pattern_horizon(
-                pattern_type, default_intraday_minutes=default_intraday_minutes
-            )
-            cache_key = (spec.name, spec.delta_minutes if spec.name == "intraday_delta" else None)
-            if cache_key not in horizon_cache:
-                if spec.name == "same_day_oc":
-                    horizon_cache[cache_key] = self._same_day_open_to_close(df)
-                elif spec.name == "next_day_cc":
-                    horizon_cache[cache_key] = self._next_day_close_to_close(df)
-                elif spec.name == "next_week_cc":
-                    horizon_cache[cache_key] = self._next_week_close_to_close(df, days=5)
-                elif spec.name == "intraday_delta":
-                    horizon_cache[cache_key] = self._intraday_delta_minutes(
-                        df, minutes=spec.delta_minutes or default_intraday_minutes
-                    )
-                else:
-                    horizon_cache[cache_key] = self._same_day_open_to_close(df)
-
-            returns_y = horizon_cache[cache_key]
-
-            if pattern_type in time_bearing_types:
-                returns_x_series = x_fw
-            elif pattern_type in weekly_types:
-                gate_mask = df[gate_col] == 1
-                if weekly_x_policy == "prev_week":
-                    if prev_week_series is None:
-                        prev_week_series = self._prev_week_return_same_session(df)
-                    returns_x_series = prev_week_series
-                else:
-                    payload_mean, _ = self._predictor_from_payload(pattern, pattern_type, "mean")
-                    scalar = payload_mean
-                    if not np.isfinite(scalar):
-                        scalar = self._weekly_mean_scalar(df, gate_mask)
-                    returns_x_series = pd.Series(scalar, index=df.index, dtype=float)
+            if pattern_type == "weekend_hedging":
+                returns_x_series, returns_y = self._weekend_hedging_returns(df)
             else:
-                payload_value, _ = self._predictor_from_payload(pattern, pattern_type, "mean")
-                returns_x_series = pd.Series(payload_value, index=df.index, dtype=float)
+                spec = self.pattern_horizon(
+                    pattern_type, default_intraday_minutes=default_intraday_minutes
+                )
+                cache_key = (spec.name, spec.delta_minutes if spec.name == "intraday_delta" else None)
+                if cache_key not in horizon_cache:
+                    if spec.name == "same_day_oc":
+                        horizon_cache[cache_key] = self._same_day_open_to_close(df)
+                    elif spec.name == "next_day_cc":
+                        horizon_cache[cache_key] = self._next_day_close_to_close(df)
+                    elif spec.name == "next_week_cc":
+                        horizon_cache[cache_key] = self._next_week_close_to_close(df, days=5)
+                    elif spec.name == "intraday_delta":
+                        horizon_cache[cache_key] = self._intraday_delta_minutes(
+                            df, minutes=spec.delta_minutes or default_intraday_minutes
+                        )
+                    elif spec.name == "next_monday_oc":
+                        horizon_cache[cache_key] = self._next_monday_open_to_close(df)
+                    else:
+                        horizon_cache[cache_key] = self._same_day_open_to_close(df)
+
+                returns_y = horizon_cache[cache_key]
+
+                if pattern_type in time_bearing_types:
+                    returns_x_series = x_fw
+                elif pattern_type in weekly_types:
+                    gate_mask = df[gate_col] == 1
+                    if weekly_x_policy == "prev_week":
+                        if prev_week_series is None:
+                            prev_week_series = self._prev_week_return_same_session(df)
+                        returns_x_series = prev_week_series
+                    else:
+                        payload_mean, _ = self._predictor_from_payload(pattern, pattern_type, "mean")
+                        scalar = payload_mean
+                        if not np.isfinite(scalar):
+                            scalar = self._weekly_mean_scalar(df, gate_mask)
+                        returns_x_series = pd.Series(scalar, index=df.index, dtype=float)
+                else:
+                    payload_value, _ = self._predictor_from_payload(pattern, pattern_type, "mean")
+                    returns_x_series = pd.Series(payload_value, index=df.index, dtype=float)
 
             _, side_hint = self._predictor_from_payload(pattern, pattern_type, mode="bias")
-            yield gate_col, pattern_type, returns_x_series, returns_y, side_hint, candidates
+            yield gate_col, pattern_type, returns_x_series, returns_y, side_hint, candidates, pattern
 
     @staticmethod
     def _signal_column_name(gate_col: str) -> str:
@@ -1298,7 +1506,22 @@ class HorizonMapper:
         df = self._prepare_bars_frame(bars_with_features)
         result = bars_with_features.copy()
 
-        for gate_col, _, returns_x_series, _, _, _ in self._iter_pattern_returns(
+        if "ts" in result.columns:
+            ts_source = result["ts"]
+        elif isinstance(result.index, pd.DatetimeIndex):
+            ts_source = result.index
+        else:
+            raise HorizonInputError(
+                "bars_with_features must include a 'ts' column or DatetimeIndex for alignment"
+            )
+
+        ts_frame = pd.DataFrame({"ts": ts_source})
+        ts_aligned = self._sanitize_ts(ts_frame)["ts"]
+        ts_to_index: Dict[pd.Timestamp, List[Any]] = {}
+        for idx_label, ts_value in zip(result.index, ts_aligned):
+            ts_to_index.setdefault(ts_value, []).append(idx_label)
+
+        for gate_col, _, returns_x_series, _, _, _, _ in self._iter_pattern_returns(
             df,
             patterns,
             default_intraday_minutes=default_intraday_minutes,
@@ -1308,13 +1531,17 @@ class HorizonMapper:
             tolerance=self.asof_tolerance,
         ):
             signal_col = self._signal_column_name(gate_col)
-            signal = pd.Series(np.nan, index=df.index, dtype=float)
+            signal = pd.Series(np.nan, index=result.index, dtype=float)
             gate_mask = df[gate_col] == 1
             if gate_mask.any():
                 aligned = returns_x_series.reindex(df.index)
                 valid_mask = gate_mask & aligned.notna()
                 if valid_mask.any():
-                    signal.loc[valid_mask] = aligned.loc[valid_mask]
+                    ts_active = df.loc[valid_mask, "ts"].to_numpy()
+                    values_active = aligned.loc[valid_mask].to_numpy()
+                    for ts_value, value in zip(ts_active, values_active):
+                        for label in ts_to_index.get(ts_value, []):
+                            signal.loc[label] = value
             result[signal_col] = signal
 
         return result
@@ -1333,6 +1560,7 @@ class HorizonMapper:
         time_match: Optional[str] = None,
         asof_tolerance: Optional[str] = None,
         debug: bool = False,
+        include_metadata: Optional[Iterable[str]] = None,
     ) -> pd.DataFrame:
         """Construct tidy decision rows for screener ``patterns``.
 
@@ -1365,6 +1593,8 @@ class HorizonMapper:
             Override merge-asof tolerance expressed as a pandas offset string.
         debug:
             Emit detailed diagnostics via the configured logger when ``True``.
+        include_metadata:
+            Optional iterable of payload keys to copy onto the emitted decision rows.
         """
 
         if patterns is None:
@@ -1413,6 +1643,8 @@ class HorizonMapper:
         rows: List[pd.DataFrame] = []
         pre_row_count = len(df)
 
+        include_fields = list(dict.fromkeys(include_metadata or []))
+
         for (
             gate_col,
             pattern_type,
@@ -1420,6 +1652,7 @@ class HorizonMapper:
             returns_y,
             side_hint,
             candidates,
+            pattern,
         ) in self._iter_pattern_returns(
             df,
             patterns,
@@ -1467,7 +1700,14 @@ class HorizonMapper:
             subset["returns_x"] = returns_x_clean.loc[active_mask].values
             subset["returns_y"] = returns_y_clean.loc[active_mask].values
             subset["side_hint"] = side_hint
-            rows.append(subset[["ts_decision", "gate", "pattern_type", "returns_x", "returns_y", "side_hint"]])
+            if include_fields:
+                meta_values = self._collect_metadata_fields(pattern, include_fields)
+                for field_name, field_value in meta_values.items():
+                    subset[field_name] = self._normalise_metadata_series(
+                        field_value, subset.index
+                    )
+            row_columns = ["ts_decision", "gate", "pattern_type", "returns_x", "returns_y", "side_hint", *include_fields]
+            rows.append(subset[row_columns])
 
             if debug:
                 dropped = int(((gate_series == 1) & ~active_mask).sum())
