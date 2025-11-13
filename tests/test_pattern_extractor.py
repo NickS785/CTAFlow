@@ -241,6 +241,77 @@ def test_seasonality_pattern_keys_preserved_with_target_time():
     assert tod_summary["metadata"].get("target_times_hhmm") == ["07:00"]
 
 
+def test_pattern_metadata_includes_time_months_and_period_labels():
+    results = {
+        "usa_all": {
+            "CL": {
+                "filtered_months": [1, 2, 3],
+                "strongest_patterns": [
+                    {
+                        "type": "time_predictive_nextweek",
+                        "time": "08:30:00",
+                        "description": "08:30 predicts next week",
+                        "strength": 0.06,
+                        "period_length_min": 120,
+                        "months_active": [1, 2, 3],
+                        "strongest_days": ["Monday", "Wednesday"],
+                    },
+                    {
+                        "type": "time_predictive_nextday",
+                        "time": "09:00:00.500000",
+                        "description": "09:00 predicts next day",
+                        "strength": 0.04,
+                        "period_length_min": 60,
+                        "months_active": [1, 2, 3],
+                    },
+                    {
+                        "type": "weekday_returns",
+                        "day": "Tuesday",
+                        "description": "Tuesday drift",
+                        "strength": 0.02,
+                        "period_length_min": 120,
+                    },
+                    {
+                        "type": "weekend_hedging",
+                        "weekday": "Friday->Monday",
+                        "description": "Weekend linkage",
+                        "strength": 0.07,
+                        "period_length_min": 120,
+                        "months_active": [1, 2, 3],
+                    },
+                ],
+            }
+        }
+    }
+
+    extractor = PatternExtractor(DummyScreener(), results, [])
+    patterns = extractor.patterns["CL"]
+
+    assert len(patterns) == len(results["usa_all"]["CL"]["strongest_patterns"])
+
+    nextweek_key = "usa_all|time_predictive_nextweek|08:30:00"
+    assert nextweek_key in patterns
+    nextweek = patterns[nextweek_key]
+    assert nextweek["key"] == nextweek_key
+    assert nextweek["symbol"] == "CL"
+    assert nextweek["metadata"]["time"] == "08:30:00"
+    assert nextweek["metadata"]["months"] == [1, 2, 3]
+    assert nextweek["metadata"]["period_length"] == "2h0m"
+    assert nextweek["metadata"]["period_length_min"] == 120
+    assert nextweek["metadata"]["strongest_days"] == ["Monday", "Wednesday"]
+
+    micro_key = "usa_all|time_predictive_nextday|09:00:00.500000"
+    micro_pattern = patterns[micro_key]
+    assert micro_pattern["metadata"]["time"] == "09:00:00.500000"
+
+    weekday_key = "usa_all|weekday_returns|Tuesday"
+    weekday_pattern = patterns[weekday_key]
+    assert weekday_pattern["metadata"]["weekday"].lower() == "tuesday"
+
+    weekend_key = "usa_all|weekend_hedging|Friday->Monday"
+    weekend_pattern = patterns[weekend_key]
+    assert weekend_pattern["metadata"]["months"] == [1, 2, 3]
+
 def test_pe_promotes_months_from_results_to_metadata():
     results = {
         "seasonality": {

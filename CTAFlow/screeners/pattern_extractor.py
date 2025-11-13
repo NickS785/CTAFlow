@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+from collections.abc import Iterable as IterableABC
 from dataclasses import dataclass, field
 from datetime import time
 from types import SimpleNamespace
@@ -139,6 +140,8 @@ class PatternSummary:
                 }
 
         return {
+            "key": self.key,
+            "symbol": self.symbol,
             "pattern_type": self.pattern_type,
             "description": self.description,
             "strength": self.strength,
@@ -1316,31 +1319,81 @@ class PatternExtractor:
                 qualifiers.append(str(pattern[key]))
         key = "|".join([screen_name, *qualifiers])
 
-        metadata = {
-            "pattern_origin": origin,
-            "screen_type": screen_type,
-        }
+        summary_key = "|".join([screen_name, *qualifiers])
+
+        metadata: Dict[str, Any] = {}
+        raw_metadata = pattern.get("metadata")
+        if isinstance(raw_metadata, Mapping):
+            metadata.update(raw_metadata)
+
+        metadata["pattern_origin"] = origin
+        if screen_type is not None and metadata.get("screen_type") is None:
+            metadata["screen_type"] = screen_type
+
         payload_dict = dict(pattern)
 
         if screen_type == "seasonality" and isinstance(params, ScreenParams):
-            metadata.update(
-                {
-                    "target_time": pattern.get("time"),
-                    "most_prevalent_day": pattern.get("most_prevalent_day"),
-                }
-            )
+            metadata.setdefault("target_time", pattern.get("time"))
+            metadata.setdefault("most_prevalent_day", pattern.get("most_prevalent_day"))
 
-        for key in ("months_active", "months_mask_12", "months_names", "target_times_hhmm", "period_length_min"):
-            value = payload_dict.get(key)
-            if value is not None:
-                metadata[key] = value
+        months_sources = (
+            metadata.get("months"),
+            payload_dict.get("months"),
+            payload_dict.get("months_active"),
+            payload_dict.get("filtered_months"),
+            self.metadata.get("filtered_months"),
+        )
 
-        regime_meta = payload_dict.get("regime_filter") or pattern.get("metadata", {}).get("regime_filter")
+        for candidate in months_sources:
+            canonical_months = self._coerce_month_list(candidate)
+            if canonical_months:
+                metadata["months"] = canonical_months
+                break
+
+        for meta_key in (
+            "months_active",
+            "months_mask_12",
+            "months_names",
+            "target_times_hhmm",
+            "period_length_min",
+        ):
+            value = payload_dict.get(meta_key)
+            if value is not None and meta_key not in metadata:
+                metadata[meta_key] = value
+
+        regime_meta = payload_dict.get("regime_filter") or metadata.get("regime_filter")
         if regime_meta is not None:
             metadata["regime_filter"] = regime_meta
 
+        time_value = payload_dict.get("time")
+        normalized_time = self._safe_time_string(time_value)
+        if normalized_time is not None:
+            metadata.setdefault("time", normalized_time)
+
+        weekday_value = payload_dict.get("weekday") or payload_dict.get("day")
+        if weekday_value is not None:
+            metadata.setdefault("weekday", str(weekday_value))
+
+        wom_value = payload_dict.get("week_of_month")
+        if wom_value is not None and not pd.isna(wom_value):
+            try:
+                metadata.setdefault("week_of_month", int(wom_value))
+            except (TypeError, ValueError):
+                pass
+
+        strongest_days = payload_dict.get("strongest_days")
+        if strongest_days:
+            metadata.setdefault("strongest_days", list(strongest_days))
+
+        period_label = self._format_minutes_label(payload_dict.get("period_length_min"))
+        if period_label is not None:
+            metadata.setdefault("period_length", period_label)
+
+        if payload_dict.get("period_length") and "period_length" not in metadata:
+            metadata["period_length"] = payload_dict["period_length"]
+
         return PatternSummary(
-            key=key,
+            key=summary_key,
             symbol=symbol,
             source_screen=screen_name,
             screen_params=params,
@@ -1350,6 +1403,66 @@ class PatternExtractor:
             payload=dict(pattern),
             metadata=metadata,
         )
+
+    @staticmethod
+    def _coerce_month_list(values: Iterable[Any] | Any) -> Optional[List[int]]:
+        if values in (None, "", (), [], {}):  # type: ignore[comparison-overlap]
+            return None
+
+        if isinstance(values, str):
+            tokens = re.split(r"[^0-9]+", values)
+            candidates: Iterable[Any] = [token for token in tokens if token]
+        elif isinstance(values, IterableABC):
+            candidates = values
+        else:
+            candidates = [values]
+
+        months: List[int] = []
+        for candidate in candidates:
+            try:
+                month = int(candidate)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= month <= 12:
+                months.append(month)
+
+        if not months:
+            return None
+
+        return sorted(set(months))
+
+    @classmethod
+    def _safe_time_string(cls, value: Any) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        try:
+            normalised = cls._normalize_time_value(value)
+        except Exception:  # pragma: no cover - defensive guard
+            return None
+
+        text = normalised.isoformat()
+        if not normalised.microsecond:
+            return normalised.strftime("%H:%M:%S")
+        return text
+
+    @staticmethod
+    def _format_minutes_label(value: Any) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        try:
+            minutes_float = float(value)
+        except (TypeError, ValueError):
+            return None
+
+        if math.isnan(minutes_float):  # type: ignore[arg-type]
+            return None
+
+        total_minutes = int(round(minutes_float))
+        if total_minutes < 0:
+            total_minutes = abs(total_minutes)
+
+        hours, minutes = divmod(total_minutes, 60)
+        return f"{hours}h{minutes}m"
 
     # ------------------------------------------------------------------
     # Series reconstruction helpers

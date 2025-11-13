@@ -27,6 +27,16 @@ SPEC.loader.exec_module(module)
 ScreenerPipeline = module.ScreenerPipeline
 HorizonMapper = module.HorizonMapper
 
+PATTERN_SPEC = importlib.util.spec_from_file_location(
+    "CTAFlow.screeners.pattern_extractor",
+    STRATEGY_DIR.parent / "screeners" / "pattern_extractor.py",
+)
+pattern_module = importlib.util.module_from_spec(PATTERN_SPEC)
+assert PATTERN_SPEC.loader is not None
+sys.modules["CTAFlow.screeners.pattern_extractor"] = pattern_module
+PATTERN_SPEC.loader.exec_module(pattern_module)
+PatternSummary = pattern_module.PatternSummary
+
 
 def _slug(value: str) -> str:
     text = str(value).strip().lower()
@@ -353,4 +363,50 @@ def test_pipeline_allows_gates_when_months_unspecified():
     assert len(gate_cols) == 1
 
     pd.testing.assert_series_equal(baseline[gate_cols[0]], unrestricted[gate_cols[0]])
+
+
+def test_pipeline_accepts_pattern_summary_instances():
+    tz = "America/Chicago"
+    bars = pd.DataFrame(
+        {
+            "ts": pd.to_datetime(
+                [
+                    "2023-01-03 09:00",
+                    "2023-01-03 10:00",
+                    "2023-02-07 09:00",
+                ]
+            )
+        }
+    )
+
+    summary = PatternSummary(
+        key="usa_all|time_predictive_nextday|09:00:00",
+        symbol="CL",
+        source_screen="usa_all",
+        screen_params=None,
+        pattern_type="time_predictive_nextday",
+        description="09:00 predicts next day",
+        strength=0.12,
+        payload={
+            "type": "time_predictive_nextday",
+            "time": "09:00:00",
+            "period_length_min": 30,
+            "months_active": [1, 2],
+        },
+        metadata={
+            "months": [1, 2],
+            "time": "09:00:00",
+            "period_length": "0h30m",
+            "period_length_min": 30,
+        },
+    )
+
+    pipeline = ScreenerPipeline(tz=tz)
+    features = pipeline.build_features(bars, [summary])
+
+    gate_name = f"{_slug(summary.key)}_gate"
+    assert gate_name in features.columns
+    active_mask = features["clock_time"] == "09:00:00"
+    assert features.loc[active_mask, gate_name].eq(1).all()
+    assert features.loc[~active_mask, gate_name].eq(0).all()
 
