@@ -2767,3 +2767,23 @@ class IntradayFileManager:
             validation_results['file_details'].append(file_result)
 
         return validation_results
+
+def read_exported_df(path):
+    df = pd.read_csv(path)
+    df.columns = df.columns.str.replace(" ", "")
+    df['Datetime'] = pd.to_datetime(df["Date"] + "T" + df["Time"])
+    df.rename({"Last":"Close"}, axis=1, inplace=True)
+    df.set_index("Datetime", inplace=True)
+    return df
+
+def read_synthetic_csv(path, include_volume=True):
+    df = read_exported_df(path)
+    px_data = pd.DataFrame(data=df.filter(like=".1").values,
+                            columns=["Open", "High", "Low","Close"],
+                            index=df.index)
+    if include_volume:
+        px_data = pd.concat([df[["BidVolume", "AskVolume", "Volume"]], px_data], axis=1)
+
+
+    return px_data
+
