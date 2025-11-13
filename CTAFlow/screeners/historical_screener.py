@@ -2613,13 +2613,14 @@ class HistoricalScreener:
 
         # Check time predictability
         if 'time_predictability' in ticker_results:
-            for time_str, pred_stats in ticker_results['time_predictability'].items():
+            for time_key, pred_stats in ticker_results['time_predictability'].items():
+                time_label = str(pred_stats.get('time') or time_key)
                 # Next-day prediction
                 if pred_stats.get('next_day_significant', False):
                     pattern_entry = {
                         'type': 'time_predictive_nextday',
-                        'time': time_str,
-                        'description': f'{time_str} predicts next day return',
+                        'time': time_label,
+                        'description': f'{time_label} predicts next day return',
                         'correlation': pred_stats['next_day_corr'],
                         'p_value': pred_stats['next_day_pvalue'],
                         'strength': abs(pred_stats['next_day_corr']),
@@ -2636,8 +2637,8 @@ class HistoricalScreener:
                 if pred_stats.get('next_week_significant', False):
                     pattern_entry = {
                         'type': 'time_predictive_nextweek',
-                        'time': time_str,
-                        'description': f'{time_str} predicts next week return',
+                        'time': time_label,
+                        'description': f'{time_label} predicts next week return',
                         'correlation': pred_stats['next_week_corr'],
                         'p_value': pred_stats['next_week_pvalue'],
                         'strength': abs(pred_stats['next_week_corr']),
