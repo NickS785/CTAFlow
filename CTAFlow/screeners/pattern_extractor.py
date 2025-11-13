@@ -1330,10 +1330,10 @@ class PatternExtractor:
                 }
             )
 
-        for meta_key in ("months_active", "months_mask_12", "months_names", "target_times_hhmm", "period_length_min"):
-            value = payload_dict.get(meta_key)
+        for key in ("months_active", "months_mask_12", "months_names", "target_times_hhmm", "period_length_min"):
+            value = payload_dict.get(key)
             if value is not None:
-                metadata[meta_key] = value
+                metadata[key] = value
 
         regime_meta = payload_dict.get("regime_filter") or pattern.get("metadata", {}).get("regime_filter")
         if regime_meta is not None:

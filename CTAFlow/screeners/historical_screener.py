@@ -864,6 +864,7 @@ class HistoricalScreener:
                 normalized_times = [clock.strftime("%H:%M") for clock in converted_times]
 
                 pattern_context = {
+                    'target_times_hhmm': normalized_times,
                     'period_length_min': period_minutes if period_minutes is not None else 0,
                     'months_active': months_meta['months_active'],
                     'months_mask_12': months_meta['months_mask_12'],
@@ -874,7 +875,6 @@ class HistoricalScreener:
                 ticker_results['months_active'] = months_meta['months_active']
                 ticker_results['months_mask_12'] = months_meta['months_mask_12']
                 ticker_results['months_names'] = months_meta['months_names']
-                ticker_results['metadata']['target_times_hhmm'] = normalized_times
 
                 # Day-of-week analysis
                 if dayofweek_screen:
@@ -893,13 +893,9 @@ class HistoricalScreener:
                         period_length,
                         tz,
                     )
-                    time_key = str(target_time)
-                    time_label = target_time.strftime("%H:%M")
                     enriched_stats = dict(pattern_context)
-                    enriched_stats['time'] = time_label
-                    enriched_stats['target_times_hhmm'] = [time_label]
                     enriched_stats.update(pred_stats)
-                    time_predictions[time_key] = enriched_stats
+                    time_predictions[str(target_time)] = enriched_stats
 
                 ticker_results['time_predictability'] = time_predictions
 
@@ -2631,7 +2627,7 @@ class HistoricalScreener:
                         'months_active': pred_stats.get('months_active'),
                         'months_mask_12': pred_stats.get('months_mask_12'),
                         'months_names': pred_stats.get('months_names'),
-                        'target_times_hhmm': pred_stats.get('target_times_hhmm') or [time_label],
+                        'target_times_hhmm': pred_stats.get('target_times_hhmm'),
                         'period_length_min': pred_stats.get('period_length_min'),
                         'regime_filter': pred_stats.get('regime_filter', regime_meta),
                     }
@@ -2649,7 +2645,7 @@ class HistoricalScreener:
                         'months_active': pred_stats.get('months_active'),
                         'months_mask_12': pred_stats.get('months_mask_12'),
                         'months_names': pred_stats.get('months_names'),
-                        'target_times_hhmm': pred_stats.get('target_times_hhmm') or [time_label],
+                        'target_times_hhmm': pred_stats.get('target_times_hhmm'),
                         'period_length_min': pred_stats.get('period_length_min'),
                         'regime_filter': pred_stats.get('regime_filter', regime_meta),
                     }

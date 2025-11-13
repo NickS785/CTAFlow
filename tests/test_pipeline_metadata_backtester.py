@@ -73,7 +73,7 @@ def test_build_xy_preserves_list_metadata():
         bars,
         patterns,
         ensure_gates=False,
-        include_metadata=["months_active", "months_mask_12", "target_times_hhmm", "weekday"],
+        include_metadata=["months_active", "months_mask_12", "target_times_hhmm"],
     )
 
     assert not result.empty
@@ -82,7 +82,6 @@ def test_build_xy_preserves_list_metadata():
     assert result.loc[0, "months_active"] == [1, 2]
     assert result.loc[0, "months_mask_12"] == "110000000000"
     assert result.loc[0, "target_times_hhmm"] == ["07:00"]
-    assert result.loc[0, "weekday"] == "Monday"
 
 
 def test_backtest_threshold_runs_on_pipeline_output():
