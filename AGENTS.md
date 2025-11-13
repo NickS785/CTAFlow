@@ -518,6 +518,32 @@ cea = CurveEvolutionAnalyzer(spread_data)  # Analysis tools
 - **Educational**: Clear example of proper data structure and patterns
 - **Debugging**: Predictable data for isolating issues
 
+### Intraday crack-spread sample (docs/example.csv)
+
+- Load the bundled CSV with **crack spread OHLC** data via:
+
+  ```python
+  from CTAFlow.data import read_synthetic_csv
+
+  crack = read_synthetic_csv()  # defaults to docs/example.csv
+  ```
+
+- To inspect the exported notebook format (Heating Oil + RBOB outrights with crack columns suffixed by `.1`):
+
+  ```python
+  from CTAFlow.data import read_exported_df
+
+  exported = read_exported_df()  # returns outrights + crack spread metadata
+  ```
+
+- Both helpers accept a custom path if you want to point at another CSV.
+- The sample is ideal for reproducing HistoricalScreener + PatternExtractor issues quickly without bootstrapping HDF5 stores.
+
+### Historical screener regression guardrails
+
+- Use `pytest tests/test_historical_screener_regressions.py` to validate seasonality metadata (target times, descriptions, etc.).
+- The screener now guards against `time_str` reference errors when ranking seasonal strength; ensure any new logic keeps the `time` label available for summary strings.
+
 ## Framework Architecture Updates
 
 ### Performance Optimization Hierarchy
