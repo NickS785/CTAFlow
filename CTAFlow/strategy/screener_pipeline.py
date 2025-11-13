@@ -328,6 +328,19 @@ class ScreenerPipeline:
     def _iter_patterns(
         cls, obj: Any, key_hint: Optional[str] = None
     ) -> Iterable[Tuple[str, Mapping[str, Any]]]:
+        if hasattr(obj, "pattern_type") and hasattr(obj, "as_dict"):
+            try:
+                pattern_dict = dict(obj.as_dict())  # type: ignore[assignment]
+            except Exception:  # pragma: no cover - defensive guard
+                pattern_dict = {}
+            if "pattern_payload" not in pattern_dict and hasattr(obj, "payload"):
+                pattern_dict["pattern_payload"] = getattr(obj, "payload")
+            if "metadata" not in pattern_dict and hasattr(obj, "metadata"):
+                pattern_dict["metadata"] = getattr(obj, "metadata")
+            key_value = getattr(obj, "key", None) or key_hint
+            yield cls._select_pattern_key(pattern_dict, key_value), pattern_dict
+            return
+
         if isinstance(obj, Mapping):
             if "pattern_type" in obj or "type" in obj:
                 key = cls._select_pattern_key(obj, key_hint)

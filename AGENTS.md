@@ -512,6 +512,10 @@ cea = CurveEvolutionAnalyzer(spread_data)  # Analysis tools
 - **Fast generation**: Creates test data in milliseconds
 - **Consistent data**: Deterministic patterns for reliable testing
 
+**Example CSV reference:** `docs/example.csv`
+- Load with `read_exported_df()` to obtain HO intraday data shaped like the raw exports used by the screeners.
+- Load with `read_synthetic_csv()` when you need the crack-spread synthetic version of the same sample. This is useful for unit tests that exercise the HistoricalScreener or PatternExtractor without relying on live data files.
+
 **Benefits:**
 - **No external dependencies**: Test functionality without HDF5 market data files
 - **Development friendly**: Quick setup for testing new features
