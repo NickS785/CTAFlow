@@ -1,17 +1,29 @@
 import re
 import importlib.util
+import sys
+import types
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
-MODULE_PATH = ROOT / "CTAFlow" / "strategy" / "screener_pipeline.py"
+STRATEGY_DIR = ROOT / "CTAFlow" / "strategy"
+PACKAGE_NAME = "CTAFlow.strategy"
 
-spec = importlib.util.spec_from_file_location("screener_pipeline", MODULE_PATH)
-module = importlib.util.module_from_spec(spec)
-assert spec.loader is not None
-spec.loader.exec_module(module)
+if PACKAGE_NAME not in sys.modules:
+    strategy_pkg = types.ModuleType(PACKAGE_NAME)
+    strategy_pkg.__path__ = [str(STRATEGY_DIR)]
+    sys.modules[PACKAGE_NAME] = strategy_pkg
+
+SPEC = importlib.util.spec_from_file_location(
+    f"{PACKAGE_NAME}.screener_pipeline",
+    STRATEGY_DIR / "screener_pipeline.py",
+)
+module = importlib.util.module_from_spec(SPEC)
+assert SPEC.loader is not None
+sys.modules[f"{PACKAGE_NAME}.screener_pipeline"] = module
+SPEC.loader.exec_module(module)
 ScreenerPipeline = module.ScreenerPipeline
 HorizonMapper = module.HorizonMapper
 
@@ -185,6 +197,46 @@ def test_screener_pipeline_generates_sparse_gates():
     assert peak_gate in gate_columns
     assert "other_pattern_gate" not in gate_columns
 
+
+def test_add_predictor_columns_aligns_with_datetime_index():
+    tz = "America/Chicago"
+    timestamps = [
+        "2023-09-04 07:00",
+        "2023-09-04 13:30",
+        "2023-09-05 07:00",
+        "2023-09-05 13:30",
+    ]
+
+    bars = pd.DataFrame({"ts": pd.to_datetime(timestamps)})
+    bars["open"] = [100.0, 101.0, 102.0, 103.0]
+    bars["close"] = [101.0, 102.0, 103.0, 104.0]
+    pipeline = ScreenerPipeline(tz=tz)
+    mapper = HorizonMapper(tz=tz)
+    patterns = {
+        "weekday_mean_monday": {
+            "pattern_type": "weekday_mean",
+            "pattern_payload": {"day": "Monday", "mean": 0.1},
+        }
+    }
+
+    features = pipeline.build_features(bars, patterns)
+    features_indexed = features.copy()
+    features_indexed.index = features_indexed["ts"].dt.tz_convert(tz)
+    features_indexed.index.name = None
+
+    enriched = mapper.add_predictor_columns(features_indexed, patterns)
+
+    slug = _slug("weekday_mean_monday")
+    gate_col = f"{slug}_gate"
+    signal_col = f"{slug}_signal"
+
+    assert gate_col in enriched.columns
+    assert signal_col in enriched.columns
+    assert enriched.index.equals(features_indexed.index)
+
+    gate_mask = enriched[gate_col] == 1
+    assert gate_mask.any()
+    assert enriched.loc[gate_mask, signal_col].notna().all()
 
 def test_horizon_mapper_accepts_mixed_case_price_columns():
     mapper = HorizonMapper(tz="America/Chicago")
