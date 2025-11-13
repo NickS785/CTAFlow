@@ -2653,12 +2653,16 @@ class HistoricalScreener:
                     # Add weekday prevalence information if available
                     if 'weekday_prevalence' in pred_stats:
                         weekday_info = pred_stats['weekday_prevalence']
-                        if 'most_prevalent_day' in weekday_info and weekday_info['most_prevalent_day']:
-                            pattern_entry['most_prevalent_day'] = weekday_info['most_prevalent_day']
-                            pattern_entry['strongest_days'] = weekday_info.get('strongest_days', [])
+                        most_prevalent = weekday_info.get('most_prevalent_day')
+                        if most_prevalent:
+                            pattern_entry['most_prevalent_day'] = most_prevalent
+                            strongest_days = weekday_info.get('strongest_days') or []
+                            if not isinstance(strongest_days, (list, tuple)):
+                                strongest_days = [strongest_days]
+                            pattern_entry['strongest_days'] = list(strongest_days)
                             pattern_entry['description'] = (
-                                f'{time_str} predicts next week return '
-                                f'(strongest on {weekday_info["most_prevalent_day"]})'
+                                f'{time_label} predicts next week return '
+                                f'(strongest on {most_prevalent})'
                             )
 
                     patterns.append(pattern_entry)
