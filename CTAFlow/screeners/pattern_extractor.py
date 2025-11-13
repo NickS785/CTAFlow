@@ -139,6 +139,8 @@ class PatternSummary:
                 }
 
         return {
+            "key": self.key,
+            "symbol": self.symbol,
             "pattern_type": self.pattern_type,
             "description": self.description,
             "strength": self.strength,
@@ -1189,6 +1191,8 @@ class PatternExtractor:
         params: Optional[ScreenParamLike],
     ) -> Iterable[PatternSummary]:
         strongest: Iterable[Dict[str, Any]] = ticker_result.get("strongest_patterns", [])  # type: ignore[assignment]
+        pattern_context = ticker_result.get("pattern_context")
+        result_metadata = ticker_result.get("metadata")
         for pattern in strongest:
             yield self._build_summary(
                 symbol,
@@ -1197,6 +1201,8 @@ class PatternExtractor:
                 params,
                 pattern,
                 origin="strongest_patterns",
+                ticker_context=pattern_context,
+                ticker_metadata=result_metadata,
             )
 
     def _iter_orderflow_summaries(
@@ -1305,18 +1311,23 @@ class PatternExtractor:
         params: Optional[ScreenParamLike],
         pattern: Mapping[str, Any],
         origin: str,
+        *,
+        ticker_context: Optional[Mapping[str, Any]] = None,
+        ticker_metadata: Optional[Mapping[str, Any]] = None,
     ) -> PatternSummary:
         pattern_type = self._infer_pattern_type(pattern)
         strength = self._extract_strength(pattern)
         description = str(pattern.get("description", pattern_type))
 
         qualifiers: List[str] = [pattern_type]
-        for key in ("day", "time", "lag", "month"):
-            if key in pattern and pattern[key] is not None:
-                qualifiers.append(str(pattern[key]))
-        key = "|".join([screen_name, *qualifiers])
+        for qualifier_field in ("day", "time", "lag", "month"):
+            qualifier_value = pattern.get(qualifier_field)
+            if qualifier_value is not None:
+                qualifiers.append(str(qualifier_value))
 
-        metadata = {
+        summary_key = "|".join(filter(None, [screen_name, *qualifiers])) or screen_name or pattern_type
+
+        metadata: Dict[str, Any] = {
             "pattern_origin": origin,
             "screen_type": screen_type,
         }
@@ -1330,17 +1341,48 @@ class PatternExtractor:
                 }
             )
 
-        for key in ("months_active", "months_mask_12", "months_names", "target_times_hhmm", "period_length_min"):
-            value = payload_dict.get(key)
-            if value is not None:
-                metadata[key] = value
+        if isinstance(ticker_context, Mapping):
+            for context_key, context_value in ticker_context.items():
+                if context_value is not None and context_key not in metadata:
+                    metadata[context_key] = context_value
+
+        if isinstance(ticker_metadata, Mapping):
+            for meta_key, meta_value in ticker_metadata.items():
+                if meta_value is not None and meta_key not in metadata:
+                    metadata[meta_key] = meta_value
+
+        for context_field in (
+            "months_active",
+            "months_mask_12",
+            "months_names",
+            "target_times_hhmm",
+            "period_length_min",
+        ):
+            value = payload_dict.get(context_field)
+            if value is not None and context_field not in metadata:
+                metadata[context_field] = value
+
+        for info_field in ("time", "day", "weekday", "week_of_month", "strongest_days"):
+            info_value = payload_dict.get(info_field)
+            if info_value is not None and info_field not in metadata:
+                metadata[info_field] = info_value
 
         regime_meta = payload_dict.get("regime_filter") or pattern.get("metadata", {}).get("regime_filter")
         if regime_meta is not None:
             metadata["regime_filter"] = regime_meta
 
+        period_label = payload_dict.get("period_length") or metadata.get("period_length")
+        period_minutes = metadata.get("period_length_min")
+        if period_label is None and period_minutes is not None:
+            formatted = self._format_period_label(period_minutes)
+            if formatted:
+                period_label = formatted
+        if period_label is not None:
+            metadata.setdefault("period_length", period_label)
+            metadata.setdefault("returns_period", period_label)
+
         return PatternSummary(
-            key=key,
+            key=summary_key,
             symbol=symbol,
             source_screen=screen_name,
             screen_params=params,
@@ -1350,6 +1392,28 @@ class PatternExtractor:
             payload=dict(pattern),
             metadata=metadata,
         )
+
+    @staticmethod
+    def _format_period_label(value: Any) -> Optional[str]:
+        try:
+            minutes = int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+        if minutes < 0:
+            minutes = abs(minutes)
+
+        hours, minute_part = divmod(minutes, 60)
+        days, hour_part = divmod(hours, 24)
+
+        if days > 0:
+            remaining_minutes = minute_part + hour_part * 60
+            if remaining_minutes:
+                hrs, mins = divmod(remaining_minutes, 60)
+                return f"{days}d{hrs}h{mins}m"
+            return f"{days}d"
+
+        return f"{hour_part}h{minute_part}m"
 
     # ------------------------------------------------------------------
     # Series reconstruction helpers
