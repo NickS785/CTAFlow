@@ -225,6 +225,7 @@ def test_seasonality_pattern_keys_preserved_with_target_time():
                         "pattern_type": "weekend_hedging",
                         "weekday": "Friday->Monday",
                         "strength": 0.3,
+                        "p_value": 0.01,
                     },
                 ]
             }
@@ -239,6 +240,29 @@ def test_seasonality_pattern_keys_preserved_with_target_time():
 
     tod_summary = patterns["seasonality_scan|time_predictive_nextday|07:00"]
     assert tod_summary["metadata"].get("target_times_hhmm") == ["07:00"]
+
+
+def test_weekend_pattern_with_high_p_value_is_ignored():
+    results = {
+        "seasonality_scan": {
+            "CL": {
+                "strongest_patterns": [
+                    {
+                        "type": "weekend_hedging",
+                        "pattern_type": "weekend_hedging",
+                        "weekday": "Friday->Monday",
+                        "strength": 0.25,
+                        "p_value": 0.42,
+                    }
+                ]
+            }
+        }
+    }
+
+    extractor = PatternExtractor(DummyScreener(), results, [])
+    patterns = extractor.patterns.get("CL", {})
+
+    assert "seasonality_scan|weekend_hedging" not in patterns
 
 
 def test_pattern_metadata_includes_time_months_and_period_labels():
@@ -278,6 +302,7 @@ def test_pattern_metadata_includes_time_months_and_period_labels():
                         "strength": 0.07,
                         "period_length_min": 120,
                         "months_active": [1, 2, 3],
+                        "p_value": 0.01,
                     },
                 ],
             }

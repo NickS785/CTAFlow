@@ -1,7 +1,9 @@
 import sys
 import types
+from datetime import time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -190,3 +192,44 @@ def test_rank_seasonal_strength_includes_weekday_context(historical_screener):
     assert "09:30" in pattern["description"]
     assert pattern.get("most_prevalent_day") == "Friday"
     assert pattern.get("strongest_days") == ["Friday", "Monday"]
+
+
+def test_weekend_hedging_requires_significant_p_value(historical_screener):
+    screener = historical_screener
+    tz = "UTC"
+
+    friday_returns = np.array([0.01, 0.02, 0.03, -0.02, 0.01, -0.015])
+    monday_returns = np.array([0.02, -0.01, 0.015, 0.005, -0.02, 0.01])
+
+    base_friday = pd.Timestamp("2024-01-05 09:00", tz=tz)
+    rows: list[dict[str, object]] = []
+
+    for idx, (fri_ret, mon_ret) in enumerate(zip(friday_returns, monday_returns, strict=True)):
+        friday_start = base_friday + pd.Timedelta(weeks=idx)
+        friday_end = friday_start + pd.Timedelta(hours=5)
+        monday_start = friday_start + pd.Timedelta(days=3)
+        monday_end = monday_start + pd.Timedelta(hours=5)
+
+        friday_open = 100.0 + idx
+        friday_close = friday_open * float(np.exp(fri_ret))
+        monday_open = 110.0 + idx
+        monday_close = monday_open * float(np.exp(mon_ret))
+
+        rows.append({"ts": friday_start, "Close": friday_open})
+        rows.append({"ts": friday_end, "Close": friday_close})
+        rows.append({"ts": monday_start, "Close": monday_open})
+        rows.append({"ts": monday_end, "Close": monday_close})
+
+    session_data = pd.DataFrame(rows).set_index("ts")
+
+    pattern = screener._compute_weekend_hedging_pattern(
+        session_data,
+        session_start=time(9, 0),
+        session_end=time(14, 0),
+        price_col="Close",
+        is_synthetic=False,
+        tz=tz,
+        pattern_context={},
+    )
+
+    assert pattern is None

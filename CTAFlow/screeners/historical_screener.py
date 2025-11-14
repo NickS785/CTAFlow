@@ -2416,6 +2416,10 @@ class HistoricalScreener:
         except ValueError:
             corr, p_val = np.nan, np.nan
 
+        significance_level = 0.05
+        if not np.isfinite(p_val) or p_val >= significance_level:
+            return None
+
         pos_mask = friday_returns > 0
         neg_mask = friday_returns < 0
         mean_monday_pos = float(monday_returns[pos_mask].mean()) if pos_mask.any() else np.nan
@@ -2435,7 +2439,7 @@ class HistoricalScreener:
             'weekday': 'Friday->Monday',
             'n': int(valid_mask.sum()),
             'corr_Fri_Mon': float(corr) if not np.isnan(corr) else np.nan,
-            'p_value': float(p_val) if not np.isnan(p_val) else np.nan,
+            'p_value': float(p_val),
             'mean_Mon_given_Fri_pos': mean_monday_pos,
             'mean_Mon_given_Fri_neg': mean_monday_neg,
             'friday_mean_return': float(friday_returns.mean()),

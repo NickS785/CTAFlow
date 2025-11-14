@@ -990,6 +990,62 @@ class HorizonMapper:
 
         return pd.Series([value] * length, index=index, dtype=object)
 
+    @staticmethod
+    def _coerce_minutes(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+
+        if isinstance(value, numbers.Number) and not isinstance(value, bool):
+            minutes = float(value)
+            if not np.isfinite(minutes):
+                return None
+            minutes_int = int(round(minutes))
+            return minutes_int if minutes_int > 0 else None
+
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                numeric = float(text)
+            except ValueError:
+                matches = re.findall(r"(\d+)\s*([hHmM])", text)
+                if not matches:
+                    return None
+                total = 0
+                for amount, unit in matches:
+                    unit_lower = unit.lower()
+                    qty = int(amount)
+                    if unit_lower == "h":
+                        total += qty * 60
+                    elif unit_lower == "m":
+                        total += qty
+                return total if total > 0 else None
+            else:
+                if not np.isfinite(numeric):
+                    return None
+                minutes_int = int(round(numeric))
+                return minutes_int if minutes_int > 0 else None
+
+        return None
+
+    @classmethod
+    def _extract_period_minutes(cls, pattern: Mapping[str, Any]) -> Optional[int]:
+        metadata = pattern.get("metadata") or {}
+        payload = pattern.get("pattern_payload") or {}
+
+        for source in (
+            metadata.get("period_length_min"),
+            payload.get("period_length_min"),
+            metadata.get("period_length"),
+            payload.get("period_length"),
+        ):
+            minutes = cls._coerce_minutes(source)
+            if minutes is not None:
+                return minutes
+
+        return None
+
     # ------------------------------------------------------------------
     # Configuration helpers
     # ------------------------------------------------------------------
@@ -1441,7 +1497,13 @@ class HorizonMapper:
                 spec = self.pattern_horizon(
                     pattern_type, default_intraday_minutes=default_intraday_minutes
                 )
-                cache_key = (spec.name, spec.delta_minutes if spec.name == "intraday_delta" else None)
+                effective_delta = spec.delta_minutes
+                if spec.name == "intraday_delta":
+                    inferred_minutes = self._extract_period_minutes(pattern)
+                    if inferred_minutes is not None:
+                        effective_delta = inferred_minutes
+
+                cache_key = (spec.name, effective_delta if spec.name == "intraday_delta" else None)
                 if cache_key not in horizon_cache:
                     if spec.name == "same_day_oc":
                         horizon_cache[cache_key] = self._same_day_open_to_close(df)
@@ -1451,7 +1513,8 @@ class HorizonMapper:
                         horizon_cache[cache_key] = self._next_week_close_to_close(df, days=5)
                     elif spec.name == "intraday_delta":
                         horizon_cache[cache_key] = self._intraday_delta_minutes(
-                            df, minutes=spec.delta_minutes or default_intraday_minutes
+                            df,
+                            minutes=(effective_delta or spec.delta_minutes or default_intraday_minutes),
                         )
                     elif spec.name == "next_monday_oc":
                         horizon_cache[cache_key] = self._next_monday_open_to_close(df)

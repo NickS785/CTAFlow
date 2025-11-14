@@ -187,7 +187,7 @@ def test_orderflow_peak_pressure_forward_returns():
                 "metric": "net_pressure",
                 "pressure_bias": "buy",
             },
-            "metadata": {"orderflow_bias": "buy"},
+            "metadata": {"orderflow_bias": "buy", "period_length": "0h5m"},
             "key": "peak_tuesday",
         }
     ]
@@ -197,7 +197,7 @@ def test_orderflow_peak_pressure_forward_returns():
         df,
         patterns,
         predictor_minutes=5,
-        default_intraday_minutes=5,
+        default_intraday_minutes=3,
         ensure_gates=False,
     )
 
