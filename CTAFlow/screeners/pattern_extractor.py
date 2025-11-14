@@ -1193,6 +1193,8 @@ class PatternExtractor:
     ) -> Iterable[PatternSummary]:
         strongest: Iterable[Dict[str, Any]] = ticker_result.get("strongest_patterns", [])  # type: ignore[assignment]
         for pattern in strongest:
+            if not self._should_include_pattern(pattern):
+                continue
             yield self._build_summary(
                 symbol,
                 screen_name,
@@ -1201,6 +1203,43 @@ class PatternExtractor:
                 pattern,
                 origin="strongest_patterns",
             )
+
+    @classmethod
+    def _should_include_pattern(cls, pattern: Mapping[str, Any]) -> bool:
+        pattern_type = str(pattern.get("pattern_type") or pattern.get("type") or "")
+        if pattern_type != "weekend_hedging":
+            return True
+
+        p_value = cls._extract_weekend_p_value(pattern)
+        if p_value is None:
+            return False
+
+        return p_value < 0.05
+
+    @classmethod
+    def _extract_weekend_p_value(cls, pattern: Mapping[str, Any]) -> Optional[float]:
+        candidates: List[Any] = []
+        for source_key in ("p_value", "seasonality_p_value"):
+            if source_key in pattern:
+                candidates.append(pattern.get(source_key))
+
+        payload = pattern.get("pattern_payload")
+        if isinstance(payload, Mapping):
+            for source_key in ("p_value", "seasonality_p_value"):
+                if source_key in payload:
+                    candidates.append(payload.get(source_key))
+
+        metadata = pattern.get("metadata")
+        if isinstance(metadata, Mapping):
+            for source_key in ("p_value", "seasonality_p_value"):
+                if source_key in metadata:
+                    candidates.append(metadata.get(source_key))
+
+        for candidate in candidates:
+            value = cls._coerce_optional_float(candidate)
+            if value is not None:
+                return value
+        return None
 
     def _iter_orderflow_summaries(
         self,
