@@ -337,6 +337,258 @@ def test_pattern_metadata_includes_time_months_and_period_labels():
     weekend_pattern = patterns[weekend_key]
     assert weekend_pattern["metadata"]["months"] == [1, 2, 3]
 
+
+def test_period_length_resolution_prefers_metadata_over_params():
+    params = FakeScreenParams(
+        screen_type="seasonality",
+        name="usa_all",
+        target_times=["08:30"],
+        period_length=180,
+        seasonality_session_start="08:00",
+        seasonality_session_end="16:00",
+        tz="America/Chicago",
+    )
+
+    summary = _make_summary(
+        key="usa_all|time_predictive_nextday|08:30:00",
+        symbol="CL",
+        payload={"time": "08:30:00"},
+    )
+    summary.metadata["period_length_min"] = 45
+
+    extractor = _make_extractor({}, screen_params={params.name: params})
+
+    resolved = extractor._resolve_period_length(summary, params)
+    assert resolved == pd.Timedelta(minutes=45)
+
+
+def test_pattern_extractor_emits_momentum_weekday_patterns():
+    ScreenParams = pattern_module.ScreenParams
+    params = ScreenParams(
+        screen_type="momentum",
+        name="usa_spring_momentum",
+        months=[3, 4, 5],
+        session_starts=["02:30", "08:30"],
+        session_ends=["10:30", "15:00"],
+        sess_start_hrs=1,
+        sess_start_minutes=30,
+        sess_end_hrs=1,
+        sess_end_mins=0,
+        tz="America/Chicago",
+        period_length=90,
+    )
+
+    results = {
+        params.name: {
+            "CS": {
+                "filtered_months": [3, 4, 5],
+                "ticker": "CS",
+                "momentum_params": {
+                    "st_momentum_days": params.st_momentum_days,
+                    "period_length_min": params.period_length,
+                },
+                "session_0": {
+                    "session_start": "02:30:00",
+                    "session_end": "10:30:00",
+                    "momentum_params": {
+                        "st_momentum_days": params.st_momentum_days,
+                        "period_length_min": params.period_length,
+                    },
+                    "momentum_by_dayofweek": {
+                        "opening_momentum_by_dow": {
+                            "Monday": {
+                                "n": 30,
+                                "mean": 0.012,
+                                "std": 0.02,
+                                "sharpe": 0.6,
+                                "positive_pct": 0.6,
+                                "t_stat": 2.5,
+                                "skew": 0.1,
+                                "months_active": [3, 4, 5],
+                                "months_mask_12": "001110000000",
+                                "months_names": ["Mar", "Apr", "May"],
+                            },
+                            "anova": {
+                                "f_stat": 4.1,
+                                "p_value": 0.01,
+                                "significant": True,
+                            },
+                        },
+                        "summary": {
+                            "total_observations": 60,
+                            "n_weekdays_analyzed": 5,
+                            "significant_patterns": [
+                                {
+                                    "momentum_type": "opening_momentum",
+                                    "f_stat": 4.1,
+                                    "p_value": 0.01,
+                                }
+                            ],
+                        },
+                    },
+                },
+            }
+        }
+    }
+
+    screener = DummyScreener()
+    screener.data["CS"] = pd.DataFrame()
+
+    extractor = PatternExtractor(screener, results, [params])
+    patterns = extractor.filter_patterns("CS")
+
+    assert patterns, "Expected momentum patterns to be generated"
+    key, summary = next(iter(patterns.items()))
+    assert "momentum_weekday" in key
+    assert summary["pattern_type"] == "momentum_weekday"
+    metadata = summary["metadata"]
+    assert metadata["weekday"].lower() == "monday"
+    assert metadata["momentum_type"] == "opening_momentum"
+    assert metadata["session_key"] == "session_0"
+    assert metadata["window_anchor"] == "start"
+    assert metadata["window_minutes"] == params.sess_start_hrs * 60 + params.sess_start_minutes
+    assert metadata["bias"] == "long"
+    assert metadata["months"] == [3, 4, 5]
+    assert metadata["momentum_params"]["st_momentum_days"] == params.st_momentum_days
+    assert metadata["period_length_min"] == pytest.approx(params.period_length)
+    assert summary["strength"] == pytest.approx(2.5, rel=1e-6)
+
+
+def test_pattern_extractor_extracts_momentum_correlation_and_volatility_patterns():
+    ScreenParams = pattern_module.ScreenParams
+    params = ScreenParams(
+        screen_type="momentum",
+        name="usa_momentum_full",
+        months=[1, 2, 3],
+        session_starts=["08:30"],
+        session_ends=["15:00"],
+        st_momentum_days=5,
+        sess_start_hrs=1,
+        sess_start_minutes=0,
+        tz="America/Chicago",
+        period_length=60,
+    )
+
+    session_payload = {
+        "session_start": "08:30:00",
+        "session_end": "15:00:00",
+        "momentum_params": {
+            "st_momentum_days": params.st_momentum_days,
+            "period_length_min": params.period_length,
+        },
+        "momentum_by_dayofweek": {
+            "full_session_by_dow": {
+                "Monday": {
+                    "mean": -0.001,
+                    "t_stat": -2.1,
+                    "n": 100,
+                },
+                "Friday": {
+                    "mean": 0.0025,
+                    "t_stat": 2.8,
+                    "n": 110,
+                },
+                "anova": {
+                    "significant": True,
+                    "p_value": 0.01,
+                    "f_stat": 4.5,
+                },
+            },
+            "summary": {
+                "total_observations": 210,
+                "significant_patterns": [
+                    {
+                        "momentum_type": "full_session",
+                        "p_value": 0.01,
+                        "f_stat": 4.5,
+                    }
+                ],
+            },
+        },
+        "correlations": {
+            "open_close_corr": 0.32,
+            "open_close_pvalue": 0.012,
+            "close_st_mom_corr": 0.41,
+            "close_vs_rest_corr": -0.28,
+            "close_vs_rest_pvalue": 0.018,
+            "n_observations": 240,
+        },
+        "volatility": {
+            "vol_correlation_significant": True,
+            "opening_closing_vol_correlation": 0.58,
+            "vol_correlation_pvalue": 1e-08,
+            "vol_correlation_interpretation": "Strong positive correlation",
+            "n_high_vol_days": 18,
+            "n_low_vol_days": 3,
+            "overall_stats": {"n_observations": 500},
+            "volatility_by_dayofweek": {
+                "Monday": {"high_vol_days_count": 10},
+                "Tuesday": {"high_vol_days_count": 2},
+                "Wednesday": {"high_vol_days_count": 2},
+                "Thursday": {"high_vol_days_count": 2},
+                "Friday": {"high_vol_days_count": 2},
+            },
+        },
+    }
+
+    results = {
+        params.name: {
+            "CS": {
+                "filtered_months": params.months,
+                "ticker": "CS",
+                "momentum_params": {
+                    "st_momentum_days": params.st_momentum_days,
+                    "period_length_min": params.period_length,
+                },
+                "session_0": session_payload,
+            }
+        }
+    }
+
+    screener = DummyScreener()
+    screener.data["CS"] = pd.DataFrame()
+
+    extractor = PatternExtractor(screener, results, [params])
+    patterns = extractor.filter_patterns("CS")
+
+    oc_pattern = next(
+        summary for summary in patterns.values() if summary["pattern_type"] == "momentum_oc"
+    )
+    assert oc_pattern["p_value"] < 0.05
+    assert oc_pattern["metadata"]["momentum_params"]["st_momentum_days"] == params.st_momentum_days
+
+    cc_pattern = next(
+        summary for summary in patterns.values() if summary["pattern_type"] == "momentum_cc"
+    )
+    assert cc_pattern["p_value"] < 0.05
+
+    sc_pattern = next(
+        summary for summary in patterns.values() if summary["pattern_type"] == "momentum_sc"
+    )
+    assert sc_pattern["p_value"] < 0.05
+
+    ti_pattern = next(
+        summary
+        for summary in patterns.values()
+        if summary["pattern_type"] == "time_predictive_intraday"
+    )
+    assert ti_pattern["metadata"]["best_weekday"] == "Friday"
+    assert ti_pattern["metadata"]["momentum_params"]["period_length_min"] == pytest.approx(
+        params.period_length
+    )
+
+    vol_pattern = next(
+        summary for summary in patterns.values() if summary["pattern_type"] == "vol_persistence"
+    )
+    assert vol_pattern["p_value"] < 0.05
+    bias_pattern = next(
+        summary
+        for summary in patterns.values()
+        if summary["pattern_type"] == "volatility_weekday_bias"
+    )
+    assert bias_pattern["metadata"]["weekday"] == "Monday"
+
+
 def test_pe_promotes_months_from_results_to_metadata():
     results = {
         "seasonality": {
@@ -423,6 +675,7 @@ def test_pattern_extractor_resolves_missing_seasonality_params():
                         "time": "10:30:00",
                         "description": "10:30 predicts next day",
                         "strength": 0.5,
+                        "period_length_min": 30,
                     },
                 ],
                 "metadata": {
@@ -463,6 +716,79 @@ def test_pattern_extractor_resolves_missing_seasonality_params():
 
     assert extractor.get_pattern_summary("GC", weekday_key).screen_params is params[0]
     assert extractor.get_pattern_summary("GC", tod_key).screen_params is params[0]
+
+
+def test_time_of_day_series_prefers_result_period_length(monkeypatch):
+    index = pd.date_range(
+        "2023-01-03 08:00",
+        "2023-01-06 16:00",
+        freq="5min",
+        tz="America/Chicago",
+    )
+    prices = pd.Series(100 + 0.001 * np.arange(len(index)), index=index)
+    data = pd.DataFrame({"Close": prices})
+    screener = SeasonalityDummyScreener(data)
+
+    screen_name = "result_period_length"
+    results = {
+        screen_name: {
+            "GC": {
+                "strongest_patterns": [
+                    {
+                        "type": "time_predictive_nextday",
+                        "time": "10:30:00",
+                        "description": "10:30 predicts next day",
+                        "strength": 0.5,
+                        "period_length_min": 45,
+                    }
+                ],
+                "metadata": {
+                    "session_start": "08:00",
+                    "session_end": "16:00",
+                    "tz": "America/Chicago",
+                },
+            }
+        }
+    }
+
+    params = [
+        FakeScreenParams(
+            screen_type="seasonality",
+            name=screen_name,
+            months=[1, 2, 3],
+            target_times=["10:30"],
+            period_length=15,
+            seasonality_session_start="08:00",
+            seasonality_session_end="16:00",
+            tz="America/Chicago",
+        )
+    ]
+
+    extractor = PatternExtractor(screener, results, params)
+
+    captured: dict = {}
+
+    def fake_time_of_day(
+        session_data, price_col, is_synthetic, target_time_obj, period_length
+    ):
+        captured["period_length"] = period_length
+        return pd.Series(dtype=float)
+
+    monkeypatch.setattr(
+        pattern_module.PatternExtractor,
+        "_compute_time_of_day_returns",
+        staticmethod(fake_time_of_day),
+    )
+
+    tod_key = next(
+        key
+        for key in extractor.get_pattern_keys("GC")
+        if "time_predictive_nextday" in key
+    )
+
+    extractor.get_pattern_series("GC", tod_key)
+
+    assert captured.get("period_length") == pd.Timedelta(minutes=45)
 
 
 def test_concat_disjoint_tickers():
