@@ -337,6 +337,234 @@ def test_pattern_metadata_includes_time_months_and_period_labels():
     weekend_pattern = patterns[weekend_key]
     assert weekend_pattern["metadata"]["months"] == [1, 2, 3]
 
+
+def test_pattern_extractor_emits_momentum_weekday_patterns():
+    ScreenParams = pattern_module.ScreenParams
+    params = ScreenParams(
+        screen_type="momentum",
+        name="usa_spring_momentum",
+        months=[3, 4, 5],
+        session_starts=["02:30", "08:30"],
+        session_ends=["10:30", "15:00"],
+        sess_start_hrs=1,
+        sess_start_minutes=30,
+        sess_end_hrs=1,
+        sess_end_mins=0,
+        tz="America/Chicago",
+        period_length=90,
+    )
+
+    results = {
+        params.name: {
+            "CS": {
+                "filtered_months": [3, 4, 5],
+                "ticker": "CS",
+                "momentum_params": {
+                    "st_momentum_days": params.st_momentum_days,
+                    "period_length_min": params.period_length,
+                },
+                "session_0": {
+                    "session_start": "02:30:00",
+                    "session_end": "10:30:00",
+                    "momentum_params": {
+                        "st_momentum_days": params.st_momentum_days,
+                        "period_length_min": params.period_length,
+                    },
+                    "momentum_by_dayofweek": {
+                        "opening_momentum_by_dow": {
+                            "Monday": {
+                                "n": 30,
+                                "mean": 0.012,
+                                "std": 0.02,
+                                "sharpe": 0.6,
+                                "positive_pct": 0.6,
+                                "t_stat": 2.5,
+                                "skew": 0.1,
+                                "months_active": [3, 4, 5],
+                                "months_mask_12": "001110000000",
+                                "months_names": ["Mar", "Apr", "May"],
+                            },
+                            "anova": {
+                                "f_stat": 4.1,
+                                "p_value": 0.01,
+                                "significant": True,
+                            },
+                        },
+                        "summary": {
+                            "total_observations": 60,
+                            "n_weekdays_analyzed": 5,
+                            "significant_patterns": [
+                                {
+                                    "momentum_type": "opening_momentum",
+                                    "f_stat": 4.1,
+                                    "p_value": 0.01,
+                                }
+                            ],
+                        },
+                    },
+                },
+            }
+        }
+    }
+
+    screener = DummyScreener()
+    screener.data["CS"] = pd.DataFrame()
+
+    extractor = PatternExtractor(screener, results, [params])
+    patterns = extractor.filter_patterns("CS")
+
+    assert patterns, "Expected momentum patterns to be generated"
+    key, summary = next(iter(patterns.items()))
+    assert "momentum_weekday" in key
+    assert summary["pattern_type"] == "momentum_weekday"
+    metadata = summary["metadata"]
+    assert metadata["weekday"].lower() == "monday"
+    assert metadata["momentum_type"] == "opening_momentum"
+    assert metadata["session_key"] == "session_0"
+    assert metadata["window_anchor"] == "start"
+    assert metadata["window_minutes"] == params.sess_start_hrs * 60 + params.sess_start_minutes
+    assert metadata["bias"] == "long"
+    assert metadata["months"] == [3, 4, 5]
+    assert metadata["momentum_params"]["st_momentum_days"] == params.st_momentum_days
+    assert metadata["period_length_min"] == pytest.approx(params.period_length)
+    assert summary["strength"] == pytest.approx(2.5, rel=1e-6)
+
+
+def test_pattern_extractor_extracts_momentum_correlation_and_volatility_patterns():
+    ScreenParams = pattern_module.ScreenParams
+    params = ScreenParams(
+        screen_type="momentum",
+        name="usa_momentum_full",
+        months=[1, 2, 3],
+        session_starts=["08:30"],
+        session_ends=["15:00"],
+        st_momentum_days=5,
+        sess_start_hrs=1,
+        sess_start_minutes=0,
+        tz="America/Chicago",
+        period_length=60,
+    )
+
+    session_payload = {
+        "session_start": "08:30:00",
+        "session_end": "15:00:00",
+        "momentum_params": {
+            "st_momentum_days": params.st_momentum_days,
+            "period_length_min": params.period_length,
+        },
+        "momentum_by_dayofweek": {
+            "full_session_by_dow": {
+                "Monday": {
+                    "mean": -0.001,
+                    "t_stat": -2.1,
+                    "n": 100,
+                },
+                "Friday": {
+                    "mean": 0.0025,
+                    "t_stat": 2.8,
+                    "n": 110,
+                },
+                "anova": {
+                    "significant": True,
+                    "p_value": 0.01,
+                    "f_stat": 4.5,
+                },
+            },
+            "summary": {
+                "total_observations": 210,
+                "significant_patterns": [
+                    {
+                        "momentum_type": "full_session",
+                        "p_value": 0.01,
+                        "f_stat": 4.5,
+                    }
+                ],
+            },
+        },
+        "correlations": {
+            "open_close_corr": 0.32,
+            "open_close_pvalue": 0.012,
+            "close_st_mom_corr": 0.41,
+            "close_vs_rest_corr": -0.28,
+            "close_vs_rest_pvalue": 0.018,
+            "n_observations": 240,
+        },
+        "volatility": {
+            "vol_correlation_significant": True,
+            "opening_closing_vol_correlation": 0.58,
+            "vol_correlation_pvalue": 1e-08,
+            "vol_correlation_interpretation": "Strong positive correlation",
+            "n_high_vol_days": 18,
+            "n_low_vol_days": 3,
+            "overall_stats": {"n_observations": 500},
+            "volatility_by_dayofweek": {
+                "Monday": {"high_vol_days_count": 10},
+                "Tuesday": {"high_vol_days_count": 2},
+                "Wednesday": {"high_vol_days_count": 2},
+                "Thursday": {"high_vol_days_count": 2},
+                "Friday": {"high_vol_days_count": 2},
+            },
+        },
+    }
+
+    results = {
+        params.name: {
+            "CS": {
+                "filtered_months": params.months,
+                "ticker": "CS",
+                "momentum_params": {
+                    "st_momentum_days": params.st_momentum_days,
+                    "period_length_min": params.period_length,
+                },
+                "session_0": session_payload,
+            }
+        }
+    }
+
+    screener = DummyScreener()
+    screener.data["CS"] = pd.DataFrame()
+
+    extractor = PatternExtractor(screener, results, [params])
+    patterns = extractor.filter_patterns("CS")
+
+    oc_pattern = next(
+        summary for summary in patterns.values() if summary["pattern_type"] == "momentum_oc"
+    )
+    assert oc_pattern["p_value"] < 0.05
+    assert oc_pattern["metadata"]["momentum_params"]["st_momentum_days"] == params.st_momentum_days
+
+    cc_pattern = next(
+        summary for summary in patterns.values() if summary["pattern_type"] == "momentum_cc"
+    )
+    assert cc_pattern["p_value"] < 0.05
+
+    sc_pattern = next(
+        summary for summary in patterns.values() if summary["pattern_type"] == "momentum_sc"
+    )
+    assert sc_pattern["p_value"] < 0.05
+
+    ti_pattern = next(
+        summary
+        for summary in patterns.values()
+        if summary["pattern_type"] == "time_predictive_intraday"
+    )
+    assert ti_pattern["metadata"]["best_weekday"] == "Friday"
+    assert ti_pattern["metadata"]["momentum_params"]["period_length_min"] == pytest.approx(
+        params.period_length
+    )
+
+    vol_pattern = next(
+        summary for summary in patterns.values() if summary["pattern_type"] == "vol_persistence"
+    )
+    assert vol_pattern["p_value"] < 0.05
+    bias_pattern = next(
+        summary
+        for summary in patterns.values()
+        if summary["pattern_type"] == "volatility_weekday_bias"
+    )
+    assert bias_pattern["metadata"]["weekday"] == "Monday"
+
+
 def test_pe_promotes_months_from_results_to_metadata():
     results = {
         "seasonality": {
