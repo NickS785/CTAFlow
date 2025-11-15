@@ -1,3 +1,4 @@
+import importlib.util
 import sys
 import types
 from pathlib import Path
@@ -36,11 +37,39 @@ if "numba" not in sys.modules:
 
     sys.modules["numba"] = numba_mod
 
-try:
-    import CTAFlow as _cta_module  # type: ignore[import-not-found]
-except Exception:  # pragma: no cover - optional when deps missing
-    _cta_module = None  # type: ignore[assignment]
-else:
+def _load_repo_package(module_name: str, package_root: Path):
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        package_root / "__init__.py",
+        submodule_search_locations=[str(package_root)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    sys.modules[module_name] = module
+    return module
+
+
+CTA_PACKAGE = ROOT / "CTAFlow"
+_cta_module = None
+if CTA_PACKAGE.exists():
+    try:  # Prefer existing installation when it already points at the repo
+        import CTAFlow as _imported_cta  # type: ignore[import-not-found]
+    except Exception:  # pragma: no cover - optional when deps missing
+        _imported_cta = None  # type: ignore[assignment]
+
+    if _imported_cta is not None:
+        module_path = Path(getattr(_imported_cta, "__file__", "")).resolve().parent
+        if module_path == CTA_PACKAGE.resolve():
+            _cta_module = _imported_cta  # type: ignore[assignment]
+
+    if _cta_module is None:
+        try:
+            _cta_module = _load_repo_package("CTAFlow", CTA_PACKAGE)
+        except Exception:  # pragma: no cover - fallback when optional deps missing
+            _cta_module = None  # type: ignore[assignment]
+
+if _cta_module is not None:
     sys.modules.setdefault("CTAFlow.CTAFlow", _cta_module)
 
 try:

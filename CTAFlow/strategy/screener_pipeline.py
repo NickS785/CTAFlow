@@ -134,6 +134,11 @@ class ScreenerPipeline:
         "orderflow_peak_pressure",
     }
 
+    #: Pattern types emitted by the momentum extractor
+    _MOMENTUM_TYPES = {
+        "momentum_weekday",
+    }
+
     def __init__(self, tz: str = "America/Chicago", time_match: str = "auto", log: Any = None) -> None:
         """Configure the pipeline.
 
@@ -541,6 +546,9 @@ class ScreenerPipeline:
         if pattern_type in self._ORDERFLOW_TYPES:
             return self._dispatch_orderflow(df, pattern, key, pattern_type)
 
+        if pattern_type in self._MOMENTUM_TYPES:
+            return self._dispatch_momentum(df, pattern, key, pattern_type)
+
         return []
 
     def _dispatch_seasonal(
@@ -582,6 +590,103 @@ class ScreenerPipeline:
             return self._extract_oflow_peak(df, payload, metadata, key)
 
         return []
+
+    def _dispatch_momentum(
+        self,
+        df: pd.DataFrame,
+        pattern: Mapping[str, Any],
+        key: Optional[str],
+        pattern_type: str,
+    ) -> List[str]:
+        payload = pattern.get("pattern_payload", {}) or {}
+        metadata = pattern.get("metadata", {}) or {}
+
+        weekday_norm = self._normalize_weekday(payload.get("weekday") or metadata.get("weekday"))
+        if weekday_norm is None:
+            return []
+
+        months = self._resolve_months(key, pattern)
+
+        mask = df["weekday_lower"] == weekday_norm
+        mask &= self._months_mask(df, months)
+
+        session_start = payload.get("session_start") or metadata.get("session_start")
+        session_end = payload.get("session_end") or metadata.get("session_end")
+        window_anchor = str(payload.get("window_anchor") or metadata.get("window_anchor") or "session").lower()
+        window_minutes = payload.get("window_minutes") or metadata.get("window_minutes")
+        try:
+            window_minutes_int = int(window_minutes)
+        except (TypeError, ValueError):
+            window_minutes_int = None
+
+        start_hms, _ = self._time_to_strings(session_start)
+        end_hms, _ = self._time_to_strings(session_end)
+
+        lower_bound = start_hms
+        upper_bound = end_hms
+
+        if window_anchor == "start" and start_hms is not None:
+            upper_bound = self._shift_time_str(start_hms, window_minutes_int, forward=True)
+        elif window_anchor == "end" and end_hms is not None:
+            lower_bound = self._shift_time_str(end_hms, window_minutes_int, forward=False)
+
+        if lower_bound is not None and upper_bound is not None:
+            if lower_bound <= upper_bound:
+                mask &= (df["clock_time"] >= lower_bound) & (df["clock_time"] <= upper_bound)
+            else:
+                mask &= (df["clock_time"] >= lower_bound) | (df["clock_time"] <= upper_bound)
+        else:
+            if lower_bound is not None:
+                mask &= df["clock_time"] >= lower_bound
+            if upper_bound is not None:
+                mask &= df["clock_time"] <= upper_bound
+
+        momentum_type = payload.get("momentum_type") or metadata.get("momentum_type") or "momentum"
+        bias = payload.get("bias") or metadata.get("bias")
+        if bias is None:
+            mean_value = payload.get("mean")
+            try:
+                mean_float = float(mean_value)
+            except (TypeError, ValueError):
+                mean_float = 0.0
+            if np.isfinite(mean_float):
+                if mean_float > 0:
+                    bias = "long"
+                elif mean_float < 0:
+                    bias = "short"
+                else:
+                    bias = "neutral"
+            else:
+                bias = "neutral"
+
+        base_suffix = f"momentum_{momentum_type}_{weekday_norm}"
+        session_key = payload.get("session_key") or metadata.get("session_key")
+        session_index = payload.get("session_index") or metadata.get("session_index")
+        if session_key:
+            base_suffix += f"_{session_key}"
+        elif session_index is not None:
+            base_suffix += f"_session{session_index}"
+
+        base = self._feature_base_name(key, base_suffix)
+
+        sidecars: Dict[str, Any] = {
+            "weekday": weekday_norm,
+            "momentum_type": momentum_type,
+            "bias": bias,
+            "session_key": session_key,
+            "session_index": session_index,
+            "session_start": start_hms,
+            "session_end": end_hms,
+            "window_anchor": window_anchor,
+            "window_minutes": window_minutes_int,
+            "t_stat": payload.get("t_stat") or metadata.get("t_stat"),
+            "mean": payload.get("mean"),
+            "sharpe": payload.get("sharpe"),
+            "positive_pct": payload.get("positive_pct"),
+            "strength": pattern.get("strength") or payload.get("strength"),
+        }
+
+        return self._add_feature(df, base, mask, sidecars)
 
     # ------------------------------------------------------------------
     # Seasonal extractors
@@ -816,8 +921,20 @@ class ScreenerPipeline:
             if "." in text:
                 head, frac = text.split(".", 1)
                 frac = (frac + "000000")[:6]
-                return head, f"{head}.{frac}"
-            return text, f"{text}.000000"
+            return head, f"{head}.{frac}"
+        return text, f"{text}.000000"
+
+    @staticmethod
+    def _shift_time_str(base: Optional[str], minutes: Optional[int], *, forward: bool) -> Optional[str]:
+        if base is None or minutes in (None, 0):
+            return base
+        try:
+            timestamp = pd.Timestamp(f"2000-01-01 {base}")
+        except Exception:
+            return base
+        delta = pd.Timedelta(minutes=int(minutes))
+        shifted = timestamp + delta if forward else timestamp - delta
+        return shifted.time().strftime("%H:%M:%S")
 
         hms = parsed.strftime("%H:%M:%S")
         return hms, parsed.strftime("%H:%M:%S.%f")

@@ -233,3 +233,60 @@ def test_weekend_hedging_requires_significant_p_value(historical_screener):
     )
 
     assert pattern is None
+
+
+def test_parse_params_resolves_duplicate_regime_kwargs(historical_screener, monkeypatch):
+    from CTAFlow.screeners.historical_screener import ScreenParams
+
+    params = ScreenParams(
+        screen_type="momentum",
+        name="momentum_test",
+        session_starts=["02:30"],
+        session_ends=["10:30"],
+        use_regime_filtering=True,
+        regime_col="regime_state",
+        target_regimes=[1, 2],
+    )
+
+    captured_kwargs: dict[str, object] = {}
+
+    def _fake_momentum_screen(**kwargs):
+        captured_kwargs.update(kwargs)
+        return {"HO": {"pattern": "mock"}}
+
+    monkeypatch.setattr(historical_screener, "intraday_momentum_screen", _fake_momentum_screen)
+
+    result = historical_screener._parse_params(
+        params,
+        session_starts=params.session_starts,
+        session_ends=params.session_ends,
+        _selected_months=[3, 4, 5],
+        _precomputed_sessions={"HO": {}},
+        use_regime_filtering=True,
+        regime_col="regime_state",
+        target_regimes=[1, 2],
+    )
+
+    assert "HO" in result
+    assert captured_kwargs["use_regime_filtering"] is True
+    assert captured_kwargs["regime_col"] == "regime_state"
+    assert captured_kwargs["target_regimes"] == [1, 2]
+
+
+def test_intraday_momentum_screen_includes_analysis_params(historical_screener):
+    screener = historical_screener
+    results = screener.intraday_momentum_screen(
+        session_starts=["00:00"],
+        session_ends=["23:59"],
+        st_momentum_days=4,
+        period_length=30,
+        max_workers=1,
+        show_progress=False,
+    )
+
+    ticker_payload = results["HO"]
+    assert ticker_payload["momentum_params"]["st_momentum_days"] == 4
+    session_payload = ticker_payload.get("session_0")
+    assert session_payload is not None
+    assert session_payload["momentum_params"]["st_momentum_days"] == 4
+    assert session_payload["momentum_params"]["period_length_min"] == pytest.approx(30.0)

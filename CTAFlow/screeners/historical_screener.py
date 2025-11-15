@@ -359,6 +359,7 @@ class HistoricalScreener:
         session_starts: List[Union[str, time]] = ["02:30", "08:30"],
         session_ends: List[Union[str, time]] = ["10:30", "13:30"],
         st_momentum_days: int = 3,
+        period_length: Optional[Union[int, timedelta]] = None,
         sess_start_hrs: int = 1,
         sess_start_minutes: int = 30,
         sess_end_hrs: Optional[int] = None,
@@ -458,6 +459,10 @@ class HistoricalScreener:
         )
         """
         session_starts, session_ends = self._convert_times(session_starts, session_ends)
+        momentum_params = self._build_momentum_params(
+            st_momentum_days,
+            period_length,
+        )
 
         # Determine which months to analyze (allow override when precomputed)
         selected_months = (
@@ -568,6 +573,7 @@ class HistoricalScreener:
                     'n_observations': n_observations,
                     'filtered_months': filtered_months_label,
                     'regime_filter': regime_meta,
+                    'momentum_params': momentum_params,
                 }
 
                 for i, (start_time, end_time) in enumerate(zip(session_starts, session_ends)):
@@ -597,6 +603,7 @@ class HistoricalScreener:
                         price_col=price_col,
                         is_synthetic=is_synthetic
                     )
+                    momentum_stats['momentum_params'] = dict(momentum_params)
 
                     ticker_results[session_key] = momentum_stats
 
@@ -633,6 +640,29 @@ class HistoricalScreener:
             self.logger.info(f"Completed momentum screen: {successful}/{len(results)} successful")
 
         return results
+
+    @staticmethod
+    def _coerce_period_minutes(period_length: Optional[Union[int, float, timedelta]]) -> Optional[float]:
+        if period_length is None:
+            return None
+        if isinstance(period_length, timedelta):
+            return period_length.total_seconds() / 60.0
+        try:
+            minutes = float(period_length)
+        except (TypeError, ValueError):
+            return None
+        return minutes
+
+    def _build_momentum_params(
+        self,
+        st_momentum_days: int,
+        period_length: Optional[Union[int, float, timedelta]],
+    ) -> Dict[str, Any]:
+        params: Dict[str, Any] = {'st_momentum_days': int(st_momentum_days)}
+        period_minutes = self._coerce_period_minutes(period_length)
+        if period_minutes is not None:
+            params['period_length_min'] = period_minutes
+        return params
 
     def st_seasonality_screen(
         self,
@@ -1207,12 +1237,18 @@ class HistoricalScreener:
             override_session_ends = momentum_kwargs.pop('session_ends', params.session_ends)
             selected_months_override = momentum_kwargs.pop('_selected_months', None)
             precomputed_sessions = momentum_kwargs.pop('_precomputed_sessions', None)
+            override_use_regime_filtering = momentum_kwargs.pop(
+                'use_regime_filtering', params.use_regime_filtering
+            )
+            override_regime_col = momentum_kwargs.pop('regime_col', params.regime_col)
+            override_target_regimes = momentum_kwargs.pop('target_regimes', params.target_regimes)
 
             # Run momentum screen with provided parameters
             return self.intraday_momentum_screen(
                 session_starts=override_session_starts,
                 session_ends=override_session_ends,
                 st_momentum_days=params.st_momentum_days,
+                period_length=params.period_length,
                 sess_start_hrs=params.sess_start_hrs,
                 sess_start_minutes=params.sess_start_minutes,
                 sess_end_hrs=params.sess_end_hrs,
@@ -1222,9 +1258,9 @@ class HistoricalScreener:
                 season=params.season,
                 _selected_months=selected_months_override,
                 _precomputed_sessions=precomputed_sessions,
-                use_regime_filtering=params.use_regime_filtering,
-                regime_col=params.regime_col,
-                target_regimes=params.target_regimes,
+                use_regime_filtering=override_use_regime_filtering,
+                regime_col=override_regime_col,
+                target_regimes=override_target_regimes,
                 **momentum_kwargs
             )
 

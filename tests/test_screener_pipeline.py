@@ -208,6 +208,66 @@ def test_screener_pipeline_generates_sparse_gates():
     assert "other_pattern_gate" not in gate_columns
 
 
+def test_screener_pipeline_emits_momentum_gates():
+    tz = "America/Chicago"
+    monday = pd.date_range("2024-03-04 02:30", "2024-03-04 11:00", freq="30min", tz=tz)
+    tuesday = pd.date_range("2024-03-05 02:30", "2024-03-05 11:00", freq="30min", tz=tz)
+    bars = pd.DataFrame({"ts": monday.append(tuesday)})
+
+    pattern_key = "usa_spring_momentum|momentum_weekday|Tuesday|opening_momentum|session_0"
+    patterns = {
+        pattern_key: {
+            "pattern_type": "momentum_weekday",
+            "pattern_payload": {
+                "weekday": "Tuesday",
+                "momentum_type": "opening_momentum",
+                "session_key": "session_0",
+                "session_index": 0,
+                "session_start": "02:30:00",
+                "session_end": "10:30:00",
+                "window_anchor": "start",
+                "window_minutes": 90,
+                "mean": 0.012,
+                "t_stat": 2.5,
+                "bias": "long",
+                "strength": 2.5,
+            },
+            "metadata": {"screen_type": "momentum"},
+        }
+    }
+
+    pipeline = ScreenerPipeline(tz=tz)
+    features = pipeline.build_features(bars, patterns)
+
+    gate_columns = [col for col in features.columns if col.endswith("_gate") and col != "any_pattern_active"]
+    assert len(gate_columns) == 1
+    gate_col = gate_columns[0]
+    base = gate_col[: -len("_gate")]
+
+    active_mask = (
+        (features["weekday"] == "Tuesday")
+        & (features["clock_time"] >= "02:30:00")
+        & (features["clock_time"] <= "04:00:00")
+    )
+    assert active_mask.any()
+    assert features.loc[active_mask, gate_col].eq(1).all()
+
+    off_window = (features["weekday"] == "Tuesday") & (features["clock_time"] > "04:00:00")
+    assert features.loc[off_window, gate_col].eq(0).all()
+    monday_mask = features["weekday"] == "Monday"
+    assert features.loc[monday_mask, gate_col].eq(0).all()
+
+    bias_col = f"{base}_bias"
+    momentum_col = f"{base}_momentum_type"
+    window_col = f"{base}_window_minutes"
+    session_col = f"{base}_session_key"
+
+    assert features.loc[active_mask, bias_col].eq("long").all()
+    assert features.loc[active_mask, momentum_col].eq("opening_momentum").all()
+    assert features.loc[active_mask, window_col].eq(90).all()
+    assert features.loc[active_mask, session_col].eq("session_0").all()
+
+
 def test_horizon_mapper_accepts_mixed_case_price_columns():
     mapper = HorizonMapper(tz="America/Chicago")
     df = pd.DataFrame(
