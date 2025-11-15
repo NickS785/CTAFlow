@@ -338,6 +338,30 @@ def test_pattern_metadata_includes_time_months_and_period_labels():
     assert weekend_pattern["metadata"]["months"] == [1, 2, 3]
 
 
+def test_period_length_resolution_prefers_metadata_over_params():
+    params = FakeScreenParams(
+        screen_type="seasonality",
+        name="usa_all",
+        target_times=["08:30"],
+        period_length=180,
+        seasonality_session_start="08:00",
+        seasonality_session_end="16:00",
+        tz="America/Chicago",
+    )
+
+    summary = _make_summary(
+        key="usa_all|time_predictive_nextday|08:30:00",
+        symbol="CL",
+        payload={"time": "08:30:00"},
+    )
+    summary.metadata["period_length_min"] = 45
+
+    extractor = _make_extractor({}, screen_params={params.name: params})
+
+    resolved = extractor._resolve_period_length(summary, params)
+    assert resolved == pd.Timedelta(minutes=45)
+
+
 def test_pattern_extractor_emits_momentum_weekday_patterns():
     ScreenParams = pattern_module.ScreenParams
     params = ScreenParams(
@@ -651,6 +675,7 @@ def test_pattern_extractor_resolves_missing_seasonality_params():
                         "time": "10:30:00",
                         "description": "10:30 predicts next day",
                         "strength": 0.5,
+                        "period_length_min": 30,
                     },
                 ],
                 "metadata": {
@@ -691,6 +716,79 @@ def test_pattern_extractor_resolves_missing_seasonality_params():
 
     assert extractor.get_pattern_summary("GC", weekday_key).screen_params is params[0]
     assert extractor.get_pattern_summary("GC", tod_key).screen_params is params[0]
+
+
+def test_time_of_day_series_prefers_result_period_length(monkeypatch):
+    index = pd.date_range(
+        "2023-01-03 08:00",
+        "2023-01-06 16:00",
+        freq="5min",
+        tz="America/Chicago",
+    )
+    prices = pd.Series(100 + 0.001 * np.arange(len(index)), index=index)
+    data = pd.DataFrame({"Close": prices})
+    screener = SeasonalityDummyScreener(data)
+
+    screen_name = "result_period_length"
+    results = {
+        screen_name: {
+            "GC": {
+                "strongest_patterns": [
+                    {
+                        "type": "time_predictive_nextday",
+                        "time": "10:30:00",
+                        "description": "10:30 predicts next day",
+                        "strength": 0.5,
+                        "period_length_min": 45,
+                    }
+                ],
+                "metadata": {
+                    "session_start": "08:00",
+                    "session_end": "16:00",
+                    "tz": "America/Chicago",
+                },
+            }
+        }
+    }
+
+    params = [
+        FakeScreenParams(
+            screen_type="seasonality",
+            name=screen_name,
+            months=[1, 2, 3],
+            target_times=["10:30"],
+            period_length=15,
+            seasonality_session_start="08:00",
+            seasonality_session_end="16:00",
+            tz="America/Chicago",
+        )
+    ]
+
+    extractor = PatternExtractor(screener, results, params)
+
+    captured: dict = {}
+
+    def fake_time_of_day(
+        session_data, price_col, is_synthetic, target_time_obj, period_length
+    ):
+        captured["period_length"] = period_length
+        return pd.Series(dtype=float)
+
+    monkeypatch.setattr(
+        pattern_module.PatternExtractor,
+        "_compute_time_of_day_returns",
+        staticmethod(fake_time_of_day),
+    )
+
+    tod_key = next(
+        key
+        for key in extractor.get_pattern_keys("GC")
+        if "time_predictive_nextday" in key
+    )
+
+    extractor.get_pattern_series("GC", tod_key)
+
+    assert captured.get("period_length") == pd.Timedelta(minutes=45)
 
 
 def test_concat_disjoint_tickers():

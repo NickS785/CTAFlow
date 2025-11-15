@@ -2210,9 +2210,7 @@ class PatternExtractor:
         if session_data.empty:
             return pd.Series(dtype=float)
 
-        period_length = params.period_length
-        if isinstance(period_length, (int, float)):
-            period_length = pd.Timedelta(minutes=period_length)
+        period_length = self._resolve_period_length(summary, params)
 
         returns = self._compute_time_of_day_returns(
             session_data,
@@ -2222,6 +2220,68 @@ class PatternExtractor:
             period_length,
         )
         return returns
+
+    def _resolve_period_length(
+        self,
+        summary: PatternSummary,
+        params: ScreenParamLike,
+    ) -> Optional[pd.Timedelta]:
+        """Determine the aggregation window for time-of-day series."""
+
+        minutes = self._period_minutes_from_summary(summary)
+
+        raw_period: Any
+        if minutes is not None:
+            raw_period = minutes
+        else:
+            raw_period = getattr(params, "period_length", None) if params is not None else None
+
+        if raw_period is None:
+            return None
+
+        if isinstance(raw_period, pd.Timedelta):
+            return raw_period
+
+        minutes_value = self._coerce_minutes(raw_period)
+        if minutes_value is None:
+            return None
+
+        return pd.Timedelta(minutes=minutes_value)
+
+    @staticmethod
+    def _period_minutes_from_summary(summary: PatternSummary) -> Optional[float]:
+        """Extract ``period_length_min`` from summary metadata/payload."""
+
+        containers = []
+        if isinstance(summary.metadata, Mapping):
+            containers.append(summary.metadata)
+        if isinstance(summary.payload, Mapping):
+            containers.append(summary.payload)
+
+        for container in containers:
+            value = container.get("period_length_min")
+            minutes = PatternExtractor._coerce_minutes(value)
+            if minutes is not None:
+                return minutes
+        return None
+
+    @staticmethod
+    def _coerce_minutes(value: Any) -> Optional[float]:
+        if value in (None, "", 0, 0.0):
+            return None
+
+        if isinstance(value, pd.Timedelta):
+            minutes = value.total_seconds() / 60.0
+        else:
+            try:
+                minutes = float(value)
+            except (TypeError, ValueError):
+                return None
+
+        if math.isnan(minutes) or minutes <= 0:
+            return None
+
+        return minutes
 
     def _extract_weekend_hedging_series(self, symbol: str, summary: PatternSummary) -> pd.Series:
         params = self._ensure_seasonality_params(summary, context="Weekend hedging")
