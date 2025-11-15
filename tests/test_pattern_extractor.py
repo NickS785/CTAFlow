@@ -1,19 +1,58 @@
+from __future__ import annotations
+
 import asyncio
-import pandas as pd
-import numpy as np
-import pytest
+
+import sys
+import types
 from datetime import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, List, Optional
 
-from CTAFlow.CTAFlow.data.data_client import ResultsClient
-from CTAFlow.CTAFlow.screeners.orderflow_scan import OrderflowParams
-from CTAFlow.CTAFlow.screeners.pattern_extractor import (
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+if "sierrapy" not in sys.modules:
+    parser_mod = types.ModuleType("sierrapy.parser")
+    parser_mod.ScidReader = object
+    parser_mod.AsyncScidReader = object
+    parser_mod.bucket_by_volume = lambda *args, **kwargs: None
+    parser_mod.resample_ohlcv = lambda *args, **kwargs: None
+    sierrapy_mod = types.ModuleType("sierrapy")
+    sierrapy_mod.parser = parser_mod
+    sys.modules["sierrapy"] = sierrapy_mod
+    sys.modules["sierrapy.parser"] = parser_mod
+
+if "numba" not in sys.modules:
+    numba_mod = types.ModuleType("numba")
+
+    def _identity_decorator(*_args, **_kwargs):
+        def _wrap(func):
+            return func
+
+        return _wrap
+
+    numba_mod.jit = _identity_decorator
+    numba_mod.njit = _identity_decorator
+    numba_mod.guvectorize = _identity_decorator
+    numba_mod.vectorize = _identity_decorator
+    numba_mod.prange = range  # type: ignore[assignment]
+
+    sys.modules["numba"] = numba_mod
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from CTAFlow.data.data_client import ResultsClient
+from CTAFlow.screeners.orderflow_scan import OrderflowParams
+from CTAFlow.screeners.pattern_extractor import (
     PatternExtractor,
     PatternSummary,
     validate_filtered_months,
 )
-import CTAFlow.CTAFlow.screeners.pattern_extractor as pattern_module
+import CTAFlow.screeners.pattern_extractor as pattern_module
 
 
 @dataclass
@@ -587,6 +626,40 @@ def test_pattern_extractor_extracts_momentum_correlation_and_volatility_patterns
         if summary["pattern_type"] == "volatility_weekday_bias"
     )
     assert bias_pattern["metadata"]["weekday"] == "Monday"
+
+
+def test_pattern_extractor_detects_momentum_without_params():
+    results = {
+        "usa_intraday_momentum": {
+            "CS": {
+                "session_0": {
+                    "session_start": "08:30:00",
+                    "session_end": "15:00:00",
+                    "momentum_params": {"st_momentum_days": 3, "period_length_min": 90},
+                    "momentum_by_dayofweek": {
+                        "full_session_by_dow": {
+                            "Monday": {
+                                "n": 120,
+                                "mean": 0.0015,
+                                "t_stat": 2.2,
+                                "positive_pct": 0.58,
+                            },
+                        }
+                    },
+                }
+            }
+        }
+    }
+
+    extractor = PatternExtractor(DummyScreener(), results, [])
+    patterns = extractor.filter_patterns("CS")
+
+    assert patterns, "Momentum payloads should emit summaries even without params"
+    summary = next(
+        details for details in patterns.values() if details["pattern_type"] == "momentum_weekday"
+    )
+    assert summary["metadata"]["momentum_params"]["st_momentum_days"] == 3
+    assert summary["metadata"]["session_key"] == "session_0"
 
 
 def test_pe_promotes_months_from_results_to_metadata():

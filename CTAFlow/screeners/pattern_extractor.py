@@ -1188,13 +1188,14 @@ class PatternExtractor:
     def _build_index(self) -> None:
         for screen_name, ticker_results in self._results.items():
             params = self._screen_params.get(screen_name)
-            screen_type = getattr(params, "screen_type", None)
+            declared_type = getattr(params, "screen_type", None)
 
             for symbol, result in ticker_results.items():
                 if not isinstance(result, Mapping) or "error" in result:
                     continue
 
                 symbol_patterns = self._pattern_index.setdefault(symbol, {})
+                screen_type = self._infer_screen_type(declared_type, result)
 
                 if self._is_orderflow_result(result):
                     for summary in self._iter_orderflow_summaries(
@@ -1214,6 +1215,27 @@ class PatternExtractor:
                     params=params,
                 ):
                     symbol_patterns[summary.key] = summary
+
+    def _infer_screen_type(
+        self,
+        declared_type: Optional[str],
+        ticker_result: Mapping[str, Any],
+    ) -> Optional[str]:
+        """Infer the screen type when params were not provided.
+
+        Some callers instantiate :class:`PatternExtractor` without passing the
+        originating :class:`ScreenParams`.  When that happens we need to detect
+        momentum outputs directly from the payload so the specialised parsing
+        path runs instead of the generic ``strongest_patterns`` handler.
+        """
+
+        if declared_type:
+            return declared_type
+
+        if self._is_momentum_result(ticker_result):
+            return "momentum"
+
+        return None
 
     def _iter_historical_summaries(
         self,
@@ -2540,6 +2562,33 @@ class PatternExtractor:
             return weekdays[name.lower()]
         except KeyError as exc:  # pragma: no cover - defensive guard
             raise ValueError(f"Unknown weekday '{name}'") from exc
+
+    # ------------------------------------------------------------------
+    # Orderflow / Momentum helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_momentum_result(ticker_result: Mapping[str, Any]) -> bool:
+        if not isinstance(ticker_result, Mapping):
+            return False
+
+        if str(ticker_result.get("screen_type")) == "momentum":
+            return True
+
+        if "momentum_params" in ticker_result:
+            return True
+
+        for key, value in ticker_result.items():
+            if not isinstance(key, str) or not key.startswith("session_"):
+                continue
+            if not isinstance(value, Mapping):
+                continue
+            if any(
+                candidate in value and isinstance(value.get(candidate), Mapping)
+                for candidate in ("momentum_by_dayofweek", "correlations", "volatility")
+            ):
+                return True
+
+        return False
 
     # ------------------------------------------------------------------
     # Orderflow helpers
