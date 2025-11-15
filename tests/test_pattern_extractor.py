@@ -337,6 +337,88 @@ def test_pattern_metadata_includes_time_months_and_period_labels():
     weekend_pattern = patterns[weekend_key]
     assert weekend_pattern["metadata"]["months"] == [1, 2, 3]
 
+
+def test_pattern_extractor_emits_momentum_weekday_patterns():
+    ScreenParams = pattern_module.ScreenParams
+    params = ScreenParams(
+        screen_type="momentum",
+        name="usa_spring_momentum",
+        months=[3, 4, 5],
+        session_starts=["02:30", "08:30"],
+        session_ends=["10:30", "15:00"],
+        sess_start_hrs=1,
+        sess_start_minutes=30,
+        sess_end_hrs=1,
+        sess_end_mins=0,
+        tz="America/Chicago",
+    )
+
+    results = {
+        params.name: {
+            "CS": {
+                "filtered_months": [3, 4, 5],
+                "ticker": "CS",
+                "session_0": {
+                    "session_start": "02:30:00",
+                    "session_end": "10:30:00",
+                    "momentum_by_dayofweek": {
+                        "opening_momentum_by_dow": {
+                            "Monday": {
+                                "n": 30,
+                                "mean": 0.012,
+                                "std": 0.02,
+                                "sharpe": 0.6,
+                                "positive_pct": 0.6,
+                                "t_stat": 2.5,
+                                "skew": 0.1,
+                                "months_active": [3, 4, 5],
+                                "months_mask_12": "001110000000",
+                                "months_names": ["Mar", "Apr", "May"],
+                            },
+                            "anova": {
+                                "f_stat": 4.1,
+                                "p_value": 0.01,
+                                "significant": True,
+                            },
+                        },
+                        "summary": {
+                            "total_observations": 60,
+                            "n_weekdays_analyzed": 5,
+                            "significant_patterns": [
+                                {
+                                    "momentum_type": "opening_momentum",
+                                    "f_stat": 4.1,
+                                    "p_value": 0.01,
+                                }
+                            ],
+                        },
+                    },
+                },
+            }
+        }
+    }
+
+    screener = DummyScreener()
+    screener.data["CS"] = pd.DataFrame()
+
+    extractor = PatternExtractor(screener, results, [params])
+    patterns = extractor.filter_patterns("CS")
+
+    assert patterns, "Expected momentum patterns to be generated"
+    key, summary = next(iter(patterns.items()))
+    assert "momentum_weekday" in key
+    assert summary["pattern_type"] == "momentum_weekday"
+    metadata = summary["metadata"]
+    assert metadata["weekday"].lower() == "monday"
+    assert metadata["momentum_type"] == "opening_momentum"
+    assert metadata["session_key"] == "session_0"
+    assert metadata["window_anchor"] == "start"
+    assert metadata["window_minutes"] == params.sess_start_hrs * 60 + params.sess_start_minutes
+    assert metadata["bias"] == "long"
+    assert metadata["months"] == [3, 4, 5]
+    assert summary["strength"] == pytest.approx(2.5, rel=1e-6)
+
+
 def test_pe_promotes_months_from_results_to_metadata():
     results = {
         "seasonality": {

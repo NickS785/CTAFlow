@@ -199,6 +199,15 @@ class PatternExtractor:
         "months_active",
         "months_mask_12",
         "months_names",
+        "momentum_type",
+        "bias",
+        "session_key",
+        "session_index",
+        "session_start",
+        "session_end",
+        "session_tz",
+        "window_anchor",
+        "window_minutes",
         "target_times_hhmm",
         "period_length_min",
         "regime_filter",
@@ -1191,6 +1200,15 @@ class PatternExtractor:
         ticker_result: Mapping[str, Any],
         params: Optional[ScreenParamLike],
     ) -> Iterable[PatternSummary]:
+        if screen_type == "momentum":
+            yield from self._iter_momentum_summaries(
+                symbol=symbol,
+                screen_name=screen_name,
+                ticker_result=ticker_result,
+                params=params,
+            )
+            return
+
         strongest: Iterable[Dict[str, Any]] = ticker_result.get("strongest_patterns", [])  # type: ignore[assignment]
         for pattern in strongest:
             if not self._should_include_pattern(pattern):
@@ -1203,6 +1221,210 @@ class PatternExtractor:
                 pattern,
                 origin="strongest_patterns",
             )
+
+    def _iter_momentum_summaries(
+        self,
+        *,
+        symbol: str,
+        screen_name: str,
+        ticker_result: Mapping[str, Any],
+        params: Optional[ScreenParamLike],
+    ) -> Iterable[PatternSummary]:
+        momentum_sessions = [
+            (session_key, session_value)
+            for session_key, session_value in ticker_result.items()
+            if isinstance(session_key, str)
+            and session_key.startswith("session_")
+            and isinstance(session_value, Mapping)
+        ]
+
+        if not momentum_sessions:
+            return
+
+        for session_key, session_data in momentum_sessions:
+            if "error" in session_data:
+                continue
+
+            momentum_breakdown = session_data.get("momentum_by_dayofweek")
+            if not isinstance(momentum_breakdown, Mapping):
+                continue
+
+            for pattern in self._build_momentum_patterns(
+                ticker_result=ticker_result,
+                session_key=session_key,
+                session_data=session_data,
+                momentum_breakdown=momentum_breakdown,
+                params=params,
+            ):
+                yield self._build_summary(
+                    symbol,
+                    screen_name,
+                    "momentum",
+                    params,
+                    pattern,
+                    origin=f"{session_key}.momentum_by_dayofweek",
+                )
+
+    def _build_momentum_patterns(
+        self,
+        *,
+        ticker_result: Mapping[str, Any],
+        session_key: str,
+        session_data: Mapping[str, Any],
+        momentum_breakdown: Mapping[str, Any],
+        params: Optional[ScreenParamLike],
+    ) -> Iterable[Dict[str, Any]]:
+        momentum_map = {
+            "opening_momentum": "Opening momentum",
+            "closing_momentum": "Closing momentum",
+            "full_session": "Full session returns",
+            "st_momentum": "Short-term momentum",
+        }
+
+        session_index = self._parse_session_index(session_key)
+        session_start = session_data.get("session_start")
+        session_end = session_data.get("session_end")
+        session_tz = getattr(params, "tz", None) if params is not None else None
+        regime_meta = ticker_result.get("regime_filter")
+
+        for momentum_type, label in momentum_map.items():
+            series_key = f"{momentum_type}_by_dow"
+            dow_stats = momentum_breakdown.get(series_key)
+            if not isinstance(dow_stats, Mapping):
+                continue
+
+            for weekday_name, stats in dow_stats.items():
+                if weekday_name == "anova" or not isinstance(stats, Mapping):
+                    continue
+
+                t_stat = stats.get("t_stat")
+                if t_stat is None:
+                    continue
+                try:
+                    t_value = float(t_stat)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(t_value) or abs(t_value) < 1.96:
+                    continue
+
+                pattern: Dict[str, Any] = {
+                    "pattern_type": "momentum_weekday",
+                    "momentum_type": momentum_type,
+                    "weekday": weekday_name,
+                    "description": f"{label} skew on {weekday_name}",
+                    "t_stat": t_value,
+                    "strength": abs(t_value),
+                    "mean": stats.get("mean"),
+                    "sharpe": stats.get("sharpe"),
+                    "positive_pct": stats.get("positive_pct"),
+                    "skew": stats.get("skew"),
+                    "n": stats.get("n"),
+                    "bias": self._infer_momentum_bias(stats.get("mean")),
+                    "session_key": session_key,
+                    "session_index": session_index,
+                    "session_start": session_start,
+                    "session_end": session_end,
+                    "session_tz": session_tz,
+                    "window_anchor": self._momentum_window_anchor(momentum_type),
+                    "window_minutes": self._momentum_window_minutes(momentum_type, params),
+                }
+
+                months_active = stats.get("months_active")
+                if months_active:
+                    pattern["months_active"] = months_active
+                months_mask = stats.get("months_mask_12")
+                if months_mask:
+                    pattern["months_mask_12"] = months_mask
+                months_names = stats.get("months_names")
+                if months_names:
+                    pattern["months_names"] = months_names
+
+                filtered_months = ticker_result.get("filtered_months")
+                if filtered_months and "months_active" not in pattern:
+                    pattern["months_active"] = filtered_months
+
+                if regime_meta is not None:
+                    pattern["regime_filter"] = regime_meta
+
+                summary = momentum_breakdown.get("summary")
+                if isinstance(summary, Mapping):
+                    significant = summary.get("significant_patterns")
+                    if isinstance(significant, list):
+                        matched = next(
+                            (
+                                item
+                                for item in significant
+                                if isinstance(item, Mapping)
+                                and item.get("momentum_type") == momentum_type
+                            ),
+                            None,
+                        )
+                        if isinstance(matched, Mapping):
+                            if "p_value" in matched:
+                                pattern.setdefault("p_value", matched.get("p_value"))
+                            if "f_stat" in matched:
+                                pattern.setdefault("f_stat", matched.get("f_stat"))
+
+                yield pattern
+
+    @staticmethod
+    def _parse_session_index(session_key: str) -> Optional[int]:
+        match = re.match(r"session_(\d+)", session_key)
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _infer_momentum_bias(mean_value: Any) -> str:
+        try:
+            value = float(mean_value)
+        except (TypeError, ValueError):
+            return "neutral"
+        if not math.isfinite(value) or value == 0:
+            return "neutral"
+        return "long" if value > 0 else "short"
+
+    @staticmethod
+    def _momentum_window_anchor(momentum_type: str) -> str:
+        if momentum_type == "opening_momentum":
+            return "start"
+        if momentum_type == "closing_momentum":
+            return "end"
+        return "session"
+
+    @staticmethod
+    def _momentum_window_minutes(
+        momentum_type: str,
+        params: Optional[ScreenParamLike],
+    ) -> Optional[int]:
+        if params is None or not hasattr(params, "sess_start_hrs"):
+            return None
+
+        def _combine(hours: Any, minutes: Any) -> Optional[int]:
+            try:
+                total = int(hours or 0) * 60 + int(minutes or 0)
+            except (TypeError, ValueError):
+                return None
+            return total if total > 0 else None
+
+        if momentum_type == "opening_momentum":
+            hours = getattr(params, "sess_start_hrs", None)
+            minutes = getattr(params, "sess_start_minutes", None)
+            return _combine(hours, minutes)
+
+        if momentum_type == "closing_momentum":
+            hours = getattr(params, "sess_end_hrs", None)
+            minutes = getattr(params, "sess_end_mins", None)
+            if hours is None:
+                hours = getattr(params, "sess_start_hrs", None)
+            if minutes is None:
+                minutes = getattr(params, "sess_start_minutes", None)
+            return _combine(hours, minutes)
+
+        return None
 
     @classmethod
     def _should_include_pattern(cls, pattern: Mapping[str, Any]) -> bool:
@@ -1353,7 +1575,7 @@ class PatternExtractor:
         description = str(pattern.get("description", pattern_type))
 
         qualifiers: List[str] = [pattern_type]
-        for key in ("day", "time", "lag", "month"):
+        for key in ("day", "weekday", "time", "lag", "month", "momentum_type", "session_key"):
             if key in pattern and pattern[key] is not None:
                 qualifiers.append(str(pattern[key]))
         key = "|".join([screen_name, *qualifiers])
@@ -1395,6 +1617,17 @@ class PatternExtractor:
             "months_names",
             "target_times_hhmm",
             "period_length_min",
+            "momentum_type",
+            "bias",
+            "session_key",
+            "session_index",
+            "session_start",
+            "session_end",
+            "session_tz",
+            "window_anchor",
+            "window_minutes",
+            "positive_pct",
+            "skew",
         ):
             value = payload_dict.get(meta_key)
             if value is not None and meta_key not in metadata:
