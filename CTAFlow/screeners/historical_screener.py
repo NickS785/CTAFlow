@@ -1207,6 +1207,11 @@ class HistoricalScreener:
             override_session_ends = momentum_kwargs.pop('session_ends', params.session_ends)
             selected_months_override = momentum_kwargs.pop('_selected_months', None)
             precomputed_sessions = momentum_kwargs.pop('_precomputed_sessions', None)
+            override_use_regime_filtering = momentum_kwargs.pop(
+                'use_regime_filtering', params.use_regime_filtering
+            )
+            override_regime_col = momentum_kwargs.pop('regime_col', params.regime_col)
+            override_target_regimes = momentum_kwargs.pop('target_regimes', params.target_regimes)
 
             # Run momentum screen with provided parameters
             return self.intraday_momentum_screen(
@@ -1222,9 +1227,9 @@ class HistoricalScreener:
                 season=params.season,
                 _selected_months=selected_months_override,
                 _precomputed_sessions=precomputed_sessions,
-                use_regime_filtering=params.use_regime_filtering,
-                regime_col=params.regime_col,
-                target_regimes=params.target_regimes,
+                use_regime_filtering=override_use_regime_filtering,
+                regime_col=override_regime_col,
+                target_regimes=override_target_regimes,
                 **momentum_kwargs
             )
 
