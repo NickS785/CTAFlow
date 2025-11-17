@@ -369,6 +369,7 @@ class HistoricalScreener:
         season: Optional[str] = None,
         _selected_months: Optional[List[int]] = None,
         _precomputed_sessions: Optional[Dict[str, Dict[str, any]]] = None,
+        tz: str = "America/Chicago",
         use_regime_filtering: bool = False,
         regime_col: Optional[str] = None,
         target_regimes: Optional[List[int]] = None,
@@ -406,6 +407,8 @@ class HistoricalScreener:
             - spring: Mar, Apr, May (3, 4, 5)
             - summer: Jun, Jul, Aug (6, 7, 8)
             - fall: Sep, Oct, Nov (9, 10, 11)
+        tz : str
+            Olson timezone string used to interpret session windows (default "America/Chicago").
         use_regime_filtering : bool
             Apply a discrete regime filter to the underlying dataset before computing
             statistics.
@@ -483,6 +486,7 @@ class HistoricalScreener:
             self.logger.info(f"  Momentum days: {st_momentum_days}, Opening window: {sess_start_hrs}h {sess_start_minutes}m")
             if selected_months:
                 self.logger.info(f"  Filtering to months: {selected_months}")
+            self.logger.info(f"  Timezone: {tz}")
 
         results = {}
         precomputed_sessions = _precomputed_sessions or {}
@@ -522,7 +526,10 @@ class HistoricalScreener:
                     else:
                         ticker_data = self.data[t]
 
-                    if ticker_data.empty:
+                    if ticker_data is not None and not ticker_data.empty:
+                        ticker_data = self._localize_intraday_index(ticker_data, tz)
+
+                    if ticker_data is None or ticker_data.empty:
                         return (t, {'error': 'No data available', 'regime_filter': None})
 
                     # Filter by months/season if specified
@@ -787,6 +794,8 @@ class HistoricalScreener:
                 if data.empty:
                     return (ticker, {'error': 'No data available', 'regime_filter': None})
 
+                data = self._localize_intraday_index(data, tz)
+
                 # Filter to session window in local timezone
                 session_data = filter_session_bars(
                     data,
@@ -988,6 +997,7 @@ class HistoricalScreener:
         self,
         session_pairs: Tuple[Tuple[time, time], ...],
         selected_months: Optional[List[int]],
+        tz: str = "America/Chicago",
         *,
         use_regime_filtering: bool = False,
         regime_col: Optional[str] = None,
@@ -1004,6 +1014,17 @@ class HistoricalScreener:
                 base_data = synthetic_obj.price if hasattr(synthetic_obj, 'price') else synthetic_obj.data_engine.build_spread_series(return_ohlc=True)
             else:
                 base_data = self.data[ticker]
+
+            if base_data is None or base_data.empty:
+                cache[ticker] = {
+                    'data': None,
+                    'is_synthetic': is_synthetic,
+                    'filtered_months': selected_months if selected_months else 'all',
+                    'error': 'No data available'
+                }
+                continue
+
+            base_data = self._localize_intraday_index(base_data, tz)
 
             if base_data.empty:
                 cache[ticker] = {
@@ -1144,6 +1165,7 @@ class HistoricalScreener:
                 Tuple[time, ...],
                 Optional[Tuple[int, ...]],
                 Optional[Tuple[str, Tuple[int, ...]]],
+                str,
             ],
             Dict[str, Dict[str, Any]],
         ] = {}
@@ -1158,12 +1180,13 @@ class HistoricalScreener:
                 if params.use_regime_filtering and params.regime_col and params.target_regimes:
                     regime_key = (params.regime_col, tuple(params.target_regimes))
 
-                cache_key = (tuple(session_starts), tuple(session_ends), months_key, regime_key)
+                cache_key = (tuple(session_starts), tuple(session_ends), months_key, regime_key, params.tz)
 
                 if cache_key not in momentum_cache:
                     momentum_cache[cache_key] = self._prepare_momentum_session_cache(
                         session_pairs,
                         selected_months,
+                        tz=params.tz,
                         use_regime_filtering=params.use_regime_filtering,
                         regime_col=params.regime_col,
                         target_regimes=params.target_regimes,
@@ -1258,6 +1281,7 @@ class HistoricalScreener:
                 season=params.season,
                 _selected_months=selected_months_override,
                 _precomputed_sessions=precomputed_sessions,
+                tz=params.tz,
                 use_regime_filtering=override_use_regime_filtering,
                 regime_col=override_regime_col,
                 target_regimes=override_target_regimes,
@@ -2872,6 +2896,38 @@ class HistoricalScreener:
             'months_mask_12': mask,
             'months_names': names,
         }
+
+    def _localize_intraday_index(self, data: pd.DataFrame, tz: str) -> pd.DataFrame:
+        """Return a copy of ``data`` with a timezone-aware index/``ts`` column."""
+
+        if data is None or data.empty:
+            return data
+
+        localized = data.copy()
+
+        def _localize_values(values: Union[pd.Index, pd.Series]) -> pd.DatetimeIndex:
+            dt_values = pd.to_datetime(values, errors='coerce')
+            dt_index = pd.DatetimeIndex(dt_values)
+            if dt_index.tz is None:
+                return dt_index.tz_localize(tz)
+            return dt_index.tz_convert(tz)
+
+        if isinstance(localized.index, pd.DatetimeIndex):
+            idx = localized.index
+            if idx.tz is None:
+                localized.index = idx.tz_localize(tz)
+            else:
+                localized.index = idx.tz_convert(tz)
+        elif 'ts' in localized.columns:
+            localized.index = _localize_values(localized['ts'])
+        else:
+            localized.index = _localize_values(localized.index)
+
+        if 'ts' in localized.columns:
+            ts_localized = _localize_values(localized['ts'])
+            localized['ts'] = pd.Series(ts_localized, index=localized.index)
+
+        return localized
 
     def _analyze_by_month(
         self,
