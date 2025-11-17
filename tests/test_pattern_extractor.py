@@ -275,7 +275,9 @@ def test_seasonality_pattern_keys_preserved_with_target_time():
     patterns = extractor.patterns["CL"]
 
     assert "seasonality_scan|time_predictive_nextday|07:00" in patterns
-    assert "seasonality_scan|weekend_hedging" in patterns
+    assert any(
+        key.startswith("seasonality_scan|weekend_hedging") for key in patterns
+    )
 
     tod_summary = patterns["seasonality_scan|time_predictive_nextday|07:00"]
     assert tod_summary["metadata"].get("target_times_hhmm") == ["07:00"]
@@ -446,6 +448,9 @@ def test_pattern_extractor_emits_momentum_weekday_patterns():
                                 "months_active": [3, 4, 5],
                                 "months_mask_12": "001110000000",
                                 "months_names": ["Mar", "Apr", "May"],
+                                "p_value_vs_rest": 0.005,
+                                "cohen_d_vs_rest": 0.6,
+                                "significant_vs_rest": True,
                             },
                             "anova": {
                                 "f_stat": 4.1,
@@ -515,18 +520,24 @@ def test_pattern_extractor_extracts_momentum_correlation_and_volatility_patterns
             "st_momentum_days": params.st_momentum_days,
             "period_length_min": params.period_length,
         },
-        "momentum_by_dayofweek": {
-            "full_session_by_dow": {
-                "Monday": {
-                    "mean": -0.001,
-                    "t_stat": -2.1,
-                    "n": 100,
-                },
-                "Friday": {
-                    "mean": 0.0025,
-                    "t_stat": 2.8,
-                    "n": 110,
-                },
+                "momentum_by_dayofweek": {
+                    "full_session_by_dow": {
+                        "Monday": {
+                            "mean": -0.001,
+                            "t_stat": -2.1,
+                            "n": 100,
+                            "p_value_vs_rest": 0.004,
+                            "cohen_d_vs_rest": -0.4,
+                            "significant_vs_rest": True,
+                        },
+                        "Friday": {
+                            "mean": 0.0025,
+                            "t_stat": 2.8,
+                            "n": 110,
+                            "p_value_vs_rest": 0.009,
+                            "cohen_d_vs_rest": 0.5,
+                            "significant_vs_rest": True,
+                        },
                 "anova": {
                     "significant": True,
                     "p_value": 0.01,
@@ -643,6 +654,9 @@ def test_pattern_extractor_detects_momentum_without_params():
                                 "mean": 0.0015,
                                 "t_stat": 2.2,
                                 "positive_pct": 0.58,
+                                "p_value_vs_rest": 0.01,
+                                "cohen_d_vs_rest": 0.4,
+                                "significant_vs_rest": True,
                             },
                         }
                     },

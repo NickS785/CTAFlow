@@ -246,13 +246,12 @@ def test_screener_pipeline_emits_momentum_gates():
 
     active_mask = (
         (features["weekday"] == "Tuesday")
-        & (features["clock_time"] >= "02:30:00")
-        & (features["clock_time"] <= "04:00:00")
+        & (features["clock_time"] == "02:30:00")
     )
-    assert active_mask.any()
+    assert active_mask.sum() == 1
     assert features.loc[active_mask, gate_col].eq(1).all()
 
-    off_window = (features["weekday"] == "Tuesday") & (features["clock_time"] > "04:00:00")
+    off_window = ~active_mask
     assert features.loc[off_window, gate_col].eq(0).all()
     monday_mask = features["weekday"] == "Monday"
     assert features.loc[monday_mask, gate_col].eq(0).all()
