@@ -31,3 +31,25 @@ def test_prediction_to_position_handles_empty_frame():
     df = pd.DataFrame(columns=["ts_decision", "returns_x", "returns_y"])
     resolved = resolver.aggregate(df)
     assert resolved.empty
+
+
+def test_resolve_collapses_with_group_members():
+    resolver = PredictionToPosition()
+    ts = pd.Timestamp("2024-01-01 08:30", tz="UTC")
+    df = pd.DataFrame(
+        {
+            "ts_decision": [ts, ts, ts + pd.Timedelta(hours=1)],
+            "returns_x": [0.1, -0.4, 0.2],
+            "returns_y": [0.05, 0.1, -0.2],
+            "correlation": [0.4, 0.9, 0.7],
+            "momentum_type": ["open", "close", "open"],
+        }
+    )
+
+    resolved = resolver.resolve(df, group_field="momentum_type")
+
+    assert len(resolved) == 2
+    first = resolved.iloc[0]
+    assert first["returns_x"] == pytest.approx(-0.4)
+    assert first["momentum_type"] == "close"
+    assert first["_group_members"] == ["open", "close"]
