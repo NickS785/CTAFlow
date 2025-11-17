@@ -179,14 +179,14 @@ class ScreenParams:
                 self.name = f"all_{self.screen_type}"
 
     @property
-    def sess_end_minutes(self) -> Optional[int]:
-        """Expose ``sess_end_mins`` under the full ``*_minutes`` name."""
+    def sess_end_mins(self) -> Optional[int]:
+        """Backwards-compatible alias for ``sess_end_minutes``."""
 
-        return self.sess_end_mins
+        return self.sess_end_minutes
 
-    @sess_end_minutes.setter
-    def sess_end_minutes(self, value: Optional[int]) -> None:
-        self.sess_end_mins = value
+    @sess_end_mins.setter
+    def sess_end_mins(self, value: Optional[int]) -> None:
+        self.sess_end_minutes = value
 
 
 class HistoricalScreener:
@@ -1532,6 +1532,9 @@ class HistoricalScreener:
         # Without shift, today's full_session_returns would be included in st_momentum, creating spurious correlations
         st_momentum = full_session_returns.shift(1).rolling(window=momentum_days).sum()
 
+        # Returns for the rest of the session (used by momentum_sc patterns)
+        rest_of_session_returns = (full_session_returns - closing_returns).dropna()
+
         # Correlation analysis
         correlation_stats = self._calculate_momentum_correlations(
             opening_returns,
@@ -1601,7 +1604,9 @@ class HistoricalScreener:
                 'opening_returns': opening_returns,
                 'closing_returns': closing_returns,
                 'full_session_returns': full_session_returns,
-                'st_momentum': st_momentum
+                'st_momentum': st_momentum,
+                'rest_of_session_returns': rest_of_session_returns,
+                'session_pre_close_returns': rest_of_session_returns,
             }
         }
 
