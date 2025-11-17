@@ -12,6 +12,7 @@ This module contains:
 from .screener_pipeline import ScreenerPipeline, HorizonMapper, ScreenerBacktester
 from .sessionizer import Sessionizer, SessionizerConfig
 from .backtester import BacktestSummary
+from .prediction_to_position import PredictionToPosition
 
 __all__ = [
     'ScreenerPipeline',
@@ -20,6 +21,7 @@ __all__ = [
     "Sessionizer",
     "SessionizerConfig",
     "BacktestSummary",
+    "PredictionToPosition",
 ]
 
 try:

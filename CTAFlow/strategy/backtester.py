@@ -28,6 +28,7 @@ class ScreenerBacktester:
     def __init__(self, *, annualisation: int = 252, risk_free_rate: float = 0.0) -> None:
         self.annualisation = annualisation
         self.risk_free_rate = risk_free_rate
+        self._collision_resolver = PredictionToPosition()
 
     def threshold(
         self,
@@ -72,6 +73,8 @@ class ScreenerBacktester:
                 "monthly": pd.Series(dtype=float),
                 "cumulative": pd.Series(dtype=float),
             }
+
+        frame = self._collision_resolver.resolve(frame, group_field=group_field)
 
         direction = np.sign(frame["returns_x"])
         if use_side_hint and "side_hint" in frame.columns:
@@ -124,18 +127,36 @@ class ScreenerBacktester:
         }
 
         if group_field and group_field in frame.columns:
-            grouped_results: Dict[Any, Dict[str, float]] = {}
             grouped_frame = frame.loc[signal_mask].copy()
+            grouped_results: Dict[Any, Dict[str, float]] = {}
             if not grouped_frame.empty:
-                for level, subset in grouped_frame.groupby(group_field):
-                    level_positions = positions.loc[subset.index]
-                    level_pnl = pnl.loc[subset.index]
-                    grouped_results[level] = {
-                        "trades": int((level_positions != 0).sum()),
-                        "total_return": float(level_pnl.sum()),
-                        "mean_return": float(level_pnl.mean()) if not level_pnl.empty else 0.0,
-                    }
-            result["group_breakdown"] = grouped_results
+                for idx, row in grouped_frame.iterrows():
+                    members = row.get("_group_members") if "_group_members" in row else None
+                    if not members:
+                        value = row.get(group_field)
+                        members = [] if pd.isna(value) else [value]
+                    if not members:
+                        continue
+                    share = 1.0 / len(members)
+                    row_position = positions.loc[idx]
+                    row_pnl = pnl.loc[idx]
+                    for member in members:
+                        stats = grouped_results.setdefault(
+                            member,
+                            {"trades": 0, "total_return": 0.0, "_pnl_count": 0.0},
+                        )
+                        stats["trades"] += int(row_position != 0)
+                        stats["total_return"] += float(row_pnl * share)
+                        stats["_pnl_count"] += share
+            formatted: Dict[Any, Dict[str, float]] = {}
+            for member, stats in grouped_results.items():
+                count = stats.get("_pnl_count", 1.0) or 1.0
+                formatted[member] = {
+                    "trades": stats.get("trades", 0),
+                    "total_return": stats.get("total_return", 0.0),
+                    "mean_return": stats.get("total_return", 0.0) / count,
+                }
+            result["group_breakdown"] = formatted
             result["group_field"] = group_field
 
         return result

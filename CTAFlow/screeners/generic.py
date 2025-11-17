@@ -7,11 +7,27 @@ from CTAFlow.config import DLY_DATA_PATH
 
 two_h = timedelta(hours=2)
 energy_tickers = ["HO", "RB", "CL", "NG"]
-period_time = timedelta(hours=2, minutes=0)
+period_time = timedelta(hours=1, minutes=30)
 london_start, london_end = time(hour=2, minute=30), time(hour=11, minute=30)
 usa_start, usa_end = time(hour=8, minute=30), time(hour=15, minute=30)
-fall = {'month_filter':[9,10,11]}
-spring = {'month_filter': [3,4,5]}
+winter, spring, summer, fall = {'months':[12,1,2,3]}, {'months':[3,4,5]}, {'months':[5,6,7,8]}, {'months':[9,10,11]}
+livestock_session =dict(seasonality_session_start=time(hour=8, minute=30), seasonality_session_end=time(hour=13, minute=0), session_starts=["08:30"], session_ends=["13:00"])
+livestock_tgt_times = ["9:00", "9:30", "11:00", "12:00"]
+seasonal_livestock_params = dict(screen_type="seasonality", target_times=livestock_tgt_times, period_length=period_time)
+momentum_livestock_params = dict(screen_type="momentum", sess_start_hrs=1, sess_start_minutes=0)
+livestock_seasonal = ScreenParams( name="livestock_seasonal", **seasonal_livestock_params, **livestock_session)
+livestock_winter = ScreenParams(name="livestock_seasonal_winter", **seasonal_livestock_params, **livestock_session, **winter)
+livestock_summer = ScreenParams(name="livestock_seasonal_summer", **seasonal_livestock_params, **livestock_session, **summer)
+livestock_fall = ScreenParams(name="livestock_seasonal_fall", **seasonal_livestock_params, **livestock_session, **fall)
+livestock_spring = ScreenParams(name="livestock_seasonal_spring", **seasonal_livestock_params, **livestock_session, **spring)
+livestock_momentum = ScreenParams(name="livestock_momentum", **momentum_livestock_params, **livestock_session)
+livestock_winter_momentum = ScreenParams(name="livestock_winter_momo", **momentum_livestock_params, **livestock_session, **winter)
+livestock_spring_momentum = ScreenParams(name="livestock_spring_momo", **momentum_livestock_params, **livestock_session, **spring)
+livestock_fall_momentum = ScreenParams(name="livestock_fall_momo", **momentum_livestock_params, **livestock_session, **fall)
+livestock_summer_momentum = ScreenParams(name="livestock_summer_momo", **momentum_livestock_params, **livestock_session, **summer)
+
+livestock_seasonals = [livestock_seasonal, livestock_spring, livestock_fall, livestock_winter, livestock_summer]
+livestock_momentums = [livestock_momentum, livestock_spring_momentum, livestock_fall_momentum, livestock_winter_momentum, livestock_summer_momentum]
 london_tgt_times = ["3:00", "03:30", "02:30", "07:30", "09:30"]
 usa_tgt_times = ["08:30", "10:30","9:00", "13:30"]
 
@@ -70,6 +86,11 @@ london_seasonals = [london_fall_seasonality, london_winter_seasonality, london_s
 momentums = [spring_momentum, summer_momentum, fall_momentum, winter_momentum, momentum_generic]
 us_session = {'session_start':"08:30", 'session_end':"15:30"}
 london_session = {'session_start':"02:30", "session_end":"10:30"}
+
+fall = {'month_filter':[9,10,11]}
+spring = {'month_filter': [3,4,5]}
+winter = {'month_filter': [12,1,2,3]}
+summer = {'month_filter': [5,6,7,8]}
 us_of_screen = OrderflowParams(session_start="08:30", session_end="15:30")
 us_of_fall = OrderflowParams(**us_session, **fall, vpin_window=25    , name="us_of_fall")
 us_of_spring = OrderflowParams(**us_session, **spring, vpin_window=25, name="us_of_spring")
@@ -82,3 +103,4 @@ london_of_spring = OrderflowParams(**london_session, **spring, vpin_window=25, n
 london_of_fall = OrderflowParams(**london_session, **fall, vpin_window=25, name="london_of_fall")
 london_of_all = [london_of, london_of_winter, london_of_summer, london_of_spring, london_of_fall]
 us_of_all = [us_of_screen, us_of_fall, us_of_summer, us_of_spring, us_of_winter]
+

@@ -131,3 +131,30 @@ def test_backtester_group_breakdown():
     assert set(breakdown.keys()) == {"opening", "closing"}
     assert breakdown["opening"]["trades"] == 1
     assert breakdown["closing"]["total_return"] == pytest.approx(-0.1)
+
+
+def test_backtester_collapses_duplicate_decisions():
+    ts = pd.Timestamp("2024-01-01 14:00", tz="UTC")
+    xy = pd.DataFrame(
+        {
+            "ts_decision": [ts, ts],
+            "gate": ["g1", "g2"],
+            "pattern_type": ["momentum_weekday", "momentum_weekday"],
+            "returns_x": [0.2, -0.4],
+            "returns_y": [0.1, 0.1],
+            "correlation": [0.5, 0.9],
+            "side_hint": [1, -1],
+        }
+    )
+
+    backtester = backtester_module.ScreenerBacktester()
+    result = backtester.threshold(xy)
+
+    pnl = result["pnl"]
+    positions = result["positions"]
+
+    assert len(pnl) == 1
+    assert len(positions) == 1
+    assert positions.iloc[0] == -1
+    assert pnl.iloc[0] == pytest.approx(-0.1)
+    assert result["summary"].trades == 1

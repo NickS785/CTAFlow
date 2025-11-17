@@ -1549,6 +1549,15 @@ class PatternExtractor:
 
     @staticmethod
     def _apply_momentum_context(pattern: Dict[str, Any], context: Mapping[str, Any]) -> None:
+        if "window_minutes" not in pattern:
+            momentum_type = pattern.get("momentum_type")
+            if momentum_type == "opening_momentum" and "opening_window_minutes" in context:
+                pattern["window_minutes"] = context.get("opening_window_minutes")
+            elif momentum_type == "closing_momentum" and "closing_window_minutes" in context:
+                pattern["window_minutes"] = context.get("closing_window_minutes")
+            elif "period_length_min" in context:
+                pattern["window_minutes"] = context.get("period_length_min")
+
         for key, value in context.items():
             pattern.setdefault(key, value)
 
@@ -1931,17 +1940,10 @@ class PatternExtractor:
         if params is None or not hasattr(params, "sess_start_hrs"):
             return None
 
-        def _combine(hours: Any, minutes: Any) -> Optional[int]:
-            try:
-                total = int(hours or 0) * 60 + int(minutes or 0)
-            except (TypeError, ValueError):
-                return None
-            return total if total > 0 else None
-
         if momentum_type == "opening_momentum":
             hours = getattr(params, "sess_start_hrs", None)
             minutes = getattr(params, "sess_start_minutes", None)
-            return _combine(hours, minutes)
+            return PatternExtractor._combine_minutes(hours, minutes)
 
         if momentum_type == "closing_momentum":
             hours = getattr(params, "sess_end_hrs", None)
@@ -1950,9 +1952,17 @@ class PatternExtractor:
                 hours = getattr(params, "sess_start_hrs", None)
             if minutes is None:
                 minutes = getattr(params, "sess_start_minutes", None)
-            return _combine(hours, minutes)
+            return PatternExtractor._combine_minutes(hours, minutes)
 
         return None
+
+    @staticmethod
+    def _combine_minutes(hours: Any, minutes: Any) -> Optional[int]:
+        try:
+            total = int(hours or 0) * 60 + int(minutes or 0)
+        except (TypeError, ValueError):
+            return None
+        return total if total > 0 else None
 
     @classmethod
     def _should_include_pattern(cls, pattern: Mapping[str, Any]) -> bool:

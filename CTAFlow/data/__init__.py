@@ -25,6 +25,7 @@ from .classifications_reference import (
     get_all_classifications
 )
 from .raw_formatting.synthetic import CrossProductEngine, IntradaySpreadEngine , CrossSpreadLeg, IntradayLeg
+from .raw_formatting.intraday_manager import read_exported_df, read_synthetic_csv
 
 # Data processing utilities
 try:
@@ -59,6 +60,8 @@ __all__ = [
     'convert_cot_date_to_datetime',
     "DLYFolderUpdater",
     "DLYContractManager",
+    "read_synthetic_csv",
+    "read_exported_df",
 
     # Classification mappings
     'COMMODITY_TICKERS',
