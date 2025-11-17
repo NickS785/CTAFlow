@@ -28,6 +28,7 @@ if TYPE_CHECKING:  # pragma: no cover - import for type checking only
     from .sessionizer import Sessionizer
 
 from .backtester import ScreenerBacktester
+from .prediction_to_position import PredictionToPosition
 
 __all__ = [
     "ScreenerPipeline",
@@ -35,6 +36,7 @@ __all__ = [
     "HorizonMapper",
     "HorizonSpec",
     "ScreenerBacktester",
+    "PredictionToPosition",
 ]
 
 
@@ -137,6 +139,9 @@ class ScreenerPipeline:
     #: Pattern types emitted by the momentum extractor
     _MOMENTUM_TYPES = {
         "momentum_weekday",
+        "momentum_oc",
+        "momentum_cc",
+        "momentum_sc",
     }
 
     def __init__(self, tz: str = "America/Chicago", time_match: str = "auto", log: Any = None) -> None:
@@ -237,13 +242,26 @@ class ScreenerPipeline:
         annualisation: int = 252,
         risk_free_rate: float = 0.0,
         include_metadata: Optional[Iterable[str]] = None,
+        prediction_resolver: Optional[PredictionToPosition] = None,
         **build_xy_kwargs: Any,
     ) -> Dict[str, Any]:
         """Materialise decision rows and run a threshold backtest."""
 
         xy_kwargs = dict(build_xy_kwargs)
-        if include_metadata is not None:
-            xy_kwargs["include_metadata"] = include_metadata
+        combined_meta: List[str] = []
+
+        def _extend_meta(source: Any) -> None:
+            if source is None:
+                return
+            if isinstance(source, str):
+                combined_meta.append(source)
+                return
+            combined_meta.extend(list(source))
+
+        _extend_meta(xy_kwargs.pop("include_metadata", None))
+        _extend_meta(include_metadata)
+        combined_meta.append("correlation")
+        xy_kwargs["include_metadata"] = list(dict.fromkeys(filter(None, combined_meta)))
 
         tester = ScreenerBacktester(
             annualisation=annualisation,
@@ -270,7 +288,13 @@ class ScreenerPipeline:
         )
 
         xy = mapper.build_xy(bars_with_features, patterns, **xy_kwargs)
-        return tester.threshold(xy, threshold=threshold, use_side_hint=use_side_hint)
+        resolver = prediction_resolver if prediction_resolver is not None else PredictionToPosition()
+        return tester.threshold(
+            xy,
+            threshold=threshold,
+            use_side_hint=use_side_hint,
+            prediction_resolver=resolver,
+        )
 
     # ------------------------------------------------------------------
     # Normalisation helpers
@@ -423,6 +447,60 @@ class ScreenerPipeline:
             names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
             return names[int(value) % 7]
         return str(value).strip().lower() or None
+
+    @classmethod
+    def _momentum_weekday_info(
+        cls, payload: Mapping[str, Any], metadata: Mapping[str, Any]
+    ) -> Tuple[Optional[str], str]:
+        def _iter_candidates(candidate: Any) -> Iterable:
+            if candidate is None:
+                return ()
+            if isinstance(candidate, (list, tuple, set)):
+                return candidate
+            return (candidate,)
+
+        sources: List[Any] = [
+            payload.get("weekday"),
+            payload.get("day"),
+            metadata.get("weekday"),
+            metadata.get("best_weekday"),
+            metadata.get("strongest_days"),
+            payload.get("strongest_days"),
+        ]
+
+        for candidate in sources:
+            for entry in _iter_candidates(candidate):
+                normalized = cls._normalize_weekday(entry)
+                if normalized:
+                    return normalized, normalized
+
+        return None, "all_days"
+
+    @classmethod
+    def _momentum_base_suffix(
+        cls,
+        payload: Mapping[str, Any],
+        metadata: Mapping[str, Any],
+        pattern_type: Optional[str] = None,
+    ) -> Tuple[Optional[str], str]:
+        weekday_norm, weekday_token = cls._momentum_weekday_info(payload, metadata)
+        momentum_type = (
+            payload.get("momentum_type")
+            or metadata.get("momentum_type")
+            or "momentum"
+        )
+        pattern_token = cls._slugify(pattern_type) if pattern_type else None
+        session_key = metadata.get("session_key") or payload.get("session_key")
+        session_index = metadata.get("session_index") or payload.get("session_index")
+        if pattern_token in {"momentum_cc", "momentum_sc", "momentum_oc"}:
+            suffix = f"{pattern_token}_{cls._slugify(momentum_type)}_{weekday_token}"
+        else:
+            suffix = f"momentum_{momentum_type}_{weekday_token}"
+        if session_key:
+            suffix = f"{suffix}_{cls._slugify(str(session_key))}"
+        elif session_index is not None:
+            suffix = f"{suffix}_session{session_index}"
+        return weekday_norm, suffix
 
     def _broadcast_sidecar(self, df: pd.DataFrame, mask: pd.Series, value: Any) -> pd.Series:
         if isinstance(value, pd.Series):
@@ -670,17 +748,21 @@ class ScreenerPipeline:
         payload = pattern.get("pattern_payload", {}) or {}
         metadata = pattern.get("metadata", {}) or {}
 
-        weekday_norm = self._normalize_weekday(payload.get("weekday") or metadata.get("weekday"))
+        weekday_norm, base_suffix = self._momentum_base_suffix(
+            payload, metadata, pattern_type
+        )
+
         if weekday_norm is None:
-            return []
+            mask = pd.Series(True, index=df.index, dtype=bool)
+        else:
+            mask = df["weekday_lower"] == weekday_norm
 
         months = self._resolve_months(key, pattern)
-
-        mask = df["weekday_lower"] == weekday_norm
         mask &= self._months_mask(df, months)
 
         session_start = payload.get("session_start") or metadata.get("session_start")
         session_end = payload.get("session_end") or metadata.get("session_end")
+        session_tz = metadata.get("session_tz") or payload.get("session_tz")
         window_anchor = str(payload.get("window_anchor") or metadata.get("window_anchor") or "session").lower()
         session_tz = metadata.get("session_tz")
 
@@ -746,10 +828,8 @@ class ScreenerPipeline:
 
         window_minutes_int = _resolve_window_minutes()
 
-        start_hms, _ = self._time_to_strings(session_start)
-        end_hms, _ = self._time_to_strings(session_end)
-        start_hms = self._convert_session_clock(start_hms, session_tz)
-        end_hms = self._convert_session_clock(end_hms, session_tz)
+        start_hms, _ = self._session_clock_strings(session_start, session_tz)
+        end_hms, _ = self._session_clock_strings(session_end, session_tz)
 
         lower_bound = start_hms
         upper_bound = end_hms
@@ -771,6 +851,10 @@ class ScreenerPipeline:
                 mask &= df["clock_time"] <= upper_bound
 
         mask = self._anchor_session_mask(df, mask, window_anchor=window_anchor)
+
+        momentum_type = payload.get("momentum_type") or metadata.get("momentum_type") or "momentum"
+        session_key = payload.get("session_key") or metadata.get("session_key")
+        session_index = payload.get("session_index") or metadata.get("session_index")
         bias = payload.get("bias") or metadata.get("bias")
         if bias is None:
             mean_value = payload.get("mean")
@@ -787,14 +871,6 @@ class ScreenerPipeline:
                     bias = "neutral"
             else:
                 bias = "neutral"
-
-        base_suffix = f"momentum_{momentum_type}_{weekday_norm}"
-        session_key = payload.get("session_key") or metadata.get("session_key")
-        session_index = payload.get("session_index") or metadata.get("session_index")
-        if session_key:
-            base_suffix += f"_{session_key}"
-        elif session_index is not None:
-            base_suffix += f"_session{session_index}"
 
         base = self._feature_base_name(key, base_suffix)
 
@@ -827,6 +903,7 @@ class ScreenerPipeline:
             "session_index": session_index,
             "session_start": start_hms,
             "session_end": end_hms,
+            "session_tz": session_tz or self.tz,
             "window_anchor": window_anchor,
             "window_minutes": window_minutes_int,
             "period_length_min": period_minutes,
@@ -1076,6 +1153,19 @@ class ScreenerPipeline:
             return head, f"{head}.{frac}"
         hms = parsed.strftime("%H:%M:%S")
         return hms, parsed.strftime("%H:%M:%S.%f")
+
+    def _session_clock_strings(
+        self, value: Any, source_tz: Optional[str]
+    ) -> Tuple[Optional[str], Optional[str]]:
+        hms, hmsf = self._time_to_strings(value)
+        if hms is None or not source_tz or source_tz == self.tz:
+            return hms, hmsf
+        try:
+            base = pd.Timestamp(f"2000-01-01 {hms}", tz=source_tz)
+            converted = base.tz_convert(self.tz)
+        except Exception:
+            return hms, hmsf
+        return converted.strftime("%H:%M:%S"), converted.strftime("%H:%M:%S.%f")
 
     @staticmethod
     def _combine_minutes(hours: Any, minutes: Any) -> Optional[int]:
@@ -1964,7 +2054,7 @@ class HorizonMapper:
                 )
                 continue
 
-            if pattern_type == "momentum_weekday":
+            if pattern_type in ScreenerPipeline._MOMENTUM_TYPES:
                 returns_x_series, returns_y = self._momentum_xy_series(
                     df,
                     pattern,
@@ -2393,6 +2483,11 @@ class HorizonMapper:
             for suffix in order:
                 if weekday_norm and suffix:
                     candidates.append(f"oflow_peak_{weekday_norm}_{suffix}_{metric}_{bias}_gate")
+        elif pattern_type in ScreenerPipeline._MOMENTUM_TYPES:
+            _, suffix = ScreenerPipeline._momentum_base_suffix(
+                payload, metadata, pattern_type
+            )
+            candidates.append(f"{suffix}_gate")
 
         explicit = payload.get("gate") or metadata.get("gate")
         if isinstance(explicit, str) and explicit:

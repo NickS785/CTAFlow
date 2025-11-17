@@ -267,6 +267,117 @@ def test_screener_pipeline_emits_momentum_gates():
     assert features.loc[active_mask, session_col].eq("session_0").all()
 
 
+def test_screener_pipeline_supports_momentum_correlations_without_weekday():
+    tz = "America/Chicago"
+    monday = pd.date_range("2024-03-04 08:00", "2024-03-04 14:00", freq="30min", tz=tz)
+    tuesday = pd.date_range("2024-03-05 08:00", "2024-03-05 14:00", freq="30min", tz=tz)
+    bars = pd.DataFrame({"ts": monday.append(tuesday)})
+
+    pattern_key = "livestock_momentum|momentum_cc|closing_momentum|session_0"
+    pattern = {
+        "pattern_type": "momentum_cc",
+        "pattern_payload": {
+            "momentum_type": "closing_momentum",
+            "session_key": "session_0",
+            "session_index": 0,
+            "session_start": "08:30:00",
+            "session_end": "13:00:00",
+            "window_anchor": "session",
+            "window_minutes": 270,
+            "sess_start_hrs": [8],
+            "sess_start_minutes": [30],
+            "sess_end_hrs": [13],
+            "sess_end_minutes": [0],
+            "correlation": 0.2,
+        },
+        "metadata": {"screen_type": "momentum"},
+    }
+
+    pipeline = ScreenerPipeline(tz=tz)
+    features = pipeline.build_features(bars, {pattern_key: pattern})
+
+    gate_col = f"{_slug(pattern_key)}_gate"
+    assert gate_col in features.columns
+
+    session_mask = (
+        (features["clock_time"] >= "08:30:00")
+        & (features["clock_time"] <= "13:00:00")
+    )
+    assert features.loc[session_mask, gate_col].eq(1).all()
+    assert features.loc[~session_mask, gate_col].eq(0).all()
+
+    base = gate_col[: -len("_gate")]
+    weekday_col = f"{base}_weekday"
+    session_col = f"{base}_session_key"
+
+    assert features[weekday_col].isna().all()
+    assert features.loc[session_mask, session_col].eq("session_0").all()
+
+
+def test_screener_pipeline_emits_all_momentum_correlation_gates():
+    tz = "America/Chicago"
+    bars = pd.DataFrame(
+        {
+            "ts": pd.date_range(
+                "2024-03-04 08:00", "2024-03-04 13:30", freq="30min", tz=tz
+            )
+        }
+    )
+
+    specs = [
+        (
+            "livestock_momentum|momentum_cc|closing_momentum|session_0",
+            "momentum_cc",
+            "closing_momentum",
+        ),
+        (
+            "livestock_momentum|momentum_sc|closing_momentum|session_0",
+            "momentum_sc",
+            "closing_momentum",
+        ),
+        (
+            "livestock_momentum|momentum_oc|opening_momentum|session_0",
+            "momentum_oc",
+            "opening_momentum",
+        ),
+    ]
+
+    patterns = {}
+    for key, pattern_type, momentum_type in specs:
+        patterns[key] = {
+            "pattern_type": pattern_type,
+            "pattern_payload": {
+                "momentum_type": momentum_type,
+                "session_key": "session_0",
+                "session_index": 0,
+                "session_start": "08:00:00",
+                "session_end": "13:00:00",
+                "window_anchor": "session",
+                "window_minutes": 300,
+                "sess_start_hrs": [8],
+                "sess_start_minutes": [0],
+                "sess_end_hrs": [13],
+                "sess_end_minutes": [0],
+                "correlation": 0.2,
+            },
+            "metadata": {"screen_type": "momentum"},
+        }
+
+    pipeline = ScreenerPipeline(tz=tz)
+    features = pipeline.build_features(bars, patterns)
+
+    gate_columns = {
+        col
+        for col in features.columns
+        if col.endswith("_gate") and col != "any_pattern_active"
+    }
+
+    expected = {f"{_slug(key)}_gate" for key, *_ in specs}
+    assert expected.issubset(gate_columns)
+    for gate in expected:
+        assert features[gate].sum() > 0
+
+
 def test_horizon_mapper_accepts_mixed_case_price_columns():
     mapper = HorizonMapper(tz="America/Chicago")
     df = pd.DataFrame(

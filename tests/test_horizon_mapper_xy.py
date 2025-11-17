@@ -282,6 +282,121 @@ def test_momentum_weekday_returns_use_window_and_trend():
     assert xy.loc[0, "returns_x"] == pytest.approx(monday_return)
 
 
+def test_momentum_closing_correlation_uses_backward_returns():
+    bars = _make_momentum_bars()
+    pipeline = ScreenerPipeline(tz="America/Chicago")
+    pattern_key = "livestock_momentum|momentum_cc|closing_momentum|session_0"
+    pattern = {
+        "pattern_type": "momentum_cc",
+        "pattern_payload": {
+            "momentum_type": "closing_momentum",
+            "session_key": "session_0",
+            "session_index": 0,
+            "session_start": "08:30:00",
+            "session_end": "10:30:00",
+            "window_anchor": "session",
+            "window_minutes": 120,
+            "sess_start_hrs": [8],
+            "sess_start_minutes": [30],
+            "sess_end_hrs": [10],
+            "sess_end_minutes": [30],
+            "correlation": 0.25,
+        },
+        "metadata": {
+            "screen_type": "momentum",
+            "st_momentum_days": 1,
+            "period_length_min": 120,
+        },
+    }
+    patterns = {pattern_key: pattern}
+    features = pipeline.build_features(bars, patterns)
+
+    mapper = HorizonMapper(tz="America/Chicago")
+    xy = mapper.build_xy(features, patterns, ensure_gates=False)
+
+    assert not xy.empty
+
+    features_idx = features.set_index("ts")
+    features_session = features_idx["session_id"]
+    grouped = bars.groupby("session_id")
+    session_returns = np.log(grouped["close"].last() / grouped["open"].first())
+    expected_trend = session_returns.shift(1).dropna()
+
+    xy["session_id"] = xy["ts_decision"].map(features_session)
+    assert xy["session_id"].notna().all()
+
+    for session_id, expected in expected_trend.items():
+        subset = xy[xy["session_id"] == session_id]
+        if subset.empty:
+            continue
+        assert subset["returns_x"].tolist() == pytest.approx([expected] * len(subset))
+
+    window = pd.Timedelta(minutes=120)
+    for _, row in xy.iterrows():
+        now_ts = row["ts_decision"]
+        prev_ts = now_ts - window
+        now_close = float(features_idx.loc[now_ts, "close"])
+        prev_close = float(features_idx.loc[prev_ts, "close"])
+        expected = np.log(now_close / prev_close)
+        assert row["returns_y"] == pytest.approx(expected)
+
+
+def test_momentum_opening_correlation_uses_forward_returns():
+    bars = _make_momentum_bars()
+    pipeline = ScreenerPipeline(tz="America/Chicago")
+    pattern_key = "livestock_momentum|momentum_oc|opening_momentum|session_0"
+    pattern = {
+        "pattern_type": "momentum_oc",
+        "pattern_payload": {
+            "momentum_type": "opening_momentum",
+            "session_key": "session_0",
+            "session_index": 0,
+            "session_start": "08:30:00",
+            "session_end": "10:30:00",
+            "window_anchor": "start",
+            "window_minutes": 60,
+            "sess_start_hrs": [8],
+            "sess_start_minutes": [30],
+            "sess_end_hrs": [10],
+            "sess_end_minutes": [30],
+            "correlation": 0.3,
+        },
+        "metadata": {
+            "screen_type": "momentum",
+            "st_momentum_days": 1,
+            "period_length_min": 60,
+        },
+    }
+
+    patterns = {pattern_key: pattern}
+    features = pipeline.build_features(bars, patterns)
+
+    mapper = HorizonMapper(tz="America/Chicago")
+    xy = mapper.build_xy(features, patterns, ensure_gates=False)
+
+    assert not xy.empty
+
+    features_idx = features.set_index("ts")
+    window = pd.Timedelta(minutes=60)
+    for _, row in xy.iterrows():
+        now_ts = row["ts_decision"]
+        future_ts = now_ts + window
+        now_close = float(features_idx.loc[now_ts, "close"])
+        future_close = float(features_idx.loc[future_ts, "close"])
+        expected = np.log(future_close / now_close)
+        assert row["returns_y"] == pytest.approx(expected)
+
+    grouped = bars.groupby("session_id")
+    session_returns = np.log(grouped["close"].last() / grouped["open"].first())
+    expected_trend = session_returns.shift(1).dropna()
+    xy["session_id"] = xy["ts_decision"].map(features_idx["session_id"])
+    for session_id, expected in expected_trend.items():
+        subset = xy[xy["session_id"] == session_id]
+        if subset.empty:
+            continue
+        assert subset["returns_x"].tolist() == pytest.approx([expected] * len(subset))
+
+
 def test_weekly_mean_policy_uses_payload_value():
     df = _make_sample_bars()
     mapper = HorizonMapper(tz="America/Chicago")

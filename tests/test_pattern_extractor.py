@@ -68,6 +68,11 @@ class FakeScreenParams:
     season: Optional[str] = None
     session_starts: Optional[List[str]] = None
     session_ends: Optional[List[str]] = None
+    st_momentum_days: int = 3
+    sess_start_hrs: int = 1
+    sess_start_minutes: int = 30
+    sess_end_hrs: Optional[int] = None
+    sess_end_minutes: Optional[int] = None
 
 
 if getattr(pattern_module, "ScreenParams", None) is Any:  # pragma: no cover - optional dependency fallback
@@ -414,7 +419,7 @@ def test_pattern_extractor_emits_momentum_weekday_patterns():
         sess_start_hrs=1,
         sess_start_minutes=30,
         sess_end_hrs=1,
-        sess_end_mins=0,
+        sess_end_minutes=0,
         tz="America/Chicago",
         period_length=90,
     )
@@ -491,15 +496,14 @@ def test_pattern_extractor_emits_momentum_weekday_patterns():
     assert metadata["session_key"] == "session_0"
     assert metadata["window_anchor"] == "start"
     assert metadata["window_minutes"] == params.sess_start_hrs * 60 + params.sess_start_minutes
-    assert metadata["sess_start_hrs"] == params.sess_start_hrs
-    assert metadata["sess_start_minutes"] == params.sess_start_minutes
-    assert metadata["sess_end_hrs"] == params.sess_end_hrs
-    assert metadata["sess_end_minutes"] == params.sess_end_mins
-    assert metadata["opening_window_minutes"] == metadata["window_minutes"]
+    assert metadata["session_start"] == "02:30:00"
+    assert metadata["session_end"] == "10:30:00"
     assert metadata["bias"] == "long"
     assert metadata["months"] == [3, 4, 5]
     assert metadata["momentum_params"]["st_momentum_days"] == params.st_momentum_days
     assert metadata["period_length_min"] == pytest.approx(params.period_length)
+    assert metadata["sess_start_minutes"] == params.sess_start_minutes
+    assert metadata["sess_end_minutes"] == params.sess_end_minutes
     assert summary["strength"] == pytest.approx(2.5, rel=1e-6)
 
 
