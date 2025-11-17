@@ -1478,6 +1478,45 @@ class PatternExtractor:
         if params is not None and hasattr(params, "tz"):
             context["session_tz"] = getattr(params, "tz", None)
 
+        def _extract(attr: str) -> Any:
+            value = session_data.get(attr)
+            if value is not None:
+                return value
+            if params is not None:
+                return getattr(params, attr, None)
+            return None
+
+        sess_start_hrs = _extract("sess_start_hrs")
+        sess_start_minutes = _extract("sess_start_minutes")
+        sess_end_hrs = _extract("sess_end_hrs")
+        sess_end_minutes = _extract("sess_end_minutes") or _extract("sess_end_mins")
+
+        if sess_end_hrs is None:
+            sess_end_hrs = sess_start_hrs
+        if sess_end_minutes is None:
+            sess_end_minutes = sess_start_minutes
+
+        if sess_start_hrs is not None:
+            context["sess_start_hrs"] = sess_start_hrs
+        if sess_start_minutes is not None:
+            context["sess_start_minutes"] = sess_start_minutes
+        if sess_end_hrs is not None:
+            context["sess_end_hrs"] = sess_end_hrs
+        if sess_end_minutes is not None:
+            context["sess_end_minutes"] = sess_end_minutes
+
+        opening_window_minutes = session_data.get("opening_window_minutes")
+        closing_window_minutes = session_data.get("closing_window_minutes")
+        if opening_window_minutes is None:
+            opening_window_minutes = self._combine_minutes(sess_start_hrs, sess_start_minutes)
+        if closing_window_minutes is None:
+            closing_window_minutes = self._combine_minutes(sess_end_hrs, sess_end_minutes)
+
+        if opening_window_minutes is not None:
+            context["opening_window_minutes"] = opening_window_minutes
+        if closing_window_minutes is not None:
+            context["closing_window_minutes"] = closing_window_minutes
+
         filtered_months = ticker_result.get("filtered_months")
         if filtered_months is not None:
             context["filtered_months"] = filtered_months
@@ -1500,6 +1539,15 @@ class PatternExtractor:
 
     @staticmethod
     def _apply_momentum_context(pattern: Dict[str, Any], context: Mapping[str, Any]) -> None:
+        if "window_minutes" not in pattern:
+            momentum_type = pattern.get("momentum_type")
+            if momentum_type == "opening_momentum" and "opening_window_minutes" in context:
+                pattern["window_minutes"] = context.get("opening_window_minutes")
+            elif momentum_type == "closing_momentum" and "closing_window_minutes" in context:
+                pattern["window_minutes"] = context.get("closing_window_minutes")
+            elif "period_length_min" in context:
+                pattern["window_minutes"] = context.get("period_length_min")
+
         for key, value in context.items():
             pattern.setdefault(key, value)
 
@@ -1882,28 +1930,29 @@ class PatternExtractor:
         if params is None or not hasattr(params, "sess_start_hrs"):
             return None
 
-        def _combine(hours: Any, minutes: Any) -> Optional[int]:
-            try:
-                total = int(hours or 0) * 60 + int(minutes or 0)
-            except (TypeError, ValueError):
-                return None
-            return total if total > 0 else None
-
         if momentum_type == "opening_momentum":
             hours = getattr(params, "sess_start_hrs", None)
             minutes = getattr(params, "sess_start_minutes", None)
-            return _combine(hours, minutes)
+            return PatternExtractor._combine_minutes(hours, minutes)
 
         if momentum_type == "closing_momentum":
             hours = getattr(params, "sess_end_hrs", None)
-            minutes = getattr(params, "sess_end_mins", None)
+            minutes = getattr(params, "sess_end_minutes", None)
             if hours is None:
                 hours = getattr(params, "sess_start_hrs", None)
             if minutes is None:
                 minutes = getattr(params, "sess_start_minutes", None)
-            return _combine(hours, minutes)
+            return PatternExtractor._combine_minutes(hours, minutes)
 
         return None
+
+    @staticmethod
+    def _combine_minutes(hours: Any, minutes: Any) -> Optional[int]:
+        try:
+            total = int(hours or 0) * 60 + int(minutes or 0)
+        except (TypeError, ValueError):
+            return None
+        return total if total > 0 else None
 
     @classmethod
     def _should_include_pattern(cls, pattern: Mapping[str, Any]) -> bool:
@@ -2105,6 +2154,12 @@ class PatternExtractor:
             "session_start",
             "session_end",
             "session_tz",
+            "sess_start_hrs",
+            "sess_start_minutes",
+            "sess_end_hrs",
+            "sess_end_minutes",
+            "opening_window_minutes",
+            "closing_window_minutes",
             "window_anchor",
             "window_minutes",
             "positive_pct",

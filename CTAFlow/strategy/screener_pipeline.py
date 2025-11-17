@@ -522,6 +522,14 @@ class ScreenerPipeline:
 
         return None
 
+    @staticmethod
+    def _combine_minutes(hours: Any, minutes: Any) -> Optional[int]:
+        try:
+            total = int(hours or 0) * 60 + int(minutes or 0)
+        except (TypeError, ValueError):
+            return None
+        return total if total > 0 else None
+
     # ------------------------------------------------------------------
     # Pattern parsing helpers
     # ------------------------------------------------------------------
@@ -674,14 +682,74 @@ class ScreenerPipeline:
         session_start = payload.get("session_start") or metadata.get("session_start")
         session_end = payload.get("session_end") or metadata.get("session_end")
         window_anchor = str(payload.get("window_anchor") or metadata.get("window_anchor") or "session").lower()
-        window_minutes = payload.get("window_minutes") or metadata.get("window_minutes")
-        try:
-            window_minutes_int = int(window_minutes)
-        except (TypeError, ValueError):
-            window_minutes_int = None
+        session_tz = metadata.get("session_tz")
+
+        momentum_type = payload.get("momentum_type") or metadata.get("momentum_type") or "momentum"
+
+        def _resolve_window_minutes() -> Optional[int]:
+            base_candidates = (
+                payload.get("window_minutes"),
+                metadata.get("window_minutes"),
+            )
+            opening_candidates = (
+                payload.get("opening_window_minutes"),
+                metadata.get("opening_window_minutes"),
+            )
+            closing_candidates = (
+                payload.get("closing_window_minutes"),
+                metadata.get("closing_window_minutes"),
+            )
+            session_candidates = (
+                metadata.get("sess_start_hrs"),
+                metadata.get("sess_start_minutes"),
+            )
+            closing_session_candidates = (
+                metadata.get("sess_end_hrs"),
+                metadata.get("sess_end_minutes"),
+            )
+
+            candidate_pool: List[Any] = list(base_candidates)
+            if momentum_type == "opening_momentum":
+                candidate_pool.extend(opening_candidates)
+                if any(session_candidates):
+                    candidate_pool.append(
+                        self._combine_minutes(
+                            metadata.get("sess_start_hrs"), metadata.get("sess_start_minutes")
+                        )
+                    )
+            elif momentum_type == "closing_momentum":
+                candidate_pool.extend(closing_candidates)
+                if any(closing_session_candidates):
+                    candidate_pool.append(
+                        self._combine_minutes(
+                            metadata.get("sess_end_hrs"), metadata.get("sess_end_minutes")
+                        )
+                    )
+            else:
+                candidate_pool.extend(opening_candidates)
+                candidate_pool.extend(closing_candidates)
+
+            candidate_pool.extend(
+                (
+                    metadata.get("period_length_min"),
+                    payload.get("period_length_min"),
+                    metadata.get("period_length"),
+                    payload.get("period_length"),
+                )
+            )
+
+            for candidate in candidate_pool:
+                minutes_val = self._coerce_minutes(candidate)
+                if minutes_val is not None:
+                    return minutes_val
+            return None
+
+        window_minutes_int = _resolve_window_minutes()
 
         start_hms, _ = self._time_to_strings(session_start)
         end_hms, _ = self._time_to_strings(session_end)
+        start_hms = self._convert_session_clock(start_hms, session_tz)
+        end_hms = self._convert_session_clock(end_hms, session_tz)
 
         lower_bound = start_hms
         upper_bound = end_hms
@@ -703,8 +771,6 @@ class ScreenerPipeline:
                 mask &= df["clock_time"] <= upper_bound
 
         mask = self._anchor_session_mask(df, mask, window_anchor=window_anchor)
-
-        momentum_type = payload.get("momentum_type") or metadata.get("momentum_type") or "momentum"
         bias = payload.get("bias") or metadata.get("bias")
         if bias is None:
             mean_value = payload.get("mean")
@@ -1010,6 +1076,27 @@ class ScreenerPipeline:
             return head, f"{head}.{frac}"
         hms = parsed.strftime("%H:%M:%S")
         return hms, parsed.strftime("%H:%M:%S.%f")
+
+    @staticmethod
+    def _combine_minutes(hours: Any, minutes: Any) -> Optional[int]:
+        try:
+            total = int(hours or 0) * 60 + int(minutes or 0)
+        except (TypeError, ValueError):
+            return None
+        return total if total > 0 else None
+
+    def _convert_session_clock(self, clock: Optional[str], source_tz: Optional[str]) -> Optional[str]:
+        if clock is None or not source_tz or source_tz == self.tz:
+            return clock
+        try:
+            base = pd.Timestamp(f"2000-01-01 {clock}", tz=source_tz)
+        except Exception:
+            return clock
+        try:
+            converted = base.tz_convert(self.tz)
+        except Exception:
+            return clock
+        return converted.time().strftime("%H:%M:%S")
 
     @staticmethod
     def _shift_time_str(base: Optional[str], minutes: Optional[int], *, forward: bool) -> Optional[str]:
@@ -1578,14 +1665,55 @@ class HorizonMapper:
     ) -> int:
         metadata = pattern.get("metadata") or {}
         payload = pattern.get("pattern_payload") or {}
-        for source in (
+        momentum_type = (
+            payload.get("momentum_type")
+            or metadata.get("momentum_type")
+            or "opening_momentum"
+        )
+
+        candidates: List[Any] = [
             payload.get("window_minutes"),
             metadata.get("window_minutes"),
-            metadata.get("period_length_min"),
-            payload.get("period_length_min"),
-            metadata.get("period_length"),
-            payload.get("period_length"),
-        ):
+        ]
+
+        if momentum_type == "opening_momentum":
+            candidates.extend(
+                [
+                    payload.get("opening_window_minutes"),
+                    metadata.get("opening_window_minutes"),
+                    self._combine_minutes(
+                        metadata.get("sess_start_hrs"), metadata.get("sess_start_minutes")
+                    ),
+                ]
+            )
+        elif momentum_type == "closing_momentum":
+            candidates.extend(
+                [
+                    payload.get("closing_window_minutes"),
+                    metadata.get("closing_window_minutes"),
+                    self._combine_minutes(
+                        metadata.get("sess_end_hrs"), metadata.get("sess_end_minutes")
+                    ),
+                ]
+            )
+        else:
+            candidates.extend(
+                [
+                    metadata.get("opening_window_minutes"),
+                    metadata.get("closing_window_minutes"),
+                ]
+            )
+
+        candidates.extend(
+            [
+                metadata.get("period_length_min"),
+                payload.get("period_length_min"),
+                metadata.get("period_length"),
+                payload.get("period_length"),
+            ]
+        )
+
+        for source in candidates:
             minutes = self._coerce_minutes(source)
             if minutes is not None:
                 return minutes
