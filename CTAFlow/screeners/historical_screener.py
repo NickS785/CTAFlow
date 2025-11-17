@@ -1484,7 +1484,17 @@ class HistoricalScreener:
 
         # Create time windows
         opening_window = timedelta(hours=start_hrs, minutes=start_mins)
-        closing_window = timedelta(hours=end_hrs or start_hrs, minutes=end_minutes or start_mins)
+        opening_window_minutes = start_hrs * 60 + start_mins
+
+        # ``end_hrs``/``end_minutes`` default to the opening window.  Keep both the
+        # ``timedelta`` representation (used for slicing) and the raw hour/minute
+        # components so metadata serialization later on does not rely on undefined
+        # names (the previous implementation referenced ``closing_hours`` and
+        # ``closing_minutes`` without actually defining them).
+        closing_hours = end_hrs if end_hrs is not None else start_hrs
+        closing_minutes = end_minutes if end_minutes is not None else start_mins
+        closing_window = timedelta(hours=closing_hours, minutes=closing_minutes)
+        closing_window_minutes = closing_hours * 60 + closing_minutes
 
         # Extract session data using time of day filtering
         daily_sessions = session_data
