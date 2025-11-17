@@ -28,6 +28,7 @@ assert SPEC.loader is not None
 sys.modules[f"{PACKAGE_NAME}.screener_pipeline"] = module
 SPEC.loader.exec_module(module)
 HorizonMapper = module.HorizonMapper
+ScreenerPipeline = module.ScreenerPipeline
 
 SESSIONIZER_PATH = ROOT / "CTAFlow" / "strategy" / "sessionizer.py"
 SESSIONIZER_NAME = "CTAFlow.strategy.sessionizer"
@@ -83,6 +84,30 @@ def _make_sample_bars() -> pd.DataFrame:
     ).astype(np.int8)
 
     return df
+
+
+def _make_momentum_bars() -> pd.DataFrame:
+    tz = "America/Chicago"
+    session_dates = pd.date_range("2024-03-04 08:30", periods=3, tz=tz, freq="D")
+    rows: list[dict[str, object]] = []
+    for idx, session_start in enumerate(session_dates):
+        base_price = 100.0 + idx
+        times = [
+            session_start,
+            session_start + pd.Timedelta(minutes=60),
+            session_start + pd.Timedelta(hours=2),
+        ]
+        closes = [base_price, base_price + 0.5, base_price + 1.0]
+        for ts, close_price in zip(times, closes, strict=True):
+            rows.append(
+                {
+                    "ts": ts,
+                    "open": base_price,
+                    "close": close_price,
+                    "session_id": session_start.date().isoformat(),
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 def _session_close(df: pd.DataFrame, session_id: int) -> float:
@@ -212,6 +237,49 @@ def test_orderflow_peak_pressure_forward_returns():
 
     assert result.loc[0, "returns_x"] == pytest.approx(expected)
     assert result.loc[0, "returns_y"] == pytest.approx(expected)
+
+
+def test_momentum_weekday_returns_use_window_and_trend():
+    bars = _make_momentum_bars()
+    pipeline = ScreenerPipeline(tz="America/Chicago")
+    pattern_key = "usa_momentum|momentum_weekday|Tuesday|opening_momentum|session_0"
+    pattern = {
+        "pattern_type": "momentum_weekday",
+        "pattern_payload": {
+            "weekday": "Tuesday",
+            "momentum_type": "opening_momentum",
+            "session_key": "session_0",
+            "session_index": 0,
+            "session_start": "08:30:00",
+            "session_end": "10:30:00",
+            "window_anchor": "start",
+            "window_minutes": 60,
+            "mean": 0.01,
+            "t_stat": 3.1,
+            "p_value_vs_rest": 0.001,
+            "cohen_d_vs_rest": 0.45,
+            "significant_vs_rest": True,
+        },
+        "metadata": {
+            "screen_type": "momentum",
+            "st_momentum_days": 1,
+            "period_length_min": 60,
+        },
+    }
+    patterns = {pattern_key: pattern}
+    features = pipeline.build_features(bars, patterns)
+
+    mapper = HorizonMapper(tz="America/Chicago")
+    xy = mapper.build_xy(features, patterns, ensure_gates=False)
+
+    assert len(xy) == 1
+    tuesday_base = 101.0
+    expected_y = np.log((tuesday_base + 0.5) / tuesday_base)
+    assert xy.loc[0, "returns_y"] == pytest.approx(expected_y)
+
+    monday_base = 100.0
+    monday_return = np.log((monday_base + 1.0) / monday_base)
+    assert xy.loc[0, "returns_x"] == pytest.approx(monday_return)
 
 
 def test_weekly_mean_policy_uses_payload_value():

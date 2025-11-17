@@ -32,6 +32,7 @@ class ScreenerBacktester:
         *,
         threshold: float = 0.0,
         use_side_hint: bool = True,
+        group_field: Optional[str] = None,
     ) -> Dict[str, Any]:
         if xy.empty:
             empty = pd.Series(dtype=float)
@@ -97,10 +98,27 @@ class ScreenerBacktester:
             trades=trades,
         )
 
-        return {
+        result: Dict[str, Any] = {
             "pnl": pnl,
             "positions": positions,
             "summary": summary,
             "monthly": monthly,
             "cumulative": cumulative,
         }
+
+        if group_field and group_field in frame.columns:
+            grouped_results: Dict[Any, Dict[str, float]] = {}
+            grouped_frame = frame.loc[signal_mask].copy()
+            if not grouped_frame.empty:
+                for level, subset in grouped_frame.groupby(group_field):
+                    level_positions = positions.loc[subset.index]
+                    level_pnl = pnl.loc[subset.index]
+                    grouped_results[level] = {
+                        "trades": int((level_positions != 0).sum()),
+                        "total_return": float(level_pnl.sum()),
+                        "mean_return": float(level_pnl.mean()) if not level_pnl.empty else 0.0,
+                    }
+            result["group_breakdown"] = grouped_results
+            result["group_field"] = group_field
+
+        return result

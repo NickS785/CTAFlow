@@ -582,7 +582,12 @@ class PatternExtractor:
                 continue
             if screen_filter is not None and summary.source_screen not in screen_filter:
                 continue
-            filtered[key] = summary.as_dict()
+            record = summary.as_dict()
+            payload = record.get("pattern_payload") or {}
+            for promoted in ("p_value", "t_stat", "f_stat", "n"):
+                if promoted not in record and promoted in payload:
+                    record[promoted] = payload[promoted]
+            filtered[key] = record
 
         return filtered
 
@@ -1390,6 +1395,16 @@ class PatternExtractor:
                 if not math.isfinite(t_value) or abs(t_value) < 1.96:
                     continue
 
+                p_vs_rest = self._coerce_optional_float(stats.get("p_value_vs_rest"))
+                cohen_d = self._coerce_optional_float(stats.get("cohen_d_vs_rest"))
+                significant_vs_rest = bool(stats.get("significant_vs_rest"))
+
+                if not significant_vs_rest:
+                    if p_vs_rest is None or p_vs_rest >= 0.02:
+                        continue
+                    if cohen_d is not None and abs(cohen_d) < 0.35:
+                        continue
+
                 pattern: Dict[str, Any] = {
                     "pattern_type": "momentum_weekday",
                     "momentum_type": momentum_type,
@@ -1405,6 +1420,9 @@ class PatternExtractor:
                     "bias": self._infer_momentum_bias(stats.get("mean")),
                     "window_anchor": self._momentum_window_anchor(momentum_type),
                     "window_minutes": self._momentum_window_minutes(momentum_type, params),
+                    "p_value_vs_rest": p_vs_rest,
+                    "cohen_d_vs_rest": cohen_d,
+                    "significant_vs_rest": significant_vs_rest,
                 }
 
                 months_active = stats.get("months_active")
@@ -2126,6 +2144,9 @@ class PatternExtractor:
 
         if payload_dict.get("period_length") and "period_length" not in metadata:
             metadata["period_length"] = payload_dict["period_length"]
+
+        if "best_weekday" not in metadata and "weekday" in metadata:
+            metadata["best_weekday"] = metadata["weekday"]
 
         return PatternSummary(
             key=summary_key,

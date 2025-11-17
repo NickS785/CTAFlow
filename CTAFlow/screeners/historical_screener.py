@@ -1869,7 +1869,42 @@ class HistoricalScreener:
                 # T-statistic against zero (testing if mean is significantly different from 0)
                 t_stat = mean_val / (std_val / np.sqrt(len(day_data))) if std_val > 0 else np.nan
 
+                rest_data = df[df['weekday'] != dow][col_name]
+                rest_mean = float(rest_data.mean()) if len(rest_data) else np.nan
+                p_value_vs_rest = np.nan
+                cohen_d = np.nan
+                t_stat_vs_rest = np.nan
+
+                if len(rest_data) >= 5:
+                    try:
+                        t_stat_vs_rest, p_value_vs_rest = stats.ttest_ind(
+                            day_data.values,
+                            rest_data.values,
+                            equal_var=False,
+                            nan_policy='omit'
+                        )
+                    except Exception:
+                        t_stat_vs_rest = np.nan
+                        p_value_vs_rest = np.nan
+
+                    var_day = float(day_data.var(ddof=1)) if len(day_data) > 1 else 0.0
+                    var_rest = float(rest_data.var(ddof=1)) if len(rest_data) > 1 else 0.0
+                    denom = (len(day_data) + len(rest_data) - 2)
+                    if denom > 0 and var_day > 0 and var_rest > 0:
+                        pooled = np.sqrt(
+                            ((len(day_data) - 1) * var_day + (len(rest_data) - 1) * var_rest)
+                            / denom
+                        )
+                        if pooled > 0:
+                            cohen_d = (float(mean_val) - rest_mean) / pooled
+
                 months_meta = self._build_months_metadata(day_data.index, None)
+                significant_vs_rest = bool(
+                    np.isfinite(p_value_vs_rest)
+                    and p_value_vs_rest < 0.01
+                    and np.isfinite(cohen_d)
+                    and abs(cohen_d) >= 0.35
+                )
 
                 weekday_stats[day_name] = {
                     'n': len(day_data),
@@ -1879,6 +1914,11 @@ class HistoricalScreener:
                     'skew': float(day_data.skew()),
                     'positive_pct': float((day_data > 0).sum() / len(day_data)),
                     't_stat': float(t_stat) if not np.isnan(t_stat) else np.nan,
+                    'p_value_vs_rest': float(p_value_vs_rest) if np.isfinite(p_value_vs_rest) else np.nan,
+                    'mean_vs_rest': float(mean_val - rest_mean) if np.isfinite(rest_mean) else np.nan,
+                    'cohen_d_vs_rest': float(cohen_d) if np.isfinite(cohen_d) else np.nan,
+                    't_stat_vs_rest': float(t_stat_vs_rest) if np.isfinite(t_stat_vs_rest) else np.nan,
+                    'significant_vs_rest': significant_vs_rest,
                     **months_meta,
                 }
 
