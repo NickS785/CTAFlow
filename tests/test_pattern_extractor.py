@@ -491,6 +491,11 @@ def test_pattern_extractor_emits_momentum_weekday_patterns():
     assert metadata["session_key"] == "session_0"
     assert metadata["window_anchor"] == "start"
     assert metadata["window_minutes"] == params.sess_start_hrs * 60 + params.sess_start_minutes
+    assert metadata["sess_start_hrs"] == params.sess_start_hrs
+    assert metadata["sess_start_minutes"] == params.sess_start_minutes
+    assert metadata["sess_end_hrs"] == params.sess_end_hrs
+    assert metadata["sess_end_minutes"] == params.sess_end_mins
+    assert metadata["opening_window_minutes"] == metadata["window_minutes"]
     assert metadata["bias"] == "long"
     assert metadata["months"] == [3, 4, 5]
     assert metadata["momentum_params"]["st_momentum_days"] == params.st_momentum_days

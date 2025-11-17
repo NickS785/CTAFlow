@@ -290,6 +290,51 @@ def test_horizon_mapper_accepts_mixed_case_price_columns():
     assert not result.empty
 
 
+def test_momentum_gate_respects_session_timezone():
+    tz = "UTC"
+    ts = pd.date_range("2024-01-02 14:30", periods=4, freq="15min", tz=tz)
+    bars = pd.DataFrame(
+        {
+            "ts": ts,
+            "open": np.linspace(100.0, 100.3, len(ts)),
+            "close": np.linspace(100.1, 100.4, len(ts)),
+        }
+    )
+
+    pattern = {
+        "pattern_type": "momentum_weekday",
+        "pattern_payload": {
+            "weekday": "Tuesday",
+            "momentum_type": "opening_momentum",
+            "window_anchor": "start",
+            "window_minutes": 90,
+            "session_key": "session_0",
+            "t_stat": 2.1,
+            "bias": "long",
+        },
+        "metadata": {
+            "weekday": "Tuesday",
+            "session_start": "08:30:00",
+            "session_end": "15:00:00",
+            "session_tz": "America/Chicago",
+            "window_anchor": "start",
+            "window_minutes": 90,
+            "momentum_type": "opening_momentum",
+        },
+    }
+
+    pipeline = ScreenerPipeline(tz=tz)
+    features = pipeline.build_features(bars, {"momentum": pattern})
+
+    gate_cols = [col for col in features.columns if col.endswith("_gate")]
+    assert gate_cols, "Expected a momentum gate column"
+    gate = gate_cols[0]
+
+    active_mask = features[gate] == 1
+    assert active_mask.iloc[0], "Expected first bar inside converted session window"
+    assert active_mask.sum() == 1
+
+
 def test_horizon_mapper_adds_predictor_columns():
     tz = "America/Chicago"
     ts = pd.date_range("2023-09-05 09:00", periods=3, freq="h")

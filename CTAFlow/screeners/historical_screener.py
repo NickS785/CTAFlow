@@ -178,6 +178,16 @@ class ScreenParams:
             else:
                 self.name = f"all_{self.screen_type}"
 
+    @property
+    def sess_end_minutes(self) -> Optional[int]:
+        """Expose ``sess_end_mins`` under the full ``*_minutes`` name."""
+
+        return self.sess_end_mins
+
+    @sess_end_minutes.setter
+    def sess_end_minutes(self, value: Optional[int]) -> None:
+        self.sess_end_mins = value
+
 
 class HistoricalScreener:
     """Screener created to find seasonal and momentum patterns in intraday and daily data"""
@@ -1474,7 +1484,11 @@ class HistoricalScreener:
 
         # Create time windows
         opening_window = timedelta(hours=start_hrs, minutes=start_mins)
-        closing_window = timedelta(hours=end_hrs or start_hrs, minutes=end_mins or start_mins)
+        closing_hours = end_hrs if end_hrs is not None else start_hrs
+        closing_minutes = end_mins if end_mins is not None else start_mins
+        closing_window = timedelta(hours=closing_hours, minutes=closing_minutes)
+        opening_window_minutes = int(opening_window.total_seconds() // 60)
+        closing_window_minutes = int(closing_window.total_seconds() // 60)
 
         # Extract session data using time of day filtering
         daily_sessions = session_data
@@ -1553,6 +1567,12 @@ class HistoricalScreener:
             'is_synthetic': is_synthetic,
             'session_start': str(session_start),
             'session_end': str(session_end),
+            'sess_start_hrs': int(start_hrs),
+            'sess_start_minutes': int(start_mins),
+            'sess_end_hrs': int(closing_hours),
+            'sess_end_minutes': int(closing_minutes),
+            'opening_window_minutes': opening_window_minutes,
+            'closing_window_minutes': closing_window_minutes,
             'n_sessions': len(full_session_returns.dropna()),
             'opening_momentum': {
                 'mean': float(opening_returns.mean()),
