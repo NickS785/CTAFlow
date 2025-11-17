@@ -107,3 +107,27 @@ def test_backtest_threshold_runs_on_pipeline_output():
     expected_return = xy.loc[0, "returns_y"]
     assert outcome["pnl"].iloc[0] == pytest.approx(expected_return)
     assert outcome["positions"].iloc[0] == pytest.approx(1.0)
+
+
+def test_backtester_group_breakdown():
+    tz = "UTC"
+    xy = pd.DataFrame(
+        {
+            "ts_decision": pd.date_range("2024-01-01", periods=2, tz=tz),
+            "gate": ["g1", "g2"],
+            "pattern_type": ["momentum_weekday", "momentum_weekday"],
+            "returns_x": [0.2, -0.3],
+            "returns_y": [0.15, 0.1],
+            "side_hint": [1, 0],
+            "momentum_type": ["opening", "closing"],
+        }
+    )
+
+    backtester = backtester_module.ScreenerBacktester()
+    result = backtester.threshold(xy, group_field="momentum_type")
+
+    breakdown = result.get("group_breakdown")
+    assert breakdown is not None
+    assert set(breakdown.keys()) == {"opening", "closing"}
+    assert breakdown["opening"]["trades"] == 1
+    assert breakdown["closing"]["total_return"] == pytest.approx(-0.1)

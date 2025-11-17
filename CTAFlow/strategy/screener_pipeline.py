@@ -441,6 +441,29 @@ class ScreenerPipeline:
             series.loc[mask] = value
         return series
 
+    def _anchor_session_mask(
+        self, df: pd.DataFrame, mask: pd.Series, *, window_anchor: str
+    ) -> pd.Series:
+        if not mask.any():
+            return mask
+        if "session_id" not in df.columns:
+            return mask
+        normalized = window_anchor.lower()
+        if normalized not in {"start", "end"}:
+            return mask
+        valid = mask & df["session_id"].notna()
+        if not valid.any():
+            return mask
+        anchored = pd.Series(False, index=df.index)
+        subset = df.loc[valid, ["session_id", "ts"]]
+        grouped = subset.groupby("session_id")
+        if normalized == "start":
+            indices = grouped["ts"].idxmin()
+        else:
+            indices = grouped["ts"].idxmax()
+        anchored.loc[indices.values] = True
+        return anchored
+
     def _add_feature(
         self,
         df: pd.DataFrame,
@@ -460,6 +483,44 @@ class ScreenerPipeline:
             df[col_name] = self._broadcast_sidecar(df, clean_mask, value)
 
         return [gate_name]
+
+    @staticmethod
+    def _coerce_minutes(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+
+        if isinstance(value, numbers.Number) and not isinstance(value, bool):
+            minutes = float(value)
+            if not np.isfinite(minutes):
+                return None
+            minutes_int = int(round(minutes))
+            return minutes_int if minutes_int > 0 else None
+
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                numeric = float(text)
+            except ValueError:
+                matches = re.findall(r"(\d+)\s*([hHmM])", text)
+                if not matches:
+                    return None
+                total = 0
+                for amount, unit in matches:
+                    qty = int(amount)
+                    if unit.lower() == "h":
+                        total += qty * 60
+                    elif unit.lower() == "m":
+                        total += qty
+                return total if total > 0 else None
+            else:
+                if not np.isfinite(numeric):
+                    return None
+                minutes_int = int(round(numeric))
+                return minutes_int if minutes_int > 0 else None
+
+        return None
 
     # ------------------------------------------------------------------
     # Pattern parsing helpers
@@ -641,6 +702,8 @@ class ScreenerPipeline:
             if upper_bound is not None:
                 mask &= df["clock_time"] <= upper_bound
 
+        mask = self._anchor_session_mask(df, mask, window_anchor=window_anchor)
+
         momentum_type = payload.get("momentum_type") or metadata.get("momentum_type") or "momentum"
         bias = payload.get("bias") or metadata.get("bias")
         if bias is None:
@@ -669,6 +732,27 @@ class ScreenerPipeline:
 
         base = self._feature_base_name(key, base_suffix)
 
+        period_minutes = None
+        for candidate in (
+            payload.get("period_length_min"),
+            metadata.get("period_length_min"),
+            metadata.get("period_length"),
+            payload.get("period_length"),
+        ):
+            minutes_val = self._coerce_minutes(candidate)
+            if minutes_val is not None:
+                period_minutes = minutes_val
+                break
+
+        meta_params = metadata.get("momentum_params")
+        if not isinstance(meta_params, Mapping):
+            meta_params = {}
+        st_momentum_days = (
+            metadata.get("st_momentum_days")
+            or payload.get("st_momentum_days")
+            or meta_params.get("st_momentum_days")
+        )
+
         sidecars: Dict[str, Any] = {
             "weekday": weekday_norm,
             "momentum_type": momentum_type,
@@ -679,12 +763,27 @@ class ScreenerPipeline:
             "session_end": end_hms,
             "window_anchor": window_anchor,
             "window_minutes": window_minutes_int,
+            "period_length_min": period_minutes,
+            "st_momentum_days": st_momentum_days,
             "t_stat": payload.get("t_stat") or metadata.get("t_stat"),
             "mean": payload.get("mean"),
             "sharpe": payload.get("sharpe"),
             "positive_pct": payload.get("positive_pct"),
             "strength": pattern.get("strength") or payload.get("strength"),
         }
+
+        for key in (
+            "opening_window_minutes",
+            "closing_window_minutes",
+            "sess_start_window_minutes",
+            "sess_end_window_minutes",
+        ):
+            extra_value = payload.get(key)
+            if extra_value is None:
+                extra_value = metadata.get(key)
+            minutes_value = self._coerce_minutes(extra_value)
+            if minutes_value is not None:
+                sidecars[key] = minutes_value
 
         return self._add_feature(df, base, mask, sidecars)
 
@@ -922,7 +1021,8 @@ class ScreenerPipeline:
                 head, frac = text.split(".", 1)
                 frac = (frac + "000000")[:6]
             return head, f"{head}.{frac}"
-        return text, f"{text}.000000"
+        hms = parsed.strftime("%H:%M:%S")
+        return hms, parsed.strftime("%H:%M:%S.%f")
 
     @staticmethod
     def _shift_time_str(base: Optional[str], minutes: Optional[int], *, forward: bool) -> Optional[str]:
@@ -1436,6 +1536,170 @@ class HorizonMapper:
         result.replace([np.inf, -np.inf], np.nan, inplace=True)
         return result
 
+    def _backward_window_return_minutes(self, df: pd.DataFrame, minutes: int) -> pd.Series:
+        if minutes <= 0:
+            raise ValueError("minutes must be positive for intraday horizons")
+
+        ts = pd.to_datetime(df["ts"]).dt.tz_convert(self.tz)
+        close = pd.Series(df["close"].values, index=ts).astype(float)
+        close = close.sort_index()
+        delta = pd.Timedelta(minutes=minutes)
+        past = close.reindex(close.index - delta)
+        past.index = past.index + delta
+        with np.errstate(divide="ignore", invalid="ignore"):
+            raw = np.log(close / past)
+        series = pd.Series(raw, index=close.index)
+        cleaned = self._clean_return(series, policy="drop")
+        aligned = cleaned.reindex(ts)
+        result = pd.Series(aligned.values, index=df.index)
+        result.replace([np.inf, -np.inf], np.nan, inplace=True)
+        return result
+
+    def _same_day_return_series(
+        self, df: pd.DataFrame, session_cache: MutableMapping[str, Any]
+    ) -> pd.Series:
+        cached = session_cache.get("same_day_series")
+        if cached is None:
+            cached = self._same_day_open_to_close(df)
+            session_cache["same_day_series"] = cached
+        return cached
+
+    def _short_term_momentum_series(
+        self,
+        df: pd.DataFrame,
+        window: int,
+        *,
+        trend_cache: MutableMapping[int, pd.Series],
+        session_cache: MutableMapping[str, Any],
+    ) -> pd.Series:
+        if window <= 0:
+            return pd.Series(np.nan, index=df.index, dtype=float)
+        if window in trend_cache:
+            return trend_cache[window]
+        same_day = self._same_day_return_series(df, session_cache)
+        session_returns = session_cache.get("session_returns")
+        if session_returns is None:
+            session_returns = same_day.groupby(df["session_id"]).first()
+            session_cache["session_returns"] = session_returns
+        trend = session_returns.shift(1).rolling(window=window, min_periods=window).sum()
+        trend_series = df["session_id"].map(trend)
+        trend_cache[window] = trend_series
+        return trend_series
+
+    def _extract_momentum_window_minutes(
+        self,
+        pattern: Mapping[str, Any],
+        default_minutes: int,
+        momentum_type: Optional[str] = None,
+    ) -> int:
+        metadata = pattern.get("metadata") or {}
+        payload = pattern.get("pattern_payload") or {}
+        priority_fields: List[Any] = []
+        if momentum_type == "opening_momentum":
+            priority_fields.extend(
+                [
+                    payload.get("sess_start_window_minutes"),
+                    metadata.get("sess_start_window_minutes"),
+                    metadata.get("opening_window_minutes"),
+                    payload.get("opening_window_minutes"),
+                ]
+            )
+        elif momentum_type == "closing_momentum":
+            priority_fields.extend(
+                [
+                    payload.get("sess_end_window_minutes"),
+                    metadata.get("sess_end_window_minutes"),
+                    metadata.get("closing_window_minutes"),
+                    payload.get("closing_window_minutes"),
+                ]
+            )
+
+        priority_fields.extend(
+            [
+                payload.get("window_minutes"),
+                metadata.get("window_minutes"),
+                metadata.get("period_length_min"),
+                payload.get("period_length_min"),
+                metadata.get("period_length"),
+                payload.get("period_length"),
+            ]
+        )
+
+        for source in priority_fields:
+            minutes = self._coerce_minutes(source)
+            if minutes is not None:
+                return minutes
+        return max(1, int(default_minutes))
+
+    def _extract_st_momentum_days(self, pattern: Mapping[str, Any]) -> Optional[int]:
+        metadata = pattern.get("metadata") or {}
+        payload = pattern.get("pattern_payload") or {}
+        candidates = (
+            metadata.get("st_momentum_days"),
+            payload.get("st_momentum_days"),
+            metadata.get("momentum_params", {}).get("st_momentum_days")
+            if isinstance(metadata.get("momentum_params"), Mapping)
+            else None,
+        )
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            try:
+                value = int(candidate)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+        return None
+
+    def _momentum_xy_series(
+        self,
+        df: pd.DataFrame,
+        pattern: Mapping[str, Any],
+        *,
+        default_intraday_minutes: int,
+        forward_cache: MutableMapping[int, pd.Series],
+        backward_cache: MutableMapping[int, pd.Series],
+        trend_cache: MutableMapping[int, pd.Series],
+        session_cache: MutableMapping[str, Any],
+    ) -> Tuple[pd.Series, pd.Series]:
+        metadata = pattern.get("metadata") or {}
+        payload = pattern.get("pattern_payload") or {}
+        momentum_type = (
+            payload.get("momentum_type")
+            or metadata.get("momentum_type")
+            or "opening_momentum"
+        )
+        window_minutes = self._extract_momentum_window_minutes(
+            pattern, default_intraday_minutes, momentum_type
+        )
+        st_days = self._extract_st_momentum_days(pattern) or 3
+        trend_series = self._short_term_momentum_series(
+            df, st_days, trend_cache=trend_cache, session_cache=session_cache
+        )
+
+        if window_minutes <= 0:
+            window_minutes = default_intraday_minutes
+
+        if momentum_type == "opening_momentum":
+            if window_minutes not in forward_cache:
+                forward_cache[window_minutes] = self._forward_window_return_minutes(
+                    df, minutes=window_minutes
+                )
+            returns_y = forward_cache[window_minutes]
+        elif momentum_type == "closing_momentum":
+            if window_minutes not in backward_cache:
+                backward_cache[window_minutes] = self._backward_window_return_minutes(
+                    df, minutes=window_minutes
+                )
+            returns_y = backward_cache[window_minutes]
+        elif momentum_type == "st_momentum":
+            returns_y = trend_series
+        else:  # full_session or fallback
+            returns_y = self._same_day_return_series(df, session_cache)
+
+        return trend_series, returns_y
+
     def _weekly_mean_scalar(self, df: pd.DataFrame, gate_mask: pd.Series) -> float:
         """Same-day open→close mean for sessions flagged by ``gate_mask``."""
 
@@ -1586,6 +1850,10 @@ class HorizonMapper:
         x_fw = self._forward_window_return_minutes(df, minutes=predictor_minutes)
         prev_week_series: Optional[pd.Series] = None
         horizon_cache: Dict[Tuple[str, Optional[int]], pd.Series] = {}
+        momentum_forward_cache: Dict[int, pd.Series] = {}
+        momentum_backward_cache: Dict[int, pd.Series] = {}
+        momentum_trend_cache: Dict[int, pd.Series] = {}
+        session_return_cache: Dict[str, Any] = {}
         time_bearing_types = {"time_predictive_nextday", "time_predictive_nextweek", "orderflow_peak_pressure"}
         weekly_types = {"weekday_mean", "orderflow_weekly", "orderflow_week_of_month"}
 
@@ -1608,7 +1876,17 @@ class HorizonMapper:
                 )
                 continue
 
-            if pattern_type == "weekend_hedging":
+            if pattern_type == "momentum_weekday":
+                returns_x_series, returns_y = self._momentum_xy_series(
+                    df,
+                    pattern,
+                    default_intraday_minutes=default_intraday_minutes,
+                    forward_cache=momentum_forward_cache,
+                    backward_cache=momentum_backward_cache,
+                    trend_cache=momentum_trend_cache,
+                    session_cache=session_return_cache,
+                )
+            elif pattern_type == "weekend_hedging":
                 returns_x_series, returns_y = self._weekend_hedging_returns(df)
             else:
                 spec = self.pattern_horizon(
@@ -1686,6 +1964,13 @@ class HorizonMapper:
 
         df = self._prepare_bars_frame(bars_with_features)
         result = bars_with_features.copy()
+        ts_to_index: Dict[pd.Timestamp, List[Any]] = {}
+        if "ts" in result.columns:
+            ts_series = pd.to_datetime(result["ts"], errors="coerce")
+            for idx, ts_value in zip(result.index, ts_series):
+                if pd.isna(ts_value):
+                    continue
+                ts_to_index.setdefault(ts_value, []).append(idx)
 
         for gate_col, _, returns_x_series, _, _, _, _ in self._iter_pattern_returns(
             df,

@@ -275,7 +275,9 @@ def test_seasonality_pattern_keys_preserved_with_target_time():
     patterns = extractor.patterns["CL"]
 
     assert "seasonality_scan|time_predictive_nextday|07:00" in patterns
-    assert "seasonality_scan|weekend_hedging" in patterns
+    assert any(
+        key.startswith("seasonality_scan|weekend_hedging") for key in patterns
+    )
 
     tod_summary = patterns["seasonality_scan|time_predictive_nextday|07:00"]
     assert tod_summary["metadata"].get("target_times_hhmm") == ["07:00"]
@@ -414,7 +416,7 @@ def test_pattern_extractor_emits_momentum_weekday_patterns():
         sess_end_hrs=1,
         sess_end_mins=0,
         tz="America/Chicago",
-        period_length=90,
+        period_length=45,
     )
 
     results = {
@@ -425,13 +427,25 @@ def test_pattern_extractor_emits_momentum_weekday_patterns():
                 "momentum_params": {
                     "st_momentum_days": params.st_momentum_days,
                     "period_length_min": params.period_length,
+                    "opening_window_minutes": 90,
+                    "closing_window_minutes": 60,
+                    "sess_start_window_minutes": 90,
+                    "sess_end_window_minutes": 60,
                 },
                 "session_0": {
                     "session_start": "02:30:00",
                     "session_end": "10:30:00",
+                    "opening_window_minutes": 90,
+                    "closing_window_minutes": 60,
+                    "sess_start_window_minutes": 90,
+                    "sess_end_window_minutes": 60,
                     "momentum_params": {
                         "st_momentum_days": params.st_momentum_days,
                         "period_length_min": params.period_length,
+                        "opening_window_minutes": 90,
+                        "closing_window_minutes": 60,
+                        "sess_start_window_minutes": 90,
+                        "sess_end_window_minutes": 60,
                     },
                     "momentum_by_dayofweek": {
                         "opening_momentum_by_dow": {
@@ -446,6 +460,9 @@ def test_pattern_extractor_emits_momentum_weekday_patterns():
                                 "months_active": [3, 4, 5],
                                 "months_mask_12": "001110000000",
                                 "months_names": ["Mar", "Apr", "May"],
+                                "p_value_vs_rest": 0.005,
+                                "cohen_d_vs_rest": 0.6,
+                                "significant_vs_rest": True,
                             },
                             "anova": {
                                 "f_stat": 4.1,
@@ -490,7 +507,69 @@ def test_pattern_extractor_emits_momentum_weekday_patterns():
     assert metadata["months"] == [3, 4, 5]
     assert metadata["momentum_params"]["st_momentum_days"] == params.st_momentum_days
     assert metadata["period_length_min"] == pytest.approx(params.period_length)
+    assert metadata["opening_window_minutes"] == pytest.approx(90)
+    assert metadata["closing_window_minutes"] == pytest.approx(60)
+    assert metadata["sess_start_window_minutes"] == pytest.approx(90)
+    assert metadata["sess_end_window_minutes"] == pytest.approx(60)
     assert summary["strength"] == pytest.approx(2.5, rel=1e-6)
+
+
+def test_momentum_window_minutes_defaults_to_period_length_when_no_overrides():
+    ScreenParams = pattern_module.ScreenParams
+    params = ScreenParams(
+        screen_type="momentum",
+        name="usa_simple_momentum",
+        session_starts=["08:30"],
+        session_ends=["15:00"],
+        period_length=30,
+    )
+
+    results = {
+        params.name: {
+            "CL": {
+                "ticker": "CL",
+                "momentum_params": {
+                    "st_momentum_days": params.st_momentum_days,
+                    "period_length_min": params.period_length,
+                    "opening_window_minutes": 30,
+                    "closing_window_minutes": 30,
+                },
+                "session_0": {
+                    "session_start": "08:30:00",
+                    "session_end": "15:00:00",
+                    "momentum_params": {
+                        "st_momentum_days": params.st_momentum_days,
+                        "period_length_min": params.period_length,
+                        "opening_window_minutes": 30,
+                        "closing_window_minutes": 30,
+                    },
+                    "momentum_by_dayofweek": {
+                        "opening_momentum_by_dow": {
+                            "Tuesday": {
+                                "n": 20,
+                                "mean": 0.01,
+                                "std": 0.02,
+                                "sharpe": 0.5,
+                                "positive_pct": 0.55,
+                                "t_stat": 2.1,
+                            },
+                            "anova": {"f_stat": 3.5, "p_value": 0.03, "significant": True},
+                        }
+                    },
+                },
+            }
+        }
+    }
+
+    extractor = PatternExtractor(DummyScreener(), results, [params])
+    patterns = extractor.filter_patterns("CL")
+    _, summary = next(iter(patterns.items()))
+    metadata = summary["metadata"]
+    assert metadata["window_minutes"] == pytest.approx(30)
+    assert metadata["opening_window_minutes"] == pytest.approx(30)
+    assert metadata["closing_window_minutes"] == pytest.approx(30)
+    assert "sess_start_window_minutes" not in metadata
+    assert "sess_end_window_minutes" not in metadata
 
 
 def test_pattern_extractor_extracts_momentum_correlation_and_volatility_patterns():
@@ -514,19 +593,28 @@ def test_pattern_extractor_extracts_momentum_correlation_and_volatility_patterns
         "momentum_params": {
             "st_momentum_days": params.st_momentum_days,
             "period_length_min": params.period_length,
+            "opening_window_minutes": 60,
+            "closing_window_minutes": 60,
+            "sess_start_window_minutes": 60,
         },
-        "momentum_by_dayofweek": {
-            "full_session_by_dow": {
-                "Monday": {
-                    "mean": -0.001,
-                    "t_stat": -2.1,
-                    "n": 100,
-                },
-                "Friday": {
-                    "mean": 0.0025,
-                    "t_stat": 2.8,
-                    "n": 110,
-                },
+                "momentum_by_dayofweek": {
+                    "full_session_by_dow": {
+                        "Monday": {
+                            "mean": -0.001,
+                            "t_stat": -2.1,
+                            "n": 100,
+                            "p_value_vs_rest": 0.004,
+                            "cohen_d_vs_rest": -0.4,
+                            "significant_vs_rest": True,
+                        },
+                        "Friday": {
+                            "mean": 0.0025,
+                            "t_stat": 2.8,
+                            "n": 110,
+                            "p_value_vs_rest": 0.009,
+                            "cohen_d_vs_rest": 0.5,
+                            "significant_vs_rest": True,
+                        },
                 "anova": {
                     "significant": True,
                     "p_value": 0.01,
@@ -643,6 +731,9 @@ def test_pattern_extractor_detects_momentum_without_params():
                                 "mean": 0.0015,
                                 "t_stat": 2.2,
                                 "positive_pct": 0.58,
+                                "p_value_vs_rest": 0.01,
+                                "cohen_d_vs_rest": 0.4,
+                                "significant_vs_rest": True,
                             },
                         }
                     },

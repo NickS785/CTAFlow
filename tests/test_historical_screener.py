@@ -286,7 +286,14 @@ def test_intraday_momentum_screen_includes_analysis_params(historical_screener):
 
     ticker_payload = results["HO"]
     assert ticker_payload["momentum_params"]["st_momentum_days"] == 4
+    assert ticker_payload["momentum_params"]["opening_window_minutes"] == pytest.approx(30.0)
+    assert ticker_payload["momentum_params"]["closing_window_minutes"] == pytest.approx(30.0)
     session_payload = ticker_payload.get("session_0")
     assert session_payload is not None
     assert session_payload["momentum_params"]["st_momentum_days"] == 4
     assert session_payload["momentum_params"]["period_length_min"] == pytest.approx(30.0)
+    assert session_payload["momentum_params"]["opening_window_minutes"] == pytest.approx(30.0)
+    assert session_payload["momentum_params"]["closing_window_minutes"] == pytest.approx(30.0)
+    assert "sess_start_window_minutes" not in session_payload["momentum_params"]
+    assert session_payload["opening_window_minutes"] == pytest.approx(30.0)
+    assert session_payload["closing_window_minutes"] == pytest.approx(30.0)

@@ -14,6 +14,9 @@ from tqdm.auto import tqdm
 import logging
 
 
+DEFAULT_MOMENTUM_WINDOW_MINUTES = 90.0
+
+
 @dataclass
 class ScreenParams:
     """
@@ -39,14 +42,19 @@ class ScreenParams:
         Session end times for momentum screen (e.g., ["10:30", "13:30"])
     st_momentum_days : int
         Number of days for short-term momentum calculation (default: 3)
-    sess_start_hrs : int
-        Hours from session start to measure opening momentum (default: 1)
-    sess_start_minutes : int
-        Minutes from session start to measure opening momentum (default: 30)
+    sess_start_hrs : Optional[int]
+        Hours from session start to measure opening momentum. When omitted,
+        ``period_length`` determines the opening window length.
+    sess_start_minutes : Optional[int]
+        Minutes from session start to measure opening momentum. When omitted,
+        ``period_length`` determines the opening window length.
     sess_end_hrs : Optional[int]
-        Hours from session end for closing momentum (defaults to sess_start_hrs)
+        Hours from session end for closing momentum. When omitted, the closing
+        window reuses ``period_length`` (or the opening override when set).
     sess_end_mins : Optional[int]
-        Minutes from session end for closing momentum (defaults to sess_start_minutes)
+        Minutes from session end for closing momentum. When omitted, the
+        closing window reuses ``period_length`` (or the opening override when
+        set).
     test_vol : bool
         Whether to test volume patterns in momentum screen (default: True)
 
@@ -106,8 +114,8 @@ class ScreenParams:
     session_starts: Optional[List[Union[str, time]]] = None
     session_ends: Optional[List[Union[str, time]]] = None
     st_momentum_days: int = 3
-    sess_start_hrs: int = 1
-    sess_start_minutes: int = 30
+    sess_start_hrs: Optional[int] = None
+    sess_start_minutes: Optional[int] = None
     sess_end_hrs: Optional[int] = None
     sess_end_mins: Optional[int] = None
     test_vol: bool = True
@@ -360,8 +368,8 @@ class HistoricalScreener:
         session_ends: List[Union[str, time]] = ["10:30", "13:30"],
         st_momentum_days: int = 3,
         period_length: Optional[Union[int, timedelta]] = None,
-        sess_start_hrs: int = 1,
-        sess_start_minutes: int = 30,
+        sess_start_hrs: Optional[int] = None,
+        sess_start_minutes: Optional[int] = None,
         sess_end_hrs: Optional[int] = None,
         sess_end_mins: Optional[int] = None,
         test_vol: bool = True,
@@ -462,6 +470,10 @@ class HistoricalScreener:
         momentum_params = self._build_momentum_params(
             st_momentum_days,
             period_length,
+            sess_start_hrs,
+            sess_start_minutes,
+            sess_end_hrs,
+            sess_end_mins,
         )
 
         # Determine which months to analyze (allow override when precomputed)
@@ -471,16 +483,15 @@ class HistoricalScreener:
             else self._parse_season_months(months, season)
         )
 
-        # Default closing window to match opening window
-        if sess_end_hrs is None:
-            sess_end_hrs = sess_start_hrs
-        if sess_end_mins is None:
-            sess_end_mins = sess_start_minutes
-
         if self.verbose:
             self.logger.info(f"Starting intraday momentum screen for {len(self.tickers)} tickers")
             self.logger.info(f"  Sessions: {len(session_starts)} session(s)")
-            self.logger.info(f"  Momentum days: {st_momentum_days}, Opening window: {sess_start_hrs}h {sess_start_minutes}m")
+            self.logger.info(
+                "  Momentum days: %s, Opening window override: %sh %sm",
+                st_momentum_days,
+                sess_start_hrs if sess_start_hrs is not None else "-",
+                sess_start_minutes if sess_start_minutes is not None else "-",
+            )
             if selected_months:
                 self.logger.info(f"  Filtering to months: {selected_months}")
 
@@ -592,10 +603,10 @@ class HistoricalScreener:
                         ticker=t,
                         session_start=start_time,
                         session_end=end_time,
-                        start_hrs=sess_start_hrs,
-                        start_mins=sess_start_minutes,
-                        end_hrs=sess_end_hrs,
-                        end_mins=sess_end_mins,
+                        opening_window_minutes=momentum_params.get('opening_window_minutes'),
+                        closing_window_minutes=momentum_params.get('closing_window_minutes'),
+                        sess_start_window_minutes=momentum_params.get('sess_start_window_minutes'),
+                        sess_end_window_minutes=momentum_params.get('sess_end_window_minutes'),
                         momentum_days=st_momentum_days,
                         test_vol=test_vol,
                         data=ticker_data,
@@ -653,15 +664,62 @@ class HistoricalScreener:
             return None
         return minutes
 
+    @staticmethod
+    def _combine_window_minutes(
+        hours: Optional[Union[int, float]], minutes: Optional[Union[int, float]]
+    ) -> Optional[float]:
+        if hours is None and minutes is None:
+            return None
+        try:
+            hours_val = int(hours or 0)
+            minutes_val = int(minutes or 0)
+        except (TypeError, ValueError):
+            return None
+        total = hours_val * 60 + minutes_val
+        return float(total) if total > 0 else None
+
+    @staticmethod
+    def _minutes_to_timedelta(minutes: Optional[float]) -> timedelta:
+        if minutes is None or minutes <= 0:
+            minutes = DEFAULT_MOMENTUM_WINDOW_MINUTES
+        return timedelta(minutes=float(minutes))
+
     def _build_momentum_params(
         self,
         st_momentum_days: int,
         period_length: Optional[Union[int, float, timedelta]],
+        sess_start_hrs: Optional[int],
+        sess_start_minutes: Optional[int],
+        sess_end_hrs: Optional[int],
+        sess_end_mins: Optional[int],
     ) -> Dict[str, Any]:
         params: Dict[str, Any] = {'st_momentum_days': int(st_momentum_days)}
         period_minutes = self._coerce_period_minutes(period_length)
-        if period_minutes is not None:
-            params['period_length_min'] = period_minutes
+        opening_override = self._combine_window_minutes(sess_start_hrs, sess_start_minutes)
+        closing_override = self._combine_window_minutes(sess_end_hrs, sess_end_mins)
+
+        if opening_override is not None:
+            opening_minutes = opening_override
+        elif period_minutes is not None:
+            opening_minutes = period_minutes
+        else:
+            opening_minutes = DEFAULT_MOMENTUM_WINDOW_MINUTES
+
+        if closing_override is not None:
+            closing_minutes = closing_override
+        elif period_minutes is not None:
+            closing_minutes = period_minutes
+        else:
+            closing_minutes = opening_minutes
+
+        resolved_period = period_minutes if period_minutes is not None else opening_minutes
+        params['period_length_min'] = float(resolved_period)
+        params['opening_window_minutes'] = float(opening_minutes)
+        params['closing_window_minutes'] = float(closing_minutes)
+        if opening_override is not None:
+            params['sess_start_window_minutes'] = float(opening_override)
+        if closing_override is not None:
+            params['sess_end_window_minutes'] = float(closing_override)
         return params
 
     def st_seasonality_screen(
@@ -1373,15 +1431,28 @@ class HistoricalScreener:
 
         return dict(items)
 
+    @staticmethod
+    def _resolve_window_minutes(*candidates: Optional[float]) -> float:
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            try:
+                value = float(candidate)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+        return float(DEFAULT_MOMENTUM_WINDOW_MINUTES)
+
     def _session_momentum_analysis(
         self,
         ticker: str,
         session_start: time,
         session_end: time,
-        start_hrs: int = 1,
-        start_mins: int = 30,
-        end_hrs: Optional[int] = None,
-        end_mins: Optional[int] = None,
+        opening_window_minutes: Optional[float] = None,
+        closing_window_minutes: Optional[float] = None,
+        sess_start_window_minutes: Optional[float] = None,
+        sess_end_window_minutes: Optional[float] = None,
         momentum_days: int = 3,
         test_vol: bool = True,
         data: Optional[pd.DataFrame] = None,
@@ -1459,9 +1530,19 @@ class HistoricalScreener:
         if price_col is None:
             price_col = 'Close' if 'Close' in data.columns else data.columns[0]
 
+        resolved_open_minutes = self._resolve_window_minutes(
+            opening_window_minutes,
+            sess_start_window_minutes,
+        )
+        resolved_close_minutes = self._resolve_window_minutes(
+            closing_window_minutes,
+            sess_end_window_minutes,
+            resolved_open_minutes,
+        )
+
         # Create time windows
-        opening_window = timedelta(hours=start_hrs, minutes=start_mins)
-        closing_window = timedelta(hours=end_hrs or start_hrs, minutes=end_mins or start_mins)
+        opening_window = self._minutes_to_timedelta(resolved_open_minutes)
+        closing_window = self._minutes_to_timedelta(resolved_close_minutes)
 
         # Extract session data using time of day filtering
         daily_sessions = session_data
@@ -1541,6 +1622,8 @@ class HistoricalScreener:
             'session_start': str(session_start),
             'session_end': str(session_end),
             'n_sessions': len(full_session_returns.dropna()),
+            'opening_window_minutes': float(resolved_open_minutes),
+            'closing_window_minutes': float(resolved_close_minutes),
             'opening_momentum': {
                 'mean': float(opening_returns.mean()),
                 'std': float(opening_returns.std()),
@@ -1583,6 +1666,11 @@ class HistoricalScreener:
         # Add volatility analysis if available
         if volatility_stats:
             results['volatility'] = volatility_stats
+
+        if sess_start_window_minutes is not None:
+            results['sess_start_window_minutes'] = float(sess_start_window_minutes)
+        if sess_end_window_minutes is not None:
+            results['sess_end_window_minutes'] = float(sess_end_window_minutes)
 
         return results
 
@@ -1869,7 +1957,42 @@ class HistoricalScreener:
                 # T-statistic against zero (testing if mean is significantly different from 0)
                 t_stat = mean_val / (std_val / np.sqrt(len(day_data))) if std_val > 0 else np.nan
 
+                rest_data = df[df['weekday'] != dow][col_name]
+                rest_mean = float(rest_data.mean()) if len(rest_data) else np.nan
+                p_value_vs_rest = np.nan
+                cohen_d = np.nan
+                t_stat_vs_rest = np.nan
+
+                if len(rest_data) >= 5:
+                    try:
+                        t_stat_vs_rest, p_value_vs_rest = stats.ttest_ind(
+                            day_data.values,
+                            rest_data.values,
+                            equal_var=False,
+                            nan_policy='omit'
+                        )
+                    except Exception:
+                        t_stat_vs_rest = np.nan
+                        p_value_vs_rest = np.nan
+
+                    var_day = float(day_data.var(ddof=1)) if len(day_data) > 1 else 0.0
+                    var_rest = float(rest_data.var(ddof=1)) if len(rest_data) > 1 else 0.0
+                    denom = (len(day_data) + len(rest_data) - 2)
+                    if denom > 0 and var_day > 0 and var_rest > 0:
+                        pooled = np.sqrt(
+                            ((len(day_data) - 1) * var_day + (len(rest_data) - 1) * var_rest)
+                            / denom
+                        )
+                        if pooled > 0:
+                            cohen_d = (float(mean_val) - rest_mean) / pooled
+
                 months_meta = self._build_months_metadata(day_data.index, None)
+                significant_vs_rest = bool(
+                    np.isfinite(p_value_vs_rest)
+                    and p_value_vs_rest < 0.01
+                    and np.isfinite(cohen_d)
+                    and abs(cohen_d) >= 0.35
+                )
 
                 weekday_stats[day_name] = {
                     'n': len(day_data),
@@ -1879,6 +2002,11 @@ class HistoricalScreener:
                     'skew': float(day_data.skew()),
                     'positive_pct': float((day_data > 0).sum() / len(day_data)),
                     't_stat': float(t_stat) if not np.isnan(t_stat) else np.nan,
+                    'p_value_vs_rest': float(p_value_vs_rest) if np.isfinite(p_value_vs_rest) else np.nan,
+                    'mean_vs_rest': float(mean_val - rest_mean) if np.isfinite(rest_mean) else np.nan,
+                    'cohen_d_vs_rest': float(cohen_d) if np.isfinite(cohen_d) else np.nan,
+                    't_stat_vs_rest': float(t_stat_vs_rest) if np.isfinite(t_stat_vs_rest) else np.nan,
+                    'significant_vs_rest': significant_vs_rest,
                     **months_meta,
                 }
 

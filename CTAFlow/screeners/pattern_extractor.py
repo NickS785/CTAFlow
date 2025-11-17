@@ -213,6 +213,10 @@ class PatternExtractor:
         "session_tz",
         "window_anchor",
         "window_minutes",
+        "opening_window_minutes",
+        "closing_window_minutes",
+        "sess_start_window_minutes",
+        "sess_end_window_minutes",
         "target_times_hhmm",
         "period_length_min",
         "regime_filter",
@@ -582,7 +586,12 @@ class PatternExtractor:
                 continue
             if screen_filter is not None and summary.source_screen not in screen_filter:
                 continue
-            filtered[key] = summary.as_dict()
+            record = summary.as_dict()
+            payload = record.get("pattern_payload") or {}
+            for promoted in ("p_value", "t_stat", "f_stat", "n"):
+                if promoted not in record and promoted in payload:
+                    record[promoted] = payload[promoted]
+            filtered[key] = record
 
         return filtered
 
@@ -1390,6 +1399,16 @@ class PatternExtractor:
                 if not math.isfinite(t_value) or abs(t_value) < 1.96:
                     continue
 
+                p_vs_rest = self._coerce_optional_float(stats.get("p_value_vs_rest"))
+                cohen_d = self._coerce_optional_float(stats.get("cohen_d_vs_rest"))
+                significant_vs_rest = bool(stats.get("significant_vs_rest"))
+
+                if not significant_vs_rest:
+                    if p_vs_rest is None or p_vs_rest >= 0.02:
+                        continue
+                    if cohen_d is not None and abs(cohen_d) < 0.35:
+                        continue
+
                 pattern: Dict[str, Any] = {
                     "pattern_type": "momentum_weekday",
                     "momentum_type": momentum_type,
@@ -1404,7 +1423,10 @@ class PatternExtractor:
                     "n": stats.get("n"),
                     "bias": self._infer_momentum_bias(stats.get("mean")),
                     "window_anchor": self._momentum_window_anchor(momentum_type),
-                    "window_minutes": self._momentum_window_minutes(momentum_type, params),
+                    "window_minutes": self._momentum_window_minutes(momentum_type, params, context),
+                    "p_value_vs_rest": p_vs_rest,
+                    "cohen_d_vs_rest": cohen_d,
+                    "significant_vs_rest": significant_vs_rest,
                 }
 
                 months_active = stats.get("months_active")
@@ -1460,6 +1482,16 @@ class PatternExtractor:
         if params is not None and hasattr(params, "tz"):
             context["session_tz"] = getattr(params, "tz", None)
 
+        for window_key in (
+            "opening_window_minutes",
+            "closing_window_minutes",
+            "sess_start_window_minutes",
+            "sess_end_window_minutes",
+        ):
+            value = session_data.get(window_key)
+            if value is not None:
+                context.setdefault(window_key, value)
+
         filtered_months = ticker_result.get("filtered_months")
         if filtered_months is not None:
             context["filtered_months"] = filtered_months
@@ -1477,6 +1509,15 @@ class PatternExtractor:
             period_minutes = momentum_params.get("period_length_min")
             if period_minutes is not None:
                 context.setdefault("period_length_min", period_minutes)
+            for window_key in (
+                "opening_window_minutes",
+                "closing_window_minutes",
+                "sess_start_window_minutes",
+                "sess_end_window_minutes",
+            ):
+                value = momentum_params.get(window_key)
+                if value is not None and window_key not in context:
+                    context[window_key] = value
 
         return {key: value for key, value in context.items() if value is not None}
 
@@ -1860,7 +1901,43 @@ class PatternExtractor:
     def _momentum_window_minutes(
         momentum_type: str,
         params: Optional[ScreenParamLike],
+        context: Optional[Mapping[str, Any]] = None,
     ) -> Optional[int]:
+        def _from_context(keys: Sequence[str]) -> Optional[int]:
+            if context is None:
+                return None
+            for key in keys:
+                value = context.get(key)
+                minutes = PatternExtractor._coerce_optional_float(value)
+                if minutes is not None and minutes > 0:
+                    return int(round(minutes))
+            return None
+
+        priority_fields: Sequence[str]
+        if momentum_type == "opening_momentum":
+            priority_fields = (
+                "sess_start_window_minutes",
+                "opening_window_minutes",
+                "period_length_min",
+            )
+        elif momentum_type == "closing_momentum":
+            priority_fields = (
+                "sess_end_window_minutes",
+                "closing_window_minutes",
+                "period_length_min",
+                "opening_window_minutes",
+            )
+        else:
+            priority_fields = (
+                "period_length_min",
+                "opening_window_minutes",
+                "closing_window_minutes",
+            )
+
+        context_minutes = _from_context(priority_fields)
+        if context_minutes is not None:
+            return context_minutes
+
         if params is None or not hasattr(params, "sess_start_hrs"):
             return None
 
@@ -1884,6 +1961,12 @@ class PatternExtractor:
             if minutes is None:
                 minutes = getattr(params, "sess_start_minutes", None)
             return _combine(hours, minutes)
+
+        if hasattr(params, "period_length"):
+            period_length = getattr(params, "period_length")
+            minutes = PatternExtractor._coerce_optional_float(period_length)
+            if minutes is not None and minutes > 0:
+                return int(round(minutes))
 
         return None
 
@@ -2089,12 +2172,30 @@ class PatternExtractor:
             "session_tz",
             "window_anchor",
             "window_minutes",
+            "opening_window_minutes",
+            "closing_window_minutes",
+            "sess_start_window_minutes",
+            "sess_end_window_minutes",
             "positive_pct",
             "skew",
         ):
             value = payload_dict.get(meta_key)
             if value is not None and meta_key not in metadata:
                 metadata[meta_key] = value
+
+        if "window_minutes" not in metadata:
+            fallback_candidates = (
+                payload_dict.get("opening_window_minutes"),
+                payload_dict.get("closing_window_minutes"),
+                metadata.get("opening_window_minutes"),
+                metadata.get("closing_window_minutes"),
+                metadata.get("period_length_min"),
+            )
+            for candidate in fallback_candidates:
+                minutes = self._coerce_optional_float(candidate)
+                if minutes is not None and minutes > 0:
+                    metadata["window_minutes"] = minutes
+                    break
 
         regime_meta = payload_dict.get("regime_filter") or metadata.get("regime_filter")
         if regime_meta is not None:
@@ -2126,6 +2227,9 @@ class PatternExtractor:
 
         if payload_dict.get("period_length") and "period_length" not in metadata:
             metadata["period_length"] = payload_dict["period_length"]
+
+        if "best_weekday" not in metadata and "weekday" in metadata:
+            metadata["best_weekday"] = metadata["weekday"]
 
         return PatternSummary(
             key=summary_key,
