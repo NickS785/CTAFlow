@@ -1410,6 +1410,14 @@ class HorizonMapper:
 
         return None
 
+    @staticmethod
+    def _combine_minutes(hours: Any, minutes: Any) -> Optional[int]:
+        try:
+            total = int(hours or 0) * 60 + int(minutes or 0)
+        except (TypeError, ValueError):
+            return None
+        return total if total > 0 else None
+
     @classmethod
     def _extract_period_minutes(cls, pattern: Mapping[str, Any]) -> Optional[int]:
         metadata = pattern.get("metadata") or {}
@@ -1700,25 +1708,6 @@ class HorizonMapper:
         result.replace([np.inf, -np.inf], np.nan, inplace=True)
         return result
 
-    def _backward_window_return_minutes(self, df: pd.DataFrame, minutes: int) -> pd.Series:
-        if minutes <= 0:
-            raise ValueError("minutes must be positive for intraday horizons")
-
-        ts = pd.to_datetime(df["ts"]).dt.tz_convert(self.tz)
-        close = pd.Series(df["close"].values, index=ts).astype(float)
-        close = close.sort_index()
-        delta = pd.Timedelta(minutes=minutes)
-        past = close.reindex(close.index - delta)
-        past.index = past.index + delta
-        with np.errstate(divide="ignore", invalid="ignore"):
-            raw = np.log(close / past)
-        series = pd.Series(raw, index=close.index)
-        cleaned = self._clean_return(series, policy="drop")
-        aligned = cleaned.reindex(ts)
-        result = pd.Series(aligned.values, index=df.index)
-        result.replace([np.inf, -np.inf], np.nan, inplace=True)
-        return result
-
     def _same_day_return_series(
         self, df: pd.DataFrame, session_cache: MutableMapping[str, Any]
     ) -> pd.Series:
@@ -1837,7 +1826,6 @@ class HorizonMapper:
         *,
         default_intraday_minutes: int,
         forward_cache: MutableMapping[int, pd.Series],
-        backward_cache: MutableMapping[int, pd.Series],
         trend_cache: MutableMapping[int, pd.Series],
         session_cache: MutableMapping[str, Any],
     ) -> Tuple[pd.Series, pd.Series]:
@@ -1866,11 +1854,11 @@ class HorizonMapper:
                 )
             returns_y = forward_cache[window_minutes]
         elif momentum_type == "closing_momentum":
-            if window_minutes not in backward_cache:
-                backward_cache[window_minutes] = self._backward_window_return_minutes(
+            if window_minutes not in forward_cache:
+                forward_cache[window_minutes] = self._forward_window_return_minutes(
                     df, minutes=window_minutes
                 )
-            returns_y = backward_cache[window_minutes]
+            returns_y = forward_cache[window_minutes]
         elif momentum_type == "st_momentum":
             returns_y = trend_series
         else:  # full_session or fallback
@@ -2029,7 +2017,6 @@ class HorizonMapper:
         prev_week_series: Optional[pd.Series] = None
         horizon_cache: Dict[Tuple[str, Optional[int]], pd.Series] = {}
         momentum_forward_cache: Dict[int, pd.Series] = {}
-        momentum_backward_cache: Dict[int, pd.Series] = {}
         momentum_trend_cache: Dict[int, pd.Series] = {}
         session_return_cache: Dict[str, Any] = {}
         time_bearing_types = {"time_predictive_nextday", "time_predictive_nextweek", "orderflow_peak_pressure"}
@@ -2060,7 +2047,6 @@ class HorizonMapper:
                     pattern,
                     default_intraday_minutes=default_intraday_minutes,
                     forward_cache=momentum_forward_cache,
-                    backward_cache=momentum_backward_cache,
                     trend_cache=momentum_trend_cache,
                     session_cache=session_return_cache,
                 )

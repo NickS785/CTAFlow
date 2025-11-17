@@ -282,7 +282,7 @@ def test_momentum_weekday_returns_use_window_and_trend():
     assert xy.loc[0, "returns_x"] == pytest.approx(monday_return)
 
 
-def test_momentum_closing_correlation_uses_backward_returns():
+def test_momentum_closing_correlation_uses_forward_returns():
     bars = _make_momentum_bars()
     pipeline = ScreenerPipeline(tz="America/Chicago")
     pattern_key = "livestock_momentum|momentum_cc|closing_momentum|session_0"
@@ -332,13 +332,20 @@ def test_momentum_closing_correlation_uses_backward_returns():
         assert subset["returns_x"].tolist() == pytest.approx([expected] * len(subset))
 
     window = pd.Timedelta(minutes=120)
+    validated = 0
     for _, row in xy.iterrows():
         now_ts = row["ts_decision"]
-        prev_ts = now_ts - window
+        future_ts = now_ts + window
         now_close = float(features_idx.loc[now_ts, "close"])
-        prev_close = float(features_idx.loc[prev_ts, "close"])
-        expected = np.log(now_close / prev_close)
+        if future_ts not in features_idx.index:
+            assert pd.isna(row["returns_y"])
+            continue
+        future_close = float(features_idx.loc[future_ts, "close"])
+        expected = np.log(future_close / now_close)
         assert row["returns_y"] == pytest.approx(expected)
+        validated += 1
+
+    assert validated > 0
 
 
 def test_momentum_opening_correlation_uses_forward_returns():
