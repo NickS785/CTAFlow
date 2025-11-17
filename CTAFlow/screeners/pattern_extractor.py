@@ -21,7 +21,7 @@ from collections.abc import Iterable as IterableABC
 from dataclasses import dataclass, field
 from datetime import time
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, TYPE_CHECKING, Union
+from typing import Any, ClassVar, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, TYPE_CHECKING, Union
 
 import pandas as pd
 
@@ -114,6 +114,21 @@ def validate_filtered_months(
 class PatternSummary:
     """Container describing a statistically significant pattern."""
 
+    SESSION_PARAM_KEYS: ClassVar[Tuple[str, ...]] = (
+        "session_start",
+        "session_end",
+        "session_tz",
+        "window_anchor",
+        "window_minutes",
+        "period_length_min",
+        "sess_start",
+        "sess_end",
+        "sess_start_hrs",
+        "sess_start_minutes",
+        "sess_end_hrs",
+        "sess_end_minutes",
+    )
+
     key: str
     symbol: str
     source_screen: str
@@ -155,6 +170,29 @@ class PatternSummary:
             "metadata": self.metadata,
             "pattern_payload": self.payload,
         }
+
+    def get_session_params(self) -> Dict[str, Any]:
+        """Return canonical session parameters merged from metadata/payload."""
+
+        params: Dict[str, Any] = {}
+        sources: Tuple[Mapping[str, Any], Mapping[str, Any]] = (
+            self.metadata,
+            self.payload,
+        )
+        for key in self.SESSION_PARAM_KEYS:
+            for source in sources:
+                if not isinstance(source, Mapping):
+                    continue
+                if key in source and source[key] is not None:
+                    params.setdefault(key, source[key])
+                    break
+        return params
+
+    @property
+    def session_params(self) -> Dict[str, Any]:
+        """Shortcut exposing :meth:`get_session_params`."""
+
+        return self.get_session_params()
 
 
 class PatternExtractor:
@@ -735,6 +773,7 @@ class PatternExtractor:
         ascending: bool = False,
         per_ticker: bool = True,
         top: Optional[int] = None,
+        session_filters: Optional[Mapping[str, Any]] = None,
     ) -> Union[
         Dict[str, List[Tuple[str, PatternSummary, float]]],
         List[Tuple[str, str, PatternSummary, float]],
@@ -754,6 +793,11 @@ class PatternExtractor:
         top : int, optional
             Limit the number of entries per ticker (or overall when
             ``per_ticker=False``).
+        session_filters : Mapping, optional
+            When provided, restrict the ranking to summaries whose session
+            metadata matches the supplied ``sess_*`` parameters (e.g.
+            ``{"sess_start_hrs": 1}``). ``None`` or empty mappings disable the
+            filter.
 
         Returns
         -------
@@ -776,6 +820,28 @@ class PatternExtractor:
                 return PatternExtractor._extract_support(summary)
             return PatternExtractor._strength_raw(summary)
 
+        active_filters: Dict[str, Any] = {}
+        if session_filters:
+            active_filters = {
+                key: value
+                for key, value in session_filters.items()
+                if value is not None
+            }
+
+        def _matches_session_filters(summary: PatternSummary) -> bool:
+            if not active_filters:
+                return True
+            params = summary.get_session_params()
+            for key, expected in active_filters.items():
+                actual = params.get(key)
+                if isinstance(expected, (list, tuple, set)):
+                    if actual not in expected:
+                        return False
+                else:
+                    if actual != expected:
+                        return False
+            return True
+
         def _sort_key(
             ticker: str,
             pattern_key: str,
@@ -796,6 +862,8 @@ class PatternExtractor:
                 Tuple[Tuple[float, float, float, str, str], str, PatternSummary, float]
             ] = []
             for pattern_key, summary in patterns.items():
+                if not _matches_session_filters(summary):
+                    continue
                 score = self.significance_score(summary)
                 metric_value = _metric_value(summary)
                 support_value = PatternExtractor._extract_support(summary)
@@ -2164,6 +2232,8 @@ class PatternExtractor:
             "session_start",
             "session_end",
             "session_tz",
+            "sess_start",
+            "sess_end",
             "sess_start_hrs",
             "sess_start_minutes",
             "sess_end_hrs",
