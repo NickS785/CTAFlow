@@ -62,7 +62,8 @@ class ScreenParams:
     seasonality_session_end : Union[str, time]
         Local session end time applied before seasonality calculations (default "23:59:59").
     tz : str
-        Olson timezone for the seasonality session filter (default "America/Chicago").
+        Olson timezone used to localize intraday data before applying session or
+        time-of-day filters (default "America/Chicago").
 
     Examples
     --------
@@ -373,7 +374,8 @@ class HistoricalScreener:
         regime_col: Optional[str] = None,
         target_regimes: Optional[List[int]] = None,
         max_workers: Optional[int] = None,
-        show_progress: bool = True
+        show_progress: bool = True,
+        tz: str = "America/Chicago",
     ) -> Dict[str, Dict[str, any]]:
         """
         Screen for intraday momentum patterns across multiple sessions.
@@ -413,6 +415,9 @@ class HistoricalScreener:
             Name of the regime column used when ``use_regime_filtering`` is True.
         target_regimes : Optional[List[int]]
             Regime states that must be present to include a row in the analysis.
+        tz : str
+            Olson timezone used to localize ticker data before evaluating the session
+            masks (default "America/Chicago").
         session_start : Optional[Union[str, time]]
             Local session start time for filtering intraday bars (default "00:00").
         session_end : Optional[Union[str, time]]
@@ -524,6 +529,8 @@ class HistoricalScreener:
 
                     if ticker_data.empty:
                         return (t, {'error': 'No data available', 'regime_filter': None})
+
+                    ticker_data = self._localize_dataframe(ticker_data, tz)
 
                     # Filter by months/season if specified
                     if selected_months is not None:
@@ -787,6 +794,8 @@ class HistoricalScreener:
                 if data.empty:
                     return (ticker, {'error': 'No data available', 'regime_filter': None})
 
+                data = self._localize_dataframe(data, tz)
+
                 # Filter to session window in local timezone
                 session_data = filter_session_bars(
                     data,
@@ -992,6 +1001,7 @@ class HistoricalScreener:
         use_regime_filtering: bool = False,
         regime_col: Optional[str] = None,
         target_regimes: Optional[List[int]] = None,
+        tz: str = "America/Chicago",
     ) -> Dict[str, Dict[str, any]]:
         """Pre-filter ticker data for momentum screens to avoid redundant work."""
         cache: Dict[str, Dict[str, any]] = {}
@@ -1015,6 +1025,7 @@ class HistoricalScreener:
                 continue
 
             filtered_data = base_data
+            filtered_data = self._localize_dataframe(filtered_data, tz)
             if selected_months is not None:
                 filtered_data = self._filter_by_months(filtered_data, selected_months)
                 if filtered_data.empty:
@@ -1167,6 +1178,7 @@ class HistoricalScreener:
                         use_regime_filtering=params.use_regime_filtering,
                         regime_col=params.regime_col,
                         target_regimes=params.target_regimes,
+                        tz=params.tz,
                     )
 
                 screen_result = self._parse_params(
@@ -1261,6 +1273,7 @@ class HistoricalScreener:
                 use_regime_filtering=override_use_regime_filtering,
                 regime_col=override_regime_col,
                 target_regimes=override_target_regimes,
+                tz=params.tz,
                 **momentum_kwargs
             )
 
@@ -2830,6 +2843,44 @@ class HistoricalScreener:
             raise KeyError(regime_col)
 
         return data.loc[data[regime_col].isin(target_regimes)]
+
+    def _localize_dataframe(self, data: pd.DataFrame, tz: Optional[str]) -> pd.DataFrame:
+        """Return ``data`` with both the index and ``ts`` column converted to ``tz``."""
+
+        if data is None or data.empty or not tz:
+            return data
+
+        if isinstance(data.index, pd.DatetimeIndex):
+            idx = data.index
+        else:
+            idx = pd.to_datetime(data.index, errors='coerce')
+
+        result = data.copy()
+
+        try:
+            if isinstance(idx, pd.DatetimeIndex):
+                if idx.tz is None:
+                    idx = idx.tz_localize(tz)
+                else:
+                    idx = idx.tz_convert(tz)
+        except (TypeError, ValueError):
+            pass
+
+        result.index = idx
+
+        if 'ts' in result.columns:
+            ts = pd.to_datetime(result['ts'], errors='coerce')
+            if isinstance(ts, pd.Series):
+                try:
+                    if ts.dt.tz is None:
+                        ts = ts.dt.tz_localize(tz)
+                    else:
+                        ts = ts.dt.tz_convert(tz)
+                except (TypeError, ValueError):
+                    pass
+                result['ts'] = ts
+
+        return result
 
     @staticmethod
     def _months_mask_12(months: List[int]) -> str:
