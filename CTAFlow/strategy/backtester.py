@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .prediction_to_position import PredictionToPosition
 
 
 @dataclass
@@ -33,6 +36,7 @@ class ScreenerBacktester:
         threshold: float = 0.0,
         use_side_hint: bool = True,
         group_field: Optional[str] = None,
+        prediction_resolver: Optional["PredictionToPosition"] = None,
     ) -> Dict[str, Any]:
         if xy.empty:
             empty = pd.Series(dtype=float)
@@ -50,6 +54,16 @@ class ScreenerBacktester:
             raise KeyError(f"XY frame missing required columns: {sorted(missing)}")
 
         frame = xy.dropna(subset=["returns_x", "returns_y"]).copy()
+        if prediction_resolver is not None and not frame.empty:
+            frame = prediction_resolver.aggregate(frame)
+            if frame.empty:
+                return {
+                    "pnl": pd.Series(dtype=float),
+                    "positions": pd.Series(dtype=float),
+                    "summary": BacktestSummary(0.0, 0.0, np.nan, np.nan, 0.0, 0),
+                    "monthly": pd.Series(dtype=float),
+                    "cumulative": pd.Series(dtype=float),
+                }
         if frame.empty:
             return {
                 "pnl": pd.Series(dtype=float),
@@ -62,6 +76,9 @@ class ScreenerBacktester:
         direction = np.sign(frame["returns_x"])
         if use_side_hint and "side_hint" in frame.columns:
             hinted = frame["side_hint"].replace(0, np.nan)
+            direction = hinted.fillna(direction)
+        if prediction_resolver is not None and "prediction_position" in frame.columns:
+            hinted = frame["prediction_position"].replace(0, np.nan)
             direction = hinted.fillna(direction)
 
         signal_mask = frame["returns_x"].abs() >= float(threshold)

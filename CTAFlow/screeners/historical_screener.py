@@ -45,7 +45,7 @@ class ScreenParams:
         Minutes from session start to measure opening momentum (default: 30)
     sess_end_hrs : Optional[int]
         Hours from session end for closing momentum (defaults to sess_start_hrs)
-    sess_end_mins : Optional[int]
+    sess_end_minutes : Optional[int]
         Minutes from session end for closing momentum (defaults to sess_start_minutes)
     test_vol : bool
         Whether to test volume patterns in momentum screen (default: True)
@@ -109,7 +109,7 @@ class ScreenParams:
     sess_start_hrs: int = 1
     sess_start_minutes: int = 30
     sess_end_hrs: Optional[int] = None
-    sess_end_mins: Optional[int] = None
+    sess_end_minutes: Optional[int] = None
     test_vol: bool = True
 
     # Seasonality screen parameters
@@ -363,7 +363,7 @@ class HistoricalScreener:
         sess_start_hrs: int = 1,
         sess_start_minutes: int = 30,
         sess_end_hrs: Optional[int] = None,
-        sess_end_mins: Optional[int] = None,
+        sess_end_minutes: Optional[int] = None,
         test_vol: bool = True,
         months: Optional[List[int]] = None,
         season: Optional[str] = None,
@@ -392,7 +392,7 @@ class HistoricalScreener:
             Minutes from session start to measure opening momentum
         sess_end_hrs : Optional[int]
             Hours from session end for closing momentum (defaults to sess_start_hrs)
-        sess_end_mins : Optional[int]
+        sess_end_minutes : Optional[int]
             Minutes from session end for closing momentum (defaults to sess_start_minutes)
         test_vol : bool
             Whether to test volume patterns
@@ -474,8 +474,8 @@ class HistoricalScreener:
         # Default closing window to match opening window
         if sess_end_hrs is None:
             sess_end_hrs = sess_start_hrs
-        if sess_end_mins is None:
-            sess_end_mins = sess_start_minutes
+        if sess_end_minutes is None:
+            sess_end_minutes = sess_start_minutes
 
         if self.verbose:
             self.logger.info(f"Starting intraday momentum screen for {len(self.tickers)} tickers")
@@ -595,7 +595,7 @@ class HistoricalScreener:
                         start_hrs=sess_start_hrs,
                         start_mins=sess_start_minutes,
                         end_hrs=sess_end_hrs,
-                        end_mins=sess_end_mins,
+                        end_minutes=sess_end_minutes,
                         momentum_days=st_momentum_days,
                         test_vol=test_vol,
                         data=ticker_data,
@@ -1252,7 +1252,7 @@ class HistoricalScreener:
                 sess_start_hrs=params.sess_start_hrs,
                 sess_start_minutes=params.sess_start_minutes,
                 sess_end_hrs=params.sess_end_hrs,
-                sess_end_mins=params.sess_end_mins,
+                sess_end_minutes=params.sess_end_minutes,
                 test_vol=params.test_vol,
                 months=params.months,
                 season=params.season,
@@ -1381,7 +1381,7 @@ class HistoricalScreener:
         start_hrs: int = 1,
         start_mins: int = 30,
         end_hrs: Optional[int] = None,
-        end_mins: Optional[int] = None,
+        end_minutes: Optional[int] = None,
         momentum_days: int = 3,
         test_vol: bool = True,
         data: Optional[pd.DataFrame] = None,
@@ -1414,7 +1414,7 @@ class HistoricalScreener:
             Minutes for opening window
         end_hrs : Optional[int]
             Hours for closing window
-        end_mins : Optional[int]
+        end_minutes : Optional[int]
             Minutes for closing window
         momentum_days : int
             Days for short-term momentum calculation
@@ -1461,7 +1461,7 @@ class HistoricalScreener:
 
         # Create time windows
         opening_window = timedelta(hours=start_hrs, minutes=start_mins)
-        closing_window = timedelta(hours=end_hrs or start_hrs, minutes=end_mins or start_mins)
+        closing_window = timedelta(hours=end_hrs or start_hrs, minutes=end_minutes or start_mins)
 
         # Extract session data using time of day filtering
         daily_sessions = session_data

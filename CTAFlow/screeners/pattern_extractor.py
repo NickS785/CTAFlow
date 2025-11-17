@@ -1472,11 +1472,24 @@ class PatternExtractor:
         context: Dict[str, Any] = {
             "session_key": session_key,
             "session_index": self._parse_session_index(session_key),
-            "session_start": session_data.get("session_start"),
-            "session_end": session_data.get("session_end"),
+            "session_start": self._normalise_session_clock(
+                session_data.get("session_start"), params, "session_starts", session_key
+            ),
+            "session_end": self._normalise_session_clock(
+                session_data.get("session_end"), params, "session_ends", session_key
+            ),
         }
         if params is not None and hasattr(params, "tz"):
             context["session_tz"] = getattr(params, "tz", None)
+
+        if params is not None:
+            for attr in ("sess_start_hrs", "sess_start_minutes", "sess_end_hrs", "sess_end_minutes"):
+                context[attr] = getattr(params, attr, None)
+
+        start_window = self._derive_window_minutes(params, prefix="sess_start")
+        if start_window is not None:
+            context.setdefault("period_length_min", start_window)
+            context.setdefault("window_minutes", start_window)
 
         filtered_months = ticker_result.get("filtered_months")
         if filtered_months is not None:
@@ -1497,6 +1510,42 @@ class PatternExtractor:
                 context.setdefault("period_length_min", period_minutes)
 
         return {key: value for key, value in context.items() if value is not None}
+
+    def _normalise_session_clock(
+        self,
+        explicit_value: Any,
+        params: Optional[ScreenParamLike],
+        attr: str,
+        session_key: str,
+    ) -> Optional[str]:
+        clock = self._safe_time_string(explicit_value)
+        if clock is not None:
+            return clock
+        session_index = self._parse_session_index(session_key) or 0
+        if params is None or not hasattr(params, attr):
+            return None
+        candidates = getattr(params, attr, None)
+        if not candidates:
+            return None
+        try:
+            chosen = candidates[session_index]
+        except Exception:
+            return None
+        return self._safe_time_string(chosen)
+
+    @staticmethod
+    def _derive_window_minutes(
+        params: Optional[ScreenParamLike], *, prefix: str
+    ) -> Optional[int]:
+        if params is None:
+            return None
+        hours = getattr(params, f"{prefix}_hrs", None)
+        minutes = getattr(params, f"{prefix}_minutes", None)
+        try:
+            total = int(hours or 0) * 60 + int(minutes or 0)
+        except (TypeError, ValueError):
+            return None
+        return total if total > 0 else None
 
     @staticmethod
     def _apply_momentum_context(pattern: Dict[str, Any], context: Mapping[str, Any]) -> None:
@@ -1896,7 +1945,7 @@ class PatternExtractor:
 
         if momentum_type == "closing_momentum":
             hours = getattr(params, "sess_end_hrs", None)
-            minutes = getattr(params, "sess_end_mins", None)
+            minutes = getattr(params, "sess_end_minutes", None)
             if hours is None:
                 hours = getattr(params, "sess_start_hrs", None)
             if minutes is None:
@@ -2105,6 +2154,10 @@ class PatternExtractor:
             "session_start",
             "session_end",
             "session_tz",
+            "sess_start_hrs",
+            "sess_start_minutes",
+            "sess_end_hrs",
+            "sess_end_minutes",
             "window_anchor",
             "window_minutes",
             "positive_pct",
