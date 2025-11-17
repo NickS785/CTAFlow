@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Mapping, Optional, Sequence, TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -160,3 +160,158 @@ class ScreenerBacktester:
             result["group_field"] = group_field
 
         return result
+
+
+class MomentumBacktester:
+    """Utility for running light backtests on historical momentum screen outputs."""
+
+    def __init__(
+        self,
+        *,
+        annualisation: int = 252,
+        risk_free_rate: float = 0.0,
+        backtester: Optional[ScreenerBacktester] = None,
+    ) -> None:
+        self._backtester = backtester or ScreenerBacktester(
+            annualisation=annualisation,
+            risk_free_rate=risk_free_rate,
+        )
+
+    @staticmethod
+    def _resolve_screen_results(
+        results: Mapping[str, Any], screen_name: Optional[str]
+    ) -> Mapping[str, Any]:
+        if screen_name is None:
+            return results
+        try:
+            screen_results = results[screen_name]
+        except KeyError as exc:  # pragma: no cover - defensive
+            raise KeyError(f"Screen '{screen_name}' not found in results") from exc
+        if not isinstance(screen_results, Mapping):  # pragma: no cover - defensive
+            raise TypeError(
+                f"Screen '{screen_name}' results must be a mapping, got {type(screen_results)!r}"
+            )
+        return screen_results
+
+    def build_xy(
+        self,
+        results: Mapping[str, Any],
+        *,
+        screen_name: Optional[str] = None,
+        session_key: str = "session_0",
+        predictor: str = "closing_returns",
+        target: str = "rest_of_session_returns",
+        tickers: Optional[Sequence[str]] = None,
+        dropna: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Convert a nested momentum screen result dictionary into an ``XY`` frame.
+
+        Parameters
+        ----------
+        results
+            Mapping produced by :meth:`HistoricalScreener.intraday_momentum_screen`.
+        screen_name
+            Optional name of the screen to extract. If ``None`` the top-level
+            mapping is assumed to already be ticker keyed.
+        session_key
+            Session identifier such as ``"session_0"``.
+        predictor
+            Key inside ``return_series`` used for ``returns_x``.
+        target
+            Key inside ``return_series`` used for ``returns_y``.
+        tickers
+            Optional subset of tickers to include.
+        dropna
+            Whether to drop rows missing either ``returns_x`` or ``returns_y``.
+        """
+
+        if not isinstance(results, Mapping):  # pragma: no cover - defensive
+            raise TypeError(f"results must be a mapping, got {type(results)!r}")
+
+        screen_results = self._resolve_screen_results(results, screen_name)
+        columns = [
+            "returns_x",
+            "returns_y",
+            "ticker",
+            "session_key",
+            "screen_name",
+            "ts_decision",
+        ]
+        frames: List[pd.DataFrame] = []
+        iterable = tickers if tickers is not None else screen_results.keys()
+        for ticker in iterable:
+            ticker_data = screen_results.get(ticker)
+            if not isinstance(ticker_data, Mapping):
+                continue
+            session_data = ticker_data.get(session_key)
+            if not isinstance(session_data, Mapping):
+                continue
+            return_series = session_data.get("return_series")
+            if not isinstance(return_series, Mapping):
+                continue
+            predictor_series = return_series.get(predictor)
+            target_series = return_series.get(target)
+            if not isinstance(predictor_series, pd.Series) or not isinstance(
+                target_series, pd.Series
+            ):
+                continue
+            predictor_clean = pd.to_numeric(predictor_series, errors="coerce")
+            target_clean = pd.to_numeric(target_series, errors="coerce")
+            combined = pd.concat(
+                [
+                    predictor_clean.rename("returns_x"),
+                    target_clean.rename("returns_y"),
+                ],
+                axis=1,
+                join="inner",
+            )
+            if dropna:
+                combined = combined.dropna(subset=["returns_x", "returns_y"])
+            if combined.empty:
+                continue
+            decision_ts = pd.to_datetime(combined.index)
+            combined = combined.assign(
+                ticker=ticker,
+                session_key=session_key,
+                screen_name=screen_name,
+                ts_decision=decision_ts,
+            )
+            frames.append(combined)
+
+        if not frames:
+            return pd.DataFrame(columns=columns)
+
+        return pd.concat(frames).reset_index(drop=True)
+
+    def threshold_backtest(
+        self,
+        results: Mapping[str, Any],
+        *,
+        screen_name: Optional[str] = None,
+        session_key: str = "session_0",
+        predictor: str = "closing_returns",
+        target: str = "rest_of_session_returns",
+        tickers: Optional[Sequence[str]] = None,
+        threshold: float = 0.0,
+        use_side_hint: bool = False,
+        group_field: str = "ticker",
+        prediction_resolver: Optional["PredictionToPosition"] = None,
+    ) -> Dict[str, Any]:
+        """Run a quick threshold backtest over the extracted return pairs."""
+
+        xy = self.build_xy(
+            results,
+            screen_name=screen_name,
+            session_key=session_key,
+            predictor=predictor,
+            target=target,
+            tickers=tickers,
+        )
+        return self._backtester.threshold(
+            xy,
+            threshold=threshold,
+            use_side_hint=use_side_hint,
+            group_field=group_field,
+            prediction_resolver=prediction_resolver,
+        )
