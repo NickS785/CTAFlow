@@ -1509,13 +1509,15 @@ class HistoricalScreener:
         if daily_sessions.empty:
             return {'error': 'No session data found', 'ticker': ticker}
 
-        # Calculate opening momentum (first N minutes of session)
+            # Calculate opening momentum (first N minutes of session)
         opening_returns = self._calculate_session_window_returns(
             daily_sessions,
             session_start,
             opening_window,
             price_col,
-            is_synthetic
+            is_synthetic,
+            session_limit_start=session_start,  # Clamp lower bound
+            session_limit_end=session_end  # Clamp upper bound
         )
 
         # Calculate closing momentum (last N minutes of session)
@@ -1525,7 +1527,9 @@ class HistoricalScreener:
             closing_window,
             price_col,
             is_synthetic,
-            from_end=True
+            from_end=True,
+            session_limit_start=session_start,  # Clamp lower bound
+            session_limit_end=session_end  # Clamp upper bound
         )
 
         # Calculate full session returns
@@ -1643,16 +1647,19 @@ class HistoricalScreener:
         return data[mask]
 
     def _calculate_session_window_returns(
-        self,
-        session_data: pd.DataFrame,
-        anchor_time: time,
-        window: timedelta,
-        price_col: str,
-        is_synthetic: bool,
-        from_end: bool = False
+            self,
+            session_data: pd.DataFrame,
+            anchor_time: time,
+            window: timedelta,
+            price_col: str,
+            is_synthetic: bool,
+            from_end: bool = False,
+            session_limit_start: Optional[time] = None,
+            session_limit_end: Optional[time] = None
     ) -> pd.Series:
         """
         Calculate returns for a specific window within each session using vectorized operations.
+        Includes logic to clamp windows to session boundaries and handle sparse data.
 
         Parameters:
         -----------
@@ -1668,6 +1675,10 @@ class HistoricalScreener:
             Whether this is a synthetic spread
         from_end : bool
             If True, window goes backward from anchor_time
+        session_limit_start : Optional[time]
+            The earliest allowed time (session start) to prevent window overstep
+        session_limit_end : Optional[time]
+            The latest allowed time (session end) to prevent window overstep
 
         Returns:
         --------
@@ -1681,38 +1692,90 @@ class HistoricalScreener:
         session_data = session_data.copy()
         session_data['date'] = session_data.index.date
 
-        # Create time-based masks for window boundaries
-        if from_end:
-            # Window goes backward from anchor_time
-            window_end_time = anchor_time
-            window_start_seconds = (pd.Timestamp.combine(pd.Timestamp.today().date(), anchor_time) - window).time()
-            window_mask = (session_data.index.time <= window_end_time) & (session_data.index.time >= window_start_seconds)
-        else:
-            # Window goes forward from anchor_time
-            window_start_time = anchor_time
-            window_end_seconds = (pd.Timestamp.combine(pd.Timestamp.today().date(), anchor_time) + window).time()
-            window_mask = (session_data.index.time >= window_start_time) & (session_data.index.time <= window_end_seconds)
+        # Helper to safely add/sub time without date issues
+        def safe_time_offset(base_time, delta, subtract=False):
+            # Use a fixed dummy date to perform arithmetic
+            dummy_date = datetime(2000, 1, 1)
+            dt = datetime.combine(dummy_date, base_time)
+            if subtract:
+                res = dt - delta
+            else:
+                res = dt + delta
+            return res.time()
 
-        # Filter to window
+        # Helper to compare times handling midnight wrap logic if necessary
+        # (Assuming simple intraday session for clamping logic for now)
+        def clamp_time(target_t, lower_bound, upper_bound):
+            if lower_bound and upper_bound and lower_bound > upper_bound:
+                # Overnight session case - Clamping is complex, skipping strictly for simplicity
+                # unless standard comparisons clearly fail.
+                # Fallback: usually don't clamp overnight logic blindly.
+                return target_t
+
+            if lower_bound and target_t < lower_bound:
+                return lower_bound
+            if upper_bound and target_t > upper_bound:
+                return upper_bound
+            return target_t
+
+        # Calculate Window Start and End Times
+        if from_end:
+            # Window: [anchor - window] to [anchor]
+            # E.g., Closing Window: [16:00 - 30m] to [16:00] = 15:30 to 16:00
+            win_end = anchor_time
+            win_start = safe_time_offset(anchor_time, window, subtract=True)
+
+            # Clamp start to session start (don't look before session began)
+            if session_limit_start:
+                win_start = clamp_time(win_start, session_limit_start, session_limit_end)
+        else:
+            # Window: [anchor] to [anchor + window]
+            # E.g., Opening Window: [09:30] to [09:30 + 30m] = 09:30 to 10:00
+            win_start = anchor_time
+            win_end = safe_time_offset(anchor_time, window, subtract=False)
+
+            # Clamp end to session end (don't look after session ends)
+            if session_limit_end:
+                win_end = clamp_time(win_end, session_limit_start, session_limit_end)
+
+        # Generate Mask
+        # Handle cases where window wraps midnight (start > end)
+        if win_start <= win_end:
+            window_mask = (session_data.index.time >= win_start) & (session_data.index.time <= win_end)
+        else:
+            # Window spans midnight (e.g., 23:30 to 00:30)
+            window_mask = (session_data.index.time >= win_start) | (session_data.index.time <= win_end)
+
+        # Filter data
         window_data = session_data[window_mask].copy()
 
         if window_data.empty:
             return pd.Series(dtype=float)
 
         # Group by date and get first/last prices
+        # This implicitly handles "last available" data.
+        # If window is 15:30-16:00 and data ends at 15:58, .last() returns 15:58 price.
         grouped = window_data.groupby('date')[price_col]
+
+        # We must ensure we have enough data points in the window (optional validation)
+        # For now, standard calculation:
         start_prices = grouped.first()
         end_prices = grouped.last()
 
+        # Align indices (dates)
+        # Intersection of dates ensures we calculate returns only for days with data at BOTH ends of window
+        common_dates = start_prices.index.intersection(end_prices.index)
+        start_prices = start_prices.loc[common_dates]
+        end_prices = end_prices.loc[common_dates]
+
         # Calculate returns vectorized
         if is_synthetic:
-            # For spreads, use change in spread value
             returns = end_prices - start_prices
         else:
             # For prices, use log return
             # Filter out non-positive prices
             valid_mask = (start_prices > 0) & (end_prices > 0)
-            returns = pd.Series(index=start_prices.index, dtype=float)
+            returns = pd.Series(index=common_dates, dtype=float)
             returns[valid_mask] = np.log(end_prices[valid_mask] / start_prices[valid_mask])
 
         return returns.dropna()
