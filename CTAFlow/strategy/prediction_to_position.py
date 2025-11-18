@@ -30,7 +30,11 @@ class PredictionToPosition:
 
         frame = xy.copy()
         returns_x = pd.to_numeric(frame["returns_x"], errors="coerce")
-        weights = pd.to_numeric(frame.get(self.correlation_field, 1.0), errors="coerce").fillna(1.0)
+        weights_source = frame.get(self.correlation_field)
+        if weights_source is None:
+            weights = pd.Series(1.0, index=frame.index, dtype=float)
+        else:
+            weights = pd.to_numeric(weights_source, errors="coerce").fillna(1.0)
         if self.min_abs_correlation > 0:
             weights = weights.where(weights.abs() >= self.min_abs_correlation, 0.0)
         frame["_ptp_score"] = returns_x * weights
@@ -70,20 +74,47 @@ class PredictionToPosition:
 
         working = frame.copy()
         working["_ptp_score"] = pd.to_numeric(working["returns_x"], errors="coerce").fillna(0.0)
-        weights = pd.to_numeric(working.get(self.correlation_field, 1.0), errors="coerce").fillna(1.0)
+        weights_source = working.get(self.correlation_field)
+        if weights_source is None:
+            weights = pd.Series(1.0, index=working.index, dtype=float)
+        else:
+            weights = pd.to_numeric(weights_source, errors="coerce").fillna(1.0)
         working["_ptp_score"] *= weights
 
         collapsed_rows = []
         grouped = working.groupby("ts_decision", sort=True)
+        include_grouping = bool(group_field and group_field in working.columns)
         for _, subset in grouped:
-            row = self._select_best_row(subset)
-            if group_field and group_field in subset.columns:
-                members = [value for value in subset[group_field].tolist() if not pd.isna(value)]
+            if include_grouping:
+                values = subset[group_field].tolist()
+                order = []
+                seen_keys = set()
+                for value in values:
+                    key = "__nan__" if pd.isna(value) else value
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        order.append(value)
+
+                members = [value for value in values if not pd.isna(value)]
                 if members:
-                    # Preserve original order while removing duplicates
-                    seen = dict.fromkeys(members)
-                    row["_group_members"] = list(seen.keys())
-            collapsed_rows.append(row)
+                    members = list(dict.fromkeys(members))
+
+                for value in order:
+                    if pd.isna(value):
+                        per_subset = subset[subset[group_field].isna()]
+                    else:
+                        per_subset = subset[subset[group_field] == value]
+
+                    if per_subset.empty:
+                        continue
+
+                    row = self._select_best_row(per_subset)
+                    if members:
+                        row["_group_members"] = members
+                    collapsed_rows.append(row)
+            else:
+                row = self._select_best_row(subset)
+                collapsed_rows.append(row)
 
         resolved = pd.DataFrame(collapsed_rows).drop(columns=["_ptp_score"], errors="ignore")
         return resolved.reset_index(drop=True)
