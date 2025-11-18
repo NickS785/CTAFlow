@@ -1,5 +1,5 @@
 from ..utils.seasonal import last_year_predicts_this_year, intraday_lag_autocorr, abnormal_months, prewindow_feature, prewindow_predicts_month
-from typing import Any, List, Dict, Optional, Sequence, Union, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 import calendar
 import pandas as pd
 import numpy as np
@@ -12,6 +12,11 @@ from scipy import stats
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm.auto import tqdm
 import logging
+from ..features.regime_classification import (
+    BaseRegimeClassifier,
+    RegimeSpecificationLike,
+    build_regime_classifier,
+)
 
 
 @dataclass
@@ -102,6 +107,7 @@ class ScreenParams:
     use_regime_filtering: bool = False
     regime_col: Optional[str] = None
     target_regimes: Optional[List[int]] = None
+    regime_settings: Optional[RegimeSpecificationLike] = None
 
     # Momentum screen parameters
     session_starts: Optional[List[Union[str, time]]] = None
@@ -220,6 +226,7 @@ class HistoricalScreener:
         self.verbose = verbose
         self.results_client = results_client
         self.auto_write_results = bool(auto_write_results and results_client is not None)
+        self._regime_cache: Dict[Tuple[str, str, str], Dict[str, pd.Series]] = {}
 
         # Setup logging
         self.logger = logging.getLogger(f"{__name__}.HistoricalScreener")
@@ -383,6 +390,7 @@ class HistoricalScreener:
         use_regime_filtering: bool = False,
         regime_col: Optional[str] = None,
         target_regimes: Optional[List[int]] = None,
+        regime_settings: Optional[RegimeSpecificationLike] = None,
         max_workers: Optional[int] = None,
         show_progress: bool = True,
         tz: str = "America/Chicago",
@@ -418,13 +426,19 @@ class HistoricalScreener:
             - spring: Mar, Apr, May (3, 4, 5)
             - summer: Jun, Jul, Aug (6, 7, 8)
             - fall: Sep, Oct, Nov (9, 10, 11)
-        use_regime_filtering : bool
-            Apply a discrete regime filter to the underlying dataset before computing
-            statistics.
-        regime_col : Optional[str]
-            Name of the regime column used when ``use_regime_filtering`` is True.
+    use_regime_filtering : bool
+        Apply a discrete regime filter to the underlying dataset before computing
+        statistics.
+    regime_col : Optional[str]
+        Name of the regime column used when ``use_regime_filtering`` is True.
         target_regimes : Optional[List[int]]
             Regime states that must be present to include a row in the analysis.
+        regime_settings : Optional[RegimeSpecificationLike]
+            Optional classifier configuration used to materialise ``regime_col``
+            when it is absent from the ticker data.
+    regime_settings : Optional[RegimeSpecificationLike]
+        Optional configuration describing how to construct ``regime_col`` when it does
+        not already exist on the input DataFrame.
         tz : str
             Olson timezone used to localize ticker data before evaluating the session
             masks (default "America/Chicago").
@@ -447,6 +461,9 @@ class HistoricalScreener:
             Name of the column containing discrete regime identifiers.
         target_regimes : Optional[List[int]]
             Regime states to include when ``use_regime_filtering`` is True.
+        regime_settings : Optional[RegimeSpecificationLike]
+            Optional classifier configuration used to derive ``regime_col`` when it is
+            missing from the raw data.
         max_workers : Optional[int]
             Maximum number of parallel workers. If None, uses min(32, cpu_count + 4).
         show_progress : bool
@@ -478,6 +495,8 @@ class HistoricalScreener:
             st_momentum_days,
             period_length,
         )
+        regime_classifier = self._resolve_regime_classifier(regime_settings)
+        regime_meta_template = self._build_regime_metadata(regime_col, target_regimes, regime_classifier)
 
         # Determine which months to analyze (allow override when precomputed)
         selected_months = (
@@ -538,48 +557,62 @@ class HistoricalScreener:
                         ticker_data = self.data[t]
 
                     if ticker_data.empty:
-                        return (t, {'error': 'No data available', 'regime_filter': None})
+                        return (t, {'error': 'No data available', 'regime_filter': regime_meta_template})
 
                     ticker_data = self._localize_dataframe(ticker_data, tz)
 
-                    # Filter by months/season if specified
-                    if selected_months is not None:
-                        ticker_data = self._filter_by_months(ticker_data, selected_months)
-                        if ticker_data.empty:
-                            return (t, {
-                                'error': 'No data available for selected months/season',
+                if (
+                    ticker_data is not None
+                    and use_regime_filtering
+                    and regime_col
+                    and regime_classifier is not None
+                    and regime_col not in ticker_data.columns
+                ):
+                    ticker_data = self._ensure_regime_column(
+                        ticker_data,
+                        ticker=t,
+                        regime_col=regime_col,
+                        classifier=regime_classifier,
+                    )
+
+                # Filter by months/season if specified
+                if selected_months is not None:
+                    ticker_data = self._filter_by_months(ticker_data, selected_months)
+                    if ticker_data.empty:
+                        return (t, {
+                            'error': 'No data available for selected months/season',
+                            'selected_months': selected_months,
+                            'regime_filter': regime_meta_template,
+                        })
+
+                if use_regime_filtering and regime_col and target_regimes:
+                    try:
+                        ticker_data = self._filter_by_regime(ticker_data, regime_col, target_regimes)
+                    except KeyError:
+                        return (
+                            t,
+                            {
+                                'error': f"Regime column '{regime_col}' missing",
                                 'selected_months': selected_months,
-                                'regime_filter': None,
-                            })
+                                'regime_filter': regime_meta_template,
+                            },
+                        )
 
-                    if use_regime_filtering and regime_col and target_regimes:
-                        try:
-                            ticker_data = self._filter_by_regime(ticker_data, regime_col, target_regimes)
-                        except KeyError:
-                            return (
-                                t,
-                                {
-                                    'error': f"Regime column '{regime_col}' missing",
-                                    'selected_months': selected_months,
-                                    'regime_filter': {'column': regime_col, 'targets': target_regimes},
-                                },
-                            )
+                    if ticker_data.empty:
+                        return (
+                            t,
+                            {
+                                'error': 'No data available for selected regimes',
+                                'selected_months': selected_months,
+                                'regime_filter': regime_meta_template,
+                            },
+                        )
 
-                        if ticker_data.empty:
-                            return (
-                                t,
-                                {
-                                    'error': 'No data available for selected regimes',
-                                    'selected_months': selected_months,
-                                    'regime_filter': {'column': regime_col, 'targets': target_regimes},
-                                },
-                            )
+                    regime_meta = regime_meta_template
 
-                        regime_meta = {'column': regime_col, 'targets': list(target_regimes)}
-
-                    price_col = 'Close' if 'Close' in ticker_data.columns else ticker_data.columns[0]
-                    filtered_months_label = selected_months if selected_months else 'all'
-                    n_observations = len(ticker_data)
+                price_col = 'Close' if 'Close' in ticker_data.columns else ticker_data.columns[0]
+                filtered_months_label = selected_months if selected_months else 'all'
+                n_observations = len(ticker_data)
 
                 if price_col is None and ticker_data is not None:
                     price_col = 'Close' if 'Close' in ticker_data.columns else ticker_data.columns[0]
@@ -697,6 +730,7 @@ class HistoricalScreener:
         use_regime_filtering: bool = False,
         regime_col: Optional[str] = None,
         target_regimes: Optional[List[int]] = None,
+        regime_settings: Optional[RegimeSpecificationLike] = None,
     ) -> Dict[str, Dict[str, any]]:
         """
         Screen for seasonality patterns in intraday data.
@@ -779,6 +813,8 @@ class HistoricalScreener:
 
         # Determine which months to analyze
         selected_months = self._parse_season_months(months, season)
+        regime_classifier = self._resolve_regime_classifier(regime_settings)
+        regime_meta_template = self._build_regime_metadata(regime_col, target_regimes, regime_classifier)
 
         if self.verbose:
             self.logger.info(f"Starting seasonality screen for {len(self.tickers)} tickers")
@@ -802,7 +838,7 @@ class HistoricalScreener:
                     data = self.data[ticker]
 
                 if data.empty:
-                    return (ticker, {'error': 'No data available', 'regime_filter': None})
+                    return (ticker, {'error': 'No data available', 'regime_filter': regime_meta_template})
 
                 data = self._localize_dataframe(data, tz)
 
@@ -822,6 +858,19 @@ class HistoricalScreener:
                         'tz': tz,
                     })
 
+                if (
+                    use_regime_filtering
+                    and regime_col
+                    and regime_classifier is not None
+                    and regime_col not in session_data.columns
+                ):
+                    session_data = self._ensure_regime_column(
+                        session_data,
+                        ticker=ticker,
+                        regime_col=regime_col,
+                        classifier=regime_classifier,
+                    )
+
                 if selected_months is not None:
                     session_data = self._filter_by_months(session_data, selected_months)
                     if session_data.empty:
@@ -831,7 +880,7 @@ class HistoricalScreener:
                             'session_start': session_start_time.strftime("%H:%M:%S"),
                             'session_end': session_end_time.strftime("%H:%M:%S"),
                             'tz': tz,
-                            'regime_filter': None,
+                            'regime_filter': regime_meta_template,
                         })
 
                 regime_meta: Optional[Dict[str, Any]] = None
@@ -847,7 +896,7 @@ class HistoricalScreener:
                                 'session_start': session_start_time.strftime("%H:%M:%S"),
                                 'session_end': session_end_time.strftime("%H:%M:%S"),
                                 'tz': tz,
-                                'regime_filter': {'column': regime_col, 'targets': target_regimes},
+                                'regime_filter': regime_meta_template,
                             },
                         )
 
@@ -860,11 +909,11 @@ class HistoricalScreener:
                                 'session_start': session_start_time.strftime("%H:%M:%S"),
                                 'session_end': session_end_time.strftime("%H:%M:%S"),
                                 'tz': tz,
-                                'regime_filter': {'column': regime_col, 'targets': target_regimes},
+                                'regime_filter': regime_meta_template,
                             },
                         )
 
-                    regime_meta = {'column': regime_col, 'targets': list(target_regimes)}
+                    regime_meta = regime_meta_template
 
                 # Determine price column
                 price_col = 'Close' if 'Close' in session_data.columns else session_data.columns[0]
@@ -1011,10 +1060,13 @@ class HistoricalScreener:
         use_regime_filtering: bool = False,
         regime_col: Optional[str] = None,
         target_regimes: Optional[List[int]] = None,
+        regime_settings: Optional[RegimeSpecificationLike] = None,
         tz: str = "America/Chicago",
     ) -> Dict[str, Dict[str, any]]:
         """Pre-filter ticker data for momentum screens to avoid redundant work."""
         cache: Dict[str, Dict[str, any]] = {}
+        regime_classifier = self._resolve_regime_classifier(regime_settings)
+        regime_meta_template = self._build_regime_metadata(regime_col, target_regimes, regime_classifier)
 
         for ticker in self.tickers:
             is_synthetic = self.synthetic_tickers.get(ticker, False)
@@ -1036,6 +1088,19 @@ class HistoricalScreener:
 
             filtered_data = base_data
             filtered_data = self._localize_dataframe(filtered_data, tz)
+            if (
+                filtered_data is not None
+                and use_regime_filtering
+                and regime_col
+                and regime_classifier is not None
+                and regime_col not in filtered_data.columns
+            ):
+                filtered_data = self._ensure_regime_column(
+                    filtered_data,
+                    ticker=ticker,
+                    regime_col=regime_col,
+                    classifier=regime_classifier,
+                )
             if selected_months is not None:
                 filtered_data = self._filter_by_months(filtered_data, selected_months)
                 if filtered_data.empty:
@@ -1043,7 +1108,7 @@ class HistoricalScreener:
                         'data': None,
                         'is_synthetic': is_synthetic,
                         'filtered_months': selected_months,
-                        'regime_filter': None,
+                        'regime_filter': regime_meta_template,
                         'error': 'No data available for selected months/season'
                     }
                     continue
@@ -1057,7 +1122,7 @@ class HistoricalScreener:
                         'data': None,
                         'is_synthetic': is_synthetic,
                         'filtered_months': selected_months if selected_months else 'all',
-                        'regime_filter': {'column': regime_col, 'targets': target_regimes},
+                        'regime_filter': regime_meta_template,
                         'error': f"Regime column '{regime_col}' missing from data"
                     }
                     continue
@@ -1067,12 +1132,12 @@ class HistoricalScreener:
                         'data': None,
                         'is_synthetic': is_synthetic,
                         'filtered_months': selected_months if selected_months else 'all',
-                        'regime_filter': {'column': regime_col, 'targets': target_regimes},
+                        'regime_filter': regime_meta_template,
                         'error': 'No data available for selected regimes'
                     }
                     continue
 
-                regime_meta = {'column': regime_col, 'targets': list(target_regimes)}
+                regime_meta = regime_meta_template
 
             price_col = 'Close' if 'Close' in filtered_data.columns else filtered_data.columns[0]
 
@@ -1176,8 +1241,9 @@ class HistoricalScreener:
                 session_pairs = tuple(zip(session_starts, session_ends))
                 months_key = tuple(selected_months) if selected_months else None
                 regime_key = None
+                regime_signature = self._regime_signature(params.regime_settings)
                 if params.use_regime_filtering and params.regime_col and params.target_regimes:
-                    regime_key = (params.regime_col, tuple(params.target_regimes))
+                    regime_key = (params.regime_col, tuple(params.target_regimes), regime_signature)
 
                 cache_key = (tuple(session_starts), tuple(session_ends), months_key, regime_key)
 
@@ -1188,6 +1254,7 @@ class HistoricalScreener:
                         use_regime_filtering=params.use_regime_filtering,
                         regime_col=params.regime_col,
                         target_regimes=params.target_regimes,
+                        regime_settings=params.regime_settings,
                         tz=params.tz,
                     )
 
@@ -1200,10 +1267,11 @@ class HistoricalScreener:
                     use_regime_filtering=params.use_regime_filtering,
                     regime_col=params.regime_col,
                     target_regimes=params.target_regimes,
+                    regime_settings=params.regime_settings,
                 )
             else:
                 # Parse parameters and run appropriate screen
-                screen_result = self._parse_params(params)
+                screen_result = self._parse_params(params, regime_settings=params.regime_settings)
 
             if self.auto_write_results and self.results_client:
                 try:
@@ -1255,6 +1323,7 @@ class HistoricalScreener:
         """
         if params.screen_type == 'momentum':
             momentum_kwargs = dict(kwargs)
+            regime_settings_override = momentum_kwargs.pop('regime_settings', params.regime_settings)
             override_session_starts = momentum_kwargs.pop('session_starts', params.session_starts)
             override_session_ends = momentum_kwargs.pop('session_ends', params.session_ends)
             selected_months_override = momentum_kwargs.pop('_selected_months', None)
@@ -1283,11 +1352,13 @@ class HistoricalScreener:
                 use_regime_filtering=override_use_regime_filtering,
                 regime_col=override_regime_col,
                 target_regimes=override_target_regimes,
+                regime_settings=regime_settings_override,
                 tz=params.tz,
                 **momentum_kwargs
             )
 
         elif params.screen_type == 'seasonality':
+            regime_settings_override = kwargs.pop('regime_settings', params.regime_settings)
             # Run seasonality screen with provided parameters
             return self.st_seasonality_screen(
                 target_times=params.target_times,
@@ -1301,6 +1372,7 @@ class HistoricalScreener:
                 use_regime_filtering=params.use_regime_filtering,
                 regime_col=params.regime_col,
                 target_regimes=params.target_regimes,
+                regime_settings=regime_settings_override,
             )
 
         else:
@@ -1395,6 +1467,62 @@ class HistoricalScreener:
                 items.append((new_key, v))
 
         return dict(items)
+
+    # ------------------------------------------------------------------
+    # Regime helpers
+    # ------------------------------------------------------------------
+    def _resolve_regime_classifier(
+        self, settings: Optional[RegimeSpecificationLike]
+    ) -> Optional[BaseRegimeClassifier]:
+        if settings is None:
+            return None
+        return build_regime_classifier(settings)
+
+    def _regime_signature(self, settings: Optional[RegimeSpecificationLike]) -> Optional[str]:
+        classifier = self._resolve_regime_classifier(settings)
+        return classifier.cache_key() if classifier is not None else None
+
+    def _build_regime_metadata(
+        self,
+        regime_col: Optional[str],
+        target_regimes: Optional[Sequence[int]],
+        classifier: Optional[BaseRegimeClassifier],
+    ) -> Optional[Dict[str, Any]]:
+        if not regime_col or not target_regimes:
+            return None
+        meta: Dict[str, Any] = {
+            'column': regime_col,
+            'targets': list(target_regimes),
+        }
+        if classifier is not None:
+            meta['classifier'] = classifier.describe()
+        return meta
+
+    @staticmethod
+    def _frame_fingerprint(df: pd.DataFrame) -> str:
+        hashed = pd.util.hash_pandas_object(df.index, index=True)
+        return str(int(hashed.sum()))
+
+    def _ensure_regime_column(
+        self,
+        df: pd.DataFrame,
+        *,
+        ticker: str,
+        regime_col: str,
+        classifier: BaseRegimeClassifier,
+    ) -> pd.DataFrame:
+        if regime_col in df.columns:
+            return df
+        fingerprint = self._frame_fingerprint(df)
+        cache_key = (ticker, regime_col, classifier.cache_key())
+        bucket = self._regime_cache.setdefault(cache_key, {})
+        series = bucket.get(fingerprint)
+        if series is None:
+            series = classifier.classify(df)
+            bucket[fingerprint] = series
+        result = df.copy()
+        result[regime_col] = series.reindex(df.index)
+        return result
 
     def _session_momentum_analysis(
         self,
