@@ -18,6 +18,15 @@ from .feature_engineering import IntradayFeatures
 from .curve_analysis import SpreadData, FuturesCurve, CurveShapeAnalyzer, CurveEvolutionAnalyzer
 from .seasonal_anamoly import intraday_autocorr_between_times, intraday_lag_autocorr, last_year_predicts_this_year, abnormal_months, prewindow_feature, prewindow_predicts_month
 from .signals_processing import COTAnalyzer, TechnicalAnalysis
+from .regime_classification import (
+    BaseRegimeClassifier,
+    CrowdingRegimeClassifier,
+    RegimeSpecification,
+    RegimeSpecificationLike,
+    TrendRegimeClassifier,
+    VolatilityRegimeClassifier,
+    build_regime_classifier,
+)
 SpreadFeatures = SpreadData
 
 __all__ = [
@@ -30,4 +39,12 @@ __all__ = [
     # Signal processing classes
     'COTAnalyzer',
     'TechnicalAnalysis',
+    # Regime classification helpers
+    'BaseRegimeClassifier',
+    'TrendRegimeClassifier',
+    'VolatilityRegimeClassifier',
+    'CrowdingRegimeClassifier',
+    'RegimeSpecification',
+    'RegimeSpecificationLike',
+    'build_regime_classifier',
 ]

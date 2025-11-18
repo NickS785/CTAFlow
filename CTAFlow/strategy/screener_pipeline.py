@@ -2346,6 +2346,7 @@ class HorizonMapper:
             )
 
         result = pd.concat(rows, axis=0, ignore_index=True)
+        result = result.drop_duplicates().reset_index(drop=True)
         if debug:
             self._log_warn(
                 "HorizonMapper build complete",

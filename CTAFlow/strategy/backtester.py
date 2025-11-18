@@ -46,6 +46,7 @@ class ScreenerBacktester:
                 "summary": BacktestSummary(0.0, 0.0, np.nan, np.nan, 0.0, 0),
                 "monthly": pd.Series(dtype=float),
                 "cumulative": empty,
+                "daily_pnl": pd.Series(dtype=float),
             }
 
         required = {"returns_x", "returns_y"}
@@ -53,9 +54,10 @@ class ScreenerBacktester:
         if missing:
             raise KeyError(f"XY frame missing required columns: {sorted(missing)}")
 
-        frame = xy.dropna(subset=["returns_x", "returns_y"]).copy()
+        frame = xy.dropna(subset=["returns_x", "returns_y"]).drop_duplicates().copy()
         if prediction_resolver is not None and not frame.empty:
             frame = prediction_resolver.aggregate(frame)
+            frame = frame.drop_duplicates().copy()
             if frame.empty:
                 return {
                     "pnl": pd.Series(dtype=float),
@@ -63,6 +65,7 @@ class ScreenerBacktester:
                     "summary": BacktestSummary(0.0, 0.0, np.nan, np.nan, 0.0, 0),
                     "monthly": pd.Series(dtype=float),
                     "cumulative": pd.Series(dtype=float),
+                    "daily_pnl": pd.Series(dtype=float),
                 }
         if frame.empty:
             return {
@@ -71,9 +74,11 @@ class ScreenerBacktester:
                 "summary": BacktestSummary(0.0, 0.0, np.nan, np.nan, 0.0, 0),
                 "monthly": pd.Series(dtype=float),
                 "cumulative": pd.Series(dtype=float),
+                "daily_pnl": pd.Series(dtype=float),
             }
 
         frame = self._collision_resolver.resolve(frame, group_field=group_field)
+        frame = frame.drop_duplicates().copy()
 
         direction = np.sign(frame["returns_x"])
         if use_side_hint and "side_hint" in frame.columns:
@@ -84,7 +89,7 @@ class ScreenerBacktester:
             direction = hinted.fillna(direction)
 
         signal_mask = frame["returns_x"].abs() >= float(threshold)
-        positions = direction.where(signal_mask, 0.0)
+        raw_positions = direction.where(signal_mask, 0.0)
 
         trade_rows = frame.loc[signal_mask].copy()
         if not trade_rows.empty and "ts_decision" in trade_rows.columns:
@@ -94,11 +99,26 @@ class ScreenerBacktester:
         else:
             trade_rows["_trade_day"] = pd.NaT
 
-        pnl = positions * frame["returns_y"].astype(float)
-        cumulative = pnl.cumsum()
-        rolling_max = cumulative.cummax()
-        drawdown = cumulative - rolling_max
+        if "ts_decision" in frame.columns:
+            trade_index = pd.to_datetime(frame["ts_decision"], errors="coerce")
+            trade_index.name = "ts_decision"
+        else:
+            trade_index = pd.Index(frame.index, name=frame.index.name or "row")
+
+        raw_pnl = raw_positions * frame["returns_y"].astype(float)
+        raw_cumulative = raw_pnl.cumsum()
+        rolling_max = raw_cumulative.cummax()
+        drawdown = raw_cumulative - rolling_max
         max_drawdown = float(drawdown.min()) if not drawdown.empty else 0.0
+
+        def _assign_trade_index(series: pd.Series) -> pd.Series:
+            aligned = series.copy()
+            aligned.index = trade_index
+            return aligned
+
+        positions = _assign_trade_index(raw_positions)
+        pnl = _assign_trade_index(raw_pnl)
+        cumulative = _assign_trade_index(raw_cumulative)
 
         trades = int(signal_mask.sum())
         if not trade_rows.empty:
@@ -122,11 +142,27 @@ class ScreenerBacktester:
         else:
             sharpe = np.nan
 
-        if "ts_decision" in frame.columns:
-            ts = pd.to_datetime(frame["ts_decision"])
-            monthly = pnl.groupby(ts.dt.to_period("M")).sum().astype(float)
+        if isinstance(trade_index, pd.DatetimeIndex):
+            valid = trade_index.notna()
+            if valid.any():
+                monthly = (
+                    pnl.iloc[valid]
+                    .groupby(trade_index[valid].to_period("M"))
+                    .sum()
+                    .astype(float)
+                )
+                daily_pnl = (
+                    pnl.iloc[valid]
+                    .groupby(trade_index[valid].normalize())
+                    .sum()
+                    .astype(float)
+                )
+            else:
+                monthly = pd.Series(dtype=float)
+                daily_pnl = pd.Series(dtype=float)
         else:
             monthly = pd.Series(dtype=float)
+            daily_pnl = pd.Series(dtype=float)
 
         summary = BacktestSummary(
             total_return=total_return,
@@ -143,6 +179,7 @@ class ScreenerBacktester:
             "summary": summary,
             "monthly": monthly,
             "cumulative": cumulative,
+            "daily_pnl": daily_pnl,
         }
 
         if group_field and group_field in frame.columns:
@@ -157,8 +194,8 @@ class ScreenerBacktester:
                     if not members:
                         continue
                     share = 1.0 / len(members)
-                    row_position = positions.loc[idx]
-                    row_pnl = pnl.loc[idx]
+                    row_position = raw_positions.loc[idx]
+                    row_pnl = raw_pnl.loc[idx]
                     trade_day = row.get("_trade_day")
                     for member in members:
                         stats = grouped_results.setdefault(
@@ -270,7 +307,10 @@ class MomentumBacktester:
             "ts_decision",
         ]
         frames: List[pd.DataFrame] = []
-        iterable = tickers if tickers is not None else screen_results.keys()
+        if tickers is not None:
+            iterable = list(dict.fromkeys(tickers))
+        else:
+            iterable = screen_results.keys()
         for ticker in iterable:
             ticker_data = screen_results.get(ticker)
             if not isinstance(ticker_data, Mapping):
@@ -313,7 +353,8 @@ class MomentumBacktester:
         if not frames:
             return pd.DataFrame(columns=columns)
 
-        return pd.concat(frames).reset_index(drop=True)
+        combined = pd.concat(frames).reset_index(drop=True)
+        return combined.drop_duplicates().reset_index(drop=True)
 
     def threshold_backtest(
         self,
