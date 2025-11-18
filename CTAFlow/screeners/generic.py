@@ -14,7 +14,7 @@ winter, spring, summer, fall = {'months':[12,1,2,3]}, {'months':[3,4,5]}, {'mont
 livestock_session =dict(seasonality_session_start=time(hour=8, minute=30), seasonality_session_end=time(hour=13, minute=0), session_starts=["08:30"], session_ends=["13:00"])
 livestock_tgt_times = ["9:00", "9:30", "11:00", "12:00"]
 seasonal_livestock_params = dict(screen_type="seasonality", target_times=livestock_tgt_times, period_length=period_time)
-momentum_livestock_params = dict(screen_type="momentum", sess_start_hrs=1, sess_start_minutes=0)
+momentum_livestock_params = dict(screen_type="momentum", sess_start_hrs=1, sess_start_minutes=30, st_momentum_days=5)
 livestock_seasonal = ScreenParams( name="livestock_seasonal", **seasonal_livestock_params, **livestock_session)
 livestock_winter = ScreenParams(name="livestock_seasonal_winter", **seasonal_livestock_params, **livestock_session, **winter)
 livestock_summer = ScreenParams(name="livestock_seasonal_summer", **seasonal_livestock_params, **livestock_session, **summer)
