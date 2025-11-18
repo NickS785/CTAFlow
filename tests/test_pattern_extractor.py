@@ -123,6 +123,7 @@ def _make_summary(
     pattern_type: str = "demo",
     source_screen: str = "test",
     description: str = "demo pattern",
+    metadata: Optional[dict] = None,
 ) -> PatternSummary:
     return PatternSummary(
         key=key,
@@ -133,7 +134,7 @@ def _make_summary(
         description=description,
         strength=strength,
         payload=payload or {},
-        metadata={},
+        metadata=dict(metadata or {}),
     )
 
 
@@ -154,6 +155,22 @@ def _make_extractor(
     extractor.metadata = dict(metadata or {})
     extractor._filtered_months = None
     return extractor
+
+
+def test_pattern_summary_session_params_merges_sources():
+    summary = _make_summary(
+        key="scan|sess",
+        symbol="CL",
+        payload={"sess_end": "12:00"},
+        metadata={"sess_start_hrs": 1, "sess_start_minutes": 15},
+    )
+
+    params = summary.get_session_params()
+
+    assert params["sess_start_hrs"] == 1
+    assert params["sess_start_minutes"] == 15
+    assert params["sess_end"] == "12:00"
+    assert summary.session_params == params
 
 
 def _orderflow_result_fixture(ticker: str = "ZS") -> dict:
@@ -1080,6 +1097,26 @@ def test_rank_global_sorted_desc():
 
     assert scores == sorted(scores, reverse=True)
     assert ranked[0][0] == "CL"
+
+
+def test_rank_patterns_session_filters():
+    s1 = _make_summary(
+        key="scan|sess1",
+        symbol="CL",
+        metadata={"sess_start_hrs": 1, "sess_start_minutes": 30},
+    )
+    s2 = _make_summary(
+        key="scan|sess2",
+        symbol="CL",
+        metadata={"sess_start_hrs": 2, "sess_start_minutes": 0},
+    )
+
+    extractor = _make_extractor({"CL": {s1.key: s1, s2.key: s2}})
+
+    ranked = extractor.rank_patterns(session_filters={"sess_start_hrs": 1})
+
+    assert len(ranked["CL"]) == 1
+    assert ranked["CL"][0][0] == s1.key
 
 
 def test_significance_weight_sensitivity():

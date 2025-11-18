@@ -158,3 +158,32 @@ def test_backtester_collapses_duplicate_decisions():
     assert positions.iloc[0] == -1
     assert pnl.iloc[0] == pytest.approx(-0.1)
     assert result["summary"].trades == 1
+
+
+def test_backtester_counts_unique_trade_days_per_group():
+    tz = "UTC"
+    xy = pd.DataFrame(
+        {
+            "ts_decision": [
+                pd.Timestamp("2024-01-01 09:00", tz=tz),
+                pd.Timestamp("2024-01-01 15:00", tz=tz),
+                pd.Timestamp("2024-01-02 09:30", tz=tz),
+                pd.Timestamp("2024-01-01 10:00", tz=tz),
+                pd.Timestamp("2024-01-01 14:00", tz=tz),
+                pd.Timestamp("2024-01-02 11:00", tz=tz),
+            ],
+            "returns_x": [0.2, 0.05, -0.25, 0.3, -0.15, -0.2],
+            "returns_y": [0.1, 0.06, -0.08, 0.09, -0.05, -0.03],
+            "ticker": ["ZC_F", "ZC_F", "ZC_F", "ZW_F", "ZW_F", "ZW_F"],
+        }
+    )
+
+    backtester = backtester_module.ScreenerBacktester()
+    result = backtester.threshold(xy, group_field="ticker")
+
+    summary = result["summary"]
+    assert summary.trades == 4  # two tickers traded across two unique days
+
+    breakdown = result["group_breakdown"]
+    assert breakdown["ZC_F"]["trades"] == 2
+    assert breakdown["ZW_F"]["trades"] == 2

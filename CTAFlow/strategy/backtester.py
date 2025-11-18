@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence, TYPE_CHECKING
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
 
-if TYPE_CHECKING:  # pragma: no cover
-    from .prediction_to_position import PredictionToPosition
+from .prediction_to_position import PredictionToPosition
 
 
 @dataclass
@@ -87,6 +86,14 @@ class ScreenerBacktester:
         signal_mask = frame["returns_x"].abs() >= float(threshold)
         positions = direction.where(signal_mask, 0.0)
 
+        trade_rows = frame.loc[signal_mask].copy()
+        if not trade_rows.empty and "ts_decision" in trade_rows.columns:
+            trade_rows["_trade_day"] = pd.to_datetime(
+                trade_rows["ts_decision"], errors="coerce"
+            ).dt.normalize()
+        else:
+            trade_rows["_trade_day"] = pd.NaT
+
         pnl = positions * frame["returns_y"].astype(float)
         cumulative = pnl.cumsum()
         rolling_max = cumulative.cummax()
@@ -94,6 +101,18 @@ class ScreenerBacktester:
         max_drawdown = float(drawdown.min()) if not drawdown.empty else 0.0
 
         trades = int(signal_mask.sum())
+        if not trade_rows.empty:
+            trade_days = trade_rows["_trade_day"].dropna()
+            if not trade_days.empty:
+                if group_field and group_field in trade_rows.columns:
+                    combos = trade_rows.loc[trade_days.index, ["_trade_day", group_field]]
+                    valid = combos.dropna(subset=[group_field])
+                    trades = int(len(valid.drop_duplicates()))
+                    missing = combos[combos[group_field].isna()]
+                    if not missing.empty:
+                        trades += int(missing["_trade_day"].nunique())
+                else:
+                    trades = int(trade_days.nunique())
         mean_return = float(pnl.mean()) if not pnl.empty else 0.0
         total_return = float(pnl.sum())
         hit_rate = float((pnl > 0).mean()) if not pnl.empty else np.nan
@@ -127,7 +146,7 @@ class ScreenerBacktester:
         }
 
         if group_field and group_field in frame.columns:
-            grouped_frame = frame.loc[signal_mask].copy()
+            grouped_frame = trade_rows.copy()
             grouped_results: Dict[Any, Dict[str, float]] = {}
             if not grouped_frame.empty:
                 for idx, row in grouped_frame.iterrows():
@@ -140,19 +159,31 @@ class ScreenerBacktester:
                     share = 1.0 / len(members)
                     row_position = positions.loc[idx]
                     row_pnl = pnl.loc[idx]
+                    trade_day = row.get("_trade_day")
                     for member in members:
                         stats = grouped_results.setdefault(
                             member,
-                            {"trades": 0, "total_return": 0.0, "_pnl_count": 0.0},
+                            {
+                                "total_return": 0.0,
+                                "_pnl_count": 0.0,
+                                "_trade_days": set(),
+                                "_fallback_trade_count": 0,
+                            },
                         )
-                        stats["trades"] += int(row_position != 0)
                         stats["total_return"] += float(row_pnl * share)
                         stats["_pnl_count"] += share
+                        if row_position != 0:
+                            if pd.notna(trade_day):
+                                stats["_trade_days"].add(trade_day)
+                            else:
+                                stats["_fallback_trade_count"] += 1
             formatted: Dict[Any, Dict[str, float]] = {}
             for member, stats in grouped_results.items():
                 count = stats.get("_pnl_count", 1.0) or 1.0
+                trade_count = len(stats.get("_trade_days", set()))
+                trade_count += stats.get("_fallback_trade_count", 0)
                 formatted[member] = {
-                    "trades": stats.get("trades", 0),
+                    "trades": trade_count,
                     "total_return": stats.get("total_return", 0.0),
                     "mean_return": stats.get("total_return", 0.0) / count,
                 }
