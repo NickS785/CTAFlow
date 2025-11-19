@@ -64,6 +64,60 @@ def _weekday_pattern() -> dict[str, object]:
     }
 
 
+def _multirow_bars() -> pd.DataFrame:
+    tz = "America/Chicago"
+    ts = pd.to_datetime(
+        [
+            "2024-01-01 07:00",
+            "2024-01-01 12:00",
+            "2024-01-02 07:00",
+            "2024-01-02 12:00",
+        ]
+    ).tz_localize(tz)
+    return pd.DataFrame(
+        {
+            "ts": ts,
+            "open": [100.0, 101.0, 102.0, 103.0],
+            "close": [101.0, 101.5, 103.0, 103.5],
+            "session_id": [
+                "2024-01-01",
+                "2024-01-01",
+                "2024-01-02",
+                "2024-01-02",
+            ],
+        }
+    )
+
+
+def _orderflow_weekly_pattern() -> dict[str, object]:
+    return {
+        "pattern_type": "orderflow_weekly",
+        "pattern_payload": {
+            "weekday": "monday",
+            "metric": "net_pressure",
+            "pressure_bias": "buy",
+            "mean": 0.05,
+            "n": 25,
+        },
+        "metadata": {"orderflow_bias": "buy"},
+    }
+
+
+def _orderflow_wom_pattern() -> dict[str, object]:
+    return {
+        "pattern_type": "orderflow_week_of_month",
+        "pattern_payload": {
+            "weekday": "monday",
+            "week_of_month": 1,
+            "metric": "net_pressure",
+            "pressure_bias": "buy",
+            "mean": 0.07,
+            "n": 15,
+        },
+        "metadata": {"orderflow_bias": "buy"},
+    }
+
+
 def test_build_xy_preserves_list_metadata():
     bars = _make_simple_bars()
     mapper = HorizonMapper(tz="America/Chicago")
@@ -131,6 +185,39 @@ def test_backtester_group_breakdown():
     assert set(breakdown.keys()) == {"opening", "closing"}
     assert breakdown["opening"]["trades"] == 1
     assert breakdown["closing"]["total_return"] == pytest.approx(-0.1)
+
+
+@pytest.mark.parametrize(
+    "pattern_key, pattern_factory, gate_column",
+    [
+        ("weekday_mean_monday", _weekday_pattern, "weekday_mean_monday_gate"),
+        (
+            "oflow_weekly_monday_net_pressure_buy",
+            _orderflow_weekly_pattern,
+            "oflow_weekly_monday_net_pressure_buy_gate",
+        ),
+        (
+            "oflow_wom_monday_w1_net_pressure_buy",
+            _orderflow_wom_pattern,
+            "oflow_wom_monday_w1_net_pressure_buy_gate",
+        ),
+    ],
+)
+def test_session_level_gates_anchor_to_close(pattern_key, pattern_factory, gate_column):
+    bars = _multirow_bars()
+    pipeline = ScreenerPipeline(tz="America/Chicago")
+    patterns = {pattern_key: pattern_factory()}
+
+    featured = pipeline.build_features(bars, patterns)
+    assert gate_column in featured.columns
+
+    gate_series = featured[gate_column]
+    assert gate_series.sum() == 1
+
+    monday_rows = featured["session_id"] == "2024-01-01"
+    last_idx = featured.loc[monday_rows, "ts"].idxmax()
+    assert gate_series.loc[last_idx] == 1
+    assert gate_series.loc[monday_rows].sum() == 1
 
 
 def test_backtester_collapses_duplicate_decisions():
