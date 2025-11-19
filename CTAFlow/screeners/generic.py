@@ -1,9 +1,12 @@
 from CTAFlow.data import SyntheticSymbol, IntradayLeg, IntradayFileManager, DataClient
+from CTAFlow.features import VolatilityRegimeClassifier
 from CTAFlow.screeners import HistoricalScreener, ScreenParams, OrderflowParams
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, time
+
 from CTAFlow.config import DLY_DATA_PATH
+vol_clf = VolatilityRegimeClassifier(method='rv', window=10)
 
 two_h = timedelta(hours=2)
 energy_tickers = ["HO", "RB", "CL", "NG"]
@@ -34,6 +37,7 @@ usa_tgt_times = ["08:30", "10:30","9:00", "13:30"]
 session_starts = ["02:30", "08:30"]
 
 session_ends = ["10:30", "15:00"]
+
 default_london_settings = {"screen_type":"seasonality","target_times":london_tgt_times, "period_length":period_time, "seasonality_session_start":london_start, "seasonality_session_end":london_end}
 default_usa_settings = {"screen_type":"seasonality", "target_times":usa_tgt_times, "period_length":period_time, "seasonality_session_start":usa_start, "seasonality_session_end":usa_end}
 london_winter_seasonality = ScreenParams("seasonality",name="london_winter", months=[12,1,2,3], target_times=london_tgt_times, period_length=period_time, seasonality_session_start=london_start, seasonality_session_end=london_end)
@@ -69,15 +73,18 @@ london_seasonality = ScreenParams("seasonality", name="london_all",target_times=
 
 usa_seasonality = ScreenParams("seasonality",name="usa_all", target_times=usa_tgt_times, period_length=period_time, seasonality_session_start=usa_start, seasonality_session_end=usa_end)
 
-summer_momentum = ScreenParams("momentum",name="usa_summer_momentum", months=[5,6,7,8], session_starts=session_starts, session_ends=session_ends, sess_start_hrs=1, sess_start_minutes=30)
+summer_momentum = ScreenParams("momentum",name="usa_summer_momentum", months=[5,6,7,8], session_starts=session_starts, session_ends=session_ends,
+                               sess_start_hrs=1, sess_start_minutes=30, regime_settings=vol_clf, target_regimes=[0,1])
 
-spring_momentum = ScreenParams("momentum",name="usa_spring_momentum", months=[3,4,5], session_starts=session_starts, session_ends=session_ends, sess_start_hrs=1, sess_start_minutes=30)
+spring_momentum = ScreenParams("momentum",name="usa_spring_momentum", months=[3,4,5], session_starts=session_starts, session_ends=session_ends,
+                               sess_start_hrs=1, sess_start_minutes=30, regime_settings=vol_clf, target_regimes=[0,1])
 
-fall_momentum = ScreenParams("momentum",name="usa_fall_momentum", months=[9, 10,11],session_starts=session_starts, session_ends=session_ends, sess_start_hrs=1, sess_start_minutes=30)
+fall_momentum = ScreenParams("momentum",name="usa_fall_momentum", months=[9, 10,11],session_starts=session_starts, session_ends=session_ends,
+                             sess_start_hrs=1, sess_start_minutes=30, regime_settings=vol_clf, target_regimes=[0,1])
 
-winter_momentum = ScreenParams("momentum",name="usa_winter_momentum", months=[12,1,2,3], session_starts=session_starts, session_ends=session_ends, sess_start_hrs=1, sess_start_minutes=30)
+winter_momentum = ScreenParams("momentum",name="usa_winter_momentum", months=[12,1,2,3], session_starts=session_starts, session_ends=session_ends, sess_start_hrs=1, sess_start_minutes=30, regime_settings=vol_clf, target_regimes=[0,1])
 
-momentum_generic = ScreenParams("momentum",name="momentum_generic", session_starts=session_starts, session_ends=session_ends, sess_start_hrs=1, sess_start_minutes=30)
+momentum_generic = ScreenParams("momentum",name="momentum_generic", session_starts=session_starts, session_ends=session_ends, sess_start_hrs=1, sess_start_minutes=30, regime_settings=vol_clf, target_regimes=[0,1])
 
 usa_seasonals = [usa_winter_seasonality, usa_summer_seasonality, usa_spring_seasonality, usa_fall_seasonality, usa_seasonality]
 

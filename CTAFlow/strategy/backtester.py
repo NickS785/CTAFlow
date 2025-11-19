@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence
-
 import numpy as np
 import pandas as pd
-
+from matplotlib import pyplot as plt
 from .prediction_to_position import PredictionToPosition
 
 
@@ -408,3 +407,87 @@ class MomentumBacktester:
             group_field=group_field,
             prediction_resolver=prediction_resolver,
         )
+
+
+
+def _align_series(*series: pd.Series) -> list[pd.Series]:
+    """Inner helper: intersection of non-null indices, forward-fill if needed."""
+    if not series:
+        return []
+    idx = series[0].index
+    for s in series[1:]:
+        idx = idx.intersection(s.index)
+    aligned = []
+    for s in series:
+        ss = s.reindex(idx).astype(float)
+        aligned.append(ss)
+    return aligned
+
+def build_overlay_frame(
+    cumulative: pd.Series,
+    price: Optional[pd.Series] = None,
+    *,
+    scale: Literal["minmax", "rebase100", "zscore"] = "minmax",
+) -> pd.DataFrame:
+    """
+    Return a tidy frame with columns:
+      - 'cum_pnl'       : cumulative PnL as provided
+      - 'price_scaled'  : None if no price; otherwise scaled to cum_pnl range
+    Scaling options:
+      - minmax    : maps price into [cum.min, cum.max]
+      - rebase100 : price indexed to 100, then re-mapped to cum range (same var scale)
+      - zscore    : (price - mean)/std, then scaled to cum range
+    """
+    if cumulative is None or cumulative.empty:
+        return pd.DataFrame(columns=["cum_pnl", "price_scaled"])
+    cumulative = pd.to_numeric(cumulative, errors="coerce").dropna()
+    if price is None or price.empty:
+        return pd.DataFrame({"cum_pnl": cumulative})
+
+    cum, px = _align_series(cumulative, price)
+
+    # Target range for overlay
+    tgt_lo, tgt_hi = float(cum.min()), float(cum.max())
+    tgt_span = max(tgt_hi - tgt_lo, 1e-12)
+
+    px = px.astype(float)
+    if scale == "minmax":
+        src_lo, src_hi = float(px.min()), float(px.max())
+        src_span = max(src_hi - src_lo, 1e-12)
+        px_scaled = (px - src_lo) / src_span
+    elif scale == "rebase100":
+        px_scaled = (px / px.iloc[0])  # index to 1.0
+        px_scaled = (px_scaled - px_scaled.min()) / max(px_scaled.max() - px_scaled.min(), 1e-12)
+    elif scale == "zscore":
+        mu, sd = float(px.mean()), float(px.std(ddof=0)) or 1.0
+        px_scaled = (px - mu) / sd
+        # normalize to [0,1] for range map
+        px_scaled = (px_scaled - px_scaled.min()) / max(px_scaled.max() - px_scaled.min(), 1e-12)
+    else:
+        raise ValueError(f"Unknown scale: {scale}")
+
+    px_rescaled = tgt_lo + px_scaled * tgt_span
+    return pd.DataFrame({"cum_pnl": cum, "price_scaled": px_rescaled})
+
+def plot_backtest_results(
+    cumulative: pd.Series,
+    price: Optional[pd.Series] = None,
+    *,
+    scale: Literal["minmax", "rebase100", "zscore"] = "minmax",
+    ax=None,
+):
+    """
+    Convenience wrapper. Returns the matplotlib Axes.
+    (Leave styling to caller; this function only plots two aligned lines.)
+    """
+    frame = build_overlay_frame(cumulative, price, scale=scale)
+    if frame.empty:
+        return None
+    if ax is None:
+        fig, ax = plt.subplots()
+    frame["cum_pnl"].plot(ax=ax, label="Cumulative PnL")
+    if "price_scaled" in frame:
+        frame["price_scaled"].plot(ax=ax, label="Price (scaled)")
+    ax.legend()
+    ax.set_title("Cumulative PnL with optional price overlay")
+    return ax

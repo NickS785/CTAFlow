@@ -154,14 +154,16 @@ class VolatilityRegimeClassifier(BaseRegimeClassifier):
     name = "volatility"
 
     def __init__(
-        self,
-        *,
-        returns_col: str = "returns",
-        price_col: Optional[str] = None,
-        window: int = 20,
-        method: str = "ewm",
-        low_quantile: float = 0.33,
-        high_quantile: float = 0.66,
+            self,
+            *,
+            returns_col: str = "returns",
+            price_col: Optional[str] = None,
+            window: int = 20,
+            method: str = "ewm",
+            low_quantile: float = 0.33,
+            high_quantile: float = 0.66,
+            resample_rule: str = "1D",
+            resample_offset: str | pd.Timedelta | None = "-9H",
     ) -> None:
         if window <= 1:
             raise ValueError("window must be greater than 1")
@@ -175,6 +177,8 @@ class VolatilityRegimeClassifier(BaseRegimeClassifier):
         self.method = method
         self.low_quantile = float(low_quantile)
         self.high_quantile = float(high_quantile)
+        self.resample_rule = resample_rule
+        self.resample_offset = resample_offset
 
     def _resolve_returns(self, data: pd.DataFrame) -> pd.Series:
         if self.returns_col in data.columns:
@@ -184,19 +188,67 @@ class VolatilityRegimeClassifier(BaseRegimeClassifier):
             return np.log(price).diff()
         raise KeyError(self.returns_col)
 
+    def _ensure_dt_index(self, s: pd.Series) -> pd.Series:
+        if isinstance(s.index, pd.DatetimeIndex):
+            return s
+        try:
+            idx = pd.to_datetime(s.index, errors="raise")
+        except Exception as exc:
+            raise TypeError("VolatilityRegimeClassifier requires a DatetimeIndex") from exc
+        return s.set_axis(idx)
+
+    def _daily_returns(self, data: pd.DataFrame) -> pd.Series:
+        """
+        Returns a DAILY series of log returns using last price per day
+        (aligned to resample_rule/offset). Used by 'ewm' and 'sma' vol.
+        """
+        if self.price_col and self.price_col in data.columns:
+            price = pd.to_numeric(data[self.price_col], errors="coerce").dropna()
+            price = self._ensure_dt_index(price)
+            daily_price = price.resample(self.resample_rule, offset=self.resample_offset).last().dropna()
+            return np.log(daily_price).diff()
+        # fallback from returns_col: resample by *sum* of intraday returns for the day
+        r = self._resolve_returns(data).dropna()
+        r = self._ensure_dt_index(r)
+        daily_r = r.resample(self.resample_rule, offset=self.resample_offset).sum().dropna()
+        return daily_r
+
+    def _daily_rv(self, data: pd.DataFrame) -> pd.Series:
+        """
+        Realized volatility proxy: sum of squared intraday log returns per day.
+        """
+        r = self._resolve_returns(data).dropna()
+        r = self._ensure_dt_index(r)
+        rv_daily = (r ** 2).resample(self.resample_rule, offset=self.resample_offset).sum().dropna()
+        return rv_daily
+
     def classify(self, data: pd.DataFrame) -> pd.Series:
-        returns = self._resolve_returns(data)
-        if self.method == "ewm":
-            vol = returns.ewm(span=self.window, adjust=False, min_periods=self.window).std(bias=False)
+        # Compute a daily volatility series per 'method'
+        if self.method == "rv":
+            vol = self._daily_rv(data)
         else:
-            vol = returns.rolling(window=self.window, min_periods=self.window).std(ddof=0)
+            # daily returns then a daily std estimator
+            daily_r = self._daily_returns(data)
+            if self.method == "ewm":
+                vol = daily_r.ewm(span=self.window, adjust=False, min_periods=self.window).std(bias=False)
+            elif self.method == "sma":
+                vol = daily_r.rolling(window=self.window, min_periods=self.window).std(ddof=0)
+            else:
+                raise ValueError("method must be one of {'ewm','sma','rv'}")
+
+        # Rank in-sample (daily)
         rank = vol.rank(pct=True, method="first")
-        regimes = pd.Series(pd.NA, index=vol.index, dtype="Int64")
-        regimes.loc[rank >= self.high_quantile] = 1
-        regimes.loc[rank <= self.low_quantile] = -1
+        regimes_daily = pd.Series(pd.NA, index=vol.index, dtype="Int64")
+        regimes_daily.loc[rank >= self.high_quantile] = 1
+        regimes_daily.loc[rank <= self.low_quantile] = -1
         mid_mask = rank.between(self.low_quantile, self.high_quantile, inclusive="neither")
-        regimes.loc[mid_mask] = 0
-        return regimes
+        regimes_daily.loc[mid_mask] = 0
+
+        # Reindex back to input index (ffill), to keep API consistent
+        original_index = data.index if isinstance(data.index, pd.DatetimeIndex) else pd.to_datetime(data.index,
+                                                                                                    errors="coerce")
+        regimes = regimes_daily.reindex(original_index, method="ffill")
+        return regimes.astype("Int64")
 
     def describe(self) -> Dict[str, Any]:
         return {
@@ -207,8 +259,9 @@ class VolatilityRegimeClassifier(BaseRegimeClassifier):
             "method": self.method,
             "low_quantile": self.low_quantile,
             "high_quantile": self.high_quantile,
+            "resample_rule": self.resample_rule,
+            "resample_offset": self.resample_offset,
         }
-
 
 class CrowdingRegimeClassifier(BaseRegimeClassifier):
     """Classify regimes using COT net-position z-scores."""
