@@ -54,10 +54,11 @@ class ScreenerBacktester:
         if missing:
             raise KeyError(f"XY frame missing required columns: {sorted(missing)}")
 
-        frame = xy.dropna(subset=["returns_x", "returns_y"]).drop_duplicates().copy()
+        frame = xy.dropna(subset=["returns_x", "returns_y"]).copy()
+        frame = self._drop_duplicate_rows(frame)
         if prediction_resolver is not None and not frame.empty:
             frame = prediction_resolver.aggregate(frame)
-            frame = frame.drop_duplicates().copy()
+            frame = self._drop_duplicate_rows(frame)
             if frame.empty:
                 return {
                     "pnl": pd.Series(dtype=float),
@@ -78,7 +79,7 @@ class ScreenerBacktester:
             }
 
         frame = self._collision_resolver.resolve(frame, group_field=group_field)
-        frame = frame.drop_duplicates().copy()
+        frame = self._drop_duplicate_rows(frame)
 
         direction = np.sign(frame["returns_x"])
         if use_side_hint and "side_hint" in frame.columns:
@@ -228,6 +229,26 @@ class ScreenerBacktester:
             result["group_field"] = group_field
 
         return result
+
+    @staticmethod
+    def _drop_duplicate_rows(frame: pd.DataFrame) -> pd.DataFrame:
+        if frame.empty:
+            return frame.copy()
+        subset = [
+            col
+            for col in [
+                "ts_decision",
+                "gate",
+                "pattern_type",
+                "returns_x",
+                "returns_y",
+                "side_hint",
+            ]
+            if col in frame.columns
+        ]
+        if subset:
+            return frame.drop_duplicates(subset=subset).copy()
+        return frame.drop_duplicates().copy()
 
 
 class MomentumBacktester:

@@ -954,6 +954,7 @@ class ScreenerPipeline:
 
         mask = df["weekday_lower"] == weekday_norm
         mask &= self._months_mask(df, months)
+        mask = self._anchor_session_mask(df, mask, window_anchor="end")
 
         base = self._feature_base_name(key, f"weekday_mean_{weekday_norm}")
         sidecars: Dict[str, Any] = {
@@ -1251,6 +1252,7 @@ class ScreenerPipeline:
             return []
 
         mask = (df["weekday_lower"] == weekday_norm) & (df["wom"].astype(int) == week_of_month)
+        mask = self._anchor_session_mask(df, mask, window_anchor="end")
 
         metric = payload.get("metric", "net_pressure")
         bias = self._format_bias(metadata.get("orderflow_bias") or payload.get("pressure_bias"))
@@ -1278,6 +1280,7 @@ class ScreenerPipeline:
             return []
 
         mask = df["weekday_lower"] == weekday_norm
+        mask = self._anchor_session_mask(df, mask, window_anchor="end")
 
         metric = payload.get("metric", "net_pressure")
         bias = self._format_bias(metadata.get("orderflow_bias") or payload.get("pressure_bias"))
@@ -2667,7 +2670,22 @@ class HorizonMapper:
             )
 
         result = pd.concat(rows, axis=0, ignore_index=True)
-        result = result.drop_duplicates().reset_index(drop=True)
+        subset = [
+            col
+            for col in [
+                "ts_decision",
+                "gate",
+                "pattern_type",
+                "returns_x",
+                "returns_y",
+                "side_hint",
+            ]
+            if col in result.columns
+        ]
+        if subset:
+            result = result.drop_duplicates(subset=subset).reset_index(drop=True)
+        else:
+            result = result.drop_duplicates().reset_index(drop=True)
         if debug:
             self._log_warn(
                 "HorizonMapper build complete",
