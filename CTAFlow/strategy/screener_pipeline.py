@@ -17,7 +17,19 @@ import numbers
 import re
 from collections.abc import Iterable as IterableABC, Sequence as SequenceABC
 from datetime import time as time_cls
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, NamedTuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Sequence,
+    Tuple,
+    NamedTuple,
+)
 
 import numpy as np
 import pandas as pd
@@ -42,6 +54,12 @@ __all__ = [
 
 def _is_numeric(value: Any) -> bool:
     return isinstance(value, numbers.Number) and not isinstance(value, bool)
+
+
+class WeekendPatternSpec(NamedTuple):
+    gate_day: str
+    target_day: str
+    gate_time: Optional[str]
 
 
 def extract_ticker_patterns(
@@ -172,6 +190,7 @@ class ScreenerPipeline:
         self.asof_tolerance = None
         self.return_clip = (-0.5, 0.5)
         self.sessionizer = None
+        self.weekend_exit_policy = "last"
 
     # ------------------------------------------------------------------
     # Public API
@@ -285,6 +304,7 @@ class ScreenerPipeline:
             asof_tolerance=getattr(self, "asof_tolerance", None),
             log=self.log,
             sessionizer=getattr(self, "sessionizer", None),
+            weekend_exit_policy=getattr(self, "weekend_exit_policy", "last"),
         )
 
         xy = mapper.build_xy(bars_with_features, patterns, **xy_kwargs)
@@ -715,7 +735,7 @@ class ScreenerPipeline:
         if pattern_type == "time_predictive_nextweek":
             return self._extract_time_nextweek(df, payload, key, months)
         if pattern_type == "weekend_hedging":
-            return self._extract_weekend_hedging(df, payload, key, months)
+            return self._extract_weekend_hedging(df, pattern, payload, key, months)
 
         return []
 
@@ -1007,16 +1027,24 @@ class ScreenerPipeline:
     def _extract_weekend_hedging(
         self,
         df: pd.DataFrame,
+        pattern: Mapping[str, Any],
         payload: Mapping[str, Any],
         key: Optional[str],
         months: Optional[List[int]],
     ) -> List[str]:
-        mask = df["weekday_lower"] == "friday"
-        mask &= self._months_mask(df, months)
+        spec = self._weekend_pattern_spec(pattern, payload)
+        if spec is None:
+            return []
 
         base = self._feature_base_name(key, "weekend_hedging_friday")
+        gate_mask, weekday_col = self._map_weekend_hedging_flags(
+            df, spec, base_name=base, months=months
+        )
+
         sidecars = {
-            "weekday": "friday",
+            "gate_weekday": spec.gate_day,
+            "target_weekday": spec.target_day,
+            "gate_time": spec.gate_time or "session_close",
             "n": payload.get("n"),
             "corr": payload.get("corr_Fri_Mon"),
             "p": payload.get("p_value"),
@@ -1024,7 +1052,184 @@ class ScreenerPipeline:
             "mean_neg": payload.get("mean_Mon_given_Fri_neg"),
             "bias": payload.get("bias"),
         }
-        return self._add_feature(df, base, mask, sidecars)
+        created = self._add_feature(df, base, gate_mask, sidecars)
+        gate_col = created[0] if created else None
+        self._register_pattern_features(
+            pattern, gate_column=gate_col, weekday_column=weekday_col
+        )
+        if gate_col:
+            self._validate_weekend_flags(
+                df,
+                gate_column=gate_col,
+                weekday_column=weekday_col,
+                spec=spec,
+                months=months,
+            )
+        return created
+
+    def _map_weekend_hedging_flags(
+        self,
+        df: pd.DataFrame,
+        spec: WeekendPatternSpec,
+        *,
+        base_name: str,
+        months: Optional[List[int]],
+    ) -> Tuple[pd.Series, str]:
+        ts_local = pd.to_datetime(df["ts"]).dt.tz_convert(self.tz)
+        hhmm = ts_local.dt.strftime("%H:%M")
+        month_mask = self._months_mask(df, months)
+
+        weekday_series = df["weekday_lower"]
+        if spec.gate_time:
+            gate_mask = (
+                (weekday_series == spec.gate_day)
+                & (hhmm == spec.gate_time)
+                & month_mask
+            )
+        else:
+            candidates = (weekday_series == spec.gate_day) & month_mask
+            gate_mask = self._anchor_session_mask(
+                df, candidates.astype(bool), window_anchor="end"
+            )
+
+        weekday_mask = (weekday_series == spec.target_day) & month_mask
+
+        weekday_col = f"{base_name}_weekday"
+        df[weekday_col] = weekday_mask.astype(np.int8)
+        return gate_mask, weekday_col
+
+    def _register_pattern_features(
+        self,
+        pattern: Mapping[str, Any],
+        *,
+        gate_column: Optional[str],
+        weekday_column: Optional[str],
+    ) -> None:
+        if not isinstance(pattern, MutableMapping):
+            return
+        features = pattern.setdefault("features", {})
+        if not isinstance(features, MutableMapping):
+            features = {}
+            pattern["features"] = features
+        if gate_column:
+            features["pattern_gate_col"] = gate_column
+        if weekday_column:
+            features["pattern_weekday_col"] = weekday_column
+
+    def _validate_weekend_flags(
+        self,
+        df: pd.DataFrame,
+        *,
+        gate_column: str,
+        weekday_column: str,
+        spec: WeekendPatternSpec,
+        months: Optional[List[int]],
+    ) -> None:
+        if gate_column not in df.columns or weekday_column not in df.columns:
+            raise KeyError("Weekend hedging gate/weekday columns missing from DataFrame")
+
+        if "session_id" not in df.columns:
+            raise ValueError("Weekend hedging validation requires a session_id column")
+
+        gate_rows = df.loc[df[gate_column] == 1]
+        if gate_rows.empty:
+            raise ValueError("Weekend hedging gate produced no Friday rows at the gate time")
+
+        if not (gate_rows["weekday_lower"] == spec.gate_day).all():
+            raise ValueError("Weekend hedging gate emitted rows outside the configured gate weekday")
+
+        duplicates = gate_rows["session_id"].value_counts()
+        if (duplicates > 1).any():
+            raise ValueError("Weekend hedging gate must emit exactly one row per Friday session")
+
+        target_mask = (df["weekday_lower"] == spec.target_day) & self._months_mask(df, months)
+        weekday_rows = df.loc[target_mask]
+        if weekday_rows.empty:
+            raise ValueError("Weekend hedging weekday column produced no Monday rows in the active months")
+
+        weekday_values = weekday_rows[weekday_column]
+        if weekday_values.isna().any() or not (weekday_values == 1).all():
+            raise ValueError("Weekend hedging weekday column must flag every Monday row with 1s")
+
+    def _weekend_pattern_spec(
+        self, pattern: Mapping[str, Any], payload: Mapping[str, Any]
+    ) -> Optional[WeekendPatternSpec]:
+        metadata = pattern.get("metadata") or {}
+        best_weekday = (
+            metadata.get("best_weekday")
+            or payload.get("weekday")
+            or metadata.get("weekday")
+            or pattern.get("weekday")
+        )
+        weekday_pair = self._split_weekday_sequence(best_weekday)
+        if weekday_pair is None:
+            return None
+        gate_day, target_day = weekday_pair
+
+        gate_time = self._normalize_hhmm(
+            metadata.get("gate_time_hhmm") or payload.get("gate_time_hhmm")
+        )
+
+        return WeekendPatternSpec(
+            gate_day=gate_day,
+            target_day=target_day,
+            gate_time=gate_time,
+        )
+
+    def _split_weekday_sequence(self, value: Any) -> Optional[Tuple[str, str]]:
+        if value is None:
+            return None
+        parts: List[str] = []
+        if isinstance(value, (list, tuple)):
+            parts = [str(item) for item in value if item is not None]
+        else:
+            text = str(value)
+            if "->" in text:
+                parts = [seg.strip() for seg in text.split("->") if seg.strip()]
+            elif ">" in text:
+                parts = [seg.strip() for seg in text.split(">") if seg.strip()]
+            elif "to" in text.lower():
+                parts = [seg.strip() for seg in re.split(r"to", text, flags=re.IGNORECASE) if seg.strip()]
+            else:
+                parts = [text]
+
+        if len(parts) == 1:
+            first = self._normalize_weekday(parts[0])
+            return (first, first) if first else None
+        if len(parts) >= 2:
+            gate_day = self._normalize_weekday(parts[0])
+            target_day = self._normalize_weekday(parts[1])
+            if gate_day and target_day:
+                return gate_day, target_day
+        return None
+
+    @staticmethod
+    def _normalize_hhmm(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, time_cls):
+            return value.strftime("%H:%M")
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            parsed = pd.to_datetime(text).time()
+        except Exception:
+            return None
+        return parsed.strftime("%H:%M")
+
+    def _normalize_hhmm_list(self, values: Any) -> List[str]:
+        if values is None:
+            return []
+        if isinstance(values, (str, time_cls)):
+            normalized = self._normalize_hhmm(values)
+            return [normalized] if normalized else []
+        result: List[str] = []
+        for value in values:
+            normalized = self._normalize_hhmm(value)
+            if normalized:
+                result.append(normalized)
+        return sorted(dict.fromkeys(result))
 
     # ------------------------------------------------------------------
     # Orderflow extractors
@@ -1295,6 +1500,7 @@ class HorizonMapper:
         asof_tolerance: Optional[str] = None,
         log: Any = None,
         sessionizer: Optional["Sessionizer"] = None,
+        weekend_exit_policy: str = "last",
     ) -> None:
         if time_match not in {"auto", "second", "microsecond"}:
             raise HorizonInputError(
@@ -1303,6 +1509,11 @@ class HorizonMapper:
 
         if nan_policy not in {"drop", "zero", "ffill"}:
             raise HorizonInputError("nan_policy must be one of {'drop', 'zero', 'ffill'}")
+
+        if weekend_exit_policy not in {"first", "last", "average"}:
+            raise HorizonInputError(
+                "weekend_exit_policy must be one of {'first', 'last', 'average'}"
+            )
 
         lower, upper = return_clip
         if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
@@ -1316,6 +1527,7 @@ class HorizonMapper:
         self.asof_tolerance = asof_tolerance
         self.log = log
         self.sessionizer = sessionizer
+        self.weekend_exit_policy = weekend_exit_policy
 
     # ------------------------------------------------------------------
     # Logging helpers
@@ -1342,6 +1554,17 @@ class HorizonMapper:
             else:
                 collected[field] = pattern.get(field)
         return collected
+
+    @staticmethod
+    def _pattern_feature_column(pattern: Mapping[str, Any], key: str) -> Optional[str]:
+        if not isinstance(pattern, Mapping):
+            return None
+        features = pattern.get("features")
+        if isinstance(features, Mapping):
+            value = features.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return None
 
     @staticmethod
     def _normalise_metadata_series(value: Any, index: pd.Index) -> pd.Series:
@@ -1664,23 +1887,121 @@ class HorizonMapper:
         })
         info["next_weekday"] = info["weekday"].shift(-1)
         info["next_oc"] = info["oc_return"].shift(-1)
+        info["next_session_id"] = info["session_id"].shift(-1)
         return info
 
-    def _weekend_hedging_returns(self, df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+    def _weekend_hedging_returns(
+        self, df: pd.DataFrame, pattern: Mapping[str, Any]
+    ) -> Tuple[pd.Series, pd.Series]:
         info = self._session_level_info(df)
         friday_mask = info["weekday"] == 4
-        monday_mask = info["next_weekday"] == 0
-        valid = friday_mask & monday_mask
+        has_future = info["next_session_id"].notna()
+        valid = friday_mask & has_future
 
         friday_returns = pd.Series(np.nan, index=info["session_id"], dtype=float)
         friday_returns.loc[info.loc[valid, "session_id"]] = info.loc[valid, "oc_return"].astype(float)
 
-        monday_returns = pd.Series(np.nan, index=info["session_id"], dtype=float)
-        monday_returns.loc[info.loc[valid, "session_id"]] = info.loc[valid, "next_oc"].astype(float)
+        default_monday = pd.Series(np.nan, index=info["session_id"], dtype=float)
+        default_monday.loc[info.loc[valid, "session_id"]] = info.loc[valid, "next_oc"].astype(float)
 
         x_series = df["session_id"].map(friday_returns)
-        y_series = df["session_id"].map(monday_returns)
+        custom_y = self._weekend_returns_from_weekday_flags(
+            df, pattern, info, valid, fallback_to_session_close=True
+        )
+        if custom_y is None:
+            y_series = df["session_id"].map(default_monday)
+        else:
+            y_series = custom_y
         return x_series, y_series
+
+    def _weekend_returns_from_weekday_flags(
+        self,
+        df: pd.DataFrame,
+        pattern: Mapping[str, Any],
+        info: pd.DataFrame,
+        valid_mask: pd.Series,
+        *,
+        fallback_to_session_close: bool = False,
+    ) -> Optional[pd.Series]:
+        gate_col = self._pattern_feature_column(pattern, "pattern_gate_col")
+        weekday_col = self._pattern_feature_column(pattern, "pattern_weekday_col")
+        if not gate_col or not weekday_col:
+            return None
+        if gate_col not in df.columns or weekday_col not in df.columns:
+            return None
+
+        gate_series = df[gate_col].fillna(0).astype(int) == 1
+        weekday_series = df[weekday_col].fillna(0).astype(int) == 1
+        if not gate_series.any() or not weekday_series.any():
+            return None
+
+        weekday_rows = df.loc[weekday_series, ["session_id", "ts", "close"]].copy()
+        if weekday_rows.empty:
+            return None
+
+        weekday_rows["close"] = weekday_rows["close"].astype(float)
+        close_series = df["close"].astype(float)
+        grouped = weekday_rows.groupby("session_id")
+        policy = self.weekend_exit_policy
+        exit_indices: Dict[Any, Any]
+        grouped_indices: Dict[Any, List[Any]]
+
+        if policy == "average":
+            grouped_indices = {key: list(idxs) for key, idxs in grouped.groups.items()}
+            exit_indices = {}
+        elif policy == "first":
+            grouped_indices = {}
+            exit_indices = grouped["ts"].idxmin().to_dict()
+        else:  # last
+            grouped_indices = {}
+            exit_indices = grouped["ts"].idxmax().to_dict()
+
+        info_indexed = info.set_index("session_id")
+        next_session_map = info_indexed["next_session_id"].to_dict()
+        valid_sessions = set(info.loc[valid_mask, "session_id"])
+
+        session_last_idx = (
+            df.loc[df["session_id"].notna(), ["session_id", "ts"]]
+            .groupby("session_id")["ts"]
+            .idxmax()
+        )
+        session_last_prices = close_series.loc[session_last_idx.values].astype(float)
+        session_last_prices.index = session_last_idx.index
+        session_last_map = session_last_prices.to_dict()
+
+        returns_y = pd.Series(np.nan, index=df.index, dtype=float)
+        for idx in gate_series[gate_series].index:
+            session_id = df.at[idx, "session_id"]
+            if session_id not in valid_sessions:
+                continue
+            next_session = next_session_map.get(session_id)
+            if not next_session:
+                continue
+            entry_price = close_series.loc[idx]
+            if pd.isna(entry_price) or entry_price <= 0:
+                continue
+
+            if policy == "average":
+                target_indices = grouped_indices.get(next_session)
+                if not target_indices:
+                    continue
+                target_prices = close_series.loc[target_indices].astype(float)
+                valid_prices = target_prices[target_prices > 0]
+                if valid_prices.empty:
+                    continue
+                log_returns = np.log(valid_prices / float(entry_price))
+                returns_y.loc[idx] = float(np.nanmean(log_returns.values))
+            else:
+                exit_idx = exit_indices.get(next_session)
+                if exit_idx is not None and exit_idx in close_series.index:
+                    exit_price = close_series.loc[exit_idx]
+                else:
+                    exit_price = session_last_map.get(next_session) if fallback_to_session_close else None
+                if exit_price is None or pd.isna(exit_price) or exit_price <= 0:
+                    continue
+                returns_y.loc[idx] = float(np.log(float(exit_price) / float(entry_price)))
+
+        return returns_y if returns_y.notna().any() else None
 
     def _forward_window_return_minutes(
         self, df: pd.DataFrame, minutes: int
@@ -2051,7 +2372,7 @@ class HorizonMapper:
                     session_cache=session_return_cache,
                 )
             elif pattern_type == "weekend_hedging":
-                returns_x_series, returns_y = self._weekend_hedging_returns(df)
+                returns_x_series, returns_y = self._weekend_hedging_returns(df, pattern)
             else:
                 spec = self.pattern_horizon(
                     pattern_type, default_intraday_minutes=default_intraday_minutes
@@ -2370,6 +2691,12 @@ class HorizonMapper:
     ) -> Tuple[Optional[str], List[str]]:
         slug_key = ScreenerPipeline._slugify(key)
         candidates: List[str] = []
+
+        explicit = self._pattern_feature_column(pattern, "pattern_gate_col")
+        if explicit:
+            if explicit in df.columns:
+                return explicit, [explicit]
+            candidates.append(explicit)
 
         if slug_key:
             candidates.append(f"{slug_key}_gate")

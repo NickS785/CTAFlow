@@ -161,6 +161,26 @@ mapper = HorizonMapper(tz="America/Chicago")
 decisions = mapper.build_xy(features, cl_patterns, predictor_minutes=5)
 ```
 
+### Weekend hedging semantics
+
+Weekend hedging patterns now emit deterministic metadata so downstream research can rely on
+true Friday→Monday spans:
+
+- The Friday gate column only flags the configured weekday once per session. When
+  `gate_time_hhmm` is omitted the pipeline anchors the gate to the last regular-session bar
+  (session close).
+- The `{prefix}_weekend_hedging_friday_monday_weekday` column is an int8 mask set to 1 on
+  **every** Monday bar inside the active months and 0 elsewhere. These binary flags are stored
+  alongside the pattern metadata so the backtester can locate the exact exit bars.
+- `HorizonMapper` reads the recorded gate/weekday columns and, by default, exits on the last
+  flagged Monday bar (`weekend_exit_policy="last"`). If a Monday session is missing because of a
+  holiday, the mapper automatically rolls the trade to the next available session close so the
+  Friday entry still produces a realised PnL.
+
+This behaviour keeps the features consistent with the screening output (one Friday gate per
+week, Monday mask covering the entire session) and guarantees that ScreenerBacktester spans
+the full weekend horizon instead of collapsing to same-day moves.
+
 `PatternExtractor.load_summaries_from_results` and
 `PatternExtractor.load_summaries_from_results_async` remain available for loading persisted
 summary tables, while `ScreenerPipeline.extract_ticker_patterns` provides a convenience
