@@ -68,6 +68,8 @@ class TrendRegimeClassifier(BaseRegimeClassifier):
         method: str = "ema",
         neutral_band: float = 0.0,
         band_pct: float = 0.0,
+        resample_rule: str = "1D",
+        resample_offset: str | pd.Timedelta | None = "-9H",
     ) -> None:
         if fast_window <= 0 or slow_window <= 0:
             raise ValueError("Moving-average windows must be positive")
@@ -79,18 +81,46 @@ class TrendRegimeClassifier(BaseRegimeClassifier):
         self.method = method
         self.neutral_band = float(neutral_band)
         self.band_pct = float(band_pct)
+        self.resample_rule = resample_rule
+        self.resample_offset = resample_offset
 
     def _moving_average(self, series: pd.Series, window: int) -> pd.Series:
         if self.method == "ema":
             return series.ewm(span=window, adjust=False, min_periods=1).mean()
         return series.rolling(window=window, min_periods=window).mean()
 
+    def _resample_price(self, series: pd.Series) -> pd.Series:
+        """Aggregate the price series to the configured daily frequency."""
+
+        cleaned = series.dropna()
+        if cleaned.empty or self.resample_rule is None:
+            return cleaned
+
+        if not isinstance(cleaned.index, pd.DatetimeIndex):
+            try:
+                datetime_index = pd.to_datetime(cleaned.index, errors="raise")
+            except (TypeError, ValueError) as exc:  # pragma: no cover - defensive
+                raise TypeError(
+                    "TrendRegimeClassifier requires a DatetimeIndex to resample prices"
+                ) from exc
+            cleaned = cleaned.set_axis(datetime_index)
+
+        resampled = cleaned.resample(
+            self.resample_rule,
+            offset=self.resample_offset,
+        ).last()
+        return resampled.dropna()
+
     def classify(self, data: pd.DataFrame) -> pd.Series:
         if self.price_col not in data.columns:
             raise KeyError(self.price_col)
         price = pd.to_numeric(data[self.price_col], errors="coerce")
-        fast = self._moving_average(price, self.fast_window)
-        slow = self._moving_average(price, self.slow_window)
+        original_index = price.index
+        daily_price = self._resample_price(price)
+        if daily_price.empty:
+            return pd.Series(pd.NA, index=original_index, dtype="Int64")
+        fast = self._moving_average(daily_price, self.fast_window)
+        slow = self._moving_average(daily_price, self.slow_window)
         diff = fast - slow
         threshold = pd.Series(abs(self.neutral_band), index=diff.index, dtype=float)
         if self.band_pct > 0:
@@ -101,7 +131,8 @@ class TrendRegimeClassifier(BaseRegimeClassifier):
         regimes.loc[diff < -threshold] = -1
         mid_mask = diff.abs() <= threshold
         regimes.loc[mid_mask & diff.notna()] = 0
-        return regimes
+        regimes = regimes.reindex(original_index, method="ffill")
+        return regimes.astype("Int64")
 
     def describe(self) -> Dict[str, Any]:
         return {
@@ -112,6 +143,8 @@ class TrendRegimeClassifier(BaseRegimeClassifier):
             "method": self.method,
             "neutral_band": self.neutral_band,
             "band_pct": self.band_pct,
+            "resample_rule": self.resample_rule,
+            "resample_offset": self.resample_offset,
         }
 
 
