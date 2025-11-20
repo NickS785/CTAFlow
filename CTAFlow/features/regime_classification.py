@@ -167,7 +167,7 @@ class VolatilityRegimeClassifier(BaseRegimeClassifier):
     ) -> None:
         if window <= 1:
             raise ValueError("window must be greater than 1")
-        if method not in {"ewm", "sma"}:
+        if method not in {"ewm", "sma", "rv"}:
             raise ValueError("method must be either 'ewm' or 'sma'")
         if not (0 < low_quantile < high_quantile < 1):
             raise ValueError("quantiles must satisfy 0 < low < high < 1")

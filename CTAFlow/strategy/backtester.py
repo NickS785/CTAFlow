@@ -409,65 +409,114 @@ class MomentumBacktester:
         )
 
 
+def diagnose_alignment(a: pd.Series, b: pd.Series) -> dict:
+    def _info(s: pd.Series):
+        idx = s.index
+        tzs = str(getattr(idx, "tz", None))
+        return {
+            "first": str(idx.min()) if len(idx) else "NA",
+            "last":  str(idx.max()) if len(idx) else "NA",
+            "len":   int(len(idx)),
+            "na":    int(s.isna().sum()),
+            "tz":    tzs,
+        }
+    info_a = _info(a); info_b = _info(b)
+    overlap_ts = len(a.index.intersection(b.index))
+    return {"a": info_a, "b": info_b, "overlap_exact_timestamps": overlap_ts}
 
-def _align_series(*series: pd.Series) -> list[pd.Series]:
-    """Inner helper: intersection of non-null indices, forward-fill if needed."""
-    if not series:
-        return []
-    idx = series[0].index
-    for s in series[1:]:
-        idx = idx.intersection(s.index)
-    aligned = []
-    for s in series:
-        ss = s.reindex(idx).astype(float)
-        aligned.append(ss)
-    return aligned
+def _ensure_dt_index(s: pd.Series) -> pd.Series:
+    if not isinstance(s.index, pd.DatetimeIndex):
+        s.index = pd.to_datetime(s.index, errors="coerce")
+    return s.dropna().sort_index()
+
+def _coerce_tz(s: pd.Series, tz: Optional[str]) -> pd.Series:
+    s = _ensure_dt_index(s.copy())
+    if tz is not None:
+        if s.index.tz is None:
+            s.index = s.index.tz_localize(tz, nonexistent="shift_forward", ambiguous="NaT")
+        else:
+            s.index = s.index.tz_convert(tz)
+        s.index = s.index.tz_localize(None)  # make naive for exact equality
+    return s
+
+def _align_on_date(a: pd.Series, b: pd.Series) -> Tuple[pd.Series, pd.Series]:
+    a = _ensure_dt_index(a); b = _ensure_dt_index(b)
+    # normalize to midnight (date) and keep the last value per day (close)
+    a = a.groupby(a.index.normalize()).last()
+    b = b.groupby(b.index.normalize()).last()
+    common = a.index.intersection(b.index)
+    return a.reindex(common), b.reindex(common)
 
 def build_overlay_frame(
     cumulative: pd.Series,
     price: Optional[pd.Series] = None,
     *,
-    scale: Literal["minmax", "rebase100", "zscore"] = "minmax",
+    scale: Literal["minmax","rebase100","zscore"] = "minmax",
+    align: Literal["date","timestamp"] = "date",
+    tz: Optional[str] = "America/Chicago",
+    dropna: bool = True,
+    require_overlap: bool = True,
 ) -> pd.DataFrame:
     """
-    Return a tidy frame with columns:
-      - 'cum_pnl'       : cumulative PnL as provided
-      - 'price_scaled'  : None if no price; otherwise scaled to cum_pnl range
-    Scaling options:
-      - minmax    : maps price into [cum.min, cum.max]
-      - rebase100 : price indexed to 100, then re-mapped to cum range (same var scale)
-      - zscore    : (price - mean)/std, then scaled to cum range
+    Returns:
+      DataFrame with columns:
+        - cum_pnl
+        - price_scaled (if price is provided)
+    Defaults:
+      - align='date' (daily close alignment)
+      - tz='America/Chicago' (both series normalized then made tz-naive)
     """
-    if cumulative is None or cumulative.empty:
-        return pd.DataFrame(columns=["cum_pnl", "price_scaled"])
-    cumulative = pd.to_numeric(cumulative, errors="coerce").dropna()
-    if price is None or price.empty:
-        return pd.DataFrame({"cum_pnl": cumulative})
+    if cumulative is None or len(cumulative) == 0:
+        return pd.DataFrame(columns=["cum_pnl","price_scaled"])
 
-    cum, px = _align_series(cumulative, price)
+    cum = pd.to_numeric(pd.Series(cumulative.squeeze()), errors="coerce").dropna()
+    cum = _coerce_tz(cum, tz)
 
-    # Target range for overlay
-    tgt_lo, tgt_hi = float(cum.min()), float(cum.max())
-    tgt_span = max(tgt_hi - tgt_lo, 1e-12)
+    if price is None or len(price) == 0:
+        return pd.DataFrame({"cum_pnl": cum})
 
-    px = px.astype(float)
+    px = pd.to_numeric(pd.Series(price.squeeze()), errors="coerce").dropna()
+    px = _coerce_tz(px, tz)
+
+    if align == "date":
+        cum_al, px_al = _align_on_date(cum, px)
+    else:
+        idx = cum.index.intersection(px.index)
+        cum_al = cum.reindex(idx)
+        px_al  = px.reindex(idx)
+
+    if dropna:
+        m = cum_al.notna() & px_al.notna()
+        cum_al, px_al = cum_al[m], px_al[m]
+
+    if require_overlap and (len(cum_al) == 0 or len(px_al) == 0):
+        diag = diagnose_alignment(cum, px)
+        raise ValueError(
+            "No overlap after alignment. "
+            f"cum[{diag['a']['first']} → {diag['a']['last']} tz={diag['a']['tz']}], "
+            f"price[{diag['b']['first']} → {diag['b']['last']} tz={diag['b']['tz']}]."
+        )
+
+    # scale price to the cum range
+    lo, hi = float(cum_al.min()), float(cum_al.max())
+    span = max(hi - lo, 1e-12)
+
     if scale == "minmax":
-        src_lo, src_hi = float(px.min()), float(px.max())
-        src_span = max(src_hi - src_lo, 1e-12)
-        px_scaled = (px - src_lo) / src_span
+        plo, phi = float(px_al.min()), float(px_al.max())
+        pspan = max(phi - plo, 1e-12)
+        px_scaled = (px_al - plo) / pspan
     elif scale == "rebase100":
-        px_scaled = (px / px.iloc[0])  # index to 1.0
+        base = px_al.iloc[0]
+        px_scaled = (px_al / base)
         px_scaled = (px_scaled - px_scaled.min()) / max(px_scaled.max() - px_scaled.min(), 1e-12)
     elif scale == "zscore":
-        mu, sd = float(px.mean()), float(px.std(ddof=0)) or 1.0
-        px_scaled = (px - mu) / sd
-        # normalize to [0,1] for range map
+        mu, sd = float(px_al.mean()), float(px_al.std(ddof=0)) or 1.0
+        px_scaled = (px_al - mu) / sd
         px_scaled = (px_scaled - px_scaled.min()) / max(px_scaled.max() - px_scaled.min(), 1e-12)
     else:
-        raise ValueError(f"Unknown scale: {scale}")
+        raise ValueError(scale)
 
-    px_rescaled = tgt_lo + px_scaled * tgt_span
-    return pd.DataFrame({"cum_pnl": cum, "price_scaled": px_rescaled})
+    return pd.DataFrame({"cum_pnl": cum_al, "price_scaled": lo + px_scaled * span})
 
 def plot_backtest_results(
     cumulative: pd.Series,
