@@ -408,6 +408,171 @@ class MomentumBacktester:
             prediction_resolver=prediction_resolver,
         )
 
+@dataclass
+class SignalSpec:
+    signal_col: str = "signal"
+    trigger: float = 0.0               # enter long if signal >= trigger; enter short if signal <= -trigger (optional)
+    allow_short: bool = False          # if True, symmetric short rule
+
+@dataclass
+class ExecutionSpec:
+    price_in: str = "Close"
+    price_out: str = "Close"
+    bias: Literal["long","short","signed"] = "long"   # 'signed' uses sign(signal)
+    exit_policy: Literal["bars","session_close","next_day_close","monday_close"] = "session_close"
+    holding_bars: int = 1             # used when exit_policy == "bars"
+    tz: Optional[str] = None          # if you want to localize for session rules
+
+class FeatureBacktester:
+    """
+    Configurable backtester operating on a full DataFrame with arbitrary features.
+    """
+
+    def __init__(self, *, annualisation: int = 252, risk_free_rate: float = 0.0) -> None:
+        self.annualisation = annualisation
+        self.risk_free_rate = risk_free_rate
+
+    def run(
+        self,
+        data: pd.DataFrame,
+        *,
+        signal: SignalSpec,
+        execution: ExecutionSpec,
+        ts_col: Optional[str] = None,
+        group_field: Optional[str] = None,
+        side_hint_col: Optional[str] = None,  # optional override of bias per row
+    ) -> Dict[str, Any]:
+        if data.empty:
+            return {
+                "pnl": pd.Series(dtype=float),
+                "positions": pd.Series(dtype=float),
+                "cumulative": pd.Series(dtype=float),
+                "trades": pd.DataFrame(columns=["ts_in","ts_out","px_in","px_out","ret"]),
+                "summary": BacktestSummary(0.0, 0.0, np.nan, np.nan, 0.0, 0),
+            }
+        frame = data.copy()
+        if ts_col and ts_col in frame.columns:
+            frame["ts"] = pd.to_datetime(frame[ts_col], errors="coerce")
+            frame = frame.dropna(subset=["ts"]).set_index("ts").sort_index()
+        elif isinstance(frame.index, pd.DatetimeIndex):
+            pass
+        else:
+            raise TypeError("A DatetimeIndex or a ts_col is required")
+
+        # Build entry signals
+        sig = pd.to_numeric(frame[signal.signal_col], errors="coerce").fillna(0.0)
+        long_entries = sig >= float(signal.trigger)
+        if signal.allow_short:
+            short_entries = sig <= -float(signal.trigger)
+        else:
+            short_entries = pd.Series(False, index=sig.index)
+
+        # Determine entry direction
+        if execution.bias == "signed":
+            direction = np.sign(sig).where(long_entries | short_entries, 0.0)
+        elif execution.bias == "short":
+            direction = -1.0 * short_entries.astype(float)
+        else:  # "long"
+            direction = long_entries.astype(float)
+
+        # Build exits
+        px_in = pd.to_numeric(frame[execution.price_in], errors="coerce")
+        px_out = pd.to_numeric(frame[execution.price_out], errors="coerce")
+
+        entries_idx = frame.index[direction != 0]
+        trades = []
+        for i in entries_idx:
+            dir_i = int(np.sign(direction.loc[i]))
+            if dir_i == 0:
+                continue
+
+            # Resolve exit index j
+            if execution.exit_policy == "bars":
+                pos = frame.index.get_loc(i)
+                jpos = min(pos + int(execution.holding_bars), len(frame.index) - 1)
+                j = frame.index[jpos]
+            elif execution.exit_policy == "session_close":
+                # next index that is the last timestamp of the *same* session day
+                day = i.normalize()
+                same_day = frame.loc[day: day + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)]
+                j = same_day.index[-1]
+            elif execution.exit_policy == "next_day_close":
+                next_day = (i.normalize() + pd.Timedelta(days=1))
+                nxt = frame.loc[next_day: next_day + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)]
+                if len(nxt) == 0:
+                    continue
+                j = nxt.index[-1]
+            elif execution.exit_policy == "monday_close":
+                # Find the next Monday (weekday==0) close
+                search = frame.loc[i + pd.Timedelta(seconds=1):]
+                if search.empty:
+                    continue
+                monday_days = pd.Index(d for d in pd.to_datetime(search.index.normalize().unique()) if d.weekday() == 0)
+                if len(monday_days) == 0:
+                    continue
+                monday = monday_days[0]
+                mon = frame.loc[monday: monday + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)]
+                if len(mon) == 0:
+                    continue
+                j = mon.index[-1]
+            else:
+                raise ValueError(f"Unknown exit_policy: {execution.exit_policy}")
+
+            px_i = float(px_in.loc[i])
+            px_j = float(px_out.loc[j])
+            if np.isnan(px_i) or np.isnan(px_j):
+                continue
+
+            if dir_i > 0:
+                ret = (px_j / px_i) - 1.0
+            else:
+                ret = (px_i / px_j) - 1.0
+
+            trades.append({"ts_in": i, "ts_out": j, "dir": dir_i, "px_in": px_i, "px_out": px_j, "ret": ret})
+
+        trades_df = pd.DataFrame(trades)
+        if trades_df.empty:
+            empty = pd.Series(dtype=float)
+            return {
+                "pnl": empty,
+                "positions": empty,
+                "cumulative": empty,
+                "trades": trades_df,
+                "summary": BacktestSummary(0.0, 0.0, np.nan, np.nan, 0.0, 0),
+            }
+
+        # Build per-timestamp pnl and positions (impulse positions)
+        pnl = pd.Series(0.0, index=frame.index)
+        positions = pd.Series(0.0, index=frame.index)
+        for _, row in trades_df.iterrows():
+            pnl.loc[row["ts_out"]] += row["ret"]     # book at exit bar
+            positions.loc[row["ts_in"]] += row["dir"]
+
+        cumulative = pnl.cumsum()
+        mean_return = float(pnl.mean())
+        total_return = float(pnl.sum())
+        hit_rate = float((pnl > 0).mean()) if not pnl.empty else np.nan
+        std_return = float(pnl.std(ddof=0))
+        sharpe = (mean_return / std_return) * np.sqrt(self.annualisation) if std_return > 0 else np.nan
+        drawdown = cumulative - cumulative.cummax()
+        max_drawdown = float(drawdown.min()) if not drawdown.empty else 0.0
+
+        summary = BacktestSummary(
+            total_return=total_return,
+            mean_return=mean_return,
+            hit_rate=hit_rate,
+            sharpe=float(sharpe) if np.isfinite(sharpe) else np.nan,
+            max_drawdown=max_drawdown,
+            trades=len(trades_df),
+        )
+        return {
+            "pnl": pnl,
+            "positions": positions,
+            "cumulative": cumulative,
+            "trades": trades_df,
+            "summary": summary,
+        }
+
 
 def diagnose_alignment(a: pd.Series, b: pd.Series) -> dict:
     def _info(s: pd.Series):
