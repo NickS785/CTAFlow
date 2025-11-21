@@ -349,6 +349,41 @@ class ScreenerPipeline:
             prediction_resolver=resolver,
         )
 
+    # ------------------------------------------------------------------
+    # Horizon mapper helpers
+    # ------------------------------------------------------------------
+    def _mapper_cache_key(self, time_match: str) -> Tuple[Any, ...]:
+        return (
+            self.tz,
+            bool(getattr(self, "allow_naive_ts", False)),
+            time_match,
+            getattr(self, "nan_policy", "drop"),
+            getattr(self, "return_clip", (-0.5, 0.5)),
+            getattr(self, "asof_tolerance", None),
+            getattr(self, "weekend_exit_policy", "last"),
+            id(getattr(self, "sessionizer", None)),
+        )
+
+    def _get_horizon_mapper(self, time_match: str) -> HorizonMapper:
+        key = self._mapper_cache_key(time_match)
+        cached = self._mapper_cache.get(key)
+        if cached is not None:
+            return cached
+
+        mapper = HorizonMapper(
+            tz=self.tz,
+            allow_naive_ts=getattr(self, "allow_naive_ts", False),
+            time_match=time_match,
+            nan_policy=getattr(self, "nan_policy", "drop"),
+            return_clip=getattr(self, "return_clip", (-0.5, 0.5)),
+            asof_tolerance=getattr(self, "asof_tolerance", None),
+            log=self.log,
+            sessionizer=getattr(self, "sessionizer", None),
+            weekend_exit_policy=getattr(self, "weekend_exit_policy", "last"),
+        )
+        self._mapper_cache[key] = mapper
+        return mapper
+
     def build_and_backtest(
         self,
         bars: pd.DataFrame,
@@ -412,28 +447,15 @@ class ScreenerPipeline:
             return {}
 
         prepared = prepared_df if prepared_df is not None else self._prepare_bars(bars)
+        featured = self.build_features(
+            prepared,
+            dict(items),
+            allowed_months=allowed_months,
+            prepared_df=prepared,
+            max_workers=max_workers,
+        )
 
-        def _build_single(key: str, pattern: Mapping[str, Any]) -> Tuple[str, pd.DataFrame]:
-            local_df = prepared.copy()
-            featured = self.build_features(
-                local_df,
-                {key: pattern},
-                allowed_months=allowed_months,
-                prepared_df=local_df,
-                max_workers=max_workers,
-            )
-            return key, featured
-
-        if max_workers and len(items) > 1:
-            results: Dict[str, pd.DataFrame] = {}
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(_build_single, key, pattern): key for key, pattern in items}
-                for future in as_completed(futures):
-                    key, featured = future.result()
-                    results[key] = featured
-            return results
-
-        return {key: _build_single(key, pattern)[1] for key, pattern in items}
+        return {key: featured for key, _ in items}
 
     def concurrent_pattern_backtests(
         self,
@@ -1864,38 +1886,6 @@ class HorizonMapper:
     # ------------------------------------------------------------------
     # Configuration helpers
     # ------------------------------------------------------------------
-    def _mapper_cache_key(self, time_match: str) -> Tuple[Any, ...]:
-        return (
-            self.tz,
-            bool(getattr(self, "allow_naive_ts", False)),
-            time_match,
-            getattr(self, "nan_policy", "drop"),
-            getattr(self, "return_clip", (-0.5, 0.5)),
-            getattr(self, "asof_tolerance", None),
-            getattr(self, "weekend_exit_policy", "last"),
-            id(getattr(self, "sessionizer", None)),
-        )
-
-    def _get_horizon_mapper(self, time_match: str) -> HorizonMapper:
-        key = self._mapper_cache_key(time_match)
-        cached = self._mapper_cache.get(key)
-        if cached is not None:
-            return cached
-
-        mapper = HorizonMapper(
-            tz=self.tz,
-            allow_naive_ts=getattr(self, "allow_naive_ts", False),
-            time_match=time_match,
-            nan_policy=getattr(self, "nan_policy", "drop"),
-            return_clip=getattr(self, "return_clip", (-0.5, 0.5)),
-            asof_tolerance=getattr(self, "asof_tolerance", None),
-            log=self.log,
-            sessionizer=getattr(self, "sessionizer", None),
-            weekend_exit_policy=getattr(self, "weekend_exit_policy", "last"),
-        )
-        self._mapper_cache[key] = mapper
-        return mapper
-
     @staticmethod
     def _translate_time_match(policy: str) -> str:
         mapping = {"auto": "auto", "second": "hms", "microsecond": "hmsf"}
