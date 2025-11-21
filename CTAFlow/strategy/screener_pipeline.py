@@ -16,6 +16,7 @@ from __future__ import annotations
 import numbers
 import re
 from collections.abc import Iterable as IterableABC, Sequence as SequenceABC
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import time as time_cls
 from typing import (
     TYPE_CHECKING,
@@ -191,6 +192,7 @@ class ScreenerPipeline:
         self.return_clip = (-0.5, 0.5)
         self.sessionizer = None
         self.weekend_exit_policy = "last"
+        self._mapper_cache: Dict[Tuple[Any, ...], HorizonMapper] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -201,6 +203,8 @@ class ScreenerPipeline:
         patterns: Any,
         *,
         allowed_months: Optional[Iterable[int]] = None,
+        prepared_df: Optional[pd.DataFrame] = None,
+        max_workers: Optional[int] = None,
     ) -> pd.DataFrame:
         """Return a copy of ``bars`` with pattern gates appended.
 
@@ -217,21 +221,60 @@ class ScreenerPipeline:
         allowed_months:
             Optional iterable of calendar months. When provided the emitted gate
             columns are zeroed outside of the specified months.
+        prepared_df:
+            Optional prevalidated and time-enriched DataFrame. Providing this
+            avoids re-running the preparation steps when repeatedly building
+            feature sets on the same bar data.
+        max_workers:
+            Optional thread pool size used to parallelise independent pattern
+            extraction. When omitted, patterns are processed sequentially.
         """
 
-        df = self._validate_bars(bars)
-        df = self._ensure_time_cols(df)
+        df = prepared_df if prepared_df is not None else self._prepare_bars(bars)
 
+        items = tuple(self._items_from_patterns(patterns))
         gate_columns: List[str] = []
-        for key, pattern in self._items_from_patterns(patterns):
+
+        def _build_single(key: str, pattern: Mapping[str, Any]) -> Tuple[List[str], Mapping[str, pd.Series]]:
+            local_df = df.copy(deep=False)
             try:
-                created = self._dispatch(df, pattern, key)
+                created_cols = self._dispatch(local_df, pattern, key)
             except Exception as exc:  # pragma: no cover - defensive logging path
                 if self.log is not None and hasattr(self.log, "warning"):
                     self.log.warning("[screener_pipeline] skipping '%s': %s", key, exc)
-                continue
+                return [], {}
 
-            gate_columns.extend(created)
+            if not created_cols:
+                return [], {}
+
+            return created_cols, {col: local_df[col] for col in created_cols}
+
+        if max_workers and len(items) > 1:
+            collected: List[Tuple[List[str], Mapping[str, pd.Series]]] = []
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(_build_single, key, pattern): key for key, pattern in items
+                }
+                for future in as_completed(future_map):
+                    collected.append(future.result())
+
+            for created_cols, column_map in collected:
+                if not created_cols:
+                    continue
+                gate_columns.extend(created_cols)
+                for col in created_cols:
+                    df[col] = column_map[col]
+        else:
+            for key, pattern in items:
+                created = []
+                try:
+                    created = self._dispatch(df, pattern, key)
+                except Exception as exc:  # pragma: no cover - defensive logging path
+                    if self.log is not None and hasattr(self.log, "warning"):
+                        self.log.warning("[screener_pipeline] skipping '%s': %s", key, exc)
+                    continue
+
+                gate_columns.extend(created)
 
         if gate_columns:
             any_active = df[gate_columns].any(axis=1)
@@ -295,17 +338,7 @@ class ScreenerPipeline:
             if override in policy_map:
                 xy_kwargs["time_match"] = policy_map[override]
 
-        mapper = HorizonMapper(
-            tz=self.tz,
-            allow_naive_ts=getattr(self, "allow_naive_ts", False),
-            time_match=mapper_time_match,
-            nan_policy=getattr(self, "nan_policy", "drop"),
-            return_clip=getattr(self, "return_clip", (-0.5, 0.5)),
-            asof_tolerance=getattr(self, "asof_tolerance", None),
-            log=self.log,
-            sessionizer=getattr(self, "sessionizer", None),
-            weekend_exit_policy=getattr(self, "weekend_exit_policy", "last"),
-        )
+        mapper = self._get_horizon_mapper(mapper_time_match)
 
         xy = mapper.build_xy(bars_with_features, patterns, **xy_kwargs)
         resolver = prediction_resolver if prediction_resolver is not None else PredictionToPosition()
@@ -316,9 +349,176 @@ class ScreenerPipeline:
             prediction_resolver=resolver,
         )
 
+    def build_and_backtest(
+        self,
+        bars: pd.DataFrame,
+        patterns: Any,
+        *,
+        allowed_months: Optional[Iterable[int]] = None,
+        threshold: float = 0.0,
+        use_side_hint: bool = True,
+        annualisation: int = 252,
+        risk_free_rate: float = 0.0,
+        include_metadata: Optional[Iterable[str]] = None,
+        prediction_resolver: Optional[PredictionToPosition] = None,
+        build_xy_kwargs: Optional[Mapping[str, Any]] = None,
+    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """Convenience wrapper to build features then backtest.
+
+        The bar validation and time enrichment steps are shared between feature
+        construction and backtesting to minimise repeated DataFrame copies.
+        """
+
+        prepared = self._prepare_bars(bars)
+        featured = self.build_features(
+            prepared,
+            patterns,
+            allowed_months=allowed_months,
+            prepared_df=prepared,
+        )
+        backtest_result = self.backtest_threshold(
+            featured,
+            patterns,
+            threshold=threshold,
+            use_side_hint=use_side_hint,
+            annualisation=annualisation,
+            risk_free_rate=risk_free_rate,
+            include_metadata=include_metadata,
+            prediction_resolver=prediction_resolver,
+            **(dict(build_xy_kwargs) if build_xy_kwargs else {}),
+        )
+        return featured, backtest_result
+
+    def build_feature_sets(
+        self,
+        bars: pd.DataFrame,
+        patterns: Any,
+        *,
+        allowed_months: Optional[Iterable[int]] = None,
+        max_workers: Optional[int] = None,
+        prepared_df: Optional[pd.DataFrame] = None,
+    ) -> Dict[str, pd.DataFrame]:
+        """Build separate feature sets for each pattern key.
+
+        This helper is intended for workflows that need to evaluate patterns
+        independently (e.g., concurrent backtests) without recomputing the
+        common timestamp preparation for every run. A preprepared DataFrame can
+        be supplied to skip validation, and feature extraction can be
+        parallelised via ``max_workers`` when many patterns are present.
+        """
+
+        items = list(self._items_from_patterns(patterns))
+        if not items:
+            return {}
+
+        prepared = prepared_df if prepared_df is not None else self._prepare_bars(bars)
+
+        def _build_single(key: str, pattern: Mapping[str, Any]) -> Tuple[str, pd.DataFrame]:
+            local_df = prepared.copy()
+            featured = self.build_features(
+                local_df,
+                {key: pattern},
+                allowed_months=allowed_months,
+                prepared_df=local_df,
+                max_workers=max_workers,
+            )
+            return key, featured
+
+        if max_workers and len(items) > 1:
+            results: Dict[str, pd.DataFrame] = {}
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(_build_single, key, pattern): key for key, pattern in items}
+                for future in as_completed(futures):
+                    key, featured = future.result()
+                    results[key] = featured
+            return results
+
+        return {key: _build_single(key, pattern)[1] for key, pattern in items}
+
+    def concurrent_pattern_backtests(
+        self,
+        bars: pd.DataFrame,
+        patterns: Any,
+        *,
+        threshold: float = 0.0,
+        use_side_hint: bool = True,
+        annualisation: int = 252,
+        risk_free_rate: float = 0.0,
+        include_metadata: Optional[Iterable[str]] = None,
+        prediction_resolver: Optional[PredictionToPosition] = None,
+        max_workers: Optional[int] = None,
+        feature_workers: Optional[int] = None,
+        build_xy_kwargs: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Run pattern backtests individually using a thread pool.
+
+        Each pattern is evaluated in isolation so the resulting performance
+        metrics can be compared directly. Feature sets for each pattern are
+        materialised up front (optionally in parallel) and then reused during
+        concurrent backtesting to avoid redundant gate construction.
+        """
+
+        items = list(self._items_from_patterns(patterns))
+        if not items:
+            return {}
+
+        prepared = self._prepare_bars(bars)
+        results: Dict[str, Dict[str, Any]] = {}
+        build_xy_params = dict(build_xy_kwargs) if build_xy_kwargs else {}
+
+        feature_sets = self.build_feature_sets(
+            prepared,
+            patterns,
+            prepared_df=prepared,
+            max_workers=feature_workers,
+        )
+
+        def _run_single(key: str, featured: pd.DataFrame, pattern: Mapping[str, Any]) -> Tuple[str, Dict[str, Any]]:
+            outcome = self.backtest_threshold(
+                featured,
+                {key: pattern},
+                threshold=threshold,
+                use_side_hint=use_side_hint,
+                annualisation=annualisation,
+                risk_free_rate=risk_free_rate,
+                include_metadata=include_metadata,
+                prediction_resolver=prediction_resolver,
+                **build_xy_params,
+            )
+            return key, outcome
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(_run_single, key, feature_sets[key], pattern): key
+                for key, pattern in items
+                if key in feature_sets
+            }
+            for future in as_completed(future_map):
+                key = future_map[future]
+                try:
+                    pat_key, result = future.result()
+                except Exception as exc:  # pragma: no cover - defensive path
+                    if self.log is not None and hasattr(self.log, "warning"):
+                        self.log.warning("[screener_pipeline] backtest failed for '%s': %s", key, exc)
+                    continue
+                results[pat_key] = result
+
+        return results
+
     # ------------------------------------------------------------------
     # Normalisation helpers
     # ------------------------------------------------------------------
+    def _prepare_bars(self, bars: pd.DataFrame) -> pd.DataFrame:
+        """Validate and enrich bar data in a single pass.
+
+        Combining validation and time column creation reduces the number of
+        DataFrame copies required when repeatedly building feature sets during
+        grid searches or concurrent backtests.
+        """
+
+        validated = self._validate_bars(bars)
+        return self._ensure_time_cols(validated, copy=False)
+
     def _validate_bars(self, bars: pd.DataFrame) -> pd.DataFrame:
         if not isinstance(bars, pd.DataFrame):
             raise TypeError("bars must be a pandas DataFrame")
@@ -344,8 +544,8 @@ class ScreenerPipeline:
 
         return df
 
-    def _ensure_time_cols(self, df: pd.DataFrame) -> pd.DataFrame:
-        out = df.copy()
+    def _ensure_time_cols(self, df: pd.DataFrame, *, copy: bool = True) -> pd.DataFrame:
+        out = df.copy() if copy else df
         ts = out["ts"].dt.tz_convert(self.tz)
 
         out["month"] = ts.dt.month.astype(np.int8)
@@ -1664,6 +1864,38 @@ class HorizonMapper:
     # ------------------------------------------------------------------
     # Configuration helpers
     # ------------------------------------------------------------------
+    def _mapper_cache_key(self, time_match: str) -> Tuple[Any, ...]:
+        return (
+            self.tz,
+            bool(getattr(self, "allow_naive_ts", False)),
+            time_match,
+            getattr(self, "nan_policy", "drop"),
+            getattr(self, "return_clip", (-0.5, 0.5)),
+            getattr(self, "asof_tolerance", None),
+            getattr(self, "weekend_exit_policy", "last"),
+            id(getattr(self, "sessionizer", None)),
+        )
+
+    def _get_horizon_mapper(self, time_match: str) -> HorizonMapper:
+        key = self._mapper_cache_key(time_match)
+        cached = self._mapper_cache.get(key)
+        if cached is not None:
+            return cached
+
+        mapper = HorizonMapper(
+            tz=self.tz,
+            allow_naive_ts=getattr(self, "allow_naive_ts", False),
+            time_match=time_match,
+            nan_policy=getattr(self, "nan_policy", "drop"),
+            return_clip=getattr(self, "return_clip", (-0.5, 0.5)),
+            asof_tolerance=getattr(self, "asof_tolerance", None),
+            log=self.log,
+            sessionizer=getattr(self, "sessionizer", None),
+            weekend_exit_policy=getattr(self, "weekend_exit_policy", "last"),
+        )
+        self._mapper_cache[key] = mapper
+        return mapper
+
     @staticmethod
     def _translate_time_match(policy: str) -> str:
         mapping = {"auto": "auto", "second": "hms", "microsecond": "hmsf"}

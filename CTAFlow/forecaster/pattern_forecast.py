@@ -103,6 +103,20 @@ class PatternMLBuilder:
             X, y, info = self._build_weekend_hedging_dataset(
                 price_df, pattern_meta, features_df, vol_features_df
             )
+        elif "time_predictive_nextday" in ptype:
+            X, y, info = self._build_time_predictive_dataset(
+                price_df,
+                pattern_meta,
+                features_df=features_df,
+                horizon_days=1,
+            )
+        elif "time_predictive_nextweek" in ptype:
+            X, y, info = self._build_time_predictive_dataset(
+                price_df,
+                pattern_meta,
+                features_df=features_df,
+                horizon_days=5,
+            )
         elif "momentum_oc" in ptype or ptype == "momentum_oc":
             X, y, info = self._build_momentum_oc_dataset(
                 price_df, pattern_meta, features_df, vol_features_df
@@ -135,6 +149,26 @@ class PatternMLBuilder:
             return df[self.session_col]
         return df.index.normalize()
 
+    def _gate_column(self, pattern_meta: Mapping[str, Any], features_df: Optional[pd.DataFrame]) -> str:
+        if features_df is None:
+            raise ValueError("features_df is required for time-based predictive patterns")
+
+        explicit = (
+            pattern_meta.get("pattern_gate_col")
+            or pattern_meta.get("gate_col")
+            or (pattern_meta.get("pattern_payload") or {}).get("pattern_gate_col")
+        )
+        if explicit and explicit in features_df.columns:
+            return str(explicit)
+
+        gate_candidates = [col for col in features_df.columns if str(col).endswith("_gate")]
+        if not gate_candidates:
+            raise KeyError("Unable to locate a gate column for the provided pattern")
+        if len(gate_candidates) > 1:
+            # Prefer the first deterministic ordering while still being explicit
+            gate_candidates = sorted(gate_candidates)
+        return gate_candidates[0]
+
     def _month_filter(
         self, df: pd.DataFrame, months_active: Optional[Sequence[int]]
     ) -> pd.Series:
@@ -157,6 +191,17 @@ class PatternMLBuilder:
         target = day.lower()
         names = df.index.day_name().str.lower()
         return names == target
+
+    def _close_to_close_returns(self, df: pd.DataFrame, horizon_days: int) -> pd.Series:
+        df = self._ensure_dt_index(df)
+        session_key = self._session_key(df)
+        closes = pd.to_numeric(df[self.price_col], errors="coerce")
+        session_closes = closes.groupby(session_key).last()
+        future = session_closes.shift(-horizon_days)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            raw = np.log(future / session_closes)
+        cleaned = pd.Series(raw).replace([np.inf, -np.inf], np.nan)
+        return session_key.map(cleaned)
     # ------------------------------------------------------------------
     # 4) Weekend hedging: Friday → Monday
     #     X: Friday session features (at least Fri session return, weekend gap)
@@ -325,6 +370,38 @@ class PatternMLBuilder:
             "weekday": pattern_meta.get("weekday", "Friday->Monday"),
         }
         return base_X, y, info
+
+    def _build_time_predictive_dataset(
+        self,
+        price_df: pd.DataFrame,
+        pattern_meta: Mapping[str, Any],
+        *,
+        features_df: Optional[pd.DataFrame],
+        horizon_days: int,
+    ) -> Tuple[pd.DataFrame, pd.Series, Dict[str, Any]]:
+        df = self._ensure_dt_index(price_df)
+        gate_col = self._gate_column(pattern_meta, features_df)
+
+        gates = features_df[gate_col].reindex(df.index).fillna(0).astype(bool)
+        targets = self._close_to_close_returns(df, horizon_days)
+        valid_mask = gates & targets.notna()
+
+        if not valid_mask.any():
+            return pd.DataFrame(), pd.Series(dtype=float), {
+                "pattern_type": pattern_meta.get("pattern_type", "time_predictive"),
+                "n_samples": 0,
+            }
+
+        X = features_df.reindex(df.index)
+        X = X.loc[valid_mask]
+        y = targets.loc[valid_mask]
+
+        info = {
+            "pattern_type": pattern_meta.get("pattern_type", "time_predictive"),
+            "gate_col": gate_col,
+            "n_samples": int(valid_mask.sum()),
+        }
+        return X, y, info
 
 
     # ------------------------------------------------------------------
