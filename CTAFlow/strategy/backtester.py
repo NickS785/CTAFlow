@@ -7,7 +7,6 @@ import pandas as pd
 from matplotlib import pyplot as plt
 from .prediction_to_position import PredictionToPosition
 
-
 @dataclass
 class BacktestSummary:
     """Container summarising threshold backtest results."""

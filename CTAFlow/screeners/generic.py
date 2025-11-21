@@ -77,6 +77,8 @@ def make_grain_screen(screen_type="seasonality",
 def seasonal_grain_screens(screen_type="seasonality", screen_name="grain_session",):
     return [make_grain_screen(screen_type=screen_type,screen_name=f"{screen_name}_months_{''.join([str(i)+'_' for i in m])}", months=m) for m in seasons()]
 
+def livestock_screens():
+    return {'seasonal':livestock_seasonals}
 session_starts = ["02:30", "08:30"]
 
 session_ends = ["10:30", "15:00"]

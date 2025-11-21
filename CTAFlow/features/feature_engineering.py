@@ -9,6 +9,7 @@ Combines:
 
 Author: Quant Commodities Engineer
 """
+import datetime
 
 import numpy as np
 import pandas as pd
@@ -132,6 +133,35 @@ class IntradayFeatures:
                              name=f'{window}d_cumulative_delta')
 
         return cd_series
+
+class IntradaySignals:
+
+    def __init__(self):
+
+        return
+
+    def intraday_breakout_hl(self, data, time_start, time_end, bidirectional=True, bias="long", high_col="High", low_col="Low"):
+
+        if isinstance(time_start, datetime.time):
+            filtered = data.loc[time_start:time_end]
+            hl_signals = filtered.groupby(filtered.index.date).aggregate({high_col:"max", low_col:"min"})
+            data[["breakout_h", "breakout_l"]] = hl_signals
+            data.ffill()
+            data['signal'] = 0
+            if not bidirectional:
+                if bias == "short":
+                    data['signal'].loc[data["Close"] < data["breakout_l"]] = -1
+                else:
+                    data['signal'].loc[data["Close"] > data["breakout_h"]] = -1
+
+            data['signal'].loc[data["Close"] > data['breakout_h']] = 1
+            data['signal'].loc[data["Close"] < data["breakout_l"]] = -1
+        else:
+            return print("Please use datetime.time")
+
+        return
+
+
 
 
 class SeasonalAnalyzer:
