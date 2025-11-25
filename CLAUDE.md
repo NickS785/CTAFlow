@@ -925,8 +925,196 @@ driver_analysis = analyzer.analyze_curve_evolution_drivers()
 # Available drivers detected from log price Lévy areas:
 drivers = {
     'front_end_changes': "Near-term contract dynamics and front month pressure",
-    'back_end_changes': "Long-term contract structural changes and back month flows", 
+    'back_end_changes': "Long-term contract structural changes and back month flows",
     'seasonal_deviations': "Deviations from typical seasonal curve patterns",
     'momentum': "Rate of change in curve evolution and directional momentum"
 }
+```
+
+## Screeners and Strategy Architecture Summary
+
+### Data Flow: Pattern Discovery to Live Trading
+
+The screeners and strategy modules implement a complete pipeline from statistical pattern discovery to validated trading signals:
+
+**Stage 1: Pattern Discovery (Screeners)**
+```
+Raw Data → HistoricalScreener → Statistical Tests → Pattern Payloads
+```
+- HistoricalScreener scans for momentum, seasonality, and orderflow patterns
+- Statistical validation via t-tests, correlations, FDR correction
+- Outputs nested dicts with pattern metadata, statistics, and configuration
+
+**Stage 2: Pattern Organization (PatternExtractor)**
+```
+Pattern Payloads → PatternExtractor → Ranked PatternSummary Objects
+```
+- Restructures raw screener output into canonical PatternSummary format
+- Computes strength scores for deterministic ranking
+- Supports merging multiple screen runs with collision resolution
+- Filters by pattern type, screen name, month windows
+
+**Stage 3: Feature Materialization (ScreenerPipeline)**
+```
+PatternSummary + Bar Data → ScreenerPipeline → Sparse Gate Columns
+```
+- Transforms patterns into boolean gate columns on bar DataFrame
+- Dispatches to specialized extractors: seasonal, orderflow, momentum
+- Handles timezone normalization, session filtering, month masks
+- Adds sidecar columns (strength, bias, session params) for each gate
+
+**Stage 4: Return Alignment (HorizonMapper)**
+```
+Bar Data + Gates → HorizonMapper.build_xy() → (returns_x, returns_y) pairs
+```
+- Aligns gate activations with realized forward returns
+- Supports multiple horizon types (intraday, session, next-day, Monday)
+- Handles weekend patterns with configurable exit policies
+- Creates standardized XY frame for backtesting
+
+**Stage 5: Validation (Backtester Classes)**
+```
+XY Frame → ScreenerBacktester.threshold() → Performance Metrics
+```
+- Threshold-based backtest on returns_x signal
+- Collision resolution for overlapping patterns (PredictionToPosition)
+- Returns: PnL series, positions, summary statistics, trade breakdown
+- Alternative: FeatureBacktester for full entry/exit control
+
+### Key Design Principles
+
+**1. Separation of Concerns**
+- Screeners: Statistical discovery only, no trading logic
+- PatternExtractor: Organization and ranking only
+- ScreenerPipeline: Feature engineering only
+- HorizonMapper: Return calculation only
+- Backtester: Validation only
+
+**2. Flexible Pattern Representation**
+- PatternSummary is the canonical interchange format
+- as_dict() method provides JSON-serializable output for persistence
+- ScreenerPipeline._items_from_patterns() accepts multiple input shapes
+- Supports nested dicts, (key, pattern) tuples, generators, PatternExtractor.patterns
+
+**3. Parallel Processing**
+- ScreenerPipeline.build_features: max_workers for pattern-level parallelism
+- ScreenerPipeline.concurrent_pattern_backtests: parallel backtest execution
+- HistoricalScreener screens: ThreadPoolExecutor for multi-ticker processing
+- OrderflowScanner: ProcessPoolExecutor for tick-level analysis
+
+**4. Timezone Consistency**
+- All timestamp operations require timezone-aware data
+- ScreenerPipeline normalizes to configured tz (default America/Chicago)
+- HorizonMapper validates and converts timestamps before return calculations
+- Session filtering operates in local timezone after conversion
+
+**5. Statistical Rigor**
+- FDR correction (Benjamini-Hochberg) for multiple hypothesis testing
+- Minimum sample size requirements (OrderflowParams.min_days)
+- Robust statistics (MAD-based z-scores) for outlier handling
+- Significance scoring combines p-value, effect size, sample size
+
+### Common Usage Patterns
+
+**Quick Backtest of Discovered Patterns**
+```python
+# Discover → Extract → Backtest in one flow
+screener = HistoricalScreener(ticker_data)
+results = screener.intraday_momentum_screen(season='winter')
+extractor = PatternExtractor(screener, results)
+
+pipeline = ScreenerPipeline()
+bars_with_features = pipeline.build_features(bars, extractor.patterns)
+backtest = pipeline.backtest_threshold(bars_with_features, extractor.patterns)
+```
+
+**Parallel Ranking of Individual Patterns**
+```python
+# Backtest each pattern independently for ranking
+pipeline = ScreenerPipeline()
+pattern_results = pipeline.concurrent_pattern_backtests(
+    bars,
+    extractor.patterns,
+    max_workers=4,
+    feature_workers=2  # Parallelize feature generation too
+)
+
+# Sort by Sharpe ratio
+ranked = sorted(
+    pattern_results.items(),
+    key=lambda x: x[1]['summary'].sharpe,
+    reverse=True
+)
+```
+
+**Custom Execution Logic with FeatureBacktester**
+```python
+# Full control over entry/exit rules
+signal = SignalSpec(
+    signal_col='my_feature',
+    trigger=2.0,
+    allow_short=True
+)
+
+execution = ExecutionPolicy(
+    price_in='Open',
+    price_out='Close',
+    bias='signed',
+    exit_policy='target_pct',
+    target_pct=0.02
+)
+
+backtester = FeatureBacktester()
+results = backtester.run(df, signal=signal, execution=execution)
+```
+
+**Regime-Filtered Pattern Discovery**
+```python
+# Only detect patterns in specific market regimes
+regime_params = ScreenParams(
+    screen_type='momentum',
+    season='summer',
+    use_regime_filtering=True,
+    regime_col='volatility_regime',
+    target_regimes=[1, 2],  # High/medium vol only
+    regime_settings={'method': 'volatility', 'window': 63}
+)
+
+screener = HistoricalScreener(ticker_data)
+results = screener.composite_screen([regime_params])
+```
+
+### Performance Considerations
+
+**Bottlenecks and Optimizations:**
+1. **Pattern Feature Generation**: Use max_workers in build_features() for patterns > 10
+2. **Tick Data Processing**: OrderflowScanner uses ProcessPoolExecutor for CPU-bound ops
+3. **Return Calculation**: HorizonMapper caches session_id lookups, use prepared_df parameter
+4. **Repeated Backtests**: Use build_feature_sets() to precompute features once
+
+**Memory Management:**
+- ScreenerPipeline.build_features creates column copies only when needed
+- HorizonMapper dedupes and sorts timestamps once during sanitization
+- PatternExtractor._pattern_index stores summaries, not raw bar data
+
+**Recommended Workflow for Large Datasets:**
+```python
+# 1. Prepare bar data once (validation + time enrichment)
+prepared = pipeline._prepare_bars(bars)
+
+# 2. Build feature sets in parallel
+feature_sets = pipeline.build_feature_sets(
+    prepared,
+    patterns,
+    prepared_df=prepared,  # Skip re-preparation
+    max_workers=4
+)
+
+# 3. Backtest in parallel using pre-built features
+results = pipeline.concurrent_pattern_backtests(
+    prepared,
+    patterns,
+    max_workers=8,
+    feature_workers=None  # Already built
+)
 ```
