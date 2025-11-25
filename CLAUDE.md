@@ -87,16 +87,197 @@ The codebase follows a modular pipeline architecture with four main components:
   - Each model class maintains `self.data`, `self.features`, and `self.target` for training/validation
 
 ### Strategy Layer (`CTAFlow/strategy/`)
-- **`strategy.py`**: `RegimeStrategy` class implementing trading strategies using forecasting framework
-- **`screener_pipeline.py`**:
-  - `ScreenerPipeline`: normalises screener payloads into sparse gate columns. Keep `_items_from_patterns` compatible with nested mappings, `(key, pattern)` tuples, generator inputs, and `PatternExtractor.concat_many` outputs because both the screener pipeline and notebooks rely on those shapes.
-  - `HorizonMapper`: aligns realised returns with generated gates. `build_xy` requires timezone-aware `ts`, `open`, `close`, and `session_id` columns so horizon calculations remain stable. Expect `PatternExtractor` summaries with canonical column names when wiring horizons.
+**Core Trading Strategy Components:**
+
+- **`screener_pipeline.py`**: Pattern materialisation and feature engineering pipeline
+  - `ScreenerPipeline`: Transforms screener patterns into sparse gate columns on bar data
+    - `build_features(bars, patterns)`: Main feature generation method, supports parallel processing via max_workers
+    - `backtest_threshold()`: Quick backtest using HorizonMapper for return calculation
+    - `build_and_backtest()`: Convenience wrapper combining feature generation and backtesting
+    - `concurrent_pattern_backtests()`: Parallel backtesting of individual patterns for ranking
+    - Pattern dispatch handles seasonal, orderflow, and momentum pattern types
+    - Keep `_items_from_patterns()` compatible with nested mappings, (key, pattern) tuples, and generator inputs
+
+  - `HorizonMapper`: Return calculation engine aligning gates with realized returns
+    - `build_xy(bars_with_features, patterns)`: Creates (returns_x, returns_y) pairs for backtest
+    - Requires timezone-aware `ts`, `open`, `close`, and `session_id` columns for stability
+    - Supports multiple horizon types: intraday minutes, session close, next-day, next-week, Monday close
+    - Weekend exit policies: 'first', 'last', 'average' for Friday-to-Monday patterns
+    - Configurable NaN policies: 'drop', 'zero', 'ffill' for cleaning realized returns
+
+- **`backtester.py`**: Backtesting engines for pattern validation and strategy evaluation
+  - `ScreenerBacktester`: Lightweight backtester for ScreenerPipeline.build_xy outputs
+    - `threshold(xy, threshold=0.0)`: Simple threshold-based backtest on returns_x signal
+    - Returns: pnl, positions, cumulative, summary (BacktestSummary), monthly, daily_pnl
+    - Supports group_field for multi-instrument aggregation
+    - Uses PredictionToPosition for collision resolution when multiple patterns fire
+
+  - `FeatureBacktester`: Full-featured backtester with configurable entry/exit logic
+    - `run(data, signal, execution)`: Complete backtest with SignalSpec + ExecutionPolicy
+    - SignalSpec: signal_col, trigger threshold, allow_short flag
+    - ExecutionPolicy: price_in/out, bias (long/short/signed), exit_policy, holding_bars
+    - Exit policies: 'bars', 'session_close', 'next_day_close', 'monday_close', 'target_pct'
+    - Returns: pnl, positions, cumulative, trades DataFrame, summary
+
+  - `MomentumBacktester`: Specialized backtester for intraday momentum screen results
+    - `build_xy(results, session_key, predictor, target)`: Converts nested momentum results to XY frame
+    - `threshold_backtest()`: Quick threshold test on momentum signals
+    - Designed for HistoricalScreener.intraday_momentum_screen outputs
+
+  - `BacktestSummary`: Standardized metrics container
+    - total_return, mean_return, hit_rate, sharpe, max_drawdown, trades
+
+  - Helper Functions:
+    - `build_overlay_frame()`: Align cumulative PnL with price for visualization
+    - `plot_backtest_results()`: Matplotlib plotting of PnL and price overlay
+    - `diagnose_alignment()`: Debugging tool for timestamp alignment issues
+
+- **`prediction_to_position.py`**: Collision resolution for overlapping pattern signals
+  - `PredictionToPosition`: Aggregates multiple concurrent pattern signals
+    - `aggregate(xy)`: Combines signals firing at same timestamp
+    - `resolve(xy, group_field)`: Selects best signal when multiple patterns collide
+    - Default selection: highest abs(returns_x), fallback to correlation, then pattern_type
 
 ### Screeners (`CTAFlow/screeners/`)
-- **`pattern_extractor.py`**:
-  - `PatternExtractor`: restructures screener payloads into canonical `PatternSummary` frames, supports arithmetic/concatenation helpers, and persists ranked signals. Preserve `SUMMARY_COLUMNS`, `_strength_raw`, and async loaders (`load_summaries_from_results_async`) because downstream notebooks and the pipeline consume those exact shapes.
-  - Utility helpers compute significance scores, merge seasonal/orderflow frames, and serialise outputs. Keep scoring weights configurable via keyword arguments even though defaults live in `_strength_raw`.
-- **`__init__.py`**: re-exports `PatternExtractor` and `PatternSummary` for external import paths (used by strategy notebooks and tests).
+**Pattern Discovery and Statistical Validation:**
+
+- **`pattern_extractor.py`**: Screener output restructuring and pattern ranking
+  - `PatternExtractor`: Main class for organizing and analyzing screener results
+    - Constructor: `PatternExtractor(screener, results, screen_params, metadata)`
+    - `patterns`: Property returning nested dict of pattern summaries by symbol
+    - `concat(other, conflict='prefer_strong')`: Merge multiple extractor outputs
+    - `top_patterns(symbol, n=5)`: Ranked patterns for a ticker by strength score
+    - `top_patterns_global(n=10)`: Top patterns across all tickers
+    - `filter_patterns(symbol, pattern_types, screen_names)`: Subset extraction
+    - `get_filtered_months()`: Returns canonical set of active months (1-12)
+    - `concat_many(extractors)`: Static method for bulk merging
+    - Preserves SUMMARY_COLUMNS for downstream consumption
+    - Async loaders: `load_summaries_from_results_async()` for parallel loading
+
+  - `PatternSummary`: Dataclass describing a single pattern
+    - key, symbol, source_screen, screen_params, pattern_type, description, strength
+    - payload: Dict containing pattern-specific data (mean, p_value, correlation, etc.)
+    - metadata: Dict with session params, momentum_type, bias, etc.
+    - `as_dict()`: Serializes to JSON-compatible format for pipeline consumption
+    - `get_session_params()`: Extracts canonical session parameters
+
+  - Strength Scoring:
+    - `_strength_raw()`: Computes significance score from p-value, effect size, sample size
+    - Configurable weights: p_weight, effect_weight, n_weight
+    - Used for deterministic pattern ranking
+
+- **`historical_screener.py`**: Main screener engine for seasonal and momentum patterns
+  - `HistoricalScreener`: Primary pattern discovery class
+    - Constructor: `HistoricalScreener(ticker_data, file_mgr, results_client, auto_write_results)`
+    - `intraday_momentum_screen()`: Detects intraday momentum patterns across sessions
+      - Parameters: session_starts/ends lists, st_momentum_days, sess_start/end hours/minutes
+      - Supports season filters ('winter', 'spring', 'summer', 'fall')
+      - Supports month filters: specific months list (1-12)
+      - Regime filtering: use_regime_filtering, regime_col, target_regimes, regime_settings
+      - Returns nested dict: {ticker: {session_key: {momentum_type: stats}}}
+
+    - `intraday_seasonality_screen()`: Time-of-day and day-of-week seasonality
+      - Parameters: target_times, period_length, dayofweek_screen, session_start/end
+      - Detects predictive time-of-day patterns (next-day, next-week correlations)
+      - Weekend hedging detection: Friday-to-Monday correlation analysis
+      - Returns: time_predictive_nextday, time_predictive_nextweek, weekday_returns, weekend_hedging
+
+    - `composite_screen(screen_params_list)`: Multi-screen orchestration
+      - Takes List[ScreenParams] for parallel execution of multiple screens
+      - Returns consolidated dict with all screen results
+
+    - `write_results_to_store()`: Persist results via ResultsClient
+    - `set_results_client()`: Configure persistence backend
+
+  - `ScreenParams`: Dataclass for screen configuration
+    - screen_type: 'momentum' or 'seasonality'
+    - name: Optional custom name for the screen
+    - season: 'winter', 'spring', 'summer', 'fall' (auto-mapped to months)
+    - months: List[int] for custom month selection
+    - Momentum params: session_starts/ends, st_momentum_days, sess_start/end hrs/minutes, test_vol
+    - Seasonality params: target_times, period_length, dayofweek_screen, session_start/end, tz
+    - Regime filtering: use_regime_filtering, regime_col, target_regimes, regime_settings
+    - Auto-generates name if not provided
+
+- **`orderflow_scan.py`**: Volume-based orderflow pressure analysis
+  - `OrderflowScanner`: Tick-level orderflow analysis class
+    - `scan_tickers()`: Main method for multi-ticker orderflow analysis
+    - Computes buy/sell pressure, VPIN, net_pressure from tick data
+    - Detects seasonal orderflow patterns (weekly, week-of-month, peak pressure)
+    - Parallel processing with configurable max_workers
+    - Returns: df_weekly, df_wom_weekday, df_weekly_peak_pressure
+
+  - `OrderflowParams`: Configuration dataclass
+    - session_start/end: Session window for tick filtering
+    - tz: Timezone for session localization
+    - bucket_size: Volume bucket size ('auto' or integer)
+    - vpin_window: VPIN calculation window
+    - min_days: Minimum sample size for statistical tests
+    - cadence_target: Target buckets per day for auto bucket sizing
+    - grid_multipliers: Multipliers for grid search in auto mode
+    - month_filter/season_filter: Period filtering options
+
+  - `orderflow_scan()`: Functional interface for single-ticker analysis
+    - Alternative to OrderflowScanner class-based API
+    - Takes tick data, OrderflowParams, returns analysis results
+
+- **`session_first_hours.py`**: First hours momentum and volume analysis
+  - `run_session_first_hours()`: Analyzes opening hour momentum patterns
+  - `SessionFirstHoursParams`: Configuration for first hours analysis
+  - Detects opening momentum, relative volume patterns
+
+- **`__init__.py`**: Package exports
+  - Re-exports: PatternExtractor, PatternSummary, HistoricalScreener, ScreenParams
+  - Re-exports: OrderflowParams, OrderflowScanner, orderflow_scan
+  - Re-exports: SessionFirstHoursParams, run_session_first_hours
+
+### Screener Workflow Integration
+**Complete Pattern Discovery to Backtest Pipeline:**
+
+```python
+from CTAFlow.screeners import HistoricalScreener, ScreenParams, PatternExtractor
+from CTAFlow.strategy import ScreenerPipeline, ScreenerBacktester
+
+# 1. Configure screens
+winter_momentum = ScreenParams(
+    screen_type='momentum',
+    season='winter',
+    session_starts=["02:30", "08:30"],
+    session_ends=["10:30", "13:30"]
+)
+
+spring_seasonality = ScreenParams(
+    screen_type='seasonality',
+    season='spring',
+    target_times=["09:30", "14:00"],
+    dayofweek_screen=True
+)
+
+# 2. Run screener
+screener = HistoricalScreener(ticker_data)
+results = screener.composite_screen([winter_momentum, spring_seasonality])
+
+# 3. Extract and rank patterns
+extractor = PatternExtractor(screener, results, [winter_momentum, spring_seasonality])
+top_patterns = extractor.top_patterns_global(n=20)
+
+# 4. Materialize features on bar data
+pipeline = ScreenerPipeline(tz="America/Chicago")
+bars_with_features = pipeline.build_features(bars, extractor.patterns)
+
+# 5. Backtest patterns
+backtester = ScreenerBacktester(annualisation=252)
+results = pipeline.backtest_threshold(
+    bars_with_features,
+    extractor.patterns,
+    threshold=0.0,
+    use_side_hint=True
+)
+
+print(f"Sharpe: {results['summary'].sharpe:.2f}")
+print(f"Total Return: {results['summary'].total_return:.4f}")
+print(f"Trades: {results['summary'].trades}")
+```
 
 ### Data Pipeline (`CTAFlow/data/`)
 **Simplified Processing Pipeline (Post-Phase 3):**
