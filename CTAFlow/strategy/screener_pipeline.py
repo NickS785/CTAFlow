@@ -192,6 +192,7 @@ class ScreenerPipeline:
         self.return_clip = (-0.5, 0.5)
         self.sessionizer = None
         self.weekend_exit_policy = "last"
+        self.data_clean_policy = "ffill"  # Policy for cleaning numeric columns: 'ffill', 'drop', 'zero'
         self._mapper_cache: Dict[Tuple[Any, ...], HorizonMapper] = {}
 
     # ------------------------------------------------------------------
@@ -539,7 +540,8 @@ class ScreenerPipeline:
         """
 
         validated = self._validate_bars(bars)
-        return self._ensure_time_cols(validated, copy=False)
+        cleaned = self._clean_numeric_data(validated)
+        return self._ensure_time_cols(cleaned, copy=False)
 
     def _validate_bars(self, bars: pd.DataFrame) -> pd.DataFrame:
         if not isinstance(bars, pd.DataFrame):
@@ -565,6 +567,54 @@ class ScreenerPipeline:
             df["ts"] = ts.dt.tz_convert(tz)
 
         return df
+
+    def _clean_numeric_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Clean and validate numeric columns using the configured data_clean_policy.
+
+        Handles non-numeric types and np.nan values in OHLCV and other numeric columns.
+        Default policy is 'ffill' to forward fill missing values.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            DataFrame with potentially dirty numeric data
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with cleaned numeric columns
+        """
+        out = df.copy()
+
+        # Identify numeric columns (OHLCV and common numeric columns)
+        numeric_candidates = ['open', 'high', 'low', 'close', 'volume',
+                             'Open', 'High', 'Low', 'Close', 'Volume',
+                             'bid', 'ask', 'last', 'Bid', 'Ask', 'Last']
+
+        numeric_cols = [col for col in numeric_candidates if col in out.columns]
+
+        if not numeric_cols:
+            return out
+
+        policy = getattr(self, 'data_clean_policy', 'ffill')
+
+        for col in numeric_cols:
+            # Convert to numeric, coercing errors to NaN
+            out[col] = pd.to_numeric(out[col], errors='coerce')
+
+            # Replace inf values with NaN
+            out[col] = out[col].replace([np.inf, -np.inf], np.nan)
+
+            # Apply cleaning policy
+            if policy == 'ffill':
+                out[col] = out[col].ffill()
+            elif policy == 'drop':
+                # Drop rows with NaN in this column
+                out = out.dropna(subset=[col])
+            elif policy == 'zero':
+                out[col] = out[col].fillna(0.0)
+
+        return out
 
     def _ensure_time_cols(self, df: pd.DataFrame, *, copy: bool = True) -> pd.DataFrame:
         out = df.copy() if copy else df
