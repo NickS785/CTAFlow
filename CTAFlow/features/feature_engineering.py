@@ -182,10 +182,12 @@ class IntradaySignals:
             self.low: "min"
         }).rename(columns={self.high: "breakout_h", self.low: "breakout_l"})
 
-        # Merge back to full dataset using date index
-        data['date'] = data.index.date
-        data = data.merge(hl_signals, left_on='date', right_index=True, how='left')
-        data.drop(columns=['date'], inplace=True)
+        # Add breakout columns to data by aligning on date
+        data['_date'] = data.index.date
+        data['breakout_h'] = data['_date'].map(hl_signals['breakout_h'])
+        data['breakout_l'] = data['_date'].map(hl_signals['breakout_l'])
+        data.drop(columns=['_date'], inplace=True)
+
 
         # Forward fill breakout levels within each day (for bars after the window)
         data[['breakout_h', 'breakout_l']] = data.groupby(data.index.date)[['breakout_h', 'breakout_l']].ffill()
@@ -206,7 +208,7 @@ class IntradaySignals:
                 data.loc[data[self.close] < data['breakout_l'], 'signal_breakout'] = -1
 
         return data
-2
+
 
 
 class SeasonalAnalyzer:
