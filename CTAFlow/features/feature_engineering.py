@@ -10,6 +10,7 @@ Combines:
 Author: Quant Commodities Engineer
 """
 import datetime
+from datetime import timedelta
 
 import numpy as np
 import pandas as pd
@@ -208,6 +209,125 @@ class IntradaySignals:
                 data.loc[data[self.close] < data['breakout_l'], 'signal_breakout'] = -1
 
         return data
+
+    def intraday_momentum(self, session_open: datetime.time, session_close: datetime.time,
+                         return_x_period: Optional[datetime.time] = None,
+                         returns_period_length: timedelta = timedelta(hours=2),
+                         pre_close: bool = False):
+        """Calculate intraday momentum returns for specified time periods.
+
+        Parameters
+        ----------
+        session_open : datetime.time
+            Session start time
+        session_close : datetime.time
+            Session end time
+        return_x_period : Optional[datetime.time]
+            Custom start time for return calculation. If None, uses session_open
+        returns_period_length : timedelta
+            Length of the return measurement window (default 2 hours)
+        pre_close : bool
+            If True, measures returns ending at session_close instead of starting at open
+
+        Returns
+        -------
+        pd.Series
+            Log returns for each day, indexed by date
+
+        Notes
+        -----
+        Return calculation modes:
+        1. Default (return_x_period=None, pre_close=False):
+           Returns from session_open to (session_open + returns_period_length)
+
+        2. Custom start (return_x_period given, pre_close=False):
+           Returns from return_x_period to (return_x_period + returns_period_length)
+
+        3. Pre-close (pre_close=True, return_x_period=None):
+           Returns from (session_close - returns_period_length) to session_close
+
+        4. Pre-close with custom (pre_close=True, return_x_period given):
+           Returns from (session_close - returns_period_length) to session_close
+           (return_x_period is ignored in this case)
+        """
+        data = self.data.copy()
+
+        # Filter to session times
+        session_data = data.between_time(session_open, session_close)
+
+        if session_data.empty:
+            return pd.Series(dtype=float)
+
+        # Determine start and end times for the momentum window
+        if pre_close:
+            # Calculate returns ending at session close
+            # Calculate end time by subtracting period from session_close
+            total_seconds = returns_period_length.total_seconds()
+            hours_delta = int(total_seconds // 3600)
+            minutes_delta = int((total_seconds % 3600) // 60)
+
+            # Create start time by subtracting from session_close
+            start_hour = session_close.hour - hours_delta
+            start_minute = session_close.minute - minutes_delta
+
+            # Handle minute underflow
+            if start_minute < 0:
+                start_minute += 60
+                start_hour -= 1
+
+            # Handle hour underflow (cross midnight - unlikely for intraday)
+            if start_hour < 0:
+                start_hour += 24
+
+            time_start = datetime.time(start_hour, start_minute)
+            time_end = session_close
+        else:
+            # Calculate returns starting from open or custom period
+            if return_x_period is not None:
+                time_start = return_x_period
+            else:
+                time_start = session_open
+
+            # Calculate end time by adding period to start
+            total_seconds = returns_period_length.total_seconds()
+            hours_delta = int(total_seconds // 3600)
+            minutes_delta = int((total_seconds % 3600) // 60)
+
+            end_hour = time_start.hour + hours_delta
+            end_minute = time_start.minute + minutes_delta
+
+            # Handle minute overflow
+            if end_minute >= 60:
+                end_minute -= 60
+                end_hour += 1
+
+            # Handle hour overflow (unlikely for intraday but handle anyway)
+            if end_hour >= 24:
+                end_hour -= 24
+
+            time_end = datetime.time(end_hour, end_minute)
+
+        # Extract data within the calculated window
+        window_data = session_data.between_time(time_start, time_end)
+
+        if window_data.empty:
+            return pd.Series(dtype=float)
+
+        # Calculate log returns for each day
+        def calc_daily_return(group):
+            if len(group) < 2:
+                return np.nan
+            first_price = group[self.close].iloc[0]
+            last_price = group[self.close].iloc[-1]
+            if first_price <= 0 or last_price <= 0:
+                return np.nan
+            return np.log(last_price) - np.log(first_price)
+
+        momentum_returns = window_data.groupby(window_data.index.date).apply(calc_daily_return)
+        momentum_returns.name = 'intraday_momentum'
+
+        return momentum_returns
+
 
 
 
