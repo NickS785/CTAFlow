@@ -161,6 +161,7 @@ class ScreenerPipeline:
         "momentum_oc",
         "momentum_cc",
         "momentum_sc",
+        "time_predictive_intraday",
     }
 
     def __init__(self, tz: str = "America/Chicago", time_match: str = "auto", log: Any = None) -> None:
