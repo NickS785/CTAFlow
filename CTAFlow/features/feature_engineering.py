@@ -232,36 +232,43 @@ class IntradaySignals:
         Returns
         -------
         pd.Series
-            Log returns for each day, indexed by date
+            Momentum returns indexed by datetime (same index as self.data).
+            The momentum value is inserted at the last timestamp used in the calculation
+            and forward filled for the rest of each day.
 
         Notes
         -----
         Return calculation modes:
         1. Default (return_x_period=None, pre_close=False):
            Returns from session_open to (session_open + returns_period_length)
+           Value inserted at time_end timestamp and forward filled
 
         2. Custom start (return_x_period given, pre_close=False):
            Returns from return_x_period to (return_x_period + returns_period_length)
+           Value inserted at time_end timestamp and forward filled
 
         3. Pre-close (pre_close=True, return_x_period=None):
            Returns from (session_close - returns_period_length) to session_close
+           Value inserted at session_close timestamp and forward filled
 
         4. Pre-close with custom (pre_close=True, return_x_period given):
            Returns from (session_close - returns_period_length) to session_close
+           Value inserted at session_close timestamp and forward filled
            (return_x_period is ignored in this case)
         """
-        data = self.data.copy()
+        # Initialize result series with same index as original data
+        momentum_series = pd.Series(index=self.data.index, dtype=float, name='intraday_momentum')
+        momentum_series[:] = np.nan
 
         # Filter to session times
-        session_data = data.between_time(session_open, session_close)
+        session_data = self.data.between_time(session_open, session_close)
 
         if session_data.empty:
-            return pd.Series(dtype=float)
+            return momentum_series
 
         # Determine start and end times for the momentum window
         if pre_close:
             # Calculate returns ending at session close
-            # Calculate end time by subtracting period from session_close
             total_seconds = returns_period_length.total_seconds()
             hours_delta = int(total_seconds // 3600)
             minutes_delta = int((total_seconds % 3600) // 60)
@@ -311,22 +318,32 @@ class IntradaySignals:
         window_data = session_data.between_time(time_start, time_end)
 
         if window_data.empty:
-            return pd.Series(dtype=float)
+            return momentum_series
 
-        # Calculate log returns for each day
-        def calc_daily_return(group):
+        # Calculate log returns for each day and get the last timestamp in the window
+        def calc_daily_return_and_timestamp(group):
             if len(group) < 2:
-                return np.nan
+                return pd.Series({'return': np.nan, 'timestamp': group.index[-1]})
             first_price = group[self.close].iloc[0]
             last_price = group[self.close].iloc[-1]
             if first_price <= 0 or last_price <= 0:
-                return np.nan
-            return np.log(last_price) - np.log(first_price)
+                return pd.Series({'return': np.nan, 'timestamp': group.index[-1]})
+            log_return = np.log(last_price) - np.log(first_price)
+            return pd.Series({'return': log_return, 'timestamp': group.index[-1]})
 
-        momentum_returns = window_data.groupby(window_data.index.date).apply(calc_daily_return)
-        momentum_returns.name = 'intraday_momentum'
+        # Get returns and their timestamps
+        daily_results = window_data.groupby(window_data.index.date).apply(calc_daily_return_and_timestamp)
 
-        return momentum_returns
+        # Insert momentum values at the appropriate timestamps
+        for date, row in daily_results.iterrows():
+            if pd.notna(row['return']):
+                timestamp = row['timestamp']
+                momentum_series.loc[timestamp] = row['return']
+
+        # Forward fill within each day
+        momentum_series = momentum_series.groupby(momentum_series.index.date).ffill()
+
+        return momentum_series
 
 
 
