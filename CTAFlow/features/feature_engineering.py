@@ -14,7 +14,7 @@ import datetime
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
-from typing import Dict, Any
+from typing import Dict, Any, List, Literal, Optional
 
 from ..data.data_client import DataClient
 from ..utils.seasonal import intraday_autocorr_between_times, intraday_lag_autocorr, monthly_returns, abnormal_months, IntradayPairSpec, last_year_predicts_this_year, prewindow_predicts_month
@@ -136,32 +136,77 @@ class IntradayFeatures:
 
 class IntradaySignals:
 
-    def __init__(self):
+    def __init__(self, data, open="Open", high="High", low="Low", close="Close"):
+        self.data = data
+        self.open, self.high, self.low, self.close = open, high, low, close
 
         return
 
-    def intraday_breakout_hl(self, data, time_start, time_end, bidirectional=True, bias="long", high_col="High", low_col="Low"):
+    def intraday_breakout_hl(self, time_start:datetime.time, time_end:datetime.time, bidirectional:bool=True, bias:Literal["long", "short"]="long"):
+        """Calculate intraday breakout signals based on high/low range during specified time window.
 
-        if isinstance(time_start, datetime.time):
-            filtered = data.loc[time_start:time_end]
-            hl_signals = filtered.groupby(filtered.index.date).aggregate({high_col:"max", low_col:"min"})
-            data[["breakout_h", "breakout_l"]] = hl_signals
-            data.ffill()
-            data['signal'] = 0
-            if not bidirectional:
-                if bias == "short":
-                    data['signal'].loc[data["Close"] < data["breakout_l"]] = -1
-                else:
-                    data['signal'].loc[data["Close"] > data["breakout_h"]] = -1
+        For each day, computes the high and low within the time_start to time_end window.
+        Then generates signals for the rest of the day:
+        - Returns 1 when price breaks above the high
+        - Returns -1 when price breaks below the low
+        - Returns 0 when price remains within the range
 
-            data['signal'].loc[data["Close"] > data['breakout_h']] = 1
-            data['signal'].loc[data["Close"] < data["breakout_l"]] = -1
+        Parameters
+        ----------
+        time_start : datetime.time
+            Start time of the range calculation window
+        time_end : datetime.time
+            End time of the range calculation window
+        bidirectional : bool
+            If True, generates both long (+1) and short (-1) signals
+            If False, only generates signals in the direction of bias
+        bias : Literal["long", "short"]
+            Direction preference when bidirectional=False
+
+        Returns
+        -------
+        pd.DataFrame
+            Copy of data with added columns: breakout_h, breakout_l, signal_breakout
+        """
+        if not isinstance(time_start, datetime.time) or not isinstance(time_end, datetime.time):
+            raise ValueError("time_start and time_end must be datetime.time objects")
+
+        data = self.data.copy()
+
+        # Filter data to the specified time window
+        filtered = data.between_time(time_start, time_end)
+
+        # Calculate high and low for each day within the time window
+        hl_signals = filtered.groupby(filtered.index.date).agg({
+            self.high: "max",
+            self.low: "min"
+        }).rename(columns={self.high: "breakout_h", self.low: "breakout_l"})
+
+        # Merge back to full dataset using date index
+        data['date'] = data.index.date
+        data = data.merge(hl_signals, left_on='date', right_index=True, how='left')
+        data.drop(columns=['date'], inplace=True)
+
+        # Forward fill breakout levels within each day (for bars after the window)
+        data[['breakout_h', 'breakout_l']] = data.groupby(data.index.date)[['breakout_h', 'breakout_l']].ffill()
+
+        # Initialize signal column
+        data['signal_breakout'] = 0
+
+        # Generate signals based on price relative to breakout levels
+        if bidirectional:
+            # Both long and short signals
+            data.loc[data[self.close] > data['breakout_h'], 'signal_breakout'] = 1
+            data.loc[data[self.close] < data['breakout_l'], 'signal_breakout'] = -1
         else:
-            return print("Please use datetime.time")
+            # Single direction based on bias
+            if bias == "long":
+                data.loc[data[self.close] > data['breakout_h'], 'signal_breakout'] = 1
+            elif bias == "short":
+                data.loc[data[self.close] < data['breakout_l'], 'signal_breakout'] = -1
 
-        return
-
-
+        return data
+2
 
 
 class SeasonalAnalyzer:
