@@ -95,6 +95,8 @@ class ScreenerBacktester:
                 "monthly": pd.Series(dtype=float),
                 "cumulative": empty,
                 "daily_pnl": pd.Series(dtype=float),
+                "predictor_values": empty,
+                "correlation": empty,
             }
 
         required = {"returns_x", "returns_y"}
@@ -115,6 +117,8 @@ class ScreenerBacktester:
                     "monthly": pd.Series(dtype=float),
                     "cumulative": pd.Series(dtype=float),
                     "daily_pnl": pd.Series(dtype=float),
+                    "predictor_values": pd.Series(dtype=float),
+                    "correlation": pd.Series(dtype=float),
                 }
         if frame.empty:
             return {
@@ -124,6 +128,8 @@ class ScreenerBacktester:
                 "monthly": pd.Series(dtype=float),
                 "cumulative": pd.Series(dtype=float),
                 "daily_pnl": pd.Series(dtype=float),
+                "predictor_values": pd.Series(dtype=float),
+                "correlation": pd.Series(dtype=float),
             }
 
         frame = self._collision_resolver.resolve(frame, group_field=group_field)
@@ -168,6 +174,13 @@ class ScreenerBacktester:
         positions = _assign_trade_index(raw_positions)
         pnl = _assign_trade_index(raw_pnl)
         cumulative = _assign_trade_index(raw_cumulative)
+        predictor_values = _assign_trade_index(frame["returns_x"])
+
+        # Add correlation values if available for debugging positioning logic
+        if "correlation" in frame.columns:
+            correlation_values = _assign_trade_index(frame["correlation"])
+        else:
+            correlation_values = pd.Series(index=trade_index, dtype=float)
 
         trades = int(signal_mask.sum())
         if not trade_rows.empty:
@@ -229,6 +242,8 @@ class ScreenerBacktester:
             "monthly": monthly,
             "cumulative": cumulative,
             "daily_pnl": daily_pnl,
+            "predictor_values": predictor_values,
+            "correlation": correlation_values,
         }
 
         if group_field and group_field in frame.columns:

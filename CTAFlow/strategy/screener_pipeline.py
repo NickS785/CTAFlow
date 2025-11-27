@@ -1206,6 +1206,7 @@ class ScreenerPipeline:
             "sharpe": payload.get("sharpe"),
             "positive_pct": payload.get("positive_pct"),
             "strength": pattern.get("strength") or payload.get("strength"),
+            "correlation": payload.get("correlation") or metadata.get("correlation") or pattern.get("correlation"),
         }
 
         return self._add_feature(df, base, mask, sidecars)

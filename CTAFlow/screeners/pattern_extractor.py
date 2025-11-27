@@ -1768,6 +1768,19 @@ class PatternExtractor:
         total_obs = summary_info.get("total_observations") if summary_info else None
         pattern["n"] = best_n or total_obs
 
+        # Add correlation proxy based on t_stat sign for positioning logic
+        # Positive t_stat means the pattern predicts positive returns (long bias)
+        # Negative t_stat means the pattern predicts negative returns (short bias)
+        t_stat_value = pattern.get("t_stat")
+        if t_stat_value is not None:
+            # Use t_stat sign as correlation proxy (normalized to [-1, 1] range)
+            pattern["correlation"] = 1.0 if t_stat_value > 0 else -1.0
+        elif "best_mean" in pattern:
+            # Fallback to best_mean sign if t_stat not available
+            best_mean_value = pattern["best_mean"]
+            if best_mean_value is not None:
+                pattern["correlation"] = 1.0 if best_mean_value > 0 else -1.0
+
         return pattern
 
     def _build_momentum_correlation_patterns(
