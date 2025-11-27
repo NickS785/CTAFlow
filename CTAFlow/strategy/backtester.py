@@ -52,6 +52,8 @@ class ExecutionPolicy:
     - target_pct: threshold for 'target_pct' exit policy (must be > 0)
     - pattern_gate_col: optional gate column; entries only allowed when this column != 0
     - tz: optional timezone for session-based exits; currently only used for future extensions
+    - weekend_aware: when True, auto-detects Friday entries with 'session_close' and switches
+                     to 'monday_close' exit to handle weekend hedging patterns correctly (default: True)
     """
     price_in: str = "Close"
     price_out: str = "Close"
@@ -67,6 +69,7 @@ class ExecutionPolicy:
     target_pct: float = 0.0
     pattern_gate_col: Optional[str] = None
     tz: Optional[str] = None
+    weekend_aware: bool = True  # Auto-switch session_close to monday_close for Friday entries
 
 
 class ScreenerBacktester:
@@ -589,11 +592,35 @@ class FeatureBacktester:
                 j = frame.index[jpos]
 
             elif execution.exit_policy == "session_close":
-                day = i.normalize()
-                same_day = frame.loc[
-                    day : day + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
-                ]
-                j = same_day.index[-1]
+                # Auto-detect weekend patterns: if entry is Friday and weekend_aware is True,
+                # use monday_close logic instead to handle weekend hedging patterns
+                is_friday = i.weekday() == 4
+                if execution.weekend_aware and is_friday:
+                    # Switch to monday_close logic for Friday entries
+                    search = frame.loc[i + pd.Timedelta(seconds=1) :]
+                    if search.empty:
+                        continue
+                    monday_days = pd.Index(
+                        d
+                        for d in pd.to_datetime(search.index.normalize().unique())
+                        if d.weekday() == 0
+                    )
+                    if monday_days.empty:
+                        continue
+                    monday = monday_days[0]
+                    mon = frame.loc[
+                        monday : monday + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+                    ]
+                    if mon.empty:
+                        continue
+                    j = mon.index[-1]
+                else:
+                    # Normal session_close behavior
+                    day = i.normalize()
+                    same_day = frame.loc[
+                        day : day + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+                    ]
+                    j = same_day.index[-1]
 
             elif execution.exit_policy == "next_day_close":
                 next_day = i.normalize() + pd.Timedelta(days=1)
