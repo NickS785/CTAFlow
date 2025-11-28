@@ -2,11 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from contextlib import nullcontext
 import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
 from .prediction_to_position import PredictionToPosition
-from .gpu_acceleration import GPU_AVAILABLE, gpu_backtest_threshold, gpu_cumulative_pnl
+from .gpu_acceleration import (
+    GPU_AVAILABLE,
+    gpu_backtest_threshold,
+    to_cpu,
+)
 
 @dataclass
 class BacktestSummary:
@@ -90,11 +95,13 @@ class ScreenerBacktester:
         risk_free_rate: float = 0.0,
         use_gpu: bool = True,
         gpu_device_id: int = 0,
+        gpu_stream: Optional[Any] = None,
     ) -> None:
         self.annualisation = annualisation
         self.risk_free_rate = risk_free_rate
         self.use_gpu = use_gpu and GPU_AVAILABLE
         self.gpu_device_id = gpu_device_id
+        self.gpu_stream = gpu_stream
         self._collision_resolver = PredictionToPosition()
 
     @staticmethod
@@ -147,22 +154,12 @@ class ScreenerBacktester:
         if missing:
             raise KeyError(f"XY frame missing required columns: {sorted(missing)}")
 
-        frame = xy.dropna(subset=["returns_x", "returns_y"]).copy()
-        frame = self._drop_duplicate_rows(frame)
+        valid_mask = xy[["returns_x", "returns_y"]].notna().all(axis=1)
+        frame = xy.loc[valid_mask]
+
         if prediction_resolver is not None and not frame.empty:
             frame = prediction_resolver.aggregate(frame)
-            frame = self._drop_duplicate_rows(frame)
-            if frame.empty:
-                return {
-                    "pnl": pd.Series(dtype=float),
-                    "positions": pd.Series(dtype=float),
-                    "summary": BacktestSummary(0.0, 0.0, np.nan, np.nan, 0.0, 0),
-                    "monthly": pd.Series(dtype=float),
-                    "cumulative": pd.Series(dtype=float),
-                    "daily_pnl": pd.Series(dtype=float),
-                    "predictor_values": pd.Series(dtype=float),
-                    "correlation": pd.Series(dtype=float),
-                }
+
         if frame.empty:
             return {
                 "pnl": pd.Series(dtype=float),
@@ -178,46 +175,57 @@ class ScreenerBacktester:
         frame = self._collision_resolver.resolve(frame, group_field=group_field)
         frame = self._drop_duplicate_rows(frame)
 
+        returns_x = np.asarray(frame["returns_x"].to_numpy(copy=False), dtype=float)
+        returns_y = np.asarray(frame["returns_y"].to_numpy(copy=False), dtype=float)
+
         # GPU-accelerated position calculation if enabled
         if self.use_gpu:
-            # Extract columns for GPU processing (handled as pandas objects to
-            # allow CuPy-backed execution inside the accelerator helpers)
-            returns_x = frame["returns_x"]
-            returns_y = frame["returns_y"]
-
-            # Check for correlation-based side hint
             correlation = None
             if use_side_hint and "correlation" in frame.columns:
                 correlation = frame["correlation"]
 
-            # GPU computation
-            raw_positions_array, raw_pnl_array = gpu_backtest_threshold(
-                returns_x=returns_x,
-                returns_y=returns_y,
-                correlation=correlation,
-                threshold=threshold,
-                use_side_hint=use_side_hint,
-                use_gpu=True,
-                device_id=self.gpu_device_id,
-            )
+            stream_cm = self.gpu_stream if self.gpu_stream is not None else nullcontext()
+            with stream_cm:
+                raw_positions_backend, raw_pnl_backend, xp = gpu_backtest_threshold(
+                    returns_x=returns_x,
+                    returns_y=returns_y,
+                    correlation=correlation,
+                    threshold=threshold,
+                    use_side_hint=use_side_hint,
+                    use_gpu=True,
+                    device_id=self.gpu_device_id,
+                    stream=self.gpu_stream,
+                    return_backend=True,
+                )
 
-            # Convert back to pandas with proper index
-            raw_positions = pd.Series(raw_positions_array, index=frame.index)
-            raw_pnl = pd.Series(raw_pnl_array, index=frame.index)
-            signal_mask = raw_positions != 0.0
+                raw_cumulative_backend = xp.cumsum(raw_pnl_backend)
+                rolling_max_backend = xp.maximum.accumulate(raw_cumulative_backend)
+                drawdown_backend = raw_cumulative_backend - rolling_max_backend
+
+            positions_array = to_cpu(raw_positions_backend)
+            pnl_array = to_cpu(raw_pnl_backend)
+            cumulative_array = to_cpu(raw_cumulative_backend)
+            drawdown_array = to_cpu(drawdown_backend)
+
+            raw_positions = pd.Series(positions_array, index=frame.index)
+            raw_pnl = pd.Series(pnl_array, index=frame.index)
+            signal_mask = positions_array != 0.0
         else:
-            # CPU fallback: original logic
-            direction = np.sign(frame["returns_x"])
+            direction = np.sign(returns_x)
             if use_side_hint and "side_hint" in frame.columns:
-                hinted = frame["side_hint"].replace(0, np.nan)
-                direction = hinted.fillna(direction)
+                hinted = np.asarray(frame["side_hint"].to_numpy(copy=False), dtype=float)
+                direction = np.where(hinted != 0, hinted, direction)
             if prediction_resolver is not None and "prediction_position" in frame.columns:
-                hinted = frame["prediction_position"].replace(0, np.nan)
-                direction = hinted.fillna(direction)
+                hinted = np.asarray(
+                    frame["prediction_position"].to_numpy(copy=False), dtype=float
+                )
+                direction = np.where(hinted != 0, hinted, direction)
 
-            signal_mask = frame["returns_x"].abs() >= float(threshold)
-            raw_positions = direction.where(signal_mask, 0.0)
-            raw_pnl = raw_positions * frame["returns_y"].astype(float)
+            signal_mask = np.abs(returns_x) >= float(threshold)
+            positions_array = np.where(signal_mask, direction, 0.0)
+            pnl_array = positions_array * returns_y
+            raw_positions = pd.Series(positions_array, index=frame.index)
+            raw_pnl = pd.Series(pnl_array, index=frame.index)
 
         trade_rows = frame.loc[signal_mask].copy()
         if not trade_rows.empty and "ts_decision" in trade_rows.columns:
@@ -233,19 +241,16 @@ class ScreenerBacktester:
         else:
             trade_index = pd.Index(frame.index, name=frame.index.name or "row")
 
-        # Use GPU for cumulative calculation if enabled
         if self.use_gpu:
-            raw_cumulative_array = gpu_cumulative_pnl(
-                raw_pnl.values,
-                use_gpu=True,
-                device_id=self.gpu_device_id,
-            )
+            raw_cumulative_array = cumulative_array
+            drawdown = drawdown_array
             raw_cumulative = pd.Series(raw_cumulative_array, index=frame.index)
+            max_drawdown = float(drawdown.min()) if drawdown.size else 0.0
         else:
             raw_cumulative = raw_pnl.cumsum()
-        rolling_max = raw_cumulative.cummax()
-        drawdown = raw_cumulative - rolling_max
-        max_drawdown = float(drawdown.min()) if not drawdown.empty else 0.0
+            rolling_max = raw_cumulative.cummax()
+            drawdown_series = raw_cumulative - rolling_max
+            max_drawdown = float(drawdown_series.min()) if not drawdown_series.empty else 0.0
 
         def _assign_trade_index(series: pd.Series) -> pd.Series:
             aligned = series.copy()
@@ -329,48 +334,60 @@ class ScreenerBacktester:
 
         if group_field and group_field in frame.columns:
             grouped_frame = trade_rows.copy()
-            grouped_results: Dict[Any, Dict[str, float]] = {}
             if not grouped_frame.empty:
-                for idx, row in grouped_frame.iterrows():
-                    members = row.get("_group_members") if "_group_members" in row else None
-                    if not members:
-                        value = row.get(group_field)
-                        members = [] if pd.isna(value) else [value]
-                    if not members:
-                        continue
-                    share = 1.0 / len(members)
-                    row_position = raw_positions.loc[idx]
-                    row_pnl = raw_pnl.loc[idx]
-                    trade_day = row.get("_trade_day")
-                    for member in members:
-                        stats = grouped_results.setdefault(
-                            member,
-                            {
-                                "total_return": 0.0,
-                                "_pnl_count": 0.0,
-                                "_trade_days": set(),
-                                "_fallback_trade_count": 0,
-                            },
+                if "_group_members" in grouped_frame.columns:
+                    member_lists = grouped_frame["_group_members"]
+                    if group_field in grouped_frame.columns:
+                        fallback_values = grouped_frame[group_field]
+                        member_lists = member_lists.where(
+                            member_lists.astype(bool),
+                            fallback_values.apply(lambda v: [] if pd.isna(v) else [v]),
                         )
-                        stats["total_return"] += float(row_pnl * share)
-                        stats["_pnl_count"] += share
-                        if row_position != 0:
-                            if pd.notna(trade_day):
-                                stats["_trade_days"].add(trade_day)
-                            else:
-                                stats["_fallback_trade_count"] += 1
-            formatted: Dict[Any, Dict[str, float]] = {}
-            for member, stats in grouped_results.items():
-                count = stats.get("_pnl_count", 1.0) or 1.0
-                trade_count = len(stats.get("_trade_days", set()))
-                trade_count += stats.get("_fallback_trade_count", 0)
-                formatted[member] = {
-                    "trades": trade_count,
-                    "total_return": stats.get("total_return", 0.0),
-                    "mean_return": stats.get("total_return", 0.0) / count,
-                }
-            result["group_breakdown"] = formatted
-            result["group_field"] = group_field
+                    member_lists = member_lists.apply(
+                        lambda v: v if isinstance(v, (list, tuple, set)) else ([] if pd.isna(v) else [v])
+                    )
+                else:
+                    member_lists = grouped_frame[group_field].apply(
+                        lambda v: [] if pd.isna(v) else [v]
+                    )
+
+                member_lengths = member_lists.apply(len)
+                valid_members = member_lengths > 0
+                if valid_members.any():
+                    expanded = grouped_frame.loc[valid_members].assign(
+                        _members=member_lists[valid_members],
+                        _share=1.0 / member_lengths[valid_members],
+                        _position=raw_positions.loc[valid_members.index].to_numpy(),
+                        _pnl=raw_pnl.loc[valid_members.index].to_numpy(),
+                    )
+                    exploded = expanded.explode("_members")
+                    exploded = exploded.dropna(subset=["_members"])
+                    if not exploded.empty:
+                        exploded["_weighted_pnl"] = (
+                            exploded["_pnl"].to_numpy() * exploded["_share"].to_numpy()
+                        )
+                        pnl_sum = exploded.groupby("_members")["_weighted_pnl"].sum()
+                        share_count = exploded.groupby("_members")["_share"].sum()
+                        nonzero_positions = exploded[exploded["_position"] != 0]
+                        trade_day_counts = nonzero_positions.dropna(subset=["_trade_day"]).groupby("_members")["_trade_day"].nunique()
+                        fallback_counts = (
+                            nonzero_positions[nonzero_positions["_trade_day"].isna()]
+                            .groupby("_members")
+                            .size()
+                        )
+                        trade_counts = trade_day_counts.add(fallback_counts, fill_value=0).astype(int)
+
+                        formatted: Dict[Any, Dict[str, float]] = {}
+                        for member in pnl_sum.index:
+                            total_return = float(pnl_sum.loc[member])
+                            denominator = float(share_count.loc[member]) if share_count.loc[member] else 1.0
+                            formatted[member] = {
+                                "trades": int(trade_counts.get(member, 0)),
+                                "total_return": total_return,
+                                "mean_return": total_return / denominator,
+                            }
+                        result["group_breakdown"] = formatted
+                        result["group_field"] = group_field
 
         return result
 
