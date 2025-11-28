@@ -2307,6 +2307,94 @@ class HorizonMapper:
         result.replace([np.inf, -np.inf], np.nan, inplace=True)
         return result
 
+    def _opening_period_return_series(
+        self, df: pd.DataFrame, minutes: int, session_cache: MutableMapping[str, Any]
+    ) -> pd.Series:
+        """Calculate returns for the opening period (first N minutes) of each session.
+
+        Returns log returns from session open to close at t + N minutes from session start.
+        """
+        cache_key = f"opening_period_{minutes}"
+        cached = session_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        if minutes <= 0:
+            raise ValueError("opening period minutes must be positive")
+
+        ts = pd.to_datetime(df["ts"]).dt.tz_convert(self.tz)
+        close = pd.Series(df["close"].values, index=ts).astype(float)
+        close = close.sort_index()
+
+        # Get session open prices
+        session_opens = df.groupby("session_id")["open"].first().astype(float)
+        session_open_map = df["session_id"].map(session_opens)
+
+        # Get session start times
+        session_start_times = df.groupby("session_id")["ts"].first()
+        session_start_map = pd.to_datetime(df["session_id"].map(session_start_times)).dt.tz_convert(self.tz)
+
+        # Calculate target time (session_start + minutes)
+        target_times = session_start_map + pd.Timedelta(minutes=minutes)
+
+        # Get closing price at target time using reindex
+        target_closes = close.reindex(target_times, method="nearest", tolerance=pd.Timedelta(minutes=5))
+        target_closes.index = df.index
+
+        # Calculate returns: log(close_at_target / session_open)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            raw = np.log(target_closes / session_open_map)
+
+        result = self._clean_return(raw, policy="drop")
+        result.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+        session_cache[cache_key] = result
+        return result
+
+    def _closing_period_return_series(
+        self, df: pd.DataFrame, minutes: int, session_cache: MutableMapping[str, Any]
+    ) -> pd.Series:
+        """Calculate returns for the closing period (last N minutes) of each session.
+
+        Returns log returns from close at t - N minutes before session end to session close.
+        """
+        cache_key = f"closing_period_{minutes}"
+        cached = session_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        if minutes <= 0:
+            raise ValueError("closing period minutes must be positive")
+
+        ts = pd.to_datetime(df["ts"]).dt.tz_convert(self.tz)
+        close = pd.Series(df["close"].values, index=ts).astype(float)
+        close = close.sort_index()
+
+        # Get session close prices
+        session_closes = df.groupby("session_id")["close"].last().astype(float)
+        session_close_map = df["session_id"].map(session_closes)
+
+        # Get session end times
+        session_end_times = df.groupby("session_id")["ts"].last()
+        session_end_map = pd.to_datetime(df["session_id"].map(session_end_times)).dt.tz_convert(self.tz)
+
+        # Calculate target time (session_end - minutes)
+        target_times = session_end_map - pd.Timedelta(minutes=minutes)
+
+        # Get closing price at target time using reindex
+        target_closes = close.reindex(target_times, method="nearest", tolerance=pd.Timedelta(minutes=5))
+        target_closes.index = df.index
+
+        # Calculate returns: log(session_close / close_at_target)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            raw = np.log(session_close_map / target_closes)
+
+        result = self._clean_return(raw, policy="drop")
+        result.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+        session_cache[cache_key] = result
+        return result
+
     def _same_day_return_series(
         self, df: pd.DataFrame, session_cache: MutableMapping[str, Any]
     ) -> pd.Series:
@@ -2428,6 +2516,14 @@ class HorizonMapper:
         trend_cache: MutableMapping[int, pd.Series],
         session_cache: MutableMapping[str, Any],
     ) -> Tuple[pd.Series, pd.Series]:
+        """Calculate X and Y returns series for momentum patterns.
+
+        Pattern mappings (aligned with HistoricalScreener):
+        - momentum_oc: opening_returns vs closing_returns
+        - momentum_sc: rest_of_session_returns vs closing_returns (session spills into close)
+        - momentum_so: opening_returns vs st_momentum
+        - momentum_cc: closing_returns vs st_momentum
+        """
         metadata = pattern.get("metadata") or {}
         payload = pattern.get("pattern_payload") or {}
         window_minutes = self._extract_momentum_window_minutes(
@@ -2439,31 +2535,43 @@ class HorizonMapper:
             or "opening_momentum"
         )
         st_days = self._extract_st_momentum_days(pattern) or 3
-        trend_series = self._short_term_momentum_series(
-            df, st_days, trend_cache=trend_cache, session_cache=session_cache
-        )
 
         if window_minutes <= 0:
             window_minutes = default_intraday_minutes
 
-        if momentum_type == "opening_momentum":
-            if window_minutes not in forward_cache:
-                forward_cache[window_minutes] = self._forward_window_return_minutes(
-                    df, minutes=window_minutes
-                )
-            returns_y = forward_cache[window_minutes]
-        elif momentum_type == "closing_momentum":
-            if window_minutes not in forward_cache:
-                forward_cache[window_minutes] = self._forward_window_return_minutes(
-                    df, minutes=window_minutes
-                )
-            returns_y = forward_cache[window_minutes]
-        elif momentum_type == "st_momentum":
-            returns_y = trend_series
-        else:  # full_session or fallback
-            returns_y = self._same_day_return_series(df, session_cache)
+        # Calculate period-specific returns
+        opening_returns = self._opening_period_return_series(df, window_minutes, session_cache)
+        closing_returns = self._closing_period_return_series(df, window_minutes, session_cache)
+        full_session_returns = self._same_day_return_series(df, session_cache)
+        st_momentum = self._short_term_momentum_series(
+            df, st_days, trend_cache=trend_cache, session_cache=session_cache
+        )
 
-        return trend_series, returns_y
+        # Map momentum_type to correct X and Y series
+        if momentum_type == "opening_momentum":
+            # momentum_oc: opening period predicts closing period
+            returns_x = opening_returns
+            returns_y = closing_returns
+        elif momentum_type == "closing_momentum":
+            # momentum_sc: rest of session spills into closing period
+            rest_of_session = full_session_returns - closing_returns
+            returns_x = rest_of_session
+            returns_y = closing_returns
+        elif momentum_type == "st_momentum":
+            # momentum_so or momentum_cc: depends on pattern_type
+            # For momentum_so: opening predicts st_momentum
+            # For momentum_cc: closing predicts st_momentum
+            pattern_type = pattern.get("pattern_type", "")
+            if "momentum_so" in pattern_type:
+                returns_x = opening_returns
+            else:  # momentum_cc
+                returns_x = closing_returns
+            returns_y = st_momentum
+        else:  # full_session or fallback
+            returns_x = st_momentum
+            returns_y = full_session_returns
+
+        return returns_x, returns_y
 
     def _weekly_mean_scalar(self, df: pd.DataFrame, gate_mask: pd.Series) -> float:
         """Same-day open→close mean for sessions flagged by ``gate_mask``."""
