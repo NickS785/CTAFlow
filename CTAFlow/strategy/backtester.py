@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
 from .prediction_to_position import PredictionToPosition
+from .gpu_acceleration import GPU_AVAILABLE, gpu_backtest_threshold, gpu_cumulative_pnl
 
 @dataclass
 class BacktestSummary:
@@ -73,11 +74,27 @@ class ExecutionPolicy:
 
 
 class ScreenerBacktester:
-    """Lightweight backtester operating on ``ScreenerPipeline.build_xy`` outputs."""
+    """Lightweight backtester operating on ``ScreenerPipeline.build_xy`` outputs.
 
-    def __init__(self, *, annualisation: int = 252, risk_free_rate: float = 0.0) -> None:
+    Args:
+        annualisation: Number of periods per year for Sharpe ratio calculation
+        risk_free_rate: Risk-free rate for Sharpe ratio calculation
+        use_gpu: Enable GPU acceleration if available (default: True)
+        gpu_device_id: GPU device ID to use for computations (default: 0)
+    """
+
+    def __init__(
+        self,
+        *,
+        annualisation: int = 252,
+        risk_free_rate: float = 0.0,
+        use_gpu: bool = True,
+        gpu_device_id: int = 0,
+    ) -> None:
         self.annualisation = annualisation
         self.risk_free_rate = risk_free_rate
+        self.use_gpu = use_gpu and GPU_AVAILABLE
+        self.gpu_device_id = gpu_device_id
         self._collision_resolver = PredictionToPosition()
 
     def threshold(
@@ -138,16 +155,45 @@ class ScreenerBacktester:
         frame = self._collision_resolver.resolve(frame, group_field=group_field)
         frame = self._drop_duplicate_rows(frame)
 
-        direction = np.sign(frame["returns_x"])
-        if use_side_hint and "side_hint" in frame.columns:
-            hinted = frame["side_hint"].replace(0, np.nan)
-            direction = hinted.fillna(direction)
-        if prediction_resolver is not None and "prediction_position" in frame.columns:
-            hinted = frame["prediction_position"].replace(0, np.nan)
-            direction = hinted.fillna(direction)
+        # GPU-accelerated position calculation if enabled
+        if self.use_gpu:
+            # Extract arrays for GPU processing
+            returns_x = frame["returns_x"].values
+            returns_y = frame["returns_y"].values
 
-        signal_mask = frame["returns_x"].abs() >= float(threshold)
-        raw_positions = direction.where(signal_mask, 0.0)
+            # Check for correlation-based side hint
+            correlation = None
+            if use_side_hint and "correlation" in frame.columns:
+                correlation = frame["correlation"].values
+
+            # GPU computation
+            raw_positions_array, raw_pnl_array = gpu_backtest_threshold(
+                returns_x=returns_x,
+                returns_y=returns_y,
+                correlation=correlation,
+                threshold=threshold,
+                use_side_hint=use_side_hint,
+                use_gpu=True,
+                device_id=self.gpu_device_id,
+            )
+
+            # Convert back to pandas with proper index
+            raw_positions = pd.Series(raw_positions_array, index=frame.index)
+            raw_pnl = pd.Series(raw_pnl_array, index=frame.index)
+            signal_mask = raw_positions != 0.0
+        else:
+            # CPU fallback: original logic
+            direction = np.sign(frame["returns_x"])
+            if use_side_hint and "side_hint" in frame.columns:
+                hinted = frame["side_hint"].replace(0, np.nan)
+                direction = hinted.fillna(direction)
+            if prediction_resolver is not None and "prediction_position" in frame.columns:
+                hinted = frame["prediction_position"].replace(0, np.nan)
+                direction = hinted.fillna(direction)
+
+            signal_mask = frame["returns_x"].abs() >= float(threshold)
+            raw_positions = direction.where(signal_mask, 0.0)
+            raw_pnl = raw_positions * frame["returns_y"].astype(float)
 
         trade_rows = frame.loc[signal_mask].copy()
         if not trade_rows.empty and "ts_decision" in trade_rows.columns:
@@ -163,8 +209,16 @@ class ScreenerBacktester:
         else:
             trade_index = pd.Index(frame.index, name=frame.index.name or "row")
 
-        raw_pnl = raw_positions * frame["returns_y"].astype(float)
-        raw_cumulative = raw_pnl.cumsum()
+        # Use GPU for cumulative calculation if enabled
+        if self.use_gpu:
+            raw_cumulative_array = gpu_cumulative_pnl(
+                raw_pnl.values,
+                use_gpu=True,
+                device_id=self.gpu_device_id,
+            )
+            raw_cumulative = pd.Series(raw_cumulative_array, index=frame.index)
+        else:
+            raw_cumulative = raw_pnl.cumsum()
         rolling_max = raw_cumulative.cummax()
         drawdown = raw_cumulative - rolling_max
         max_drawdown = float(drawdown.min()) if not drawdown.empty else 0.0
