@@ -124,6 +124,7 @@ def _to_backend_array(
     *,
     use_gpu: bool,
     device_id: int,
+    stream: Optional[object] = None,
 ) -> Tuple[Union[np.ndarray, 'cp.ndarray'], Union[np, 'cp']]:
     """Return an array backed by either NumPy or CuPy along with the module used.
 
@@ -133,7 +134,7 @@ def _to_backend_array(
 
     base = values
     if pd is not None and isinstance(values, (pd.Series, pd.DataFrame)):
-        base = values.to_numpy()
+        base = values.to_numpy(copy=False)
     elif not isinstance(values, (np.ndarray,)):
         base = np.asarray(values)
 
@@ -141,6 +142,9 @@ def _to_backend_array(
         return base, np
 
     with cp.cuda.Device(device_id):
+        if stream is not None:
+            with stream:
+                return cp.asarray(base), cp
         return cp.asarray(base), cp
 
 
@@ -150,6 +154,8 @@ def gpu_backtest_returns(
     threshold: float = 0.0,
     use_gpu: bool = True,
     device_id: int = 0,
+    stream: Optional[object] = None,
+    return_backend: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Calculate positions and PnL using GPU acceleration.
 
@@ -157,14 +163,19 @@ def gpu_backtest_returns(
     available, computations are performed with CuPy on the selected device.
     """
 
-    rx, xp = _to_backend_array(returns_x, use_gpu=use_gpu, device_id=device_id)
-    ry, _ = _to_backend_array(returns_y, use_gpu=use_gpu, device_id=device_id)
+    rx, xp = _to_backend_array(
+        returns_x, use_gpu=use_gpu, device_id=device_id, stream=stream
+    )
+    ry, _ = _to_backend_array(returns_y, use_gpu=use_gpu, device_id=device_id, stream=stream)
 
     positions_backend = xp.where(
         rx >= threshold, 1.0,
         xp.where(rx <= -threshold, -1.0, 0.0)
     )
     pnl_backend = positions_backend * ry
+
+    if return_backend:
+        return positions_backend, pnl_backend, xp
 
     if xp is np:
         return positions_backend, pnl_backend
@@ -180,6 +191,8 @@ def gpu_backtest_threshold(
     use_side_hint: bool = True,
     use_gpu: bool = True,
     device_id: int = 0,
+    stream: Optional[object] = None,
+    return_backend: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Calculate positions and PnL with correlation-based side hint.
 
@@ -187,11 +200,15 @@ def gpu_backtest_threshold(
     directly. Uses CuPy for all calculations when a GPU is available.
     """
 
-    rx, xp = _to_backend_array(returns_x, use_gpu=use_gpu, device_id=device_id)
-    ry, _ = _to_backend_array(returns_y, use_gpu=use_gpu, device_id=device_id)
+    rx, xp = _to_backend_array(
+        returns_x, use_gpu=use_gpu, device_id=device_id, stream=stream
+    )
+    ry, _ = _to_backend_array(returns_y, use_gpu=use_gpu, device_id=device_id, stream=stream)
 
     if correlation is not None and use_side_hint:
-        corr, _ = _to_backend_array(correlation, use_gpu=use_gpu, device_id=device_id)
+        corr, _ = _to_backend_array(
+            correlation, use_gpu=use_gpu, device_id=device_id, stream=stream
+        )
         adjusted_x = rx * xp.sign(corr)
     else:
         adjusted_x = rx
@@ -201,6 +218,9 @@ def gpu_backtest_threshold(
         xp.where(adjusted_x <= -threshold, -1.0, 0.0)
     )
     pnl_backend = positions_backend * ry
+
+    if return_backend:
+        return positions_backend, pnl_backend, xp
 
     if xp is np:
         return positions_backend, pnl_backend
@@ -212,11 +232,18 @@ def gpu_cumulative_pnl(
     pnl: Union[np.ndarray, "pd.Series", "pd.DataFrame"],
     use_gpu: bool = True,
     device_id: int = 0,
+    stream: Optional[object] = None,
+    return_backend: bool = False,
 ) -> np.ndarray:
     """Calculate cumulative PnL using GPU acceleration."""
 
-    pnl_backend, xp = _to_backend_array(pnl, use_gpu=use_gpu, device_id=device_id)
+    pnl_backend, xp = _to_backend_array(
+        pnl, use_gpu=use_gpu, device_id=device_id, stream=stream
+    )
     cumulative_backend = xp.cumsum(pnl_backend)
+
+    if return_backend:
+        return cumulative_backend, xp
 
     if xp is np:
         return cumulative_backend
