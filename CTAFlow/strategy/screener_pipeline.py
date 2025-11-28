@@ -165,7 +165,14 @@ class ScreenerPipeline:
         "weekday_bias_intraday",
     }
 
-    def __init__(self, tz: str = "America/Chicago", time_match: str = "auto", log: Any = None) -> None:
+    def __init__(
+        self,
+        tz: str = "America/Chicago",
+        time_match: str = "auto",
+        log: Any = None,
+        use_gpu: bool = True,
+        gpu_device_id: int = 0,
+    ) -> None:
         """Configure the pipeline.
 
         Parameters
@@ -180,6 +187,11 @@ class ScreenerPipeline:
             and ``"hmsf"`` (microsecond precision).
         log:
             Optional logger with a ``warning`` method for non-fatal issues.
+        use_gpu:
+            Enable GPU acceleration for backtesting operations (default: True).
+            Automatically falls back to CPU if GPU not available.
+        gpu_device_id:
+            GPU device ID to use for computations when multiple GPUs available (default: 0).
         """
 
         if time_match not in {"auto", "hms", "hmsf"}:
@@ -188,6 +200,8 @@ class ScreenerPipeline:
         self.tz = tz
         self.time_match = time_match
         self.log = log
+        self.use_gpu = use_gpu
+        self.gpu_device_id = gpu_device_id
         self.allow_naive_ts = False
         self.nan_policy = "drop"
         self.asof_tolerance = None
@@ -331,6 +345,8 @@ class ScreenerPipeline:
         tester = ScreenerBacktester(
             annualisation=annualisation,
             risk_free_rate=risk_free_rate,
+            use_gpu=self.use_gpu,
+            gpu_device_id=self.gpu_device_id,
         )
 
         policy_map = {"auto": "auto", "hms": "second", "hmsf": "microsecond"}
