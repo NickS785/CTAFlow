@@ -2618,7 +2618,7 @@ class HorizonMapper:
         momentum_trend_cache: Dict[int, pd.Series] = {}
         session_return_cache: Dict[str, Any] = {}
         time_bearing_types = {"time_predictive_nextday", "time_predictive_nextweek", "orderflow_peak_pressure"}
-        weekly_types = {"weekday_mean", "orderflow_weekly", "orderflow_week_of_month"}
+        weekly_types = {"weekday_mean", "weekday_bias_intraday", "orderflow_weekly", "orderflow_week_of_month"}
 
         for key, pattern in ScreenerPipeline._items_from_patterns(patterns):
             pattern_type = pattern.get("pattern_type")

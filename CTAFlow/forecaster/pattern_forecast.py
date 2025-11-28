@@ -60,6 +60,10 @@ class PatternMLBuilder:
         - y: log move from that point to session close,
              e.g. log(price_close / price(t_close - 1.5h)).
 
+    - momentum_cc (close-close momentum):
+        - X: short-term momentum (returns over the last st_momentum_days).
+        - y: session return (open to close).
+
     For momentum patterns, additional volatility-significance predictors
     can be appended to X (vol_features_df).
     """
@@ -85,8 +89,23 @@ class PatternMLBuilder:
             *,
             features_df: Optional[pd.DataFrame] = None,
             vol_features_df: Optional[pd.DataFrame] = None,
+            vol_persistence: bool = False,
     ) -> PatternDataset:
-        """Dispatch to the appropriate builder based on pattern type."""
+        """Dispatch to the appropriate builder based on pattern type.
+
+        Parameters
+        ----------
+        price_df : pd.DataFrame
+            OHLCV price data
+        pattern_meta : Mapping[str, Any]
+            Pattern metadata
+        features_df : Optional[pd.DataFrame]
+            Additional features to include in X
+        vol_features_df : Optional[pd.DataFrame]
+            Volatility-specific features
+        vol_persistence : bool
+            If True, add opening period realized volatility as a feature to X
+        """
         ptype = (
                 pattern_meta.get("pattern_type")
                 or pattern_meta.get("type")
@@ -119,11 +138,15 @@ class PatternMLBuilder:
             )
         elif "momentum_oc" in ptype or ptype == "momentum_oc":
             X, y, info = self._build_momentum_oc_dataset(
-                price_df, pattern_meta, features_df, vol_features_df
+                price_df, pattern_meta, features_df, vol_features_df, vol_persistence
             )
         elif "momentum_sc" in ptype or ptype == "momentum_sc":
             X, y, info = self._build_momentum_sc_dataset(
-                price_df, pattern_meta, features_df, vol_features_df
+                price_df, pattern_meta, features_df, vol_features_df, vol_persistence
+            )
+        elif "momentum_cc" in ptype or ptype == "momentum_cc":
+            X, y, info = self._build_momentum_cc_dataset(
+                price_df, pattern_meta, features_df, vol_features_df, vol_persistence
             )
         else:
             raise NotImplementedError(f"Pattern type '{ptype}' is not supported yet.")
@@ -176,6 +199,37 @@ class PatternMLBuilder:
             return pd.Series(True, index=df.index)
         months_active = set(int(m) for m in months_active)
         return df.index.month.isin(months_active)
+
+    def _calculate_realized_volatility(
+        self,
+        df: pd.DataFrame,
+        window_minutes: int,
+    ) -> pd.Series:
+        """Calculate realized volatility over a rolling window.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Price data with DatetimeIndex
+        window_minutes : int
+            Window size in minutes for RV calculation
+
+        Returns
+        -------
+        pd.Series
+            Realized volatility (std of log returns over window)
+        """
+        df = self._ensure_dt_index(df)
+        price = pd.to_numeric(df[self.price_col], errors="coerce")
+
+        # Calculate log returns
+        log_returns = np.log(price / price.shift(1))
+
+        # Calculate rolling standard deviation
+        window_td = pd.Timedelta(minutes=window_minutes)
+        rv = log_returns.rolling(window=window_td).std()
+
+        return rv
 
     def _weekday_filter(
         self, df: pd.DataFrame, weekday_spec: Optional[str]
@@ -466,6 +520,7 @@ class PatternMLBuilder:
         pattern_meta: Mapping[str, Any],
         features_df: Optional[pd.DataFrame],
         vol_features_df: Optional[pd.DataFrame],
+        vol_persistence: bool = False,
     ) -> Tuple[pd.DataFrame, pd.Series, Dict[str, Any]]:
         df = self._ensure_dt_index(price_df)
         if self.price_col not in df.columns:
@@ -557,6 +612,21 @@ class PatternMLBuilder:
             feat_X = pd.DataFrame(feat_rows, index=index)
             base_X = pd.concat([base_X, feat_X], axis=1)
 
+        # Add opening period realized volatility if vol_persistence=True
+        if vol_persistence:
+            rv = self._calculate_realized_volatility(df, window_minutes=early_min)
+            rv_rows = []
+            for d in index:
+                t_dec = samples[d]["t_decision"]
+                if t_dec in rv.index:
+                    rv_rows.append({"opening_rv": rv.loc[t_dec]})
+                else:
+                    subset = rv.loc[:t_dec]
+                    rv_val = subset.iloc[-1] if not subset.empty else np.nan
+                    rv_rows.append({"opening_rv": rv_val})
+            rv_X = pd.DataFrame(rv_rows, index=index)
+            base_X = pd.concat([base_X, rv_X], axis=1)
+
         if vol_features_df is not None and not vol_features_df.empty:
             vdf = self._ensure_dt_index(vol_features_df)
             # assume vol_features_df already at daily frequency (or take last per day)
@@ -582,6 +652,7 @@ class PatternMLBuilder:
         pattern_meta: Mapping[str, Any],
         features_df: Optional[pd.DataFrame],
         vol_features_df: Optional[pd.DataFrame],
+        vol_persistence: bool = False,
     ) -> Tuple[pd.DataFrame, pd.Series, Dict[str, Any]]:
         df = self._ensure_dt_index(price_df)
         if self.price_col not in df.columns:
@@ -668,6 +739,21 @@ class PatternMLBuilder:
             feat_X = pd.DataFrame(feat_rows, index=index)
             base_X = pd.concat([base_X, feat_X], axis=1)
 
+        # Add opening period realized volatility if vol_persistence=True
+        if vol_persistence:
+            rv = self._calculate_realized_volatility(df, window_minutes=late_min)
+            rv_rows = []
+            for d in index:
+                t_dec = samples[d]["t_decision"]
+                if t_dec in rv.index:
+                    rv_rows.append({"opening_rv": rv.loc[t_dec]})
+                else:
+                    subset = rv.loc[:t_dec]
+                    rv_val = subset.iloc[-1] if not subset.empty else np.nan
+                    rv_rows.append({"opening_rv": rv_val})
+            rv_X = pd.DataFrame(rv_rows, index=index)
+            base_X = pd.concat([base_X, rv_X], axis=1)
+
         if vol_features_df is not None and not vol_features_df.empty:
             vdf = self._ensure_dt_index(vol_features_df)
             v_daily = vdf.groupby(vdf.index.normalize()).last()
@@ -678,6 +764,141 @@ class PatternMLBuilder:
             "pattern_type": "momentum_sc",
             "n_samples": int(len(y)),
             "period_length_min": late_min,
+            "months_active": months_active,
+            "weekday": weekday_spec,
+        }
+        return base_X, y, info
+
+    # ------------------------------------------------------------------
+    # 4) Momentum CC: X = short-term trend (st_momentum_days), y = session O->C
+    # ------------------------------------------------------------------
+    def _build_momentum_cc_dataset(
+        self,
+        price_df: pd.DataFrame,
+        pattern_meta: Mapping[str, Any],
+        features_df: Optional[pd.DataFrame],
+        vol_features_df: Optional[pd.DataFrame],
+        vol_persistence: bool = False,
+    ) -> Tuple[pd.DataFrame, pd.Series, Dict[str, Any]]:
+        df = self._ensure_dt_index(price_df)
+        if self.price_col not in df.columns:
+            raise KeyError(self.price_col)
+        if self.open_col not in df.columns:
+            raise KeyError(self.open_col)
+
+        sess_key = self._session_key(df)
+        price = pd.to_numeric(df[self.price_col], errors="coerce")
+        open_px = pd.to_numeric(df[self.open_col], errors="coerce")
+
+        # Get st_momentum_days from pattern metadata
+        st_momentum_days = int(pattern_meta.get("st_momentum_days", 3))
+        months_active = pattern_meta.get("months_active") or pattern_meta.get("months")
+        weekday_spec = pattern_meta.get("weekday")
+
+        # Calculate per-session close prices
+        sess_close = price.groupby(sess_key).last()
+        sess_open = open_px.groupby(sess_key).first()
+
+        # Calculate short-term momentum (returns over last st_momentum_days)
+        st_momentum = np.log(sess_close / sess_close.shift(st_momentum_days))
+
+        # Calculate session return (open to close)
+        sess_return = np.log(sess_close / sess_open)
+
+        samples: Dict[pd.Timestamp, Dict[str, Any]] = {}
+
+        for sid, g in df.groupby(sess_key):
+            g = g.sort_index()
+            if g.empty:
+                continue
+
+            day = g.index[0].normalize()
+            # filter by months & weekday at session level
+            if months_active and g.index[0].month not in set(int(m) for m in months_active):
+                continue
+            if weekday_spec:
+                if g.index[0].day_name().lower() != weekday_spec.split("->")[0].strip().lower():
+                    continue
+
+            # Get st_momentum and session_return for this session
+            if sid not in st_momentum.index or sid not in sess_return.index:
+                continue
+
+            x_st_mom = float(st_momentum.loc[sid])
+            y_sess_ret = float(sess_return.loc[sid])
+
+            if not np.isfinite(x_st_mom) or not np.isfinite(y_sess_ret):
+                continue
+
+            samples[day] = {
+                "x_st_momentum": x_st_mom,
+                "y_sess_ret": y_sess_ret,
+                "t_decision": g.index[0],  # Session open time
+            }
+
+        if not samples:
+            return pd.DataFrame(), pd.Series(dtype=float), {
+                "pattern_type": "momentum_cc",
+                "n_samples": 0,
+            }
+
+        index = pd.Index(sorted(samples.keys()), name="session_day")
+        base_X = pd.DataFrame(
+            {"x_st_momentum": [samples[d]["x_st_momentum"] for d in index]}, index=index
+        )
+        y = pd.Series(
+            [samples[d]["y_sess_ret"] for d in index],
+            index=index,
+            name="y_sess_ret",
+        )
+
+        # Attach intraday features at session open
+        if features_df is not None and not features_df.empty:
+            fdf = self._ensure_dt_index(features_df)
+            feat_rows = []
+            for d in index:
+                t_dec = samples[d]["t_decision"]
+                if t_dec in fdf.index:
+                    feat_rows.append(fdf.loc[t_dec])
+                else:
+                    subset = fdf.loc[:t_dec]
+                    feat_rows.append(subset.iloc[-1] if not subset.empty else pd.Series(dtype=float))
+            feat_X = pd.DataFrame(feat_rows, index=index)
+            base_X = pd.concat([base_X, feat_X], axis=1)
+
+        # Add opening period realized volatility if vol_persistence=True
+        # For CC patterns, use the st_momentum_days period as the window
+        if vol_persistence:
+            # Calculate RV over the full session (session open to close)
+            sess_key = self._session_key(df)
+            rv_rows = []
+            for d in index:
+                # Get all bars for this session
+                sid = [k for k, g in df.groupby(sess_key) if g.index[0].normalize() == d]
+                if sid:
+                    sess_data = df[df[self.session_col if self.session_col in df.columns else "session_id"] == sid[0]]
+                    if len(sess_data) > 1:
+                        sess_rv = self._calculate_realized_volatility(sess_data, window_minutes=int(st_momentum_days * 390))
+                        rv_val = sess_rv.iloc[-1] if not sess_rv.empty and len(sess_rv) > 0 else np.nan
+                    else:
+                        rv_val = np.nan
+                else:
+                    rv_val = np.nan
+                rv_rows.append({"opening_rv": rv_val})
+            rv_X = pd.DataFrame(rv_rows, index=index)
+            base_X = pd.concat([base_X, rv_X], axis=1)
+
+        # Attach volatility features for vol_persistence
+        if vol_features_df is not None and not vol_features_df.empty:
+            vdf = self._ensure_dt_index(vol_features_df)
+            v_daily = vdf.groupby(vdf.index.normalize()).last()
+            vX = v_daily.reindex(index)
+            base_X = pd.concat([base_X, vX], axis=1)
+
+        info = {
+            "pattern_type": "momentum_cc",
+            "n_samples": int(len(y)),
+            "st_momentum_days": st_momentum_days,
             "months_active": months_active,
             "weekday": weekday_spec,
         }
