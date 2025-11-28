@@ -646,7 +646,7 @@ def test_pattern_extractor_extracts_momentum_correlation_and_volatility_patterns
     ti_pattern = next(
         summary
         for summary in patterns.values()
-        if summary["pattern_type"] == "time_predictive_intraday"
+        if summary["pattern_type"] == "weekday_bias_intraday"
     )
     assert ti_pattern["metadata"]["best_weekday"] == "Friday"
     assert ti_pattern["metadata"]["momentum_params"]["period_length_min"] == pytest.approx(

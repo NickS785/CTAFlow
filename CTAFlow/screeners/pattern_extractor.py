@@ -1729,7 +1729,7 @@ class PatternExtractor:
                 strength = abs(self._coerce_optional_float(best_stats.get("mean")) or 0.0)
 
         pattern: Dict[str, Any] = {
-            "pattern_type": "time_predictive_intraday",
+            "pattern_type": "weekday_bias_intraday",
             "momentum_type": momentum_type,
             "weekday": best_day,
             "description": description,
