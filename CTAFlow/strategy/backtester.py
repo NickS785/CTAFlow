@@ -180,14 +180,15 @@ class ScreenerBacktester:
 
         # GPU-accelerated position calculation if enabled
         if self.use_gpu:
-            # Extract arrays for GPU processing
-            returns_x = frame["returns_x"].values
-            returns_y = frame["returns_y"].values
+            # Extract columns for GPU processing (handled as pandas objects to
+            # allow CuPy-backed execution inside the accelerator helpers)
+            returns_x = frame["returns_x"]
+            returns_y = frame["returns_y"]
 
             # Check for correlation-based side hint
             correlation = None
             if use_side_hint and "correlation" in frame.columns:
-                correlation = frame["correlation"].values
+                correlation = frame["correlation"]
 
             # GPU computation
             raw_positions_array, raw_pnl_array = gpu_backtest_threshold(

@@ -1,9 +1,22 @@
 """Test script for GPU-accelerated backtester functionality."""
 
+import pathlib
+import sys
+
 import numpy as np
 import pandas as pd
+
+# Ensure repository root is on sys.path for direct test execution
+ROOT = pathlib.Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from CTAFlow.strategy.backtester import ScreenerBacktester
-from CTAFlow.strategy.gpu_acceleration import GPU_AVAILABLE, get_gpu_info
+from CTAFlow.strategy.gpu_acceleration import (
+    GPU_AVAILABLE,
+    get_gpu_info,
+    gpu_backtest_threshold,
+)
 
 def test_gpu_backtester():
     """Test GPU backtester with synthetic data."""
@@ -99,6 +112,38 @@ def test_gpu_backtester():
     print("=" * 60)
 
     return result_gpu, result_cpu
+
+
+def test_gpu_backtest_threshold_accepts_pandas_inputs():
+    """Ensure GPU helpers accept pandas objects and stay consistent with CPU."""
+
+    np.random.seed(0)
+    n_samples = 128
+    dates = pd.date_range("2020-01-01", periods=n_samples, freq="D")
+    returns_x = pd.Series(np.random.randn(n_samples) * 0.01, index=dates)
+    returns_y = pd.Series(np.random.randn(n_samples) * 0.01, index=dates)
+    correlation = pd.Series(np.random.uniform(-1, 1, size=n_samples), index=dates)
+
+    positions_cpu, pnl_cpu = gpu_backtest_threshold(
+        returns_x.values,
+        returns_y.values,
+        correlation=correlation.values,
+        threshold=0.0,
+        use_side_hint=True,
+        use_gpu=False,
+    )
+
+    positions_gpu, pnl_gpu = gpu_backtest_threshold(
+        returns_x,
+        returns_y,
+        correlation=correlation,
+        threshold=0.0,
+        use_side_hint=True,
+        use_gpu=GPU_AVAILABLE,
+    )
+
+    assert np.allclose(positions_cpu, positions_gpu, rtol=1e-10, equal_nan=True)
+    assert np.allclose(pnl_cpu, pnl_gpu, rtol=1e-10, equal_nan=True)
 
 if __name__ == "__main__":
     test_gpu_backtester()
