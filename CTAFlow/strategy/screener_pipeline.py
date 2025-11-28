@@ -37,7 +37,7 @@ import pandas as pd
 from pandas.api.types import is_scalar
 
 if TYPE_CHECKING:  # pragma: no cover - import for type checking only
-    from CTAFlow.screeners.pattern_extractor import PatternExtractor
+    from ..screeners.pattern_extractor import PatternExtractor
     from .sessionizer import Sessionizer
 
 from .backtester import ScreenerBacktester
