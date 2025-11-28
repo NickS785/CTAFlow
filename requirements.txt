@@ -19,13 +19,23 @@ toml>=0.10.0   # For configuration files
 
 # Utilities
 tqdm>=4.60.0   # Progress bars
-exchange_calendars>=4.11.2 #Sessionizing 
+exchange_calendars>=4.11.2  # Sessionizing and market calendars
 
+# GPU Acceleration (Optional - requires CUDA)
+# Uncomment the appropriate line for your CUDA version:
+# cupy-cuda11x>=12.0.0  # For CUDA 11.x
+# cupy-cuda12x>=12.0.0  # For CUDA 12.x
+# Note: CuPy provides GPU acceleration for backtesting operations
+# Falls back to NumPy if not installed or GPU unavailable
 
 # Optional: Financial data libraries (uncomment if needed)
 # yfinance>=0.1.70
 # pandas-datareader>=0.10.0
 
-# Optional: Advanced time series libraries (uncomment if needed)  
+# Optional: Advanced time series libraries (uncomment if needed)
 # statsmodels>=0.13.0
 # arch>=5.0.0
+
+# Optional: Alternative GPU frameworks (uncomment if needed)
+# pycuda>=2021.1  # Lower-level CUDA interface (not used in current implementation)
+# numba>=0.56.0   # JIT compilation with CUDA support
