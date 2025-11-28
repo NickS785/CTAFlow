@@ -32,7 +32,7 @@ try:
         GPU_DEVICE_COUNT = 0
 except ImportError:
     # CuPy not installed
-    cp = np  # type: ignore
+    cp = np  # type: ignoreFGix
     GPU_AVAILABLE = False
     GPU_DEVICE_COUNT = 0
 

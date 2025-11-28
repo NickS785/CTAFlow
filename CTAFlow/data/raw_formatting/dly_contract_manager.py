@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple, Sequence
 import numpy as np
 import pandas as pd
 
-from CTAFlow.config import MARKET_DATA_PATH, DLY_DATA_PATH, MONTH_CODE_MAP
+from ...config import MARKET_DATA_PATH, DLY_DATA_PATH, MONTH_CODE_MAP
 
 
 def calculate_contract_expiry(month_code: str, year: int, ticker: Optional[str] = None) -> pd.Timestamp:
