@@ -496,7 +496,9 @@ class ScreenerPipeline:
         Each pattern is evaluated in isolation so the resulting performance
         metrics can be compared directly. Feature sets for each pattern are
         materialised up front (optionally in parallel) and then reused during
-        concurrent backtesting to avoid redundant gate construction.
+        concurrent backtesting to avoid redundant gate construction. Results
+        are ordered by ``total_return / max_drawdown`` and include a
+        ``ranking_score`` field for convenience.
         """
 
         items = list(self._items_from_patterns(patterns))
@@ -544,7 +546,14 @@ class ScreenerPipeline:
                     continue
                 results[pat_key] = result
 
-        return results
+        ranking = ScreenerBacktester.rank_results(results)
+        ordered: Dict[str, Dict[str, Any]] = {}
+        for key, score in ranking:
+            payload = dict(results.get(key, {}))
+            payload["ranking_score"] = score
+            ordered[key] = payload
+
+        return ordered
 
     # ------------------------------------------------------------------
     # Normalisation helpers
@@ -2198,7 +2207,14 @@ class HorizonMapper:
         default_monday = pd.Series(np.nan, index=info["session_id"], dtype=float)
         default_monday.loc[info.loc[valid, "session_id"]] = info.loc[valid, "next_oc"].astype(float)
 
-        x_series = df["session_id"].map(friday_returns)
+        gate_col = self._pattern_feature_column(pattern, "pattern_gate_col")
+        if gate_col and gate_col in df.columns:
+            gate_rows = df[gate_col] == 1
+            x_series = pd.Series(np.nan, index=df.index, dtype=float)
+            if gate_rows.any():
+                x_series.loc[gate_rows] = df.loc[gate_rows, "session_id"].map(friday_returns)
+        else:
+            x_series = df["session_id"].map(friday_returns)
         custom_y = self._weekend_returns_from_weekday_flags(
             df, pattern, info, valid, fallback_to_session_close=True
         )

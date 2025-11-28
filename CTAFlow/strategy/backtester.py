@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
@@ -96,6 +96,29 @@ class ScreenerBacktester:
         self.use_gpu = use_gpu and GPU_AVAILABLE
         self.gpu_device_id = gpu_device_id
         self._collision_resolver = PredictionToPosition()
+
+    @staticmethod
+    def ranking_score(summary: BacktestSummary) -> float:
+        """Return a stability-aware score for ranking backtests."""
+
+        drawdown = abs(summary.max_drawdown)
+        if drawdown == 0:
+            return float("inf") if summary.total_return > 0 else float("-inf")
+        return summary.total_return / drawdown
+
+    @classmethod
+    def rank_results(
+        cls, results: Mapping[str, Mapping[str, Any]]
+    ) -> List[Tuple[str, float]]:
+        """Order backtest results by ``total_return / max_drawdown`` descending."""
+
+        def _score(entry: Mapping[str, Any]) -> float:
+            summary = entry.get("summary")
+            return cls.ranking_score(summary) if isinstance(summary, BacktestSummary) else float("-inf")
+
+        scored = [(key, _score(value)) for key, value in results.items()]
+        scored.sort(key=lambda item: item[1], reverse=True)
+        return scored
 
     def threshold(
         self,

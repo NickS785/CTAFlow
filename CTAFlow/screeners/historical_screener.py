@@ -17,6 +17,7 @@ from ..features.regime_classification import (
     RegimeSpecificationLike,
     build_regime_classifier,
 )
+from ..strategy.gpu_acceleration import GPU_AVAILABLE, GPU_DEVICE_COUNT
 
 
 @dataclass
@@ -206,6 +207,8 @@ class HistoricalScreener:
         results_client: Optional[ResultsClient] = None,
         auto_write_results: bool = False,
         verbose: bool = True,
+        use_gpu: bool = False,
+        gpu_device_id: int = 0,
     ):
         """
         Initialize HistoricalScreener with ticker data.
@@ -224,6 +227,8 @@ class HistoricalScreener:
         self.mgr = file_mgr or IntradayFileManager(data_path=DLY_DATA_PATH, arctic_uri=INTRADAY_ADB_PATH)
         self.method = "arctic"
         self.verbose = verbose
+        self.use_gpu = bool(use_gpu and GPU_AVAILABLE)
+        self.gpu_device_id = int(gpu_device_id)
         self.results_client = results_client
         self.auto_write_results = bool(auto_write_results and results_client is not None)
         self._regime_cache: Dict[Tuple[str, str, str], Dict[str, pd.Series]] = {}
@@ -249,11 +254,30 @@ class HistoricalScreener:
                 self.logger.info(f"  - {synth_count} synthetic spreads, {len(self.tickers) - synth_count} regular tickers")
             if self.results_client and self.auto_write_results:
                 self.logger.info("  - Automatic result persistence enabled")
+            if use_gpu and not self.use_gpu:
+                self.logger.info("  - GPU scan requested but unavailable; defaulting to CPU")
+            elif self.use_gpu:
+                self.logger.info(
+                    "  - Concurrent GPU scans enabled (device %s, %s GPUs detected)",
+                    self.gpu_device_id,
+                    GPU_DEVICE_COUNT,
+                )
 
 
     # ------------------------------------------------------------------
     # Metadata helpers
     # ------------------------------------------------------------------
+    def _resolve_workers(self, max_workers: Optional[int]) -> int:
+        """Choose an executor pool size suited to the current hardware."""
+
+        if max_workers is not None and max_workers > 0:
+            return int(max_workers)
+
+        if self.use_gpu and GPU_AVAILABLE and GPU_DEVICE_COUNT > 0:
+            return GPU_DEVICE_COUNT
+
+        return 1
+
     @staticmethod
     def _serialize_period_length(value: Optional[Union[int, float, str, timedelta]]) -> Optional[str]:
         if value is None:
@@ -663,9 +687,11 @@ class HistoricalScreener:
                     self.logger.error(f"Error processing ticker {t}: {str(e)}")
                 return (t, {'error': str(e), 'ticker': t})
 
-        # Process tickers in parallel if max_workers > 1 or None
-        if max_workers is None or max_workers > 1:
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        worker_count = self._resolve_workers(max_workers)
+
+        # Process tickers in parallel if worker_count > 1
+        if worker_count > 1:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
                 futures = {executor.submit(_process_single_ticker, ticker): ticker for ticker in self.tickers}
 
                 iterator = as_completed(futures) if not show_progress else tqdm(
@@ -1024,9 +1050,11 @@ class HistoricalScreener:
                     self.logger.error(f"Error processing ticker {ticker}: {str(e)}")
                 return (ticker, {'error': str(e), 'ticker': ticker})
 
-        # Process tickers in parallel if max_workers > 1 or None
-        if max_workers is None or max_workers > 1:
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        worker_count = self._resolve_workers(max_workers)
+
+        # Process tickers in parallel if worker_count > 1
+        if worker_count > 1:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
                 futures = {executor.submit(_process_single_ticker, ticker): ticker for ticker in self.tickers}
 
                 iterator = as_completed(futures) if not show_progress else tqdm(
