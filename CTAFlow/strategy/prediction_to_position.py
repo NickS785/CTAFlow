@@ -17,7 +17,11 @@ class PredictionToPosition:
     correlation_field: str = "correlation"
 
     def aggregate(self, xy: pd.DataFrame) -> pd.DataFrame:
-        """Return a frame with one decision row per timestamp."""
+        """Return a frame with one decision row per timestamp.
+
+        Weekday bias patterns are treated specially: their bias value is always
+        added to the combined score when overlapping with other predictions.
+        """
 
         if xy is None:
             return pd.DataFrame()
@@ -42,7 +46,29 @@ class PredictionToPosition:
         grouped = frame.groupby("ts_decision", sort=True)
         records = []
         for ts_value, subset in grouped:
-            score = subset["_ptp_score"].sum(min_count=1)
+            # Separate weekday_bias patterns from other patterns
+            has_pattern_type = "pattern_type" in subset.columns
+            if has_pattern_type:
+                weekday_bias_mask = subset["pattern_type"].isin(["weekday_mean", "weekday_bias_intraday"])
+                weekday_bias_subset = subset[weekday_bias_mask]
+                other_subset = subset[~weekday_bias_mask]
+            else:
+                weekday_bias_subset = pd.DataFrame()
+                other_subset = subset
+
+            # Calculate score from non-bias patterns
+            if not other_subset.empty:
+                score = other_subset["_ptp_score"].sum(min_count=1)
+            else:
+                score = 0.0
+
+            # Add weekday bias contribution (always additive)
+            if not weekday_bias_subset.empty:
+                weekday_bias_contribution = weekday_bias_subset["_ptp_score"].sum(min_count=1)
+                if np.isfinite(weekday_bias_contribution):
+                    score += weekday_bias_contribution
+
+            # Determine position based on combined score
             if not np.isfinite(score) or abs(score) <= self.neutral_tolerance:
                 position = 0
             elif score > 0:
@@ -65,7 +91,11 @@ class PredictionToPosition:
         *,
         group_field: Optional[str] = None,
     ) -> pd.DataFrame:
-        """Collapse colliding decisions using weighted scores per timestamp."""
+        """Collapse colliding decisions using weighted scores per timestamp.
+
+        Weekday bias patterns are identified and their bias contribution is
+        tracked separately to be applied additively.
+        """
 
         if frame is None:
             return pd.DataFrame()
@@ -81,10 +111,23 @@ class PredictionToPosition:
             weights = pd.to_numeric(weights_source, errors="coerce").fillna(1.0)
         working["_ptp_score"] *= weights
 
+        # Mark weekday bias patterns
+        if "pattern_type" in working.columns:
+            working["_is_weekday_bias"] = working["pattern_type"].isin(["weekday_mean", "weekday_bias_intraday"])
+        else:
+            working["_is_weekday_bias"] = False
+
         collapsed_rows = []
         grouped = working.groupby("ts_decision", sort=True)
         include_grouping = bool(group_field and group_field in working.columns)
         for _, subset in grouped:
+            # Extract weekday bias contribution for this timestamp
+            weekday_bias_contrib = 0.0
+            if "_is_weekday_bias" in subset.columns:
+                bias_subset = subset[subset["_is_weekday_bias"]]
+                if not bias_subset.empty:
+                    weekday_bias_contrib = bias_subset["_ptp_score"].sum()
+
             if include_grouping:
                 values = subset[group_field].tolist()
                 order = []
@@ -108,15 +151,43 @@ class PredictionToPosition:
                     if per_subset.empty:
                         continue
 
-                    row = self._select_best_row(per_subset)
+                    # Filter out weekday bias from per_subset for best row selection
+                    if "_is_weekday_bias" in per_subset.columns:
+                        non_bias_subset = per_subset[~per_subset["_is_weekday_bias"]]
+                        if not non_bias_subset.empty:
+                            row = self._select_best_row(non_bias_subset)
+                        else:
+                            row = self._select_best_row(per_subset)
+                    else:
+                        row = self._select_best_row(per_subset)
+
+                    # Add weekday bias contribution to the score
+                    if np.isfinite(weekday_bias_contrib) and weekday_bias_contrib != 0.0:
+                        current_score = row.get("_ptp_score", 0.0)
+                        row["_ptp_score"] = current_score + weekday_bias_contrib
+
                     if members:
                         row["_group_members"] = members
                     collapsed_rows.append(row)
             else:
-                row = self._select_best_row(subset)
+                # Filter out weekday bias for best row selection
+                if "_is_weekday_bias" in subset.columns:
+                    non_bias_subset = subset[~subset["_is_weekday_bias"]]
+                    if not non_bias_subset.empty:
+                        row = self._select_best_row(non_bias_subset)
+                    else:
+                        row = self._select_best_row(subset)
+                else:
+                    row = self._select_best_row(subset)
+
+                # Add weekday bias contribution to the score
+                if np.isfinite(weekday_bias_contrib) and weekday_bias_contrib != 0.0:
+                    current_score = row.get("_ptp_score", 0.0)
+                    row["_ptp_score"] = current_score + weekday_bias_contrib
+
                 collapsed_rows.append(row)
 
-        resolved = pd.DataFrame(collapsed_rows).drop(columns=["_ptp_score"], errors="ignore")
+        resolved = pd.DataFrame(collapsed_rows).drop(columns=["_ptp_score", "_is_weekday_bias"], errors="ignore")
         return resolved.reset_index(drop=True)
 
     @staticmethod

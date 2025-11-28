@@ -64,6 +64,10 @@ class PatternMLBuilder:
         - X: short-term momentum (returns over the last st_momentum_days).
         - y: session return (open to close).
 
+    - momentum_so (st_momentum-open momentum):
+        - X: short-term momentum (returns over the last st_momentum_days).
+        - y: next session opening return (previous close to next open).
+
     For momentum patterns, additional volatility-significance predictors
     can be appended to X (vol_features_df).
     """
@@ -146,6 +150,10 @@ class PatternMLBuilder:
             )
         elif "momentum_cc" in ptype or ptype == "momentum_cc":
             X, y, info = self._build_momentum_cc_dataset(
+                price_df, pattern_meta, features_df, vol_features_df, vol_persistence
+            )
+        elif "momentum_so" in ptype or ptype == "momentum_so":
+            X, y, info = self._build_momentum_so_dataset(
                 price_df, pattern_meta, features_df, vol_features_df, vol_persistence
             )
         else:
@@ -897,6 +905,140 @@ class PatternMLBuilder:
 
         info = {
             "pattern_type": "momentum_cc",
+            "n_samples": int(len(y)),
+            "st_momentum_days": st_momentum_days,
+            "months_active": months_active,
+            "weekday": weekday_spec,
+        }
+        return base_X, y, info
+
+    # ------------------------------------------------------------------
+    # 5) Momentum SO: X = short-term trend (st_momentum_days), y = next session open gap
+    # ------------------------------------------------------------------
+    def _build_momentum_so_dataset(
+        self,
+        price_df: pd.DataFrame,
+        pattern_meta: Mapping[str, Any],
+        features_df: Optional[pd.DataFrame],
+        vol_features_df: Optional[pd.DataFrame],
+        vol_persistence: bool = False,
+    ) -> Tuple[pd.DataFrame, pd.Series, Dict[str, Any]]:
+        df = self._ensure_dt_index(price_df)
+        if self.price_col not in df.columns:
+            raise KeyError(self.price_col)
+        if self.open_col not in df.columns:
+            raise KeyError(self.open_col)
+
+        sess_key = self._session_key(df)
+        price = pd.to_numeric(df[self.price_col], errors="coerce")
+        open_px = pd.to_numeric(df[self.open_col], errors="coerce")
+
+        # Get st_momentum_days from pattern metadata
+        st_momentum_days = int(pattern_meta.get("st_momentum_days", 3))
+        months_active = pattern_meta.get("months_active") or pattern_meta.get("months")
+        weekday_spec = pattern_meta.get("weekday")
+
+        # Calculate per-session close and open prices
+        sess_close = price.groupby(sess_key).last()
+        sess_open = open_px.groupby(sess_key).first()
+
+        # Calculate short-term momentum (returns over last st_momentum_days)
+        st_momentum = np.log(sess_close / sess_close.shift(st_momentum_days))
+
+        # Calculate next session opening return (close to next open)
+        next_open = sess_open.shift(-1)
+        opening_return = np.log(next_open / sess_close)
+
+        samples: Dict[pd.Timestamp, Dict[str, Any]] = {}
+
+        for sid, g in df.groupby(sess_key):
+            g = g.sort_index()
+            if g.empty:
+                continue
+
+            day = g.index[0].normalize()
+            # filter by months & weekday at session level
+            if months_active and g.index[0].month not in set(int(m) for m in months_active):
+                continue
+            if weekday_spec:
+                if g.index[0].day_name().lower() != weekday_spec.split("->")[0].strip().lower():
+                    continue
+
+            # Get st_momentum and opening_return for this session
+            if sid not in st_momentum.index or sid not in opening_return.index:
+                continue
+
+            x_st_mom = float(st_momentum.loc[sid])
+            y_open_ret = float(opening_return.loc[sid])
+
+            if not np.isfinite(x_st_mom) or not np.isfinite(y_open_ret):
+                continue
+
+            samples[day] = {
+                "x_st_momentum": x_st_mom,
+                "y_open_ret": y_open_ret,
+                "t_decision": g.index[-1],  # Session close time (decision point)
+            }
+
+        if not samples:
+            return pd.DataFrame(), pd.Series(dtype=float), {
+                "pattern_type": "momentum_so",
+                "n_samples": 0,
+            }
+
+        index = pd.Index(sorted(samples.keys()), name="session_day")
+        base_X = pd.DataFrame(
+            {"x_st_momentum": [samples[d]["x_st_momentum"] for d in index]}, index=index
+        )
+        y = pd.Series(
+            [samples[d]["y_open_ret"] for d in index],
+            index=index,
+            name="y_open_ret",
+        )
+
+        # Attach intraday features at session close (decision point)
+        if features_df is not None and not features_df.empty:
+            fdf = self._ensure_dt_index(features_df)
+            feat_rows = []
+            for d in index:
+                t_dec = samples[d]["t_decision"]
+                if t_dec in fdf.index:
+                    feat_rows.append(fdf.loc[t_dec])
+                else:
+                    subset = fdf.loc[:t_dec]
+                    feat_rows.append(subset.iloc[-1] if not subset.empty else pd.Series(dtype=float))
+            feat_X = pd.DataFrame(feat_rows, index=index)
+            base_X = pd.concat([base_X, feat_X], axis=1)
+
+        # Add opening period realized volatility if vol_persistence=True
+        if vol_persistence:
+            # For SO patterns, use session-level volatility
+            sess_key_obj = self._session_key(df)
+            rv_rows = []
+            for d in index:
+                sid = [k for k, g in df.groupby(sess_key_obj) if g.index[0].normalize() == d]
+                if sid:
+                    sess_data = df[df[self.session_col if self.session_col in df.columns else "session_id"] == sid[0]]
+                    if len(sess_data) > 1:
+                        sess_rv = self._calculate_realized_volatility(sess_data, window_minutes=int(st_momentum_days * 390))
+                        rv_val = sess_rv.iloc[-1] if not sess_rv.empty and len(sess_rv) > 0 else np.nan
+                    else:
+                        rv_val = np.nan
+                else:
+                    rv_val = np.nan
+                rv_rows.append({"opening_rv": rv_val})
+            rv_X = pd.DataFrame(rv_rows, index=index)
+            base_X = pd.concat([base_X, rv_X], axis=1)
+
+        # Attach volatility features
+        if vol_features_df is not None and not vol_features_df.empty:
+            vdf = self._ensure_dt_index(vol_features_df)
+            v_daily = vdf.groupby(vdf.index.normalize()).last()
+            vX = v_daily.reindex(index)
+            base_X = pd.concat([base_X, vX], axis=1)
+
+        info = {
+            "pattern_type": "momentum_so",
             "n_samples": int(len(y)),
             "st_momentum_days": st_momentum_days,
             "months_active": months_active,

@@ -161,6 +161,7 @@ class ScreenerPipeline:
         "momentum_oc",
         "momentum_cc",
         "momentum_sc",
+        "momentum_so",
         "weekday_bias_intraday",
     }
 

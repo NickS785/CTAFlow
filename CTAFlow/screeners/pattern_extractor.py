@@ -1806,6 +1806,7 @@ class PatternExtractor:
             ("open_close_corr", "open_close_pvalue", "momentum_oc", "Opening momentum predicts the close", "opening_momentum"),
             ("close_st_mom_corr", None, "momentum_cc", "Closing drive aligns with the short-term trend", "closing_momentum"),
             ("close_vs_rest_corr", "close_vs_rest_pvalue", "momentum_sc", "Closing thrust spills into the rest of the session", "closing_momentum"),
+            ("open_st_mom_corr", None, "momentum_so", "Short-term trend predicts the open", "st_momentum"),
         ]
 
         for corr_key, p_key, pattern_type, description, momentum_type in specs:
