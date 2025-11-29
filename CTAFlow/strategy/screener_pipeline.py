@@ -44,9 +44,8 @@ from .backtester import ScreenerBacktester
 from .gpu_acceleration import (
     GPU_AVAILABLE,
     GPU_DEVICE_COUNT,
-    get_array_module,
+    to_backend_array,
     to_cpu,
-    to_gpu,
 )
 from .prediction_to_position import PredictionToPosition
 
@@ -1038,10 +1037,11 @@ class ScreenerPipeline:
             return
 
         if self.use_gpu and GPU_AVAILABLE:
-            gates_gpu = to_gpu(df[gate_columns].to_numpy(copy=False), device_id=self.gpu_device_id)
-            backend = get_array_module(gates_gpu)
-            any_active_gpu = backend.any(gates_gpu, axis=1)
-            any_active = to_cpu(any_active_gpu)
+            gate_backend, xp = to_backend_array(
+                df[gate_columns], use_gpu=True, device_id=self.gpu_device_id
+            )
+            any_active_backend = xp.any(gate_backend, axis=1)
+            any_active = to_cpu(any_active_backend)
         else:
             any_active = df[gate_columns].any(axis=1)
 
