@@ -1,4 +1,4 @@
-from CTAFlow.features.feature_engineering import SpreadData
+from ..data.raw_formatting.spread_manager import SpreadData
 
 cl_f = SpreadData("CL")
 static_df = cl_f.to_df("static")

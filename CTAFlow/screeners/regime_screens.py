@@ -2,12 +2,12 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from datetime import datetime, time, date, timedelta
-from CTAFlow.features.regime_classification import RegimeSpecification, TrendRegimeClassifier, VolatilityRegimeClassifier
-from CTAFlow.screeners import HistoricalScreener, PatternExtractor, ScreenParams
-from CTAFlow.data import read_exported_df, read_synthetic_csv
-from CTAFlow.config import INTRADAY_DATA_PATH
+from ..features.regime_classification import RegimeSpecification, TrendRegimeClassifier, VolatilityRegimeClassifier
+from . import HistoricalScreener, PatternExtractor, ScreenParams
+from ..data import read_exported_df, read_synthetic_csv
+from ..config import INTRADAY_DATA_PATH
 
-from CTAFlow.strategy import ScreenerPipeline
+from ..strategy import ScreenerPipeline
 
 fast_trend = {
     'price_col': "Close",

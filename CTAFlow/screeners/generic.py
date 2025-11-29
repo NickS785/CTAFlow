@@ -1,11 +1,11 @@
-from CTAFlow.data import SyntheticSymbol, IntradayLeg, IntradayFileManager, DataClient
-from CTAFlow.features import VolatilityRegimeClassifier
-from CTAFlow.screeners import HistoricalScreener, ScreenParams, OrderflowParams
+from ..data import SyntheticSymbol, IntradayLeg, IntradayFileManager, DataClient
+from ..features import VolatilityRegimeClassifier
+from . import HistoricalScreener, ScreenParams, OrderflowParams
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, time
 
-from CTAFlow.config import DLY_DATA_PATH
+from ..config import DLY_DATA_PATH
 
 vol_clf = VolatilityRegimeClassifier(method='rv', window=10)
 two_h = timedelta(hours=2)

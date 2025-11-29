@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union, Any, Sequence
 from datetime import datetime
-from CTAFlow.config import DLY_DATA_PATH, INTRADAY_DATA_PATH
+from ...config import DLY_DATA_PATH, INTRADAY_DATA_PATH
 
 import numpy as np
 import pandas as pd

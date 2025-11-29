@@ -10,7 +10,7 @@ from scipy import stats
 from scipy.stats import skew, kurtosis
 
 from ..data_client import DataClient
-from CTAFlow.config import *
+from ...config import *
 
 import numpy as np
 import pandas as pd
