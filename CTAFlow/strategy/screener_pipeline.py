@@ -41,6 +41,13 @@ if TYPE_CHECKING:  # pragma: no cover - import for type checking only
     from .sessionizer import Sessionizer
 
 from .backtester import ScreenerBacktester
+from .gpu_acceleration import (
+    GPU_AVAILABLE,
+    GPU_DEVICE_COUNT,
+    get_array_module,
+    to_cpu,
+    to_gpu,
+)
 from .prediction_to_position import PredictionToPosition
 
 __all__ = [
@@ -293,11 +300,7 @@ class ScreenerPipeline:
 
                 gate_columns.extend(created)
 
-        if gate_columns:
-            any_active = df[gate_columns].any(axis=1)
-            df["any_pattern_active"] = any_active.astype(np.int8)
-        else:
-            df["any_pattern_active"] = 0
+        self._combine_gate_columns(df, gate_columns)
 
         if allowed_months is not None:
             allowed_set = {int(month) for month in allowed_months}
@@ -305,7 +308,7 @@ class ScreenerPipeline:
             gate_cols = [col for col in df.columns if col.endswith("_gate")]
             if gate_cols:
                 df.loc[~month_mask, gate_cols] = 0
-                df["any_pattern_active"] = df[gate_cols].any(axis=1).astype(np.int8)
+                self._combine_gate_columns(df, gate_cols)
             else:
                 df["any_pattern_active"] = 0
 
@@ -509,11 +512,21 @@ class ScreenerPipeline:
         results: Dict[str, Dict[str, Any]] = {}
         build_xy_params = dict(build_xy_kwargs) if build_xy_kwargs else {}
 
+        worker_count = feature_workers
+        if (
+            worker_count is None
+            and self.use_gpu
+            and GPU_AVAILABLE
+            and GPU_DEVICE_COUNT > 0
+        ):
+            # Align feature extraction parallelism with available GPUs when requested
+            worker_count = GPU_DEVICE_COUNT
+
         feature_sets = self.build_feature_sets(
             prepared,
             patterns,
             prepared_df=prepared,
-            max_workers=feature_workers,
+            max_workers=worker_count,
         )
 
         def _run_single(key: str, featured: pd.DataFrame, pattern: Mapping[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -1016,6 +1029,23 @@ class ScreenerPipeline:
             return self._dispatch_momentum(df, pattern, key, pattern_type)
 
         return []
+
+    def _combine_gate_columns(self, df: pd.DataFrame, gate_columns: Sequence[str]) -> None:
+        """Compute any-pattern-active flags with optional GPU acceleration."""
+
+        if not gate_columns:
+            df["any_pattern_active"] = 0
+            return
+
+        if self.use_gpu and GPU_AVAILABLE:
+            gates_gpu = to_gpu(df[gate_columns].to_numpy(copy=False), device_id=self.gpu_device_id)
+            backend = get_array_module(gates_gpu)
+            any_active_gpu = backend.any(gates_gpu, axis=1)
+            any_active = to_cpu(any_active_gpu)
+        else:
+            any_active = df[gate_columns].any(axis=1)
+
+        df["any_pattern_active"] = np.asarray(any_active, dtype=np.int8)
 
     def _dispatch_seasonal(
         self,

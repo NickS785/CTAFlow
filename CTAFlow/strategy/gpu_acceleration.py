@@ -45,6 +45,7 @@ except ImportError:
 __all__ = [
     'GPU_AVAILABLE',
     'GPU_DEVICE_COUNT',
+    'get_array_module',
     'to_gpu',
     'to_cpu',
     'gpu_backtest_returns',
@@ -83,6 +84,14 @@ def get_gpu_info() -> dict:
             'backend': 'numpy',
             'error': str(e)
         }
+
+
+def get_array_module(values: Union[np.ndarray, 'cp.ndarray']):
+    """Return the array module (NumPy or CuPy) backing ``values``."""
+
+    if GPU_AVAILABLE and hasattr(cp, "get_array_module"):
+        return cp.get_array_module(values)
+    return np
 
 
 def to_gpu(arr: np.ndarray, device_id: int = 0) -> Union[np.ndarray, 'cp.ndarray']:
