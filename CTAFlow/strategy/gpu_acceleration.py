@@ -46,8 +46,10 @@ except ImportError:
 __all__ = [
     'GPU_AVAILABLE',
     'GPU_DEVICE_COUNT',
+    'get_array_module',
     'to_gpu',
     'to_cpu',
+    'to_backend_array',
     'gpu_backtest_returns',
     'gpu_backtest_threshold',
     'gpu_batch_threshold_sweep',
@@ -87,6 +89,14 @@ def get_gpu_info() -> dict:
         }
 
 
+def get_array_module(values: Union[np.ndarray, 'cp.ndarray']):
+    """Return the array module (NumPy or CuPy) backing ``values``."""
+
+    if GPU_AVAILABLE and hasattr(cp, "get_array_module"):
+        return cp.get_array_module(values)
+    return np
+
+
 def to_gpu(arr: np.ndarray, device_id: int = 0) -> Union[np.ndarray, 'cp.ndarray']:
     """Transfer NumPy array to GPU.
 
@@ -121,7 +131,7 @@ def to_cpu(arr: Union[np.ndarray, 'cp.ndarray']) -> np.ndarray:
     return arr
 
 
-def _to_backend_array(
+def to_backend_array(
     values: Union[np.ndarray, 'cp.ndarray', "pd.Series", "pd.DataFrame", list, tuple],
     *,
     use_gpu: bool,
@@ -165,10 +175,10 @@ def gpu_backtest_returns(
     available, computations are performed with CuPy on the selected device.
     """
 
-    rx, xp = _to_backend_array(
+    rx, xp = to_backend_array(
         returns_x, use_gpu=use_gpu, device_id=device_id, stream=stream
     )
-    ry, _ = _to_backend_array(returns_y, use_gpu=use_gpu, device_id=device_id, stream=stream)
+    ry, _ = to_backend_array(returns_y, use_gpu=use_gpu, device_id=device_id, stream=stream)
 
     positions_backend = xp.where(
         rx >= threshold, 1.0,
@@ -202,13 +212,13 @@ def gpu_backtest_threshold(
     directly. Uses CuPy for all calculations when a GPU is available.
     """
 
-    rx, xp = _to_backend_array(
+    rx, xp = to_backend_array(
         returns_x, use_gpu=use_gpu, device_id=device_id, stream=stream
     )
-    ry, _ = _to_backend_array(returns_y, use_gpu=use_gpu, device_id=device_id, stream=stream)
+    ry, _ = to_backend_array(returns_y, use_gpu=use_gpu, device_id=device_id, stream=stream)
 
     if correlation is not None and use_side_hint:
-        corr, _ = _to_backend_array(
+        corr, _ = to_backend_array(
             correlation, use_gpu=use_gpu, device_id=device_id, stream=stream
         )
         adjusted_x = rx * xp.sign(corr)
@@ -377,7 +387,7 @@ def gpu_cumulative_pnl(
 ) -> np.ndarray:
     """Calculate cumulative PnL using GPU acceleration."""
 
-    pnl_backend, xp = _to_backend_array(
+    pnl_backend, xp = to_backend_array(
         pnl, use_gpu=use_gpu, device_id=device_id, stream=stream
     )
     cumulative_backend = xp.cumsum(pnl_backend)
