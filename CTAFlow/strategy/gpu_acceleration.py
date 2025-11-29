@@ -14,7 +14,8 @@ Usage:
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, Union
+from contextlib import nullcontext
+from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 
@@ -49,6 +50,7 @@ __all__ = [
     'to_cpu',
     'gpu_backtest_returns',
     'gpu_backtest_threshold',
+    'gpu_batch_threshold_sweep',
     'gpu_cumulative_pnl',
     'get_gpu_info',
 ]
@@ -226,6 +228,144 @@ def gpu_backtest_threshold(
         return positions_backend, pnl_backend
 
     return cp.asnumpy(positions_backend), cp.asnumpy(pnl_backend)
+
+
+def gpu_batch_threshold_sweep(
+    returns_x: Union[np.ndarray, "pd.Series", "pd.DataFrame"],
+    returns_y: Union[np.ndarray, "pd.Series", "pd.DataFrame"],
+    thresholds: Union[np.ndarray, list, tuple],
+    correlation: Optional[Union[np.ndarray, "pd.Series", "pd.DataFrame"]] = None,
+    use_side_hint: bool = True,
+    use_gpu: bool = True,
+    device_id: int = 0,
+    stream: Optional[object] = None,
+) -> Dict[float, Dict[str, np.ndarray]]:
+    """Batch backtest multiple threshold values with a single GPU transfer.
+
+    Performs threshold backtesting for multiple threshold values simultaneously,
+    keeping all data on the GPU and minimizing CPU↔GPU transfers. This is
+    significantly faster than calling gpu_backtest_threshold() in a loop.
+
+    Args:
+        returns_x: Predictor returns
+        returns_y: Target returns
+        thresholds: Array of threshold values to test (e.g., [0.0, 0.5, 1.0, 1.5, 2.0])
+        correlation: Optional correlation values for side hints
+        use_side_hint: Whether to use correlation sign for position direction
+        use_gpu: Whether to use GPU acceleration
+        device_id: GPU device ID
+        stream: Optional CUDA stream for async operations
+
+    Returns:
+        Dictionary mapping each threshold to a dict containing:
+            - 'positions': Position array for this threshold
+            - 'pnl': PnL array for this threshold
+            - 'cumulative': Cumulative PnL array
+            - 'drawdown': Drawdown array
+            - 'max_drawdown': Maximum drawdown value
+
+    Example:
+        >>> thresholds = [0.0, 0.5, 1.0, 1.5]
+        >>> results = gpu_batch_threshold_sweep(returns_x, returns_y, thresholds)
+        >>> for threshold, metrics in results.items():
+        ...     print(f"Threshold {threshold}: Max DD = {metrics['max_drawdown']:.4f}")
+    """
+
+    # Convert thresholds to array
+    thresholds_array = np.asarray(thresholds, dtype=float).ravel()
+    if len(thresholds_array) == 0:
+        return {}
+
+    # CPU fallback for non-GPU execution
+    if not use_gpu or not GPU_AVAILABLE:
+        results = {}
+        for threshold in thresholds_array:
+            pos, pnl = gpu_backtest_threshold(
+                returns_x=returns_x,
+                returns_y=returns_y,
+                correlation=correlation,
+                threshold=float(threshold),
+                use_side_hint=use_side_hint,
+                use_gpu=False,
+                device_id=device_id,
+                stream=stream,
+            )
+            cumulative = np.cumsum(pnl)
+            rolling_max = np.maximum.accumulate(cumulative)
+            drawdown = cumulative - rolling_max
+            max_drawdown = float(drawdown.min()) if len(drawdown) > 0 else 0.0
+
+            results[float(threshold)] = {
+                'positions': pos,
+                'pnl': pnl,
+                'cumulative': cumulative,
+                'drawdown': drawdown,
+                'max_drawdown': max_drawdown,
+            }
+        return results
+
+    # GPU batch processing
+    with cp.cuda.Device(device_id):
+        stream_cm = stream if stream is not None else nullcontext()
+
+        with stream_cm if hasattr(stream_cm, '__enter__') else nullcontext():
+            # Transfer data to GPU once
+            rx, xp = _to_backend_array(
+                returns_x, use_gpu=True, device_id=device_id, stream=stream
+            )
+            ry, _ = _to_backend_array(
+                returns_y, use_gpu=True, device_id=device_id, stream=stream
+            )
+
+            # Apply correlation adjustment if needed
+            if correlation is not None and use_side_hint:
+                corr, _ = _to_backend_array(
+                    correlation, use_gpu=True, device_id=device_id, stream=stream
+                )
+                adjusted_x = rx * xp.sign(corr)
+            else:
+                adjusted_x = rx
+
+            # Transfer thresholds to GPU and reshape for broadcasting
+            # Shape: (n_thresholds, 1) for broadcasting against (n_samples,)
+            thresholds_gpu = xp.asarray(thresholds_array).reshape(-1, 1)
+
+            # Broadcast comparison for all thresholds simultaneously
+            # Result shape: (n_thresholds, n_samples)
+            adjusted_x_broadcast = adjusted_x.reshape(1, -1)  # (1, n_samples)
+
+            # Vectorized position calculation for all thresholds
+            positions_all = xp.where(
+                adjusted_x_broadcast >= thresholds_gpu, 1.0,
+                xp.where(adjusted_x_broadcast <= -thresholds_gpu, -1.0, 0.0)
+            )
+
+            # Calculate PnL for all thresholds
+            pnl_all = positions_all * ry.reshape(1, -1)
+
+            # Calculate cumulative PnL and drawdown for all thresholds
+            cumulative_all = xp.cumsum(pnl_all, axis=1)
+            rolling_max_all = xp.maximum.accumulate(cumulative_all, axis=1)
+            drawdown_all = cumulative_all - rolling_max_all
+
+            # Transfer results back to CPU and package into dict
+            results = {}
+            for i, threshold in enumerate(thresholds_array):
+                positions_cpu = xp.asnumpy(positions_all[i, :])
+                pnl_cpu = xp.asnumpy(pnl_all[i, :])
+                cumulative_cpu = xp.asnumpy(cumulative_all[i, :])
+                drawdown_cpu = xp.asnumpy(drawdown_all[i, :])
+                max_drawdown = float(xp.asnumpy(drawdown_all[i, :].min()))
+
+                results[float(threshold)] = {
+                    'positions': positions_cpu,
+                    'pnl': pnl_cpu,
+                    'cumulative': cumulative_cpu,
+                    'drawdown': drawdown_cpu,
+                    'max_drawdown': max_drawdown,
+                }
+
+    return results
 
 
 def gpu_cumulative_pnl(
