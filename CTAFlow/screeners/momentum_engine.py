@@ -38,7 +38,18 @@ class MomentumScreenEngine(BaseScreenEngine):
         if not isinstance(params, MomentumParams):
             raise TypeError("MomentumScreenEngine requires MomentumParams")
 
-        screener = HistoricalScreener({ticker: data}, results_client=None, auto_write_results=False, verbose=False)
+        # Extract GPU settings from context (added by HistoricalScreenerV2)
+        use_gpu = context.get('use_gpu', False)
+        gpu_device_id = context.get('gpu_device_id', 0)
+
+        screener = HistoricalScreener(
+            {ticker: data},
+            results_client=None,
+            auto_write_results=False,
+            verbose=False,
+            use_gpu=use_gpu,
+            gpu_device_id=gpu_device_id,
+        )
         results = screener.intraday_momentum_screen(
             session_starts=params.session_starts,
             session_ends=params.session_ends,

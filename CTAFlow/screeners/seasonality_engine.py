@@ -38,7 +38,18 @@ class SeasonalityScreenEngine(BaseScreenEngine):
         if not isinstance(params, SeasonalityParams):
             raise TypeError("SeasonalityScreenEngine requires SeasonalityParams")
 
-        screener = HistoricalScreener({ticker: data}, results_client=None, auto_write_results=False, verbose=False)
+        # Extract GPU settings from context (added by HistoricalScreenerV2)
+        use_gpu = context.get('use_gpu', False)
+        gpu_device_id = context.get('gpu_device_id', 0)
+
+        screener = HistoricalScreener(
+            {ticker: data},
+            results_client=None,
+            auto_write_results=False,
+            verbose=False,
+            use_gpu=use_gpu,
+            gpu_device_id=gpu_device_id,
+        )
         results = screener.st_seasonality_screen(
             target_times=params.target_times or [],
             period_length=params.period_length,
