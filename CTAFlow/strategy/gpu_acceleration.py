@@ -14,8 +14,14 @@ Usage:
 
 from __future__ import annotations
 
+from typing import Optional, Tuple, Union
+
 import numpy as np
-from typing import Tuple, Optional, Union
+
+try:  # Pandas is optional in some lightweight environments
+    import pandas as pd  # type: ignore
+except Exception:  # pragma: no cover - defensive import for optional dependency
+    pd = None
 
 # Try to import CuPy for GPU acceleration
 try:
@@ -113,137 +119,136 @@ def to_cpu(arr: Union[np.ndarray, 'cp.ndarray']) -> np.ndarray:
     return arr
 
 
+def _to_backend_array(
+    values: Union[np.ndarray, 'cp.ndarray', "pd.Series", "pd.DataFrame", list, tuple],
+    *,
+    use_gpu: bool,
+    device_id: int,
+    stream: Optional[object] = None,
+) -> Tuple[Union[np.ndarray, 'cp.ndarray'], Union[np, 'cp']]:
+    """Return an array backed by either NumPy or CuPy along with the module used.
+
+    Accepts pandas Series/DataFrames in addition to generic array likes so callers
+    can pass DataFrame columns directly when accelerating.
+    """
+
+    base = values
+    if pd is not None and isinstance(values, (pd.Series, pd.DataFrame)):
+        base = values.to_numpy(copy=False)
+    elif not isinstance(values, (np.ndarray,)):
+        base = np.asarray(values)
+
+    if not use_gpu or not GPU_AVAILABLE:
+        return base, np
+
+    with cp.cuda.Device(device_id):
+        if stream is not None:
+            with stream:
+                return cp.asarray(base), cp
+        return cp.asarray(base), cp
+
+
 def gpu_backtest_returns(
-    returns_x: np.ndarray,
-    returns_y: np.ndarray,
+    returns_x: Union[np.ndarray, "pd.Series", "pd.DataFrame"],
+    returns_y: Union[np.ndarray, "pd.Series", "pd.DataFrame"],
     threshold: float = 0.0,
     use_gpu: bool = True,
     device_id: int = 0,
+    stream: Optional[object] = None,
+    return_backend: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Calculate positions and PnL using GPU acceleration.
 
-    Computes trading positions based on threshold and calculates PnL.
-
-    Args:
-        returns_x: Predictor returns (features)
-        returns_y: Target returns (outcomes)
-        threshold: Entry threshold (long if >= threshold, short if <= -threshold)
-        use_gpu: Whether to use GPU acceleration
-        device_id: GPU device ID
-
-    Returns:
-        Tuple of (positions, pnl) as NumPy arrays
+    Accepts NumPy arrays or pandas objects. When ``use_gpu`` is True and a GPU is
+    available, computations are performed with CuPy on the selected device.
     """
-    if not use_gpu or not GPU_AVAILABLE:
-        # CPU fallback
-        positions = np.where(
-            returns_x >= threshold, 1.0,
-            np.where(returns_x <= -threshold, -1.0, 0.0)
-        )
-        pnl = positions * returns_y
-        return positions, pnl
 
-    # GPU computation
-    with cp.cuda.Device(device_id):
-        rx_gpu = cp.asarray(returns_x)
-        ry_gpu = cp.asarray(returns_y)
+    rx, xp = _to_backend_array(
+        returns_x, use_gpu=use_gpu, device_id=device_id, stream=stream
+    )
+    ry, _ = _to_backend_array(returns_y, use_gpu=use_gpu, device_id=device_id, stream=stream)
 
-        positions_gpu = cp.where(
-            rx_gpu >= threshold, 1.0,
-            cp.where(rx_gpu <= -threshold, -1.0, 0.0)
-        )
-        pnl_gpu = positions_gpu * ry_gpu
+    positions_backend = xp.where(
+        rx >= threshold, 1.0,
+        xp.where(rx <= -threshold, -1.0, 0.0)
+    )
+    pnl_backend = positions_backend * ry
 
-        # Transfer back to CPU
-        positions = cp.asnumpy(positions_gpu)
-        pnl = cp.asnumpy(pnl_gpu)
+    if return_backend:
+        return positions_backend, pnl_backend, xp
 
-    return positions, pnl
+    if xp is np:
+        return positions_backend, pnl_backend
+
+    return cp.asnumpy(positions_backend), cp.asnumpy(pnl_backend)
 
 
 def gpu_backtest_threshold(
-    returns_x: np.ndarray,
-    returns_y: np.ndarray,
-    correlation: Optional[np.ndarray] = None,
+    returns_x: Union[np.ndarray, "pd.Series", "pd.DataFrame"],
+    returns_y: Union[np.ndarray, "pd.Series", "pd.DataFrame"],
+    correlation: Optional[Union[np.ndarray, "pd.Series", "pd.DataFrame"]] = None,
     threshold: float = 0.0,
     use_side_hint: bool = True,
     use_gpu: bool = True,
     device_id: int = 0,
+    stream: Optional[object] = None,
+    return_backend: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Calculate positions and PnL with correlation-based side hint.
 
-    Args:
-        returns_x: Predictor returns
-        returns_y: Target returns
-        correlation: Correlation values for each signal
-        threshold: Entry threshold
-        use_side_hint: Whether to use correlation sign for position direction
-        use_gpu: Whether to use GPU acceleration
-        device_id: GPU device ID
-
-    Returns:
-        Tuple of (positions, pnl) as NumPy arrays
+    Supports pandas inputs so downstream callers can pass DataFrame columns
+    directly. Uses CuPy for all calculations when a GPU is available.
     """
-    if not use_gpu or not GPU_AVAILABLE:
-        # CPU fallback
-        if correlation is not None and use_side_hint:
-            # Apply correlation sign to returns_x
-            adjusted_x = returns_x * np.sign(correlation)
-        else:
-            adjusted_x = returns_x
 
-        positions = np.where(
-            adjusted_x >= threshold, 1.0,
-            np.where(adjusted_x <= -threshold, -1.0, 0.0)
+    rx, xp = _to_backend_array(
+        returns_x, use_gpu=use_gpu, device_id=device_id, stream=stream
+    )
+    ry, _ = _to_backend_array(returns_y, use_gpu=use_gpu, device_id=device_id, stream=stream)
+
+    if correlation is not None and use_side_hint:
+        corr, _ = _to_backend_array(
+            correlation, use_gpu=use_gpu, device_id=device_id, stream=stream
         )
-        pnl = positions * returns_y
-        return positions, pnl
+        adjusted_x = rx * xp.sign(corr)
+    else:
+        adjusted_x = rx
 
-    # GPU computation
-    with cp.cuda.Device(device_id):
-        rx_gpu = cp.asarray(returns_x)
-        ry_gpu = cp.asarray(returns_y)
+    positions_backend = xp.where(
+        adjusted_x >= threshold, 1.0,
+        xp.where(adjusted_x <= -threshold, -1.0, 0.0)
+    )
+    pnl_backend = positions_backend * ry
 
-        if correlation is not None and use_side_hint:
-            corr_gpu = cp.asarray(correlation)
-            adjusted_x_gpu = rx_gpu * cp.sign(corr_gpu)
-        else:
-            adjusted_x_gpu = rx_gpu
+    if return_backend:
+        return positions_backend, pnl_backend, xp
 
-        positions_gpu = cp.where(
-            adjusted_x_gpu >= threshold, 1.0,
-            cp.where(adjusted_x_gpu <= -threshold, -1.0, 0.0)
-        )
-        pnl_gpu = positions_gpu * ry_gpu
+    if xp is np:
+        return positions_backend, pnl_backend
 
-        positions = cp.asnumpy(positions_gpu)
-        pnl = cp.asnumpy(pnl_gpu)
-
-    return positions, pnl
+    return cp.asnumpy(positions_backend), cp.asnumpy(pnl_backend)
 
 
 def gpu_cumulative_pnl(
-    pnl: np.ndarray,
+    pnl: Union[np.ndarray, "pd.Series", "pd.DataFrame"],
     use_gpu: bool = True,
     device_id: int = 0,
+    stream: Optional[object] = None,
+    return_backend: bool = False,
 ) -> np.ndarray:
-    """Calculate cumulative PnL using GPU acceleration.
+    """Calculate cumulative PnL using GPU acceleration."""
 
-    Args:
-        pnl: Per-period PnL array
-        use_gpu: Whether to use GPU acceleration
-        device_id: GPU device ID
+    pnl_backend, xp = _to_backend_array(
+        pnl, use_gpu=use_gpu, device_id=device_id, stream=stream
+    )
+    cumulative_backend = xp.cumsum(pnl_backend)
 
-    Returns:
-        Cumulative PnL as NumPy array
-    """
-    if not use_gpu or not GPU_AVAILABLE:
-        return np.cumsum(pnl)
+    if return_backend:
+        return cumulative_backend, xp
 
-    with cp.cuda.Device(device_id):
-        pnl_gpu = cp.asarray(pnl)
-        cumulative_gpu = cp.cumsum(pnl_gpu)
-        return cp.asnumpy(cumulative_gpu)
+    if xp is np:
+        return cumulative_backend
+
+    return cp.asnumpy(cumulative_backend)
 
 
 # Module-level diagnostics

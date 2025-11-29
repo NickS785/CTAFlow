@@ -1,9 +1,6 @@
 import numpy as np
 import pandas as pd
 
-import numpy as np
-import pandas as pd
-
 from CTAFlow.strategy.screener_pipeline import HorizonMapper, ScreenerPipeline
 
 
@@ -144,3 +141,21 @@ def test_weekend_backtester_rolls_through_holiday():
     assert len(xy) == 2
     expected_returns = [np.log(105.0 / 100.0), np.log(107.0 / 101.0)]
     assert np.allclose(sorted(xy["returns_y"].values), sorted(expected_returns))
+
+
+def test_weekend_threshold_uses_friday_returns():
+    bars = _weekend_bars(two_weeks=True)
+    pattern = {"usa_winter": _weekend_pattern()}
+    pipeline = ScreenerPipeline(tz="America/Chicago")
+
+    enriched = pipeline.build_features(bars.copy(), pattern)
+    mapper = pipeline._get_horizon_mapper(pipeline.time_match)
+    xy = mapper.build_xy(enriched, pattern, ensure_gates=False)
+
+    assert len(xy) == 2
+
+    expected_friday = [np.log(100.0 / 99.0), np.log(101.0 / 100.0)]
+    assert np.allclose(sorted(xy["returns_x"].values), sorted(expected_friday))
+
+    result = pipeline.backtest_threshold(enriched, pattern, threshold=0.01)
+    assert result["summary"].trades == 1
