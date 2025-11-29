@@ -39,13 +39,21 @@ class MomentumScreenEngine(BaseScreenEngine):
             raise TypeError("MomentumScreenEngine requires MomentumParams")
 
         screener = HistoricalScreener({ticker: data}, results_client=None, auto_write_results=False, verbose=False)
+        session_kwargs: Dict[str, Any] = {}
+        if params.session_starts:
+            session_kwargs["session_starts"] = params.session_starts
+        if params.session_ends:
+            session_kwargs["session_ends"] = params.session_ends
+        if params.sess_start_hrs is not None:
+            session_kwargs["sess_start_hrs"] = params.sess_start_hrs
+        if params.sess_start_minutes is not None:
+            session_kwargs["sess_start_minutes"] = params.sess_start_minutes
+        if params.sess_end_hrs is not None:
+            session_kwargs["sess_end_hrs"] = params.sess_end_hrs
+        if params.sess_end_minutes is not None:
+            session_kwargs["sess_end_minutes"] = params.sess_end_minutes
+
         results = screener.intraday_momentum_screen(
-            session_starts=params.session_starts,
-            session_ends=params.session_ends,
-            sess_start_hrs=params.sess_start_hrs or 0,
-            sess_start_minutes=params.sess_start_minutes or 0,
-            sess_end_hrs=params.sess_end_hrs,
-            sess_end_minutes=params.sess_end_minutes,
             st_momentum_days=params.st_momentum_days,
             test_vol=params.test_vol,
             months=params.months,
@@ -54,6 +62,7 @@ class MomentumScreenEngine(BaseScreenEngine):
             regime_col=params.regime_col,
             target_regimes=params.target_regimes,
             regime_settings=params.regime_settings,
+            **session_kwargs,
         )
         return {
             "stats": results.get(ticker, {}),

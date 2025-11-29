@@ -30,7 +30,9 @@ class EventScreenEngine(BaseScreenEngine):
         params: BaseScreenParams,
         regime_classifier: Optional[BaseRegimeClassifier] = None,
     ) -> Dict[str, Any]:
-        events = self.event_calendars.get(ticker) or self.event_calendars.get("default", pd.DataFrame())
+        events = self.event_calendars.get(ticker)
+        if events is None or (isinstance(events, pd.DataFrame) and events.empty):
+            events = self.event_calendars.get("default", pd.DataFrame())
         return {"events": events}
 
     def run(
