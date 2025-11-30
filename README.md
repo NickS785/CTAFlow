@@ -6,13 +6,13 @@ selection, and seasonality statistics designed for systematic workflows.
 
 ## Orderflow scan
 
-The `orderflow_scan` helper ingests raw ticks, resamples them into volume buckets,
+The `orderflow_screen` helper ingests raw ticks, resamples them into volume buckets,
 summarises intraday pressure, and runs seasonality tests with Benjamini–Hochberg false
 discovery rate control.
 
 ```python
 import pandas as pd
-from screeners.orderflow_scan import OrderflowParams, orderflow_scan
+from screeners.orderflow_screen import OrderflowParams, orderflow_screen
 
 # ticks must contain columns ['ts', 'AskVolume', 'BidVolume']
 # optional quote volume columns ['ask_vol', 'bid_vol'] are supported for quote-share metrics
@@ -28,7 +28,7 @@ params = OrderflowParams(
     vpin_window=50,
     cadence_target=50,
 )
-results = orderflow_scan(tick_source, ["ZC_F", "ZS_F"], params)
+results = orderflow_screen(tick_source, ["ZC_F", "ZS_F"], params)
 ```
 
 Each symbol entry returns:
@@ -57,7 +57,7 @@ Run the scanner directly from the command line by pointing it to a directory of 
 Parquet tick files (file names are resolved via `{symbol}` substitution):
 
 ```bash
-python -m screeners.orderflow_scan --symbols ZC_F ZS_F \
+python -m screeners.orderflow_screen --symbols ZC_F ZS_F \
     --session 08:30 13:20 --tz America/Chicago --bucket auto \
     --ticks-path "data/{symbol}.csv"
 ```
