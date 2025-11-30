@@ -110,7 +110,7 @@ class EventParams(BaseScreenParams):
     """
     Configuration for event (data release) screeners.
 
-    This is a light wrapper; the heavy lifting lives in :mod:`CTAFlow.screeners.data_release_screener`.
+    This is a light wrapper; the heavy lifting lives in :mod:`CTAFlow.screeners.event_screener`.
     """
 
     screen_type: str = SCREEN_EVENT
@@ -130,3 +130,10 @@ class EventParams(BaseScreenParams):
     fdr_alpha: float = 0.05
     corr_threshold: float = 0.25
     z_threshold: float = 2.0
+
+    # Optional orderflow/tick integration
+    use_orderflow: bool = False
+    use_tick_data: bool = False
+    orderflow_window_pre_minutes: int = 5
+    orderflow_window_post_minutes: int = 15
+    orderflow_bucket_volume: int = 100

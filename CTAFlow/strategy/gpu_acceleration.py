@@ -18,6 +18,8 @@ import threading
 from contextlib import nullcontext
 from typing import Dict, Optional, Tuple, Union
 
+import logging
+
 import numpy as np
 
 try:  # Pandas is optional in some lightweight environments
@@ -26,6 +28,15 @@ except Exception:  # pragma: no cover - defensive import for optional dependency
     pd = None
 
 # Try to import CuPy for GPU acceleration
+_logger = logging.getLogger(__name__)
+
+
+def _notify_gpu_fallback(reason: str) -> None:
+    """Log a single-line warning when GPU acceleration is unavailable."""
+
+    _logger.warning("GPU acceleration unavailable (%s); falling back to CPU", reason)
+
+
 try:
     import cupy as cp
     # Verify GPU is actually available
@@ -33,16 +44,18 @@ try:
         _ = cp.cuda.runtime.getDeviceCount()
         GPU_AVAILABLE = True
         GPU_DEVICE_COUNT = cp.cuda.runtime.getDeviceCount()
-    except cp.cuda.runtime.CUDARuntimeError:
+    except cp.cuda.runtime.CUDARuntimeError as exc:
         # CUDA runtime not available
         cp = np  # type: ignore
         GPU_AVAILABLE = False
         GPU_DEVICE_COUNT = 0
+        _notify_gpu_fallback(str(exc))
 except ImportError:
     # CuPy not installed
     cp = np  # type: ignore
     GPU_AVAILABLE = False
     GPU_DEVICE_COUNT = 0
+    _notify_gpu_fallback("CuPy not installed")
 
 __all__ = [
     'GPU_AVAILABLE',
