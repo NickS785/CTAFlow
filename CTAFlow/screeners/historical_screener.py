@@ -1997,7 +1997,7 @@ class HistoricalScreener:
         st_momentum: pd.Series,
         full_session_returns: pd.Series,
     ) -> Dict[str, float]:
-        """Calculate correlations between different momentum measures."""
+        """Calculate correlations between different momentum measures using GPU batch operations."""
         # Align series
         combined = pd.DataFrame({
             'open': opening_returns,
@@ -2016,25 +2016,69 @@ class HistoricalScreener:
                 'close_vs_rest_pvalue': np.nan,
             }
 
-        # Correlation between opening and closing momentum
-        open_close_corr, open_close_pval = stats.pearsonr(combined['open'], combined['close'])
-
-        # Correlation between opening momentum and short-term momentum
-        open_st_corr, _ = stats.pearsonr(combined['open'], combined['st_mom'])
-
-        # Correlation between closing momentum and short-term momentum
-        close_st_corr, _ = stats.pearsonr(combined['close'], combined['st_mom'])
-
+        # Calculate rest of session first (needed for batch)
         rest_of_session = combined['full'] - combined['close']
-        if len(rest_of_session.unique()) <= 1:
-            close_rest_corr = np.nan
-            close_rest_pval = np.nan
-        else:
-            try:
-                close_rest_corr, close_rest_pval = stats.pearsonr(combined['close'], rest_of_session)
-            except ValueError:
+
+        # Use GPU batch correlation for all correlations at once
+        # Prepare batch: rows are different y series to correlate
+        try:
+            from ..utils.gpu_utils import gpu_batch_pearsonr
+
+            # Batch correlations with 'close' as reference (base case)
+            y_batch_close = np.vstack([
+                combined['open'].values,  # open_close
+                combined['st_mom'].values,  # close_st_mom
+                rest_of_session.values if len(rest_of_session.unique()) > 1 else np.full(len(rest_of_session), np.nan)
+            ])
+
+            close_corrs, close_pvals = gpu_batch_pearsonr(
+                combined['close'].values,
+                y_batch_close,
+                use_gpu=self.use_gpu,
+                device_id=self.gpu_device_id,
+                return_pvalues=True
+            )
+
+            # Separate batch result with 'open' as reference
+            y_batch_open = np.vstack([combined['st_mom'].values])
+            open_corrs, _ = gpu_batch_pearsonr(
+                combined['open'].values,
+                y_batch_open,
+                use_gpu=self.use_gpu,
+                device_id=self.gpu_device_id,
+                return_pvalues=False
+            )
+
+            # Extract results from batched calculations
+            open_close_corr = close_corrs[0]
+            open_close_pval = close_pvals[0]
+            close_st_corr = close_corrs[1]
+            open_st_corr = open_corrs[0]
+
+            if len(rest_of_session.unique()) > 1:
+                close_rest_corr = close_corrs[2]
+                close_rest_pval = close_pvals[2]
+            else:
                 close_rest_corr = np.nan
                 close_rest_pval = np.nan
+
+        except Exception as e:
+            # Fallback to CPU scipy if GPU fails
+            self.logger.debug(f"GPU batch correlation failed, using CPU fallback: {e}")
+
+            open_close_corr, open_close_pval = stats.pearsonr(combined['open'], combined['close'])
+            open_st_corr, _ = stats.pearsonr(combined['open'], combined['st_mom'])
+            close_st_corr, _ = stats.pearsonr(combined['close'], combined['st_mom'])
+
+            if len(rest_of_session.unique()) <= 1:
+                close_rest_corr = np.nan
+                close_rest_pval = np.nan
+            else:
+                try:
+                    close_rest_corr, close_rest_pval = stats.pearsonr(combined['close'], rest_of_session)
+                except ValueError:
+                    close_rest_corr = np.nan
+                    close_rest_pval = np.nan
 
         return {
             'open_close_corr': float(open_close_corr),
@@ -2047,35 +2091,123 @@ class HistoricalScreener:
         }
 
     def _analyze_momentum_by_dayofweek(
-            self, df: pd.DataFrame, col_name: str = "log_return"
-    ) -> pd.DataFrame:
+            self,
+            opening_returns: pd.Series,
+            closing_returns: pd.Series,
+            full_session_returns: pd.Series,
+            st_momentum: pd.Series
+    ) -> Dict[str, pd.DataFrame]:
         """
-        [PERFORMANCE FIX: Use GroupBy instead of for-loop]
-        Analyzes momentum (mean, t-stat) by the day of the week.
+        Analyzes momentum by day of week for multiple return types using GPU batch operations.
+
+        Parameters
+        ----------
+        opening_returns : pd.Series
+            Opening momentum returns indexed by date
+        closing_returns : pd.Series
+            Closing momentum returns indexed by date
+        full_session_returns : pd.Series
+            Full session returns indexed by date
+        st_momentum : pd.Series
+            Short-term momentum values indexed by date
+
+        Returns
+        -------
+        Dict[str, pd.DataFrame]
+            Dictionary with keys: 'opening', 'closing', 'full_session', 'st_momentum'
+            Each DataFrame contains columns: day_of_week, mean, std, t_stat, p_value, count, skew
         """
-        if df.empty or col_name not in df.columns:
-            return pd.DataFrame()
+        from ..utils.gpu_utils import gpu_batch_ttest
 
-        # Pre-calculate weekday as an integer (0=Monday to 6=Sunday)
-        if 'weekday' not in df.columns:
-            df['weekday'] = df.index.weekday  # Fast vectorized operation
+        # Combine all series into a single DataFrame
+        combined = pd.DataFrame({
+            'opening': opening_returns,
+            'closing': closing_returns,
+            'full_session': full_session_returns,
+            'st_momentum': st_momentum
+        })
 
-        # Group by weekday and calculate stats in one pass
-        grouped = df.groupby('weekday')[col_name]
+        # Drop rows where all values are NaN
+        combined = combined.dropna(how='all')
 
-        stats_df = grouped.agg(['mean', 'std', 'count', 'skew']).reset_index()
-        stats_df.rename(columns={'weekday': 'day_of_week'}, inplace=True)
+        if combined.empty:
+            return {
+                'opening': pd.DataFrame(),
+                'closing': pd.DataFrame(),
+                'full_session': pd.DataFrame(),
+                'st_momentum': pd.DataFrame()
+            }
 
-        # Calculate T-statistic for each day
-        stats_df['t_stat'] = stats_df['mean'] / (stats_df['std'] / np.sqrt(stats_df['count']))
+        # Add weekday column
+        combined['weekday'] = combined.index.weekday
 
-        # Calculate P-value
-        stats_df['p_value'] = stats.t.sf(np.abs(stats_df['t_stat']), stats_df['count'] - 1) * 2
+        results = {}
 
-        # Map weekday integer to name for display
-        stats_df['day_of_week'] = stats_df['day_of_week'].map(calendar.day_name)
+        for col_name in ['opening', 'closing', 'full_session', 'st_momentum']:
+            # Group by weekday and calculate basic stats
+            grouped = combined.groupby('weekday')[col_name]
+            stats_df = grouped.agg(['mean', 'std', 'count', 'skew']).reset_index()
+            stats_df.rename(columns={'weekday': 'day_of_week'}, inplace=True)
 
-        return stats_df
+            # Use GPU batch t-tests for all days simultaneously
+            day_data = []
+            valid_days = []
+            for dow in range(7):
+                mask = combined['weekday'] == dow
+                day_values = combined.loc[mask, col_name].dropna().values
+                if len(day_values) > 1:  # Need at least 2 samples for t-test
+                    day_data.append(day_values)
+                    valid_days.append(dow)
+
+            if day_data:
+                # Pad arrays to same length for batch processing
+                max_len = max(len(arr) for arr in day_data)
+                padded_data = []
+                for arr in day_data:
+                    if len(arr) < max_len:
+                        padded = np.full(max_len, np.nan)
+                        padded[:len(arr)] = arr
+                        padded_data.append(padded)
+                    else:
+                        padded_data.append(arr)
+
+                # Batch t-test on GPU
+                batch_array = np.array(padded_data)
+                try:
+                    t_stats, p_values = gpu_batch_ttest(
+                        batch_array,
+                        popmean=0.0,
+                        use_gpu=self.use_gpu,
+                        device_id=self.gpu_device_id
+                    )
+
+                    # Map results back to stats_df
+                    for i, dow in enumerate(valid_days):
+                        row_idx = stats_df[stats_df['day_of_week'] == dow].index
+                        if len(row_idx) > 0:
+                            stats_df.loc[row_idx, 't_stat'] = t_stats[i]
+                            stats_df.loc[row_idx, 'p_value'] = p_values[i]
+                except Exception as e:
+                    # CPU fallback
+                    for i, dow in enumerate(valid_days):
+                        row_idx = stats_df[stats_df['day_of_week'] == dow].index
+                        if len(row_idx) > 0:
+                            data = day_data[i]
+                            t_stat = np.mean(data) / (np.std(data, ddof=1) / np.sqrt(len(data)))
+                            p_value = stats.t.sf(np.abs(t_stat), len(data) - 1) * 2
+                            stats_df.loc[row_idx, 't_stat'] = t_stat
+                            stats_df.loc[row_idx, 'p_value'] = p_value
+            else:
+                # No valid days - compute manually
+                stats_df['t_stat'] = stats_df['mean'] / (stats_df['std'] / np.sqrt(stats_df['count']))
+                stats_df['p_value'] = stats.t.sf(np.abs(stats_df['t_stat']), stats_df['count'] - 1) * 2
+
+            # Map weekday integer to name for display
+            stats_df['day_of_week'] = stats_df['day_of_week'].map(calendar.day_name)
+
+            results[col_name] = stats_df
+
+        return results
     def _analyze_volatility_patterns(
         self,
         opening_returns: pd.Series,
@@ -2149,11 +2281,27 @@ class HistoricalScreener:
                 'n': len(vol_df)
             }
 
-        # Test correlation between opening and closing volatility
-        opening_closing_corr, corr_pvalue = stats.pearsonr(
-            vol_df['opening_vol'],
-            vol_df['closing_vol']
-        )
+        # Test correlation between opening and closing volatility using GPU batch operation
+        from ..utils.gpu_utils import gpu_batch_pearsonr
+
+        try:
+            # Batch correlation (single correlation, but using GPU infrastructure)
+            y_batch = vol_df['closing_vol'].values.reshape(1, -1)
+            corrs, pvals = gpu_batch_pearsonr(
+                vol_df['opening_vol'].values,
+                y_batch,
+                use_gpu=self.use_gpu,
+                device_id=self.gpu_device_id,
+                return_pvalues=True
+            )
+            opening_closing_corr = corrs[0]
+            corr_pvalue = pvals[0]
+        except Exception as e:
+            # CPU fallback
+            opening_closing_corr, corr_pvalue = stats.pearsonr(
+                vol_df['opening_vol'],
+                vol_df['closing_vol']
+            )
 
         # Calculate z-scores for full session volatility to identify unusual days
         mean_vol = vol_df['full_session_vol'].mean()
@@ -2517,21 +2665,48 @@ class HistoricalScreener:
                 **months_meta,
             }
 
-        # Next-day correlation
+        # Batch correlations for next-day and next-week using GPU
+        from ..utils.gpu_utils import gpu_batch_pearsonr
+
         x_1d = daily_returns[:-1].values
         y_1d = daily_returns[1:].values
-        if len(x_1d) >= 20:
-            r_1d, p_1d = stats.pearsonr(x_1d, y_1d)
-        else:
-            r_1d, p_1d = np.nan, np.nan
 
         # Next-week correlation (5-7 business days)
         lag_week = 5
-        if len(daily_returns) > lag_week + 10:
-            x_1w = daily_returns[:-lag_week].values
-            y_1w = daily_returns[lag_week:].values
-            r_1w, p_1w = stats.pearsonr(x_1w, y_1w)
+        x_1w = daily_returns[:-lag_week].values if len(daily_returns) > lag_week + 10 else np.array([])
+        y_1w = daily_returns[lag_week:].values if len(daily_returns) > lag_week + 10 else np.array([])
+
+        # Batch process both correlations together
+        if len(x_1d) >= 20 and len(x_1w) >= 20:
+            try:
+                # Pad to same length for batch processing
+                max_len = max(len(y_1d), len(y_1w))
+                y_1d_padded = np.full(max_len, np.nan)
+                y_1d_padded[:len(y_1d)] = y_1d
+                y_1w_padded = np.full(max_len, np.nan)
+                y_1w_padded[:len(y_1w)] = y_1w
+                x_padded = np.full(max_len, np.nan)
+                x_padded[:len(x_1d)] = x_1d  # Use x_1d as reference (longer than x_1w)
+
+                y_batch = np.vstack([y_1d_padded, y_1w_padded])
+                corrs, pvals = gpu_batch_pearsonr(
+                    x_padded,
+                    y_batch,
+                    use_gpu=self.use_gpu,
+                    device_id=self.gpu_device_id,
+                    return_pvalues=True
+                )
+                r_1d, p_1d = corrs[0], pvals[0]
+                r_1w, p_1w = corrs[1], pvals[1]
+            except Exception as e:
+                # CPU fallback
+                r_1d, p_1d = stats.pearsonr(x_1d, y_1d)
+                r_1w, p_1w = stats.pearsonr(x_1w, y_1w)
+        elif len(x_1d) >= 20:
+            r_1d, p_1d = stats.pearsonr(x_1d, y_1d)
+            r_1w, p_1w = np.nan, np.nan
         else:
+            r_1d, p_1d = np.nan, np.nan
             r_1w, p_1w = np.nan, np.nan
 
         # Analyze which days of the week show the pattern most strongly
@@ -2599,10 +2774,25 @@ class HistoricalScreener:
         friday_returns = returns.loc[valid_mask]
         monday_returns = monday_values.loc[valid_mask]
 
+        # GPU-accelerated correlation calculation
+        from ..utils.gpu_utils import gpu_batch_pearsonr
+
         try:
-            corr, p_val = stats.pearsonr(friday_returns.values, monday_returns.values)
-        except ValueError:
-            corr, p_val = np.nan, np.nan
+            y_batch = monday_returns.values.reshape(1, -1)
+            corrs, pvals = gpu_batch_pearsonr(
+                friday_returns.values,
+                y_batch,
+                use_gpu=self.use_gpu,
+                device_id=self.gpu_device_id,
+                return_pvalues=True
+            )
+            corr, p_val = corrs[0], pvals[0]
+        except (ValueError, Exception):
+            # CPU fallback
+            try:
+                corr, p_val = stats.pearsonr(friday_returns.values, monday_returns.values)
+            except ValueError:
+                corr, p_val = np.nan, np.nan
 
         significance_level = 0.05
         if not np.isfinite(p_val) or p_val >= significance_level:
@@ -2680,20 +2870,62 @@ class HistoricalScreener:
                 'n': len(df)
             }
 
-        # Calculate correlation for each weekday
+        # Calculate correlation for each weekday using GPU batch processing
+        from ..utils.gpu_utils import gpu_batch_pearsonr
+
         weekday_correlations = {}
         weekday_counts = {}
 
+        # Prepare batch data for all weekdays
+        valid_days = []
+        day_data_list = []
         for dow in range(5):  # Monday=0 to Friday=4
             day_data = df[df['weekday'] == dow]
+            if len(day_data) >= 5:  # Need minimum 5 observations
+                valid_days.append(dow)
+                day_data_list.append(day_data)
 
-            if len(day_data) < 5:  # Need minimum 5 observations
-                continue
+        if valid_days:
+            # Batch process all weekday correlations
+            try:
+                # Pad arrays to same length
+                max_len = max(len(dd) for dd in day_data_list)
+                x_batch = []
+                y_batch = []
 
-            # Calculate correlation for this weekday
-            if len(day_data) >= 5:
-                try:
-                    corr, p_val = stats.pearsonr(day_data['lagged'], day_data['current'])
+                for day_data in day_data_list:
+                    lagged_padded = np.full(max_len, np.nan)
+                    current_padded = np.full(max_len, np.nan)
+                    lagged_padded[:len(day_data)] = day_data['lagged'].values
+                    current_padded[:len(day_data)] = day_data['current'].values
+                    x_batch.append(lagged_padded)
+                    y_batch.append(current_padded)
+
+                x_batch_array = np.array(x_batch)
+                y_batch_array = np.array(y_batch)
+
+                # Process in batch - correlate each x with corresponding y
+                # Since gpu_batch_pearsonr expects (n_samples,) and (n_features, n_samples),
+                # we need to process each weekday individually but can prepare them together
+                corrs_list = []
+                pvals_list = []
+                for i in range(len(valid_days)):
+                    y_single = y_batch_array[i].reshape(1, -1)
+                    corrs, pvals = gpu_batch_pearsonr(
+                        x_batch_array[i],
+                        y_single,
+                        use_gpu=self.use_gpu,
+                        device_id=self.gpu_device_id,
+                        return_pvalues=True
+                    )
+                    corrs_list.append(corrs[0])
+                    pvals_list.append(pvals[0])
+
+                # Map results back to weekday_correlations
+                for i, dow in enumerate(valid_days):
+                    day_data = day_data_list[i]
+                    corr = corrs_list[i]
+                    p_val = pvals_list[i]
                     months_meta = self._build_months_metadata(day_data.index, None)
                     weekday_correlations[weekday_names[dow]] = {
                         'correlation': float(corr),
@@ -2704,8 +2936,24 @@ class HistoricalScreener:
                         **months_meta,
                     }
                     weekday_counts[weekday_names[dow]] = len(day_data)
-                except:
-                    continue
+            except Exception as e:
+                # CPU fallback - process individually
+                for i, dow in enumerate(valid_days):
+                    day_data = day_data_list[i]
+                    try:
+                        corr, p_val = stats.pearsonr(day_data['lagged'], day_data['current'])
+                        months_meta = self._build_months_metadata(day_data.index, None)
+                        weekday_correlations[weekday_names[dow]] = {
+                            'correlation': float(corr),
+                            'p_value': float(p_val),
+                            'n': len(day_data),
+                            'significant': p_val < 0.05,
+                            'abs_correlation': abs(corr),
+                            **months_meta,
+                        }
+                        weekday_counts[weekday_names[dow]] = len(day_data)
+                    except:
+                        continue
 
         if not weekday_correlations:
             return {
@@ -3378,6 +3626,11 @@ class HistoricalScreener:
         monthly_ret = monthly_returns(price_df, price_col=price_col, use_log_returns=use_log_returns)
 
         lag_results = {}
+        from ..utils.gpu_utils import gpu_batch_pearsonr
+
+        # Prepare batch data for all lags
+        valid_lags = []
+        aligned_data_list = []
 
         for lag in range(1, n_lags + 1):
             # Shift returns by lag months
@@ -3399,16 +3652,60 @@ class HistoricalScreener:
                 }
                 continue
 
-            # Calculate correlation
-            corr, p_val = stats.pearsonr(aligned['current'], aligned[f'lag_{lag}'])
+            valid_lags.append(lag)
+            aligned_data_list.append(aligned)
 
-            lag_results[f'lag_{lag}_months'] = {
-                'n': len(aligned),
-                'correlation': float(corr),
-                'p_value': float(p_val),
-                'significant': p_val < 0.05,
-                'interpretation': self._interpret_lag_correlation(lag, corr, p_val)
-            }
+        # Batch process all lag correlations using GPU
+        if valid_lags:
+            try:
+                # Pad arrays to same length for batch processing
+                max_len = max(len(ad) for ad in aligned_data_list)
+                y_batch = []
+
+                for aligned in aligned_data_list:
+                    lag_col = [c for c in aligned.columns if c.startswith('lag_')][0]
+                    lagged_padded = np.full(max_len, np.nan)
+                    lagged_padded[:len(aligned)] = aligned[lag_col].values
+                    y_batch.append(lagged_padded)
+
+                # Use first aligned dataset's 'current' as reference (padded)
+                current_padded = np.full(max_len, np.nan)
+                current_padded[:len(aligned_data_list[0])] = aligned_data_list[0]['current'].values
+
+                y_batch_array = np.array(y_batch)
+                corrs, pvals = gpu_batch_pearsonr(
+                    current_padded,
+                    y_batch_array,
+                    use_gpu=self.use_gpu,
+                    device_id=self.gpu_device_id,
+                    return_pvalues=True
+                )
+
+                # Map results back to lag_results
+                for i, lag in enumerate(valid_lags):
+                    aligned = aligned_data_list[i]
+                    corr = corrs[i]
+                    p_val = pvals[i]
+                    lag_results[f'lag_{lag}_months'] = {
+                        'n': len(aligned),
+                        'correlation': float(corr),
+                        'p_value': float(p_val),
+                        'significant': p_val < 0.05,
+                        'interpretation': self._interpret_lag_correlation(lag, corr, p_val)
+                    }
+            except Exception as e:
+                # CPU fallback - process individually
+                for i, lag in enumerate(valid_lags):
+                    aligned = aligned_data_list[i]
+                    lag_col = [c for c in aligned.columns if c.startswith('lag_')][0]
+                    corr, p_val = stats.pearsonr(aligned['current'], aligned[lag_col])
+                    lag_results[f'lag_{lag}_months'] = {
+                        'n': len(aligned),
+                        'correlation': float(corr),
+                        'p_value': float(p_val),
+                        'significant': p_val < 0.05,
+                        'interpretation': self._interpret_lag_correlation(lag, corr, p_val)
+                    }
 
         # Summary
         significant_lags = [k for k, v in lag_results.items() if v.get('significant', False)]
