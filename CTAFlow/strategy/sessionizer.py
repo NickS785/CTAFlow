@@ -3,10 +3,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Mapping, MutableMapping, Optional
+from typing import Mapping, MutableMapping, Optional, TYPE_CHECKING
 
 import pandas as pd
-import exchange_calendars as xcals
+
+if TYPE_CHECKING:
+    import exchange_calendars as xcals
+else:
+    try:
+        import exchange_calendars as xcals
+    except (ImportError, AttributeError) as exc:
+        # exchange_calendars may have issues with some calendars (e.g., KoreanSolarHoliday)
+        # Import will be retried when Sessionizer is actually used
+        xcals = None  # type: ignore[assignment]
+        _xcals_import_error = exc
 
 __all__ = ["Sessionizer", "SessionizerConfig"]
 
@@ -27,6 +37,13 @@ class Sessionizer:
         self,
         config: SessionizerConfig | None = None,
     ) -> None:
+        # Check if exchange_calendars import failed
+        if xcals is None:
+            raise ImportError(
+                "exchange_calendars is required for Sessionizer but failed to import. "
+                f"Original error: {globals().get('_xcals_import_error', 'unknown')}"
+            )
+
         self.config = config or SessionizerConfig()
         self._calendar_cache: MutableMapping[str, xcals.ExchangeCalendar] = {}
 

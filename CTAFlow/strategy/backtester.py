@@ -10,6 +10,7 @@ from .prediction_to_position import PredictionToPosition
 from .gpu_acceleration import (
     GPU_AVAILABLE,
     gpu_backtest_threshold,
+    gpu_batch_threshold_sweep,
     to_cpu,
 )
 
@@ -390,6 +391,202 @@ class ScreenerBacktester:
                         result["group_field"] = group_field
 
         return result
+
+    def batch_threshold_sweep(
+        self,
+        xy: pd.DataFrame,
+        thresholds: Union[np.ndarray, List[float], Tuple[float, ...]],
+        *,
+        use_side_hint: bool = True,
+        group_field: Optional[str] = None,
+        prediction_resolver: Optional["PredictionToPosition"] = None,
+    ) -> Dict[float, Dict[str, Any]]:
+        """Run backtests for multiple threshold values with GPU batching.
+
+        Performs threshold backtesting for multiple threshold values simultaneously
+        when GPU is available, significantly reducing CPU↔GPU transfer overhead
+        compared to calling threshold() in a loop.
+
+        Args:
+            xy: DataFrame with returns_x, returns_y columns from ScreenerPipeline.build_xy
+            thresholds: Array of threshold values to test (e.g., [0.0, 0.5, 1.0, 1.5, 2.0])
+            use_side_hint: Whether to use correlation sign for position direction
+            group_field: Optional field for grouping trades
+            prediction_resolver: Optional resolver for overlapping predictions
+
+        Returns:
+            Dictionary mapping each threshold to a results dict (same format as threshold())
+
+        Example:
+            >>> tester = ScreenerBacktester(use_gpu=True)
+            >>> thresholds = [0.0, 0.5, 1.0, 1.5, 2.0]
+            >>> results = tester.batch_threshold_sweep(xy, thresholds)
+            >>> for threshold, result in results.items():
+            ...     print(f"Threshold {threshold}: Sharpe = {result['summary'].sharpe:.2f}")
+        """
+
+        # Convert thresholds to array
+        thresholds_array = np.asarray(thresholds, dtype=float).ravel()
+        if len(thresholds_array) == 0:
+            return {}
+
+        # Handle empty or invalid input
+        if xy.empty:
+            empty_result = self.threshold(
+                xy, threshold=0.0, use_side_hint=use_side_hint,
+                group_field=group_field, prediction_resolver=prediction_resolver
+            )
+            return {float(t): empty_result for t in thresholds_array}
+
+        # For single threshold, use regular method
+        if len(thresholds_array) == 1:
+            result = self.threshold(
+                xy, threshold=float(thresholds_array[0]), use_side_hint=use_side_hint,
+                group_field=group_field, prediction_resolver=prediction_resolver
+            )
+            return {float(thresholds_array[0]): result}
+
+        # Prepare data (same preprocessing as threshold method)
+        required = {"returns_x", "returns_y"}
+        missing = required.difference(xy.columns)
+        if missing:
+            raise KeyError(f"XY frame missing required columns: {sorted(missing)}")
+
+        valid_mask = xy[["returns_x", "returns_y"]].notna().all(axis=1)
+        frame = xy.loc[valid_mask]
+
+        if prediction_resolver is not None and not frame.empty:
+            frame = prediction_resolver.aggregate(frame)
+
+        if frame.empty:
+            empty_result = self.threshold(
+                xy, threshold=0.0, use_side_hint=use_side_hint,
+                group_field=group_field, prediction_resolver=prediction_resolver
+            )
+            return {float(t): empty_result for t in thresholds_array}
+
+        frame = self._collision_resolver.resolve(frame, group_field=group_field)
+        frame = self._drop_duplicate_rows(frame)
+
+        returns_x = np.asarray(frame["returns_x"].to_numpy(copy=False), dtype=float)
+        returns_y = np.asarray(frame["returns_y"].to_numpy(copy=False), dtype=float)
+
+        # Get GPU batch results
+        correlation = frame["correlation"] if (use_side_hint and "correlation" in frame.columns) else None
+
+        gpu_results = gpu_batch_threshold_sweep(
+            returns_x=returns_x,
+            returns_y=returns_y,
+            thresholds=thresholds_array,
+            correlation=correlation,
+            use_side_hint=use_side_hint,
+            use_gpu=self.use_gpu,
+            device_id=self.gpu_device_id,
+            stream=self.gpu_stream,
+        )
+
+        # Process each threshold's results into full backtest format
+        final_results = {}
+
+        for threshold_val, gpu_metrics in gpu_results.items():
+            positions_array = gpu_metrics['positions']
+            pnl_array = gpu_metrics['pnl']
+            cumulative_array = gpu_metrics['cumulative']
+            max_drawdown = gpu_metrics['max_drawdown']
+
+            # Create pandas series with proper index
+            if "ts_decision" in frame.columns:
+                trade_index = pd.to_datetime(frame["ts_decision"], errors="coerce")
+                trade_index.name = "ts_decision"
+            else:
+                trade_index = pd.Index(frame.index, name=frame.index.name or "row")
+
+            positions = pd.Series(positions_array, index=trade_index)
+            pnl = pd.Series(pnl_array, index=trade_index)
+            cumulative = pd.Series(cumulative_array, index=trade_index)
+            predictor_values = pd.Series(frame["returns_x"].to_numpy(), index=trade_index)
+
+            if "correlation" in frame.columns:
+                correlation_values = pd.Series(frame["correlation"].to_numpy(), index=trade_index)
+            else:
+                correlation_values = pd.Series(index=trade_index, dtype=float)
+
+            # Calculate summary statistics
+            signal_mask = positions_array != 0.0
+            trades = int(signal_mask.sum())
+
+            # Group-aware trade counting
+            if trades > 0:
+                trade_rows = frame.loc[signal_mask].copy()
+                if not trade_rows.empty and "ts_decision" in trade_rows.columns:
+                    trade_rows["_trade_day"] = pd.to_datetime(
+                        trade_rows["ts_decision"], errors="coerce"
+                    ).dt.normalize()
+                    trade_days = trade_rows["_trade_day"].dropna()
+                    if not trade_days.empty:
+                        if group_field and group_field in trade_rows.columns:
+                            combos = trade_rows.loc[trade_days.index, ["_trade_day", group_field]]
+                            valid = combos.dropna(subset=[group_field])
+                            trades = int(len(valid.drop_duplicates()))
+                            missing = combos[combos[group_field].isna()]
+                            if not missing.empty:
+                                trades += int(missing["_trade_day"].nunique())
+                        else:
+                            trades = int(trade_days.nunique())
+
+            mean_return = float(pnl.mean()) if not pnl.empty else 0.0
+            total_return = float(pnl.sum())
+            hit_rate = float((pnl > 0).mean()) if not pnl.empty else np.nan
+            std_return = float(pnl.std(ddof=0))
+            if std_return > 0:
+                sharpe = (mean_return / std_return) * np.sqrt(self.annualisation)
+            else:
+                sharpe = np.nan
+
+            # Monthly and daily aggregation
+            if isinstance(trade_index, pd.DatetimeIndex):
+                valid = trade_index.notna()
+                if valid.any():
+                    monthly = (
+                        pnl.iloc[valid]
+                        .groupby(trade_index[valid].to_period("M"))
+                        .sum()
+                        .astype(float)
+                    )
+                    daily_pnl = (
+                        pnl.iloc[valid]
+                        .groupby(trade_index[valid].normalize())
+                        .sum()
+                        .astype(float)
+                    )
+                else:
+                    monthly = pd.Series(dtype=float)
+                    daily_pnl = pd.Series(dtype=float)
+            else:
+                monthly = pd.Series(dtype=float)
+                daily_pnl = pd.Series(dtype=float)
+
+            summary = BacktestSummary(
+                total_return=total_return,
+                mean_return=mean_return,
+                hit_rate=hit_rate,
+                sharpe=float(sharpe) if np.isfinite(sharpe) else np.nan,
+                max_drawdown=max_drawdown,
+                trades=trades,
+            )
+
+            final_results[threshold_val] = {
+                "pnl": pnl,
+                "positions": positions,
+                "summary": summary,
+                "monthly": monthly,
+                "cumulative": cumulative,
+                "daily_pnl": daily_pnl,
+                "predictor_values": predictor_values,
+                "correlation": correlation_values,
+            }
+
+        return final_results
 
     @staticmethod
     def _drop_duplicate_rows(frame: pd.DataFrame) -> pd.DataFrame:

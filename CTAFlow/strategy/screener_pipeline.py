@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import numbers
 import re
+import time as time_module
 from collections.abc import Iterable as IterableABC, Sequence as SequenceABC
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import time as time_cls
@@ -41,6 +42,12 @@ if TYPE_CHECKING:  # pragma: no cover - import for type checking only
     from .sessionizer import Sessionizer
 
 from .backtester import ScreenerBacktester
+from .gpu_acceleration import (
+    GPU_AVAILABLE,
+    GPU_DEVICE_COUNT,
+    to_backend_array,
+    to_cpu,
+)
 from .prediction_to_position import PredictionToPosition
 
 __all__ = [
@@ -244,7 +251,8 @@ class ScreenerPipeline:
             feature sets on the same bar data.
         max_workers:
             Optional thread pool size used to parallelise independent pattern
-            extraction. When omitted, patterns are processed sequentially.
+            extraction. When omitted and GPU is enabled, automatically uses
+            GPU_DEVICE_COUNT workers. Otherwise, patterns are processed sequentially.
         """
 
         df = prepared_df if prepared_df is not None else self._prepare_bars(bars)
@@ -266,9 +274,21 @@ class ScreenerPipeline:
 
             return created_cols, {col: local_df[col] for col in created_cols}
 
-        if max_workers and len(items) > 1:
+        # Auto-determine worker count for GPU-enabled batching
+        worker_count = max_workers
+        if (
+            worker_count is None
+            and self.use_gpu
+            and GPU_AVAILABLE
+            and GPU_DEVICE_COUNT > 0
+            and len(items) > 1
+        ):
+            # Align pattern extraction parallelism with available GPUs when requested
+            worker_count = GPU_DEVICE_COUNT
+
+        if worker_count and len(items) > 1:
             collected: List[Tuple[List[str], Mapping[str, pd.Series]]] = []
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
                 future_map = {
                     executor.submit(_build_single, key, pattern): key for key, pattern in items
                 }
@@ -293,11 +313,7 @@ class ScreenerPipeline:
 
                 gate_columns.extend(created)
 
-        if gate_columns:
-            any_active = df[gate_columns].any(axis=1)
-            df["any_pattern_active"] = any_active.astype(np.int8)
-        else:
-            df["any_pattern_active"] = 0
+        self._combine_gate_columns(df, gate_columns)
 
         if allowed_months is not None:
             allowed_set = {int(month) for month in allowed_months}
@@ -305,7 +321,7 @@ class ScreenerPipeline:
             gate_cols = [col for col in df.columns if col.endswith("_gate")]
             if gate_cols:
                 df.loc[~month_mask, gate_cols] = 0
-                df["any_pattern_active"] = df[gate_cols].any(axis=1).astype(np.int8)
+                self._combine_gate_columns(df, gate_cols)
             else:
                 df["any_pattern_active"] = 0
 
@@ -490,6 +506,7 @@ class ScreenerPipeline:
         max_workers: Optional[int] = None,
         feature_workers: Optional[int] = None,
         build_xy_kwargs: Optional[Mapping[str, Any]] = None,
+        verbose: bool = False,
     ) -> Dict[str, Dict[str, Any]]:
         """Run pattern backtests individually using a thread pool.
 
@@ -499,6 +516,13 @@ class ScreenerPipeline:
         concurrent backtesting to avoid redundant gate construction. Results
         are ordered by ``total_return / max_drawdown`` and include a
         ``ranking_score`` field for convenience.
+
+        Parameters
+        ----------
+        verbose : bool
+            If True, prints progress updates including BacktestSummary for each
+            completed pattern. Shows pattern name, completion count, and key metrics
+            (return, Sharpe, drawdown, trades). Default: False.
         """
 
         items = list(self._items_from_patterns(patterns))
@@ -509,11 +533,31 @@ class ScreenerPipeline:
         results: Dict[str, Dict[str, Any]] = {}
         build_xy_params = dict(build_xy_kwargs) if build_xy_kwargs else {}
 
+        total_patterns = len(items)
+        completed_count = 0
+        start_time = time_module.time()
+
+        if verbose:
+            print(f"\n{'='*70}")
+            print(f"Starting concurrent backtests for {total_patterns} patterns")
+            print(f"Threshold: {threshold}, GPU: {self.use_gpu}, Workers: {max_workers or 'auto'}")
+            print(f"{'='*70}\n")
+
+        worker_count = feature_workers
+        if (
+            worker_count is None
+            and self.use_gpu
+            and GPU_AVAILABLE
+            and GPU_DEVICE_COUNT > 0
+        ):
+            # Align feature extraction parallelism with available GPUs when requested
+            worker_count = GPU_DEVICE_COUNT
+
         feature_sets = self.build_feature_sets(
             prepared,
             patterns,
             prepared_df=prepared,
-            max_workers=feature_workers,
+            max_workers=worker_count,
         )
 
         def _run_single(key: str, featured: pd.DataFrame, pattern: Mapping[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -540,7 +584,26 @@ class ScreenerPipeline:
                 key = future_map[future]
                 try:
                     pat_key, result = future.result()
+                    completed_count += 1
+
+                    # Print progress if verbose
+                    if verbose:
+                        summary = result.get('summary')
+                        if summary:
+                            elapsed = time_module.time() - start_time
+                            rate = completed_count / elapsed if elapsed > 0 else 0
+
+                            print(f"[{completed_count}/{total_patterns}] {pat_key}")
+                            print(f"  Return: {summary.total_return:>8.2%}  Sharpe: {summary.sharpe:>6.2f}  "
+                                  f"MaxDD: {summary.max_drawdown:>8.2%}  Trades: {summary.trades:>4d}")
+                            print(f"  Elapsed: {elapsed:.1f}s  Rate: {rate:.2f} patterns/sec\n")
+                        else:
+                            print(f"[{completed_count}/{total_patterns}] {pat_key} - No summary available\n")
+
                 except Exception as exc:  # pragma: no cover - defensive path
+                    completed_count += 1
+                    if verbose:
+                        print(f"[{completed_count}/{total_patterns}] {key} - FAILED: {exc}\n")
                     if self.log is not None and hasattr(self.log, "warning"):
                         self.log.warning("[screener_pipeline] backtest failed for '%s': %s", key, exc)
                     continue
@@ -552,6 +615,22 @@ class ScreenerPipeline:
             payload = dict(results.get(key, {}))
             payload["ranking_score"] = score
             ordered[key] = payload
+
+        if verbose:
+            total_time = time_module.time() - start_time
+            avg_rate = len(results) / total_time if total_time > 0 else 0
+            print(f"{'='*70}")
+            print(f"Completed {len(results)}/{total_patterns} backtests in {total_time:.1f}s")
+            print(f"Average rate: {avg_rate:.2f} patterns/sec")
+
+            if len(results) > 0:
+                print(f"\nTop 3 patterns by ranking score:")
+                for idx, (key, score) in enumerate(ranking[:3], 1):
+                    summary = ordered[key].get('summary')
+                    if summary:
+                        print(f"  {idx}. {key}: score={score:.4f}, return={summary.total_return:.2%}, "
+                              f"Sharpe={summary.sharpe:.2f}")
+            print(f"{'='*70}\n")
 
         return ordered
 
@@ -1016,6 +1095,24 @@ class ScreenerPipeline:
             return self._dispatch_momentum(df, pattern, key, pattern_type)
 
         return []
+
+    def _combine_gate_columns(self, df: pd.DataFrame, gate_columns: Sequence[str]) -> None:
+        """Compute any-pattern-active flags with optional GPU acceleration."""
+
+        if not gate_columns:
+            df["any_pattern_active"] = 0
+            return
+
+        if self.use_gpu and GPU_AVAILABLE:
+            gate_backend, xp = to_backend_array(
+                df[gate_columns], use_gpu=True, device_id=self.gpu_device_id
+            )
+            any_active_backend = xp.any(gate_backend, axis=1)
+            any_active = to_cpu(any_active_backend)
+        else:
+            any_active = df[gate_columns].any(axis=1)
+
+        df["any_pattern_active"] = np.asarray(any_active, dtype=np.int8)
 
     def _dispatch_seasonal(
         self,
