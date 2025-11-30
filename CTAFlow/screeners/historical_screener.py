@@ -3155,7 +3155,9 @@ class HistoricalScreener:
         if data is None or data.empty or not tz:
             return data
 
-        target_tz = pd.Index([], dtype='datetime64[ns]', tz=tz).tz
+        # pd.Index does not guarantee timezone-aware construction across pandas versions;
+        # use DatetimeIndex to reliably materialize the target timezone object.
+        target_tz = pd.DatetimeIndex([], tz=tz).tz
 
         idx = data.index if isinstance(data.index, pd.DatetimeIndex) else pd.to_datetime(data.index, errors='coerce')
 
