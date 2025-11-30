@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from dateutil import tz
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -115,6 +116,38 @@ def historical_screener(example_dataframe):
     from CTAFlow.screeners.historical_screener import HistoricalScreener
 
     return HistoricalScreener({"HO": example_dataframe}, file_mgr=None, verbose=False)
+
+
+def test_localize_dataframe_converts_intraday_index_and_ts(historical_screener):
+    screener = historical_screener
+    tz = "America/Chicago"
+
+    utc_index = pd.date_range("2024-05-01 12:00", periods=3, freq="h", tz="UTC")
+    df = pd.DataFrame({"ts": utc_index, "Close": np.arange(len(utc_index))}, index=utc_index)
+
+    localized = screener._localize_dataframe(df, tz)
+
+    expected_index = utc_index.tz_convert(tz)
+    pd.testing.assert_index_equal(localized.index, expected_index)
+
+    expected_ts = pd.Series(utc_index.tz_convert(tz), index=expected_index, name="ts")
+    pd.testing.assert_series_equal(localized["ts"], expected_ts)
+
+
+def test_localize_dataframe_accepts_tzinfo_object(historical_screener):
+    screener = historical_screener
+    tzinfo = tz.gettz("America/Chicago")
+
+    utc_index = pd.date_range("2024-06-01 00:00", periods=2, freq="h", tz="UTC")
+    df = pd.DataFrame({"ts": utc_index, "Close": np.arange(len(utc_index))}, index=utc_index)
+
+    localized = screener._localize_dataframe(df, tzinfo)
+
+    expected_index = utc_index.tz_convert(tzinfo)
+    pd.testing.assert_index_equal(localized.index, expected_index)
+
+    expected_ts = pd.Series(expected_index, index=expected_index, name="ts")
+    pd.testing.assert_series_equal(localized["ts"], expected_ts)
 
 
 def test_run_screens_returns_patterns_structure(historical_screener):
