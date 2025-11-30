@@ -200,7 +200,9 @@ class ScreenerBacktester:
                 )
 
                 raw_cumulative_backend = xp.cumsum(raw_pnl_backend)
-                rolling_max_backend = xp.maximum.accumulate(raw_cumulative_backend)
+                # Use custom cummax for CuPy compatibility (doesn't support maximum.accumulate)
+                from .gpu_acceleration import _cupy_cummax_1d
+                rolling_max_backend = _cupy_cummax_1d(raw_cumulative_backend, xp) if xp.__name__ == 'cupy' else xp.maximum.accumulate(raw_cumulative_backend)
                 drawdown_backend = raw_cumulative_backend - rolling_max_backend
 
             positions_array = to_cpu(raw_positions_backend)

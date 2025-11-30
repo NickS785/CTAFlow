@@ -96,6 +96,57 @@ def _resolve_stream(stream: Optional[object]) -> object:
     return cached
 
 
+def _cupy_cummax_1d(arr, xp):
+    """Compute cumulative maximum for 1D CuPy arrays.
+
+    CuPy doesn't support maximum.accumulate, so we implement it manually.
+
+    Args:
+        arr: 1D array
+        xp: array module (cp for CuPy)
+
+    Returns:
+        Cumulative maximum array of same shape
+    """
+    if arr.ndim != 1:
+        raise ValueError(f"Expected 1D array, got {arr.ndim}D")
+
+    result = xp.empty_like(arr)
+    result[0] = arr[0]
+
+    for i in range(1, len(arr)):
+        result[i] = xp.maximum(result[i-1], arr[i])
+
+    return result
+
+
+def _cupy_cummax(arr, xp):
+    """Compute cumulative maximum along axis 1 for CuPy arrays.
+
+    CuPy doesn't support maximum.accumulate, so we implement it manually.
+    This function is optimized for 2D arrays with axis=1.
+
+    Args:
+        arr: 2D array (n_thresholds, n_samples)
+        xp: array module (cp for CuPy)
+
+    Returns:
+        Cumulative maximum array of same shape
+    """
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2D array, got {arr.ndim}D")
+
+    # Use vectorized approach: for each position, take max of all previous values
+    # More efficient than looping
+    result = xp.empty_like(arr)
+    result[:, 0] = arr[:, 0]
+
+    for i in range(1, arr.shape[1]):
+        result[:, i] = xp.maximum(result[:, i-1], arr[:, i])
+
+    return result
+
+
 def get_gpu_info() -> dict:
     """Return information about GPU availability and capabilities."""
     if not GPU_AVAILABLE:
@@ -392,7 +443,8 @@ def gpu_batch_threshold_sweep(
 
             # Calculate cumulative PnL and drawdown for all thresholds
             cumulative_all = xp.cumsum(pnl_all, axis=1)
-            rolling_max_all = xp.maximum.accumulate(cumulative_all, axis=1)
+            # CuPy doesn't support maximum.accumulate, use manual implementation
+            rolling_max_all = xp.maximum.accumulate(cumulative_all, axis=1) if not use_gpu else _cupy_cummax(cumulative_all, xp)
             drawdown_all = cumulative_all - rolling_max_all
 
             # Vectorized drawdown minimums to reduce transfers
