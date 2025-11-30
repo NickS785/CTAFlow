@@ -3155,7 +3155,13 @@ class HistoricalScreener:
         if data is None or data.empty or not tz:
             return data
 
-        target_tz = pd.Index([], dtype='datetime64[ns]', tz=tz).tz
+        # pd.Index/DatetimeIndex construction can raise across pandas versions. Prefer a
+        # lightweight tzinfo derived from ``Timestamp.now`` and fall back to the raw
+        # input to avoid constructing empty indexes with ``tz=``.
+        try:
+            target_tz = pd.Timestamp.now(tz).tz
+        except Exception:
+            target_tz = tz
 
         idx = data.index if isinstance(data.index, pd.DatetimeIndex) else pd.to_datetime(data.index, errors='coerce')
 
