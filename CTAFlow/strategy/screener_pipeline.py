@@ -250,7 +250,8 @@ class ScreenerPipeline:
             feature sets on the same bar data.
         max_workers:
             Optional thread pool size used to parallelise independent pattern
-            extraction. When omitted, patterns are processed sequentially.
+            extraction. When omitted and GPU is enabled, automatically uses
+            GPU_DEVICE_COUNT workers. Otherwise, patterns are processed sequentially.
         """
 
         df = prepared_df if prepared_df is not None else self._prepare_bars(bars)
@@ -272,9 +273,21 @@ class ScreenerPipeline:
 
             return created_cols, {col: local_df[col] for col in created_cols}
 
-        if max_workers and len(items) > 1:
+        # Auto-determine worker count for GPU-enabled batching
+        worker_count = max_workers
+        if (
+            worker_count is None
+            and self.use_gpu
+            and GPU_AVAILABLE
+            and GPU_DEVICE_COUNT > 0
+            and len(items) > 1
+        ):
+            # Align pattern extraction parallelism with available GPUs when requested
+            worker_count = GPU_DEVICE_COUNT
+
+        if worker_count and len(items) > 1:
             collected: List[Tuple[List[str], Mapping[str, pd.Series]]] = []
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
                 future_map = {
                     executor.submit(_build_single, key, pattern): key for key, pattern in items
                 }
