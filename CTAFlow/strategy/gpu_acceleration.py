@@ -14,6 +14,7 @@ Usage:
 
 from __future__ import annotations
 
+import threading
 from contextlib import nullcontext
 from typing import Dict, Optional, Tuple, Union
 
@@ -39,7 +40,7 @@ try:
         GPU_DEVICE_COUNT = 0
 except ImportError:
     # CuPy not installed
-    cp = np  # type: ignoreFGix
+    cp = np  # type: ignore
     GPU_AVAILABLE = False
     GPU_DEVICE_COUNT = 0
 
@@ -56,6 +57,30 @@ __all__ = [
     'gpu_cumulative_pnl',
     'get_gpu_info',
 ]
+
+
+_stream_local = threading.local()
+
+
+def _resolve_stream(stream: Optional[object]) -> object:
+    """Return a context-manager-compatible CUDA stream, defaulting to thread-local.
+
+    Using a unique stream per thread prevents contention on the default stream when
+    multiple CPU workers submit GPU work concurrently. Falls back to a no-op context
+    manager when GPU acceleration is unavailable.
+    """
+
+    if not GPU_AVAILABLE or cp is np:
+        return nullcontext()
+
+    if stream is not None:
+        return stream
+
+    cached = getattr(_stream_local, "stream", None)
+    if cached is None:
+        cached = cp.cuda.Stream(non_blocking=True)
+        _stream_local.stream = cached
+    return cached
 
 
 def get_gpu_info() -> dict:
@@ -154,10 +179,9 @@ def to_backend_array(
         return base, np
 
     with cp.cuda.Device(device_id):
-        if stream is not None:
-            with stream:
-                return cp.asarray(base), cp
-        return cp.asarray(base), cp
+        stream_cm = _resolve_stream(stream)
+        with stream_cm:
+            return cp.asarray(base), cp
 
 
 def gpu_backtest_returns(
@@ -316,21 +340,21 @@ def gpu_batch_threshold_sweep(
 
     # GPU batch processing
     with cp.cuda.Device(device_id):
-        stream_cm = stream if stream is not None else nullcontext()
+        stream_cm = _resolve_stream(stream)
 
-        with stream_cm if hasattr(stream_cm, '__enter__') else nullcontext():
+        with stream_cm:
             # Transfer data to GPU once
-            rx, xp = _to_backend_array(
-                returns_x, use_gpu=True, device_id=device_id, stream=stream
+            rx, xp = to_backend_array(
+                returns_x, use_gpu=True, device_id=device_id, stream=stream_cm
             )
-            ry, _ = _to_backend_array(
-                returns_y, use_gpu=True, device_id=device_id, stream=stream
+            ry, _ = to_backend_array(
+                returns_y, use_gpu=True, device_id=device_id, stream=stream_cm
             )
 
             # Apply correlation adjustment if needed
             if correlation is not None and use_side_hint:
-                corr, _ = _to_backend_array(
-                    correlation, use_gpu=True, device_id=device_id, stream=stream
+                corr, _ = to_backend_array(
+                    correlation, use_gpu=True, device_id=device_id, stream=stream_cm
                 )
                 adjusted_x = rx * xp.sign(corr)
             else:
@@ -358,21 +382,25 @@ def gpu_batch_threshold_sweep(
             rolling_max_all = xp.maximum.accumulate(cumulative_all, axis=1)
             drawdown_all = cumulative_all - rolling_max_all
 
-            # Transfer results back to CPU and package into dict
+            # Vectorized drawdown minimums to reduce transfers
+            drawdown_mins = drawdown_all.min(axis=1)
+
+            # Transfer batched arrays back to CPU only once
+            positions_cpu_all = xp.asnumpy(positions_all)
+            pnl_cpu_all = xp.asnumpy(pnl_all)
+            cumulative_cpu_all = xp.asnumpy(cumulative_all)
+            drawdown_cpu_all = xp.asnumpy(drawdown_all)
+            drawdown_mins_cpu = xp.asnumpy(drawdown_mins)
+
+            # Package results from shared CPU buffers
             results = {}
             for i, threshold in enumerate(thresholds_array):
-                positions_cpu = xp.asnumpy(positions_all[i, :])
-                pnl_cpu = xp.asnumpy(pnl_all[i, :])
-                cumulative_cpu = xp.asnumpy(cumulative_all[i, :])
-                drawdown_cpu = xp.asnumpy(drawdown_all[i, :])
-                max_drawdown = float(xp.asnumpy(drawdown_all[i, :].min()))
-
                 results[float(threshold)] = {
-                    'positions': positions_cpu,
-                    'pnl': pnl_cpu,
-                    'cumulative': cumulative_cpu,
-                    'drawdown': drawdown_cpu,
-                    'max_drawdown': max_drawdown,
+                    'positions': positions_cpu_all[i, :],
+                    'pnl': pnl_cpu_all[i, :],
+                    'cumulative': cumulative_cpu_all[i, :],
+                    'drawdown': drawdown_cpu_all[i, :],
+                    'max_drawdown': float(drawdown_mins_cpu[i]) if len(drawdown_cpu_all[i, :]) > 0 else 0.0,
                 }
 
     return results

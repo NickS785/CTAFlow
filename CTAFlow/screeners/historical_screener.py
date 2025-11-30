@@ -634,6 +634,8 @@ class HistoricalScreener:
 
                     regime_meta = regime_meta_template
 
+                ticker_data = self._ensure_intraday_time_metadata(ticker_data)
+
                 price_col = 'Close' if 'Close' in ticker_data.columns else ticker_data.columns[0]
                 filtered_months_label = selected_months if selected_months else 'all'
                 n_observations = len(ticker_data)
@@ -940,6 +942,8 @@ class HistoricalScreener:
                         )
 
                     regime_meta = regime_meta_template
+
+                session_data = self._ensure_intraday_time_metadata(session_data)
 
                 # Determine price column
                 price_col = 'Close' if 'Close' in session_data.columns else session_data.columns[0]
@@ -1798,9 +1802,23 @@ class HistoricalScreener:
         price_col: str
     ) -> pd.DataFrame:
         """Extract data within session hours for each day."""
-        # Filter by time of day
-        mask = (data.index.time >= session_start) & (data.index.time <= session_end)
-        return data[mask]
+        data = self._ensure_intraday_time_metadata(data)
+
+        session_start_sec = self._time_to_seconds(session_start)
+        session_end_sec = self._time_to_seconds(session_end)
+
+        if session_start_sec <= session_end_sec:
+            mask = (
+                (data['_seconds_from_midnight'] >= session_start_sec)
+                & (data['_seconds_from_midnight'] <= session_end_sec)
+            )
+        else:
+            mask = (
+                (data['_seconds_from_midnight'] >= session_start_sec)
+                | (data['_seconds_from_midnight'] <= session_end_sec)
+            )
+
+        return data.loc[mask]
 
     def _calculate_session_window_returns(
             self,
@@ -1844,9 +1862,7 @@ class HistoricalScreener:
         if session_data.empty:
             return pd.Series(dtype=float)
 
-        # Create date column for grouping
-        session_data = session_data.copy()
-        session_data['date'] = session_data.index.date
+        session_data = self._ensure_intraday_time_metadata(session_data)
 
         # Helper to safely add/sub time without date issues
         def safe_time_offset(base_time, delta, subtract=False):
@@ -1896,14 +1912,21 @@ class HistoricalScreener:
 
         # Generate Mask
         # Handle cases where window wraps midnight (start > end)
-        if win_start <= win_end:
-            window_mask = (session_data.index.time >= win_start) & (session_data.index.time <= win_end)
+        win_start_sec = self._time_to_seconds(win_start)
+        win_end_sec = self._time_to_seconds(win_end)
+
+        if win_start_sec <= win_end_sec:
+            window_mask = (
+                session_data['_seconds_from_midnight'] >= win_start_sec
+                ) & (session_data['_seconds_from_midnight'] <= win_end_sec)
         else:
             # Window spans midnight (e.g., 23:30 to 00:30)
-            window_mask = (session_data.index.time >= win_start) | (session_data.index.time <= win_end)
+            window_mask = (
+                session_data['_seconds_from_midnight'] >= win_start_sec
+                ) | (session_data['_seconds_from_midnight'] <= win_end_sec)
 
         # Filter data
-        window_data = session_data[window_mask].copy()
+        window_data = session_data.loc[window_mask]
 
         if window_data.empty:
             return pd.Series(dtype=float)
@@ -1911,7 +1934,7 @@ class HistoricalScreener:
         # Group by date and get first/last prices
         # This implicitly handles "last available" data.
         # If window is 15:30-16:00 and data ends at 15:58, .last() returns 15:58 price.
-        grouped = window_data.groupby('date')[price_col]
+        grouped = window_data.groupby('_session_date')[price_col]
 
         # We must ensure we have enough data points in the window (optional validation)
         # For now, standard calculation:
@@ -1968,12 +1991,10 @@ class HistoricalScreener:
         if session_data.empty:
             return pd.Series(dtype=float)
 
-        # Create date column for grouping
-        session_data = session_data.copy()
-        session_data['date'] = session_data.index.date
+        session_data = self._ensure_intraday_time_metadata(session_data)
 
         # Group by date and get first/last prices for the full session
-        grouped = session_data.groupby('date')[price_col]
+        grouped = session_data.groupby('_session_date')[price_col]
         start_prices = grouped.first()
         end_prices = grouped.last()
 
@@ -2110,29 +2131,27 @@ class HistoricalScreener:
         }
 
         results = {}
+        weekday_grouped = df.groupby('weekday')
 
         for momentum_name, col_name in momentum_types.items():
             weekday_stats = {}
             weekday_data_for_anova = []
+            grouped_series = weekday_grouped[col_name]
 
-            for dow in range(5):  # Monday=0 to Friday=4
-                day_data = df[df['weekday'] == dow][col_name]
-
+            for dow, day_data in grouped_series:
                 if len(day_data) < 2:
                     continue
 
                 weekday_data_for_anova.append(day_data.values)
                 day_name = weekday_names[dow]
 
-                # Calculate statistics for this weekday
                 mean_val = day_data.mean()
                 std_val = day_data.std()
                 sharpe = mean_val / std_val if std_val > 0 else np.nan
-
-                # T-statistic against zero (testing if mean is significantly different from 0)
                 t_stat = mean_val / (std_val / np.sqrt(len(day_data))) if std_val > 0 else np.nan
 
-                rest_data = df[df['weekday'] != dow][col_name]
+                rest_mask = df['weekday'] != dow
+                rest_data = df.loc[rest_mask, col_name]
                 rest_mean = float(rest_data.mean()) if len(rest_data) else np.nan
                 p_value_vs_rest = np.nan
                 cohen_d = np.nan
@@ -2185,7 +2204,6 @@ class HistoricalScreener:
                     **months_meta,
                 }
 
-            # ANOVA test across weekdays for this momentum type
             if len(weekday_data_for_anova) >= 3:
                 from scipy.stats import f_oneway
                 f_stat, p_value = f_oneway(*weekday_data_for_anova)
@@ -2323,9 +2341,7 @@ class HistoricalScreener:
         vol_df['weekday'] = vol_df.index.dayofweek
 
         volatility_by_dow = {}
-        for dow in range(5):  # Monday=0 to Friday=4
-            day_data = vol_df[vol_df['weekday'] == dow]
-
+        for dow, day_data in vol_df.groupby('weekday'):
             if len(day_data) < 2:
                 continue
 
@@ -2410,13 +2426,10 @@ class HistoricalScreener:
         if 'Volume' not in session_data.columns:
             return {}
 
-        # Vectorized approach - create date column and group by
-        session_data_copy = session_data.copy()
-        session_data_copy['date'] = session_data_copy.index.date
-        session_data_copy['time'] = session_data_copy.index.time
+        session_data_copy = self._ensure_intraday_time_metadata(session_data)
 
         # Group by date and calculate aggregates in one operation
-        vol_grouped = session_data_copy.groupby('date')['Volume']
+        vol_grouped = session_data_copy.groupby('_session_date')['Volume']
         total_vols = vol_grouped.sum()
         avg_vols = vol_grouped.mean()
 
@@ -2424,7 +2437,7 @@ class HistoricalScreener:
             return {}
 
         # Analyze volume by time of day to find peaks and troughs
-        time_of_day_vol = session_data_copy.groupby('time')['Volume'].agg(['mean', 'std', 'count'])
+        time_of_day_vol = session_data_copy.groupby('_seconds_from_midnight')['Volume'].agg(['mean', 'std', 'count'])
         time_of_day_vol = time_of_day_vol[time_of_day_vol['count'] >= 5]  # Minimum 5 observations
 
         if len(time_of_day_vol) == 0:
@@ -2445,7 +2458,7 @@ class HistoricalScreener:
         peaks = time_of_day_vol.nlargest(3, 'mean')
         peak_times = [
             {
-                'time': str(time),
+                'time': self._seconds_to_time_label(time),
                 'avg_volume': float(row['mean']),
                 'z_score': float(row['z_score']),
                 'n_observations': int(row['count'])
@@ -2457,7 +2470,7 @@ class HistoricalScreener:
         troughs = time_of_day_vol.nsmallest(3, 'mean')
         trough_times = [
             {
-                'time': str(time),
+                'time': self._seconds_to_time_label(time),
                 'avg_volume': float(row['mean']),
                 'z_score': float(row['z_score']),
                 'n_observations': int(row['count'])
@@ -2467,11 +2480,11 @@ class HistoricalScreener:
 
         # Identify significant peaks (z-score > 1.0)
         significant_peaks = time_of_day_vol[time_of_day_vol['z_score'] > 1.0]
-        optimal_trading_times = [str(t) for t in significant_peaks.index]
+        optimal_trading_times = [self._seconds_to_time_label(t) for t in significant_peaks.index]
 
         # Identify times to avoid (z-score < -1.0)
         avoid_times_data = time_of_day_vol[time_of_day_vol['z_score'] < -1.0]
-        avoid_trading_times = [str(t) for t in avoid_times_data.index]
+        avoid_trading_times = [self._seconds_to_time_label(t) for t in avoid_times_data.index]
 
         # Calculate volume concentration (what % of volume occurs in top 20% of bars)
         top_20_pct_threshold = time_of_day_vol['mean'].quantile(0.8)
@@ -2540,12 +2553,13 @@ class HistoricalScreener:
         df = pd.DataFrame({'return': returns, 'weekday': returns.index.dayofweek})
         weekday_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
 
+        weekday_grouped = df.groupby('weekday')['return']
+
         # Returns analysis by weekday
         returns_stats = {}
         weekday_returns = []
 
-        for dow in range(5):  # Monday=0 to Friday=4
-            day_data = df[df['weekday'] == dow]['return']
+        for dow, day_data in weekday_grouped:
             if len(day_data) < 2:
                 continue
 
@@ -2575,8 +2589,7 @@ class HistoricalScreener:
         # Volatility analysis by weekday
         volatility_stats = {}
 
-        for dow in range(5):
-            day_data = df[df['weekday'] == dow]['return']
+        for dow, day_data in weekday_grouped:
             if len(day_data) < 2:
                 continue
 
@@ -2652,8 +2665,7 @@ class HistoricalScreener:
             daily_returns.index = pd.to_datetime(daily_returns.index)
 
         # Group by date
-        daily_returns = daily_returns.groupby(daily_returns.index.date).sum()
-        daily_returns.index = pd.to_datetime(daily_returns.index)
+        daily_returns = daily_returns.groupby(pd.Grouper(freq='1D')).sum()
 
         months_meta = self._build_months_metadata(daily_returns.index, tz)
 
@@ -3094,38 +3106,91 @@ class HistoricalScreener:
 
         return data.loc[data[regime_col].isin(target_regimes)]
 
+    @staticmethod
+    def _time_to_seconds(value: time) -> int:
+        return value.hour * 3600 + value.minute * 60 + value.second
+
+    @staticmethod
+    def _seconds_to_time_label(total_seconds: Union[int, float]) -> str:
+        seconds_int = int(total_seconds)
+        base_time = (datetime.min + timedelta(seconds=seconds_int)).time()
+        return base_time.strftime("%H:%M:%S")
+
+    def _ensure_intraday_time_metadata(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Ensure cached seconds-from-midnight and session date columns exist."""
+
+        if data is None or data.empty:
+            return data
+
+        result = data
+        copied = False
+
+        if not isinstance(result.index, pd.DatetimeIndex):
+            coerced_index = pd.to_datetime(result.index, errors='coerce')
+            if not coerced_index.equals(result.index):
+                result = result.copy()
+                result.index = coerced_index
+                copied = True
+
+        if '_seconds_from_midnight' not in result.columns:
+            if not copied:
+                result = result.copy()
+                copied = True
+            result['_seconds_from_midnight'] = (
+                result.index.hour * 3600
+                + result.index.minute * 60
+                + result.index.second
+            )
+
+        if '_session_date' not in result.columns:
+            if not copied:
+                result = result.copy()
+            result['_session_date'] = result.index.normalize()
+
+        return result
+
     def _localize_dataframe(self, data: pd.DataFrame, tz: Optional[str]) -> pd.DataFrame:
         """Return ``data`` with both the index and ``ts`` column converted to ``tz``."""
 
         if data is None or data.empty or not tz:
             return data
 
-        if isinstance(data.index, pd.DatetimeIndex):
-            idx = data.index
-        else:
-            idx = pd.to_datetime(data.index, errors='coerce')
+        target_tz = pd.Index([], dtype='datetime64[ns]', tz=tz).tz
+
+        idx = data.index if isinstance(data.index, pd.DatetimeIndex) else pd.to_datetime(data.index, errors='coerce')
+
+        index_matches = isinstance(idx, pd.DatetimeIndex) and idx.tz is not None and idx.tz == target_tz
+        ts_col = data['ts'] if 'ts' in data.columns else None
+
+        if index_matches and ts_col is not None:
+            ts_is_datetime = pd.api.types.is_datetime64_any_dtype(ts_col)
+            ts_matches = ts_is_datetime and getattr(ts_col.dt, 'tz', None) == target_tz
+            if ts_matches:
+                return data
+        elif index_matches and ts_col is None:
+            return data
 
         result = data.copy()
 
         try:
             if isinstance(idx, pd.DatetimeIndex):
                 if idx.tz is None:
-                    idx = idx.tz_localize(tz)
-                else:
-                    idx = idx.tz_convert(tz)
+                    idx = idx.tz_localize(target_tz)
+                elif idx.tz != target_tz:
+                    idx = idx.tz_convert(target_tz)
         except (TypeError, ValueError):
             pass
 
         result.index = idx
 
-        if 'ts' in result.columns:
-            ts = pd.to_datetime(result['ts'], errors='coerce')
+        if ts_col is not None:
+            ts = pd.to_datetime(ts_col, errors='coerce')
             if isinstance(ts, pd.Series):
                 try:
                     if ts.dt.tz is None:
-                        ts = ts.dt.tz_localize(tz)
-                    else:
-                        ts = ts.dt.tz_convert(tz)
+                        ts = ts.dt.tz_localize(target_tz)
+                    elif ts.dt.tz != target_tz:
+                        ts = ts.dt.tz_convert(target_tz)
                 except (TypeError, ValueError):
                     pass
                 result['ts'] = ts
