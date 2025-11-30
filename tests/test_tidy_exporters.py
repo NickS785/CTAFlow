@@ -1,7 +1,4 @@
-import math
-
 import numpy as np
-import pandas as pd
 
 from exporters.tidy import (
     export_all_tidy,
@@ -10,7 +7,7 @@ from exporters.tidy import (
     export_seasonality_tidy,
     write_tidy,
 )
-from stats_utils.fdr import fdr_bh
+from CTAFlow.stats_utils import fdr_bh
 
 
 def _sample_seasonality():

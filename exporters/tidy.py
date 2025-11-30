@@ -11,8 +11,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 import numpy as np
 import pandas as pd
 
-from stats_utils.fdr import fdr_bh
-from stats_utils.special import regularized_beta
+from CTAFlow.stats_utils import fdr_bh
+from CTAFlow.stats_utils import regularized_beta
 
 LOGGER = logging.getLogger(__name__)
 

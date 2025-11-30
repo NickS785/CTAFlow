@@ -97,7 +97,7 @@ def fdr_bh(
 
     Examples
     --------
-    >>> from stats_utils.fdr import fdr_bh
+    >>> from CTAFlow.stats_utils import fdr_bh
     >>> res = fdr_bh([0.01, 0.04, 0.03, 0.002, 0.5])
     >>> res.q_values.round(3)
     array([0.025, 0.05 , 0.05 , 0.01 , 0.5  ])

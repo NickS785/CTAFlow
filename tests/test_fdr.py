@@ -1,6 +1,6 @@
 import numpy as np
 
-from stats_utils.fdr import fdr_bh
+from CTAFlow.stats_utils import fdr_bh
 
 
 def test_fdr_bh_known_values():
