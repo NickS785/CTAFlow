@@ -295,12 +295,17 @@ class ScreenerPipeline:
                 for future in as_completed(future_map):
                     collected.append(future.result())
 
+            # OPTIMIZATION: Collect all new columns and assign once instead of per-column
+            all_new_columns = {}
             for created_cols, column_map in collected:
                 if not created_cols:
                     continue
                 gate_columns.extend(created_cols)
-                for col in created_cols:
-                    df[col] = column_map[col]
+                all_new_columns.update(column_map)
+
+            # Assign all new columns at once (much faster than repeated df[col] = ...)
+            if all_new_columns:
+                df = df.assign(**all_new_columns)
         else:
             for key, pattern in items:
                 created = []
@@ -1969,6 +1974,42 @@ class HorizonMapper:
         self.sessionizer = sessionizer
         self.weekend_exit_policy = weekend_exit_policy
 
+        # Performance optimization: Cache frequently recomputed time series
+        self._cached_ts: Optional[pd.DatetimeIndex] = None
+        self._cached_close: Optional[pd.Series] = None
+        self._cache_df_id: Optional[int] = None  # Track which DataFrame is cached
+
+    # ------------------------------------------------------------------
+    # Performance optimization: Cache management
+    # ------------------------------------------------------------------
+    def _get_cached_series(self, df: pd.DataFrame) -> Tuple[pd.DatetimeIndex, pd.Series]:
+        """Get or create cached ts and close series for this DataFrame.
+
+        Avoids rebuilding time series for every pattern/horizon calculation.
+        Uses id(df) to detect if DataFrame has changed.
+        """
+        df_id = id(df)
+
+        if self._cache_df_id == df_id and self._cached_ts is not None and self._cached_close is not None:
+            # Cache hit - return cached series
+            return self._cached_ts, self._cached_close
+
+        # Cache miss - rebuild and cache
+        ts = pd.to_datetime(df["ts"]).dt.tz_convert(self.tz)
+        close = pd.Series(df["close"].values, index=ts).astype(float).sort_index()
+
+        self._cached_ts = ts
+        self._cached_close = close
+        self._cache_df_id = df_id
+
+        return ts, close
+
+    def _clear_cache(self) -> None:
+        """Clear cached series (e.g., when processing new DataFrame)."""
+        self._cached_ts = None
+        self._cached_close = None
+        self._cache_df_id = None
+
     # ------------------------------------------------------------------
     # Logging helpers
     # ------------------------------------------------------------------
@@ -2301,9 +2342,9 @@ class HorizonMapper:
         if minutes <= 0:
             raise ValueError("minutes must be positive for intraday horizons")
 
-        ts = pd.to_datetime(df["ts"]).dt.tz_convert(self.tz)
-        close = pd.Series(df["close"].values, index=ts).astype(float)
-        close = close.sort_index()
+        # OPTIMIZATION: Use cached time series instead of rebuilding
+        ts, close = self._get_cached_series(df)
+
         delta = pd.Timedelta(minutes=minutes)
         future = close.reindex(close.index + delta)
         future.index = future.index - delta
@@ -2461,9 +2502,9 @@ class HorizonMapper:
         if minutes <= 0:
             raise ValueError("predictor minutes must be positive")
 
-        ts = pd.to_datetime(df["ts"]).dt.tz_convert(self.tz)
-        close = pd.Series(df["close"].values, index=ts).astype(float)
-        close = close.sort_index()
+        # OPTIMIZATION: Use cached time series instead of rebuilding
+        ts, close = self._get_cached_series(df)
+
         delta = pd.Timedelta(minutes=minutes)
         future = close.reindex(close.index + delta)
         future.index = future.index - delta
