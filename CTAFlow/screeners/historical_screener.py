@@ -1795,7 +1795,11 @@ class HistoricalScreener:
         return results
 
     def _extract_session_data(
-            self, data: pd.DataFrame, session_start: time, session_end: time
+            self,
+            data: pd.DataFrame,
+            session_start: time,
+            session_end: time,
+            price_col: Optional[str] = None,
     ) -> pd.DataFrame:
         """
         [PERFORMANCE FIX: No more data.index.time]
@@ -1834,47 +1838,106 @@ class HistoricalScreener:
         return data[mask]
 
     def _calculate_session_window_returns(
-            self,
-            data: pd.DataFrame,
-            session_start: time,
-            session_end: time,
-            price_col: str = "close",
-            return_col: str = "log_return",
-    ) -> pd.DataFrame:
+        self,
+        data: pd.DataFrame,
+        anchor_time: time,
+        window: timedelta,
+        price_col: str,
+        is_synthetic: bool,
+        *,
+        from_end: bool = False,
+        session_limit_start: Optional[time] = None,
+        session_limit_end: Optional[time] = None,
+    ) -> pd.Series:
+        """Compute per-session returns over a fixed intraday window.
+
+        Parameters
+        ----------
+        data : pd.DataFrame
+            Intraday bars already filtered to the session window.
+        anchor_time : time
+            Clock time used as the anchor for the window. When ``from_end`` is
+            False the window starts at ``anchor_time``; when True the window ends
+            at ``anchor_time``.
+        window : timedelta
+            Duration of the window to evaluate.
+        price_col : str
+            Column to use for price/spread values.
+        is_synthetic : bool
+            Whether the ticker is a synthetic spread (uses price differences
+            instead of log returns).
+        from_end : bool, optional
+            If True, measure the window backwards from ``anchor_time`` (used for
+            closing momentum). Defaults to False.
+        session_limit_start, session_limit_end : Optional[time]
+            Optional bounds that clamp the computed window to the known session
+            start/end times. This prevents negative window ranges when the
+            requested slice exceeds the session boundaries.
+
+        Returns
+        -------
+        pd.Series
+            Series of window returns indexed by session date.
         """
-        [PERFORMANCE FIX: Use Grouper]
-        Calculates daily session returns based on open/close prices within the
-        session window.
-        """
+
         if data.empty:
-            return pd.DataFrame()
+            return pd.Series(dtype=float)
 
-        # 1. Extract session bars
-        session_data = self._extract_session_data(data, session_start, session_end)
+        if not isinstance(data.index, pd.DatetimeIndex):
+            data = data.copy()
+            data.index = pd.to_datetime(data.index)
 
-        if session_data.empty:
-            return pd.DataFrame()
+        # Ensure timezone information is preserved for correct grouping
+        timestamps = data.index
+        tz = timestamps.tz
 
-        # 2. Group by calendar date using Grouper (fast C-based grouping)
-        grouped = session_data.groupby(pd.Grouper(freq="1D"))[price_col]
+        def _to_minutes(value: time) -> int:
+            return value.hour * 60 + value.minute
 
-        # 3. Calculate open (first price) and close (last price) of the session
-        session_open = grouped.first().dropna()
-        session_close = grouped.last().dropna()
+        anchor_minutes = _to_minutes(anchor_time)
+        window_minutes = int(window.total_seconds() // 60)
+        start_bound = anchor_minutes
+        end_bound = anchor_minutes + window_minutes
 
-        # 4. Merge results and calculate log return
-        returns = pd.concat(
-            [session_open.rename("open"), session_close.rename("close")], axis=1
-        ).dropna()
+        if from_end:
+            start_bound = anchor_minutes - window_minutes
+            end_bound = anchor_minutes
 
-        if returns.empty:
-            return pd.DataFrame()
+        if session_limit_start is not None:
+            start_bound = max(start_bound, _to_minutes(session_limit_start))
+        if session_limit_end is not None:
+            end_bound = min(end_bound, _to_minutes(session_limit_end))
 
-        # Calculate session return: log(close / open)
-        returns[return_col] = np.log(returns["close"] / returns["open"])
-        returns.index.name = "session_date"
+        minutes = data.index.hour * 60 + data.index.minute
+        mask = (minutes >= start_bound) & (minutes <= end_bound)
+        if not mask.any():
+            return pd.Series(dtype=float)
 
-        return returns[[return_col]]
+        session_series = pd.Series(dtype=float)
+        grouped = data.loc[mask].groupby(pd.Grouper(freq="1D"))
+
+        for session_date, frame in grouped:
+            if frame.empty:
+                continue
+            frame = frame.sort_index()
+            start_price = frame[price_col].iloc[0]
+            end_price = frame[price_col].iloc[-1]
+
+            if is_synthetic:
+                window_return = end_price - start_price
+            else:
+                if start_price <= 0 or end_price <= 0:
+                    continue
+                window_return = np.log(end_price / start_price)
+
+            ts = session_date
+            if tz is not None and ts.tzinfo is None:
+                ts = ts.tz_localize(tz)
+
+            session_series.loc[ts] = float(window_return)
+
+        return session_series.sort_index()
+
     def _calculate_full_session_returns(
         self,
         session_data: pd.DataFrame,
