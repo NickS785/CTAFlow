@@ -2047,35 +2047,124 @@ class HistoricalScreener:
         }
 
     def _analyze_momentum_by_dayofweek(
-            self, df: pd.DataFrame, col_name: str = "log_return"
-    ) -> pd.DataFrame:
+        self,
+        opening_returns: pd.Series,
+        closing_returns: pd.Series,
+        full_session_returns: pd.Series,
+        st_momentum: pd.Series,
+    ) -> Dict[str, Any]:
         """
-        [PERFORMANCE FIX: Use GroupBy instead of for-loop]
-        Analyzes momentum (mean, t-stat) by the day of the week.
+        Break down intraday momentum effects by weekday for each momentum variant.
+
+        Returns a mapping structured as expected by ``PatternExtractor`` where each
+        momentum type contains weekday statistics and ANOVA significance markers.
         """
-        if df.empty or col_name not in df.columns:
-            return pd.DataFrame()
 
-        # Pre-calculate weekday as an integer (0=Monday to 6=Sunday)
-        if 'weekday' not in df.columns:
-            df['weekday'] = df.index.weekday  # Fast vectorized operation
+        def _weekday_stats(series: pd.Series) -> Dict[str, Any]:
+            series = series.dropna()
+            if series.empty:
+                return {}
 
-        # Group by weekday and calculate stats in one pass
-        grouped = df.groupby('weekday')[col_name]
+            df = pd.DataFrame({
+                'value': series,
+                'weekday': series.index.dayofweek,
+            })
 
-        stats_df = grouped.agg(['mean', 'std', 'count', 'skew']).reset_index()
-        stats_df.rename(columns={'weekday': 'day_of_week'}, inplace=True)
+            grouped = df.groupby('weekday')['value']
+            weekday_map: Dict[str, Any] = {}
+            groups: List[np.ndarray] = []
 
-        # Calculate T-statistic for each day
-        stats_df['t_stat'] = stats_df['mean'] / (stats_df['std'] / np.sqrt(stats_df['count']))
+            for dow, values in grouped:
+                if len(values) < 2:
+                    continue
 
-        # Calculate P-value
-        stats_df['p_value'] = stats.t.sf(np.abs(stats_df['t_stat']), stats_df['count'] - 1) * 2
+                mean_val = float(values.mean())
+                std_val = float(values.std())
+                sharpe = float(mean_val / std_val) if std_val > 0 else np.nan
+                t_stat = float(mean_val / (std_val / np.sqrt(len(values)))) if std_val > 0 else np.nan
+                positive_pct = float((values > 0).sum() / len(values))
 
-        # Map weekday integer to name for display
-        stats_df['day_of_week'] = stats_df['day_of_week'].map(calendar.day_name)
+                rest = df.loc[df['weekday'] != dow, 'value']
+                if len(rest) >= 2 and values.std() > 0 and rest.std() > 0:
+                    ttest = stats.ttest_ind(values, rest, equal_var=False)
+                    pooled_std = np.sqrt(((len(values) - 1) * values.var() + (len(rest) - 1) * rest.var()) / (len(values) + len(rest) - 2))
+                    cohen_d = (mean_val - float(rest.mean())) / pooled_std if pooled_std > 0 else np.nan
+                    p_vs_rest = float(ttest.pvalue)
+                    significant_vs_rest = bool(p_vs_rest < 0.05 and abs(cohen_d) >= 0.35)
+                else:
+                    p_vs_rest = np.nan
+                    cohen_d = np.nan
+                    significant_vs_rest = False
 
-        return stats_df
+                weekday_map[calendar.day_name[dow]] = {
+                    'n': int(len(values)),
+                    'mean': mean_val,
+                    'std': std_val,
+                    'sharpe': sharpe,
+                    'positive_pct': positive_pct,
+                    'skew': float(values.skew()),
+                    't_stat': t_stat,
+                    'p_value_vs_rest': p_vs_rest,
+                    'cohen_d_vs_rest': cohen_d,
+                    'significant_vs_rest': significant_vs_rest,
+                }
+                groups.append(values.values)
+
+            if len(groups) >= 2:
+                try:
+                    f_stat, p_value = stats.f_oneway(*groups)
+                    anova_result = {
+                        'f_stat': float(f_stat),
+                        'p_value': float(p_value),
+                        'significant': bool(p_value < 0.05),
+                    }
+                except Exception:
+                    anova_result = None
+            else:
+                anova_result = None
+
+            if anova_result:
+                weekday_map['anova'] = anova_result
+
+            return weekday_map
+
+        momentum_series = {
+            'opening_momentum_by_dow': opening_returns,
+            'closing_momentum_by_dow': closing_returns,
+            'full_session_by_dow': full_session_returns,
+            'st_momentum_by_dow': st_momentum,
+        }
+
+        breakdown: Dict[str, Any] = {}
+        significant_patterns: List[Dict[str, Any]] = []
+        total_observations = 0
+        weekdays_analyzed = 0
+
+        for key, series in momentum_series.items():
+            stats_map = _weekday_stats(series)
+            if not stats_map:
+                continue
+
+            breakdown[key] = stats_map
+            total_observations = max(total_observations, len(series.dropna()))
+            weekdays_analyzed = max(weekdays_analyzed, len([k for k in stats_map.keys() if k != 'anova']))
+
+            anova = stats_map.get('anova')
+            if isinstance(anova, Mapping) and anova.get('significant'):
+                significant_patterns.append({
+                    'momentum_type': key.replace('_by_dow', ''),
+                    'f_stat': anova.get('f_stat'),
+                    'p_value': anova.get('p_value'),
+                })
+
+        if breakdown:
+            breakdown['summary'] = {
+                'total_observations': total_observations,
+                'n_weekdays_analyzed': weekdays_analyzed,
+                'significant_patterns': significant_patterns,
+            }
+
+        return breakdown
     def _analyze_volatility_patterns(
         self,
         opening_returns: pd.Series,
