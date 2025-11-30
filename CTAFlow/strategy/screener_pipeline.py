@@ -519,6 +519,10 @@ class ScreenerPipeline:
 
         Parameters
         ----------
+        max_workers : Optional[int]
+            Number of parallel workers for pattern backtesting. When GPU is enabled
+            and max_workers is None or 1, patterns are processed sequentially to
+            avoid thread/GPU contention. Set to a value >1 to force parallel execution.
         verbose : bool
             If True, prints progress updates including BacktestSummary for each
             completed pattern. Shows pattern name, completion count, and key metrics
@@ -538,9 +542,10 @@ class ScreenerPipeline:
         start_time = time_module.time()
 
         if verbose:
+            execution_mode = "GPU Sequential" if (self.use_gpu and GPU_AVAILABLE and (max_workers is None or max_workers == 1)) else f"ThreadPool ({max_workers or 'auto'} workers)"
             print(f"\n{'='*70}")
             print(f"Starting concurrent backtests for {total_patterns} patterns")
-            print(f"Threshold: {threshold}, GPU: {self.use_gpu}, Workers: {max_workers or 'auto'}")
+            print(f"Threshold: {threshold}, GPU: {self.use_gpu}, Mode: {execution_mode}")
             print(f"{'='*70}\n")
 
         worker_count = feature_workers
@@ -574,16 +579,15 @@ class ScreenerPipeline:
             )
             return key, outcome
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {
-                executor.submit(_run_single, key, feature_sets[key], pattern): key
-                for key, pattern in items
-                if key in feature_sets
-            }
-            for future in as_completed(future_map):
-                key = future_map[future]
+        # When GPU is enabled, run sequentially to avoid thread/GPU contention
+        # ThreadPoolExecutor adds overhead and can cause GPU serialization issues
+        if self.use_gpu and GPU_AVAILABLE and (max_workers is None or max_workers == 1):
+            # Sequential GPU execution with progress updates
+            for key, pattern in items:
+                if key not in feature_sets:
+                    continue
                 try:
-                    pat_key, result = future.result()
+                    pat_key, result = _run_single(key, feature_sets[key], pattern)
                     completed_count += 1
 
                     # Print progress if verbose
@@ -608,6 +612,42 @@ class ScreenerPipeline:
                         self.log.warning("[screener_pipeline] backtest failed for '%s': %s", key, exc)
                     continue
                 results[pat_key] = result
+        else:
+            # Use ThreadPoolExecutor for CPU or when explicitly requested
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(_run_single, key, feature_sets[key], pattern): key
+                    for key, pattern in items
+                    if key in feature_sets
+                }
+                for future in as_completed(future_map):
+                    key = future_map[future]
+                    try:
+                        pat_key, result = future.result()
+                        completed_count += 1
+
+                        # Print progress if verbose
+                        if verbose:
+                            summary = result.get('summary')
+                            if summary:
+                                elapsed = time_module.time() - start_time
+                                rate = completed_count / elapsed if elapsed > 0 else 0
+
+                                print(f"[{completed_count}/{total_patterns}] {pat_key}")
+                                print(f"  Return: {summary.total_return:>8.2%}  Sharpe: {summary.sharpe:>6.2f}  "
+                                      f"MaxDD: {summary.max_drawdown:>8.2%}  Trades: {summary.trades:>4d}")
+                                print(f"  Elapsed: {elapsed:.1f}s  Rate: {rate:.2f} patterns/sec\n")
+                            else:
+                                print(f"[{completed_count}/{total_patterns}] {pat_key} - No summary available\n")
+
+                    except Exception as exc:  # pragma: no cover - defensive path
+                        completed_count += 1
+                        if verbose:
+                            print(f"[{completed_count}/{total_patterns}] {key} - FAILED: {exc}\n")
+                        if self.log is not None and hasattr(self.log, "warning"):
+                            self.log.warning("[screener_pipeline] backtest failed for '%s': %s", key, exc)
+                        continue
+                    results[pat_key] = result
 
         ranking = ScreenerBacktester.rank_results(results)
         ordered: Dict[str, Dict[str, Any]] = {}
