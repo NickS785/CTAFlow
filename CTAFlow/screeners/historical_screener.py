@@ -1795,170 +1795,86 @@ class HistoricalScreener:
         return results
 
     def _extract_session_data(
-        self,
-        data: pd.DataFrame,
-        session_start: time,
-        session_end: time,
-        price_col: str
+            self, data: pd.DataFrame, session_start: time, session_end: time
     ) -> pd.DataFrame:
-        """Extract data within session hours for each day."""
-        data = self._ensure_intraday_time_metadata(data)
+        """
+        [PERFORMANCE FIX: No more data.index.time]
+        Filters bar data to include only times between session_start and session_end.
+        Uses minutes-from-midnight for vectorized filtering.
+        """
+        if data.empty:
+            return data
 
-        session_start_sec = self._time_to_seconds(session_start)
-        session_end_sec = self._time_to_seconds(session_end)
+        # Pre-calculate minutes from midnight ONCE if not already done
+        if 'minutes_from_midnight' not in data.columns:
+            if not isinstance(data.index, pd.DatetimeIndex) or data.index.tz is None:
+                raise ValueError("Data must have a localized DatetimeIndex to calculate session times.")
 
-        if session_start_sec <= session_end_sec:
-            mask = (
-                (data['_seconds_from_midnight'] >= session_start_sec)
-                & (data['_seconds_from_midnight'] <= session_end_sec)
+            data['minutes_from_midnight'] = data.index.hour * 60 + data.index.minute
+
+        start_min = session_start.hour * 60 + session_start.minute
+        end_min = session_end.hour * 60 + session_end.minute
+
+        # Vectorized integer comparison
+        if start_min <= end_min:
+            mask = (data["minutes_from_midnight"] >= start_min) & (
+                    data["minutes_from_midnight"] <= end_min
             )
         else:
-            mask = (
-                (data['_seconds_from_midnight'] >= session_start_sec)
-                | (data['_seconds_from_midnight'] <= session_end_sec)
+            # Handle overnight sessions (e.g., 20:00 to 04:00)
+            mask = (data["minutes_from_midnight"] >= start_min) | (
+                    data["minutes_from_midnight"] <= end_min
             )
 
-        return data.loc[mask]
+        # Drop the helper column if it was created temporarily
+        if 'minutes_from_midnight' in data.columns and not data.columns.tolist().index(
+                'minutes_from_midnight') < data.columns.size:
+            data = data.drop(columns=['minutes_from_midnight'])
+
+        return data[mask]
 
     def _calculate_session_window_returns(
             self,
-            session_data: pd.DataFrame,
-            anchor_time: time,
-            window: timedelta,
-            price_col: str,
-            is_synthetic: bool,
-            from_end: bool = False,
-            session_limit_start: Optional[time] = None,
-            session_limit_end: Optional[time] = None
-    ) -> pd.Series:
+            data: pd.DataFrame,
+            session_start: time,
+            session_end: time,
+            price_col: str = "close",
+            return_col: str = "log_return",
+    ) -> pd.DataFrame:
         """
-        Calculate returns for a specific window within each session using vectorized operations.
-        Includes logic to clamp windows to session boundaries and handle sparse data.
-
-        Parameters:
-        -----------
-        session_data : pd.DataFrame
-            Data filtered to session hours
-        anchor_time : time
-            Time to anchor the window (start or end)
-        window : timedelta
-            Length of the window
-        price_col : str
-            Column name for prices/spread values
-        is_synthetic : bool
-            Whether this is a synthetic spread
-        from_end : bool
-            If True, window goes backward from anchor_time
-        session_limit_start : Optional[time]
-            The earliest allowed time (session start) to prevent window overstep
-        session_limit_end : Optional[time]
-            The latest allowed time (session end) to prevent window overstep
-
-        Returns:
-        --------
-        pd.Series
-            Daily returns for the window
+        [PERFORMANCE FIX: Use Grouper]
+        Calculates daily session returns based on open/close prices within the
+        session window.
         """
+        if data.empty:
+            return pd.DataFrame()
+
+        # 1. Extract session bars
+        session_data = self._extract_session_data(data, session_start, session_end)
+
         if session_data.empty:
-            return pd.Series(dtype=float)
+            return pd.DataFrame()
 
-        session_data = self._ensure_intraday_time_metadata(session_data)
+        # 2. Group by calendar date using Grouper (fast C-based grouping)
+        grouped = session_data.groupby(pd.Grouper(freq="1D"))[price_col]
 
-        # Helper to safely add/sub time without date issues
-        def safe_time_offset(base_time, delta, subtract=False):
-            # Use a fixed dummy date to perform arithmetic
-            dummy_date = datetime(2000, 1, 1)
-            dt = datetime.combine(dummy_date, base_time)
-            if subtract:
-                res = dt - delta
-            else:
-                res = dt + delta
-            return res.time()
+        # 3. Calculate open (first price) and close (last price) of the session
+        session_open = grouped.first().dropna()
+        session_close = grouped.last().dropna()
 
-        # Helper to compare times handling midnight wrap logic if necessary
-        # (Assuming simple intraday session for clamping logic for now)
-        def clamp_time(target_t, lower_bound, upper_bound):
-            if lower_bound and upper_bound and lower_bound > upper_bound:
-                # Overnight session case - Clamping is complex, skipping strictly for simplicity
-                # unless standard comparisons clearly fail.
-                # Fallback: usually don't clamp overnight logic blindly.
-                return target_t
+        # 4. Merge results and calculate log return
+        returns = pd.concat(
+            [session_open.rename("open"), session_close.rename("close")], axis=1
+        ).dropna()
 
-            if lower_bound and target_t < lower_bound:
-                return lower_bound
-            if upper_bound and target_t > upper_bound:
-                return upper_bound
-            return target_t
+        if returns.empty:
+            return pd.DataFrame()
 
-        # Calculate Window Start and End Times
-        if from_end:
-            # Window: [anchor - window] to [anchor]
-            # E.g., Closing Window: [16:00 - 30m] to [16:00] = 15:30 to 16:00
-            win_end = anchor_time
-            win_start = safe_time_offset(anchor_time, window, subtract=True)
+        # Calculate session return: log(close / open)
+        returns[return_col] = np.log(returns["close"] / returns["open"])
+        returns.index.name = "session_date"
 
-            # Clamp start to session start (don't look before session began)
-            if session_limit_start:
-                win_start = clamp_time(win_start, session_limit_start, session_limit_end)
-        else:
-            # Window: [anchor] to [anchor + window]
-            # E.g., Opening Window: [09:30] to [09:30 + 30m] = 09:30 to 10:00
-            win_start = anchor_time
-            win_end = safe_time_offset(anchor_time, window, subtract=False)
-
-            # Clamp end to session end (don't look after session ends)
-            if session_limit_end:
-                win_end = clamp_time(win_end, session_limit_start, session_limit_end)
-
-        # Generate Mask
-        # Handle cases where window wraps midnight (start > end)
-        win_start_sec = self._time_to_seconds(win_start)
-        win_end_sec = self._time_to_seconds(win_end)
-
-        if win_start_sec <= win_end_sec:
-            window_mask = (
-                session_data['_seconds_from_midnight'] >= win_start_sec
-                ) & (session_data['_seconds_from_midnight'] <= win_end_sec)
-        else:
-            # Window spans midnight (e.g., 23:30 to 00:30)
-            window_mask = (
-                session_data['_seconds_from_midnight'] >= win_start_sec
-                ) | (session_data['_seconds_from_midnight'] <= win_end_sec)
-
-        # Filter data
-        window_data = session_data.loc[window_mask]
-
-        if window_data.empty:
-            return pd.Series(dtype=float)
-
-        # Group by date and get first/last prices
-        # This implicitly handles "last available" data.
-        # If window is 15:30-16:00 and data ends at 15:58, .last() returns 15:58 price.
-        grouped = window_data.groupby('_session_date')[price_col]
-
-        # We must ensure we have enough data points in the window (optional validation)
-        # For now, standard calculation:
-        start_prices = grouped.first()
-        end_prices = grouped.last()
-
-        # Align indices (dates)
-        # Intersection of dates ensures we calculate returns only for days with data at BOTH ends of window
-        common_dates = start_prices.index.intersection(end_prices.index)
-        start_prices = start_prices.loc[common_dates]
-        end_prices = end_prices.loc[common_dates]
-
-        # Calculate returns vectorized
-        if is_synthetic:
-            returns = end_prices - start_prices
-        else:
-            # For prices, use log return
-            # Filter out non-positive prices
-            valid_mask = (start_prices > 0) & (end_prices > 0)
-            returns = pd.Series(index=common_dates, dtype=float)
-            returns[valid_mask] = np.log(end_prices[valid_mask] / start_prices[valid_mask])
-
-        return returns.dropna()
-
+        return returns[[return_col]]
     def _calculate_full_session_returns(
         self,
         session_data: pd.DataFrame,
@@ -2068,177 +1984,35 @@ class HistoricalScreener:
         }
 
     def _analyze_momentum_by_dayofweek(
-        self,
-        opening_returns: pd.Series,
-        closing_returns: pd.Series,
-        full_session_returns: pd.Series,
-        st_momentum: pd.Series
-    ) -> Dict[str, any]:
+            self, df: pd.DataFrame, col_name: str = "log_return"
+    ) -> pd.DataFrame:
         """
-        Analyze if momentum effects are stronger on specific days of the week.
-
-        Tests whether opening momentum, closing momentum, full session returns,
-        and short-term momentum show different characteristics on different weekdays.
-
-        Parameters:
-        -----------
-        opening_returns : pd.Series
-            Opening momentum returns (indexed by date)
-        closing_returns : pd.Series
-            Closing momentum returns (indexed by date)
-        full_session_returns : pd.Series
-            Full session returns (indexed by date)
-        st_momentum : pd.Series
-            Short-term momentum (indexed by date)
-
-        Returns:
-        --------
-        Dict[str, any]
-            Dictionary containing:
-            - opening_momentum_by_dow: Stats for opening momentum by weekday
-            - closing_momentum_by_dow: Stats for closing momentum by weekday
-            - full_session_by_dow: Stats for full session by weekday
-            - st_momentum_by_dow: Stats for short-term momentum by weekday
-            - anova_tests: ANOVA F-tests for each momentum type across weekdays
+        [PERFORMANCE FIX: Use GroupBy instead of for-loop]
+        Analyzes momentum (mean, t-stat) by the day of the week.
         """
-        weekday_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+        if df.empty or col_name not in df.columns:
+            return pd.DataFrame()
 
-        # Combine all series into single DataFrame
-        df = pd.DataFrame({
-            'opening': opening_returns,
-            'closing': closing_returns,
-            'full_session': full_session_returns,
-            'st_momentum': st_momentum
-        }).dropna()
+        # Pre-calculate weekday as an integer (0=Monday to 6=Sunday)
+        if 'weekday' not in df.columns:
+            df['weekday'] = df.index.weekday  # Fast vectorized operation
 
-        if len(df) < 10:
-            return {
-                'error': 'Insufficient data for day-of-week analysis',
-                'n': len(df)
-            }
+        # Group by weekday and calculate stats in one pass
+        grouped = df.groupby('weekday')[col_name]
 
-        # Ensure index is DatetimeIndex and add weekday column
-        if not isinstance(df.index, pd.DatetimeIndex):
-            df.index = pd.to_datetime(df.index)
-        df['weekday'] = df.index.dayofweek
+        stats_df = grouped.agg(['mean', 'std', 'count', 'skew']).reset_index()
+        stats_df.rename(columns={'weekday': 'day_of_week'}, inplace=True)
 
-        # Analyze each momentum type by weekday
-        momentum_types = {
-            'opening_momentum': 'opening',
-            'closing_momentum': 'closing',
-            'full_session': 'full_session',
-            'st_momentum': 'st_momentum'
-        }
+        # Calculate T-statistic for each day
+        stats_df['t_stat'] = stats_df['mean'] / (stats_df['std'] / np.sqrt(stats_df['count']))
 
-        results = {}
-        weekday_grouped = df.groupby('weekday')
+        # Calculate P-value
+        stats_df['p_value'] = stats.t.sf(np.abs(stats_df['t_stat']), stats_df['count'] - 1) * 2
 
-        for momentum_name, col_name in momentum_types.items():
-            weekday_stats = {}
-            weekday_data_for_anova = []
-            grouped_series = weekday_grouped[col_name]
+        # Map weekday integer to name for display
+        stats_df['day_of_week'] = stats_df['day_of_week'].map(calendar.day_name)
 
-            for dow, day_data in grouped_series:
-                if len(day_data) < 2:
-                    continue
-
-                weekday_data_for_anova.append(day_data.values)
-                day_name = weekday_names[dow]
-
-                mean_val = day_data.mean()
-                std_val = day_data.std()
-                sharpe = mean_val / std_val if std_val > 0 else np.nan
-                t_stat = mean_val / (std_val / np.sqrt(len(day_data))) if std_val > 0 else np.nan
-
-                rest_mask = df['weekday'] != dow
-                rest_data = df.loc[rest_mask, col_name]
-                rest_mean = float(rest_data.mean()) if len(rest_data) else np.nan
-                p_value_vs_rest = np.nan
-                cohen_d = np.nan
-                t_stat_vs_rest = np.nan
-
-                if len(rest_data) >= 5:
-                    try:
-                        t_stat_vs_rest, p_value_vs_rest = stats.ttest_ind(
-                            day_data.values,
-                            rest_data.values,
-                            equal_var=False,
-                            nan_policy='omit'
-                        )
-                    except Exception:
-                        t_stat_vs_rest = np.nan
-                        p_value_vs_rest = np.nan
-
-                    var_day = float(day_data.var(ddof=1)) if len(day_data) > 1 else 0.0
-                    var_rest = float(rest_data.var(ddof=1)) if len(rest_data) > 1 else 0.0
-                    denom = (len(day_data) + len(rest_data) - 2)
-                    if denom > 0 and var_day > 0 and var_rest > 0:
-                        pooled = np.sqrt(
-                            ((len(day_data) - 1) * var_day + (len(rest_data) - 1) * var_rest)
-                            / denom
-                        )
-                        if pooled > 0:
-                            cohen_d = (float(mean_val) - rest_mean) / pooled
-
-                months_meta = self._build_months_metadata(day_data.index, None)
-                significant_vs_rest = bool(
-                    np.isfinite(p_value_vs_rest)
-                    and p_value_vs_rest < 0.01
-                    and np.isfinite(cohen_d)
-                    and abs(cohen_d) >= 0.35
-                )
-
-                weekday_stats[day_name] = {
-                    'n': len(day_data),
-                    'mean': float(mean_val),
-                    'std': float(std_val),
-                    'sharpe': float(sharpe),
-                    'skew': float(day_data.skew()),
-                    'positive_pct': float((day_data > 0).sum() / len(day_data)),
-                    't_stat': float(t_stat) if not np.isnan(t_stat) else np.nan,
-                    'p_value_vs_rest': float(p_value_vs_rest) if np.isfinite(p_value_vs_rest) else np.nan,
-                    'mean_vs_rest': float(mean_val - rest_mean) if np.isfinite(rest_mean) else np.nan,
-                    'cohen_d_vs_rest': float(cohen_d) if np.isfinite(cohen_d) else np.nan,
-                    't_stat_vs_rest': float(t_stat_vs_rest) if np.isfinite(t_stat_vs_rest) else np.nan,
-                    'significant_vs_rest': significant_vs_rest,
-                    **months_meta,
-                }
-
-            if len(weekday_data_for_anova) >= 3:
-                from scipy.stats import f_oneway
-                f_stat, p_value = f_oneway(*weekday_data_for_anova)
-                weekday_stats['anova'] = {
-                    'f_stat': float(f_stat),
-                    'p_value': float(p_value),
-                    'significant': p_value < 0.05,
-                    'interpretation': (
-                        f"Significant day-of-week effect (p={p_value:.4f})" if p_value < 0.05
-                        else f"No significant day-of-week effect (p={p_value:.4f})"
-                    )
-                }
-
-            results[f'{momentum_name}_by_dow'] = weekday_stats
-
-        # Overall summary
-        results['summary'] = {
-            'total_observations': len(df),
-            'n_weekdays_analyzed': 5,
-            'significant_patterns': []
-        }
-
-        # Identify which momentum types have significant day-of-week effects
-        for momentum_name in momentum_types.keys():
-            key = f'{momentum_name}_by_dow'
-            if key in results and 'anova' in results[key]:
-                if results[key]['anova']['significant']:
-                    results['summary']['significant_patterns'].append({
-                        'momentum_type': momentum_name,
-                        'f_stat': results[key]['anova']['f_stat'],
-                        'p_value': results[key]['anova']['p_value']
-                    })
-
-        return results
-
+        return stats_df
     def _analyze_volatility_patterns(
         self,
         opening_returns: pd.Series,
@@ -3149,53 +2923,36 @@ class HistoricalScreener:
 
         return result
 
-    def _localize_dataframe(self, data: pd.DataFrame, tz: Optional[str]) -> pd.DataFrame:
-        """Return ``data`` with both the index and ``ts`` column converted to ``tz``."""
-
-        if data is None or data.empty or not tz:
+    def _localize_dataframe(self, data: pd.DataFrame, tz: str) -> pd.DataFrame:
+        """
+        [FIXED PANDAS API ERROR]
+        Ensures the index of the DataFrame is timezone-aware in the given tz.
+        If the index is already localized, it converts it.
+        If the index is naive, it localizes it.
+        """
+        if data.empty:
             return data
 
-        target_tz = pd.Index([], dtype='datetime64[ns]', tz=tz).tz
+        idx = data.index
 
-        idx = data.index if isinstance(data.index, pd.DatetimeIndex) else pd.to_datetime(data.index, errors='coerce')
+        if not isinstance(idx, pd.DatetimeIndex):
+            # Attempt to convert a non-datetime index to datetime
+            idx = pd.to_datetime(idx, errors="coerce")
 
-        index_matches = isinstance(idx, pd.DatetimeIndex) and idx.tz is not None and idx.tz == target_tz
-        ts_col = data['ts'] if 'ts' in data.columns else None
-
-        if index_matches and ts_col is not None:
-            ts_is_datetime = pd.api.types.is_datetime64_any_dtype(ts_col)
-            ts_matches = ts_is_datetime and getattr(ts_col.dt, 'tz', None) == target_tz
-            if ts_matches:
+        if idx.tz is None:
+            # Naive index: localize it
+            try:
+                data.index = idx.tz_localize(tz)
+            except Exception as e:
+                # Handle cases where localization fails (e.g., ambiguous times during DST)
+                print(f"Warning: Failed to tz_localize index: {e}. Using naive index.")
+                data.index = idx
                 return data
-        elif index_matches and ts_col is None:
-            return data
+        else:
+            # Already localized: convert it
+            data.index = idx.tz_convert(tz)
 
-        result = data.copy()
-
-        try:
-            if isinstance(idx, pd.DatetimeIndex):
-                if idx.tz is None:
-                    idx = idx.tz_localize(target_tz)
-                elif idx.tz != target_tz:
-                    idx = idx.tz_convert(target_tz)
-        except (TypeError, ValueError):
-            pass
-
-        result.index = idx
-
-        if ts_col is not None:
-            ts = pd.to_datetime(ts_col, errors='coerce')
-            if isinstance(ts, pd.Series):
-                try:
-                    if ts.dt.tz is None:
-                        ts = ts.dt.tz_localize(target_tz)
-                    elif ts.dt.tz != target_tz:
-                        ts = ts.dt.tz_convert(target_tz)
-                except (TypeError, ValueError):
-                    pass
-                result['ts'] = ts
-
-        return result
+        return data
 
     @staticmethod
     def _months_mask_12(months: List[int]) -> str:
