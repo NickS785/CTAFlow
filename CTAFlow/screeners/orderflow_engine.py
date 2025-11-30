@@ -10,11 +10,11 @@ import pandas as pd
 from .base_engine import BaseScreenEngine
 from .params import BaseScreenParams, OrderflowParams as EngineOrderflowParams
 from .screener_types import SCREEN_ORDERFLOW
-from . import orderflow_scan
+from . import orderflow_screen
 
 
 class OrderflowScreenEngine(BaseScreenEngine):
-    """Adapter that delegates to :func:`CTAFlow.screeners.orderflow_scan.orderflow_scan`."""
+    """Adapter that delegates to :func:`CTAFlow.screeners.orderflow_screen.orderflow_screen`."""
 
     screen_type = SCREEN_ORDERFLOW
 
@@ -37,7 +37,7 @@ class OrderflowScreenEngine(BaseScreenEngine):
         if not isinstance(params, EngineOrderflowParams):
             raise TypeError("OrderflowScreenEngine requires OrderflowParams")
 
-        native_params = orderflow_scan.OrderflowParams(
+        native_params = orderflow_screen.OrderflowParams(
             session_start=params.session_start,
             session_end=params.session_end,
             tz=params.tz,
@@ -52,7 +52,7 @@ class OrderflowScreenEngine(BaseScreenEngine):
             name=params.name,
         )
 
-        results = orderflow_scan.orderflow_scan({ticker: data}, native_params)
+        results = orderflow_screen.orderflow_screen({ticker: data}, native_params)
         return {
             "stats": results.get(ticker, {}),
             "patterns": [],

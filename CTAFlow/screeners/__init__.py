@@ -1,4 +1,4 @@
-from .orderflow_scan import OrderflowParams, OrderflowScanner, orderflow_scan
+from .orderflow_screen import OrderflowParams, OrderflowScanner, orderflow_screen
 from .session_first_hours import SessionFirstHoursParams, run_session_first_hours
 from .pattern_extractor import PatternExtractor, PatternSummary
 from .screener_types import (
@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover - allow usage without heavy data depende
 __all__ = [
     'OrderflowParams',
     'OrderflowScanner',
-    'orderflow_scan',
+    'orderflow_screen',
     'SessionFirstHoursParams',
     'run_session_first_hours',
     'HistoricalScreener',
