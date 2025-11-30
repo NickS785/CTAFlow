@@ -50,6 +50,8 @@ class OrderflowScreenEngine(BaseScreenEngine):
             month_filter=params.month_filter,
             season_filter=params.season_filter,
             name=params.name,
+            use_gpu=params.use_gpu,
+            gpu_device_id=params.gpu_device_id,
         )
 
         results = orderflow_screen.orderflow_screen({ticker: data}, native_params)

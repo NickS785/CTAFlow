@@ -103,6 +103,8 @@ class OrderflowParams(BaseScreenParams):
     month_filter: Optional[Sequence[int]] = None
     season_filter: Optional[Sequence[str]] = None
     name: Optional[str] = None
+    use_gpu: bool = False
+    gpu_device_id: int = 0
 
 
 @dataclass
