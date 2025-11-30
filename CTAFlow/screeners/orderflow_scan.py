@@ -19,7 +19,7 @@ import logging
 
 from ..utils.session import filter_session_ticks
 from ..utils.volume_bucket import auto_bucket_size, ticks_to_volume_buckets
-from stats_utils.fdr import fdr_bh
+from ..stats_utils import fdr_bh
 
 __all__ = ["OrderflowParams", "OrderflowScanner", "orderflow_scan"]
 
