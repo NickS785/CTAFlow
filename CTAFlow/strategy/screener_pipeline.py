@@ -628,12 +628,16 @@ class ScreenerPipeline:
                         self.log.warning("[screener_pipeline] backtest failed for '%s': %s", key, exc)
                     continue
 
+            # Enable parallel prep for data preparation (uses CPU multiprocessing)
+            # Let it auto-detect CPU count since we're in GPU batch mode
             batched = tester.batch_patterns(
                 xy_map,
                 threshold=threshold,
                 use_side_hint=use_side_hint,
                 group_field=None,
                 prediction_resolver=resolver,
+                parallel_prep=True,  # Enable parallel data preparation
+                max_workers=None,  # Auto-detect CPU count for multiprocessing
             )
 
             for pat_key, result in batched.items():

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from contextlib import nullcontext
+from functools import lru_cache
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
@@ -244,12 +246,12 @@ class ScreenerBacktester:
                     )
                     trades = int(member_lists.apply(len).sum())
                 elif prepared.group_field and prepared.group_field in trade_rows.columns:
+                    # Vectorized group counting - avoid duplicate row operations
                     combos = trade_rows.loc[trade_days.index, ["_trade_day", prepared.group_field]]
-                    valid = combos.dropna(subset=[prepared.group_field])
-                    trades = int(len(valid.drop_duplicates()))
-                    missing = combos[combos[prepared.group_field].isna()]
-                    if not missing.empty:
-                        trades += int(missing["_trade_day"].nunique())
+                    valid_mask = combos[prepared.group_field].notna()
+                    trades = int(combos[valid_mask].drop_duplicates().shape[0])
+                    if not valid_mask.all():
+                        trades += int(combos.loc[~valid_mask, "_trade_day"].nunique())
                 else:
                     trades = int(trade_days.nunique())
 
@@ -451,15 +453,16 @@ class ScreenerBacktester:
                         )
                         trade_counts = trade_day_counts.add(fallback_counts, fill_value=0).astype(int)
 
-                        formatted: Dict[Any, Dict[str, float]] = {}
-                        for member in pnl_sum.index:
-                            total_return = float(pnl_sum.loc[member])
-                            denominator = float(share_count.loc[member]) if share_count.loc[member] else 1.0
-                            formatted[member] = {
+                        # Vectorized formatting - avoid per-member iteration
+                        denominators = share_count.replace(0, 1.0)
+                        formatted = {
+                            member: {
                                 "trades": int(trade_counts.get(member, 0)),
-                                "total_return": total_return,
-                                "mean_return": total_return / denominator,
+                                "total_return": float(pnl_sum.loc[member]),
+                                "mean_return": float(pnl_sum.loc[member] / denominators.loc[member]),
                             }
+                            for member in pnl_sum.index
+                        }
                         result["group_breakdown"] = formatted
                         result["group_field"] = group_field
 
@@ -473,8 +476,20 @@ class ScreenerBacktester:
         use_side_hint: bool = True,
         group_field: Optional[str] = None,
         prediction_resolver: Optional["PredictionToPosition"] = None,
+        parallel_prep: bool = False,
+        max_workers: Optional[int] = None,
     ) -> Dict[str, Dict[str, Any]]:
-        """Backtest multiple screen outputs concurrently using shared GPU transfers."""
+        """Backtest multiple screen outputs concurrently using shared GPU transfers.
+
+        Args:
+            xy_map: Dictionary mapping pattern names to DataFrames
+            threshold: Signal threshold value
+            use_side_hint: Whether to use correlation hints for position direction
+            group_field: Optional field for grouping trades
+            prediction_resolver: Optional resolver for overlapping predictions
+            parallel_prep: Enable parallel data preparation using multiprocessing (default: False)
+            max_workers: Maximum number of parallel workers (default: CPU count)
+        """
 
         def _empty_result() -> Dict[str, Any]:
             empty = pd.Series(dtype=float)
@@ -489,21 +504,51 @@ class ScreenerBacktester:
                 "correlation": empty,
             }
 
+        # Prepare frames - optionally in parallel
         prepared_entries: Dict[str, Optional[ScreenerBacktester._PreparedFrame]] = {}
-        for key, xy in xy_map.items():
-            if xy is None or xy.empty:
-                prepared_entries[key] = None
-                continue
 
-            try:
-                prepared_entries[key] = self._prepare_frame_for_backtest(
-                    xy,
-                    use_side_hint=use_side_hint,
-                    group_field=group_field,
-                    prediction_resolver=prediction_resolver,
-                )
-            except Exception:
-                prepared_entries[key] = None
+        # Use parallel processing if explicitly enabled
+        # Recommended for: many patterns (20+) or when batching diverse datasets
+        use_parallel = parallel_prep and len(xy_map) > 1
+
+        if use_parallel:
+            # Parallel preparation using ProcessPoolExecutor
+            from functools import partial
+            prep_fn = partial(
+                self._prepare_single_pattern,
+                use_side_hint=use_side_hint,
+                group_field=group_field,
+                prediction_resolver=prediction_resolver,
+            )
+
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(prep_fn, key, xy): key
+                    for key, xy in xy_map.items()
+                }
+
+                for future in as_completed(futures):
+                    try:
+                        key, prepared = future.result()
+                        prepared_entries[key] = prepared
+                    except Exception:
+                        prepared_entries[futures[future]] = None
+        else:
+            # Sequential preparation (original behavior)
+            for key, xy in xy_map.items():
+                if xy is None or xy.empty:
+                    prepared_entries[key] = None
+                    continue
+
+                try:
+                    prepared_entries[key] = self._prepare_frame_for_backtest(
+                        xy,
+                        use_side_hint=use_side_hint,
+                        group_field=group_field,
+                        prediction_resolver=prediction_resolver,
+                    )
+                except Exception:
+                    prepared_entries[key] = None
 
         # Group prepared frames by length to maintain alignment during batching
         length_buckets: Dict[int, List[Tuple[str, ScreenerBacktester._PreparedFrame]]] = {}
@@ -714,12 +759,12 @@ class ScreenerBacktester:
                     trade_days = trade_rows["_trade_day"].dropna()
                     if not trade_days.empty:
                         if group_field and group_field in trade_rows.columns:
+                            # Vectorized group counting - avoid duplicate row operations
                             combos = trade_rows.loc[trade_days.index, ["_trade_day", group_field]]
-                            valid = combos.dropna(subset=[group_field])
-                            trades = int(len(valid.drop_duplicates()))
-                            missing = combos[combos[group_field].isna()]
-                            if not missing.empty:
-                                trades += int(missing["_trade_day"].nunique())
+                            valid_mask = combos[group_field].notna()
+                            trades = int(combos[valid_mask].drop_duplicates().shape[0])
+                            if not valid_mask.all():
+                                trades += int(combos.loc[~valid_mask, "_trade_day"].nunique())
                         else:
                             trades = int(trade_days.nunique())
 
@@ -776,6 +821,31 @@ class ScreenerBacktester:
             }
 
         return final_results
+
+    @staticmethod
+    def _prepare_single_pattern(
+        key: str,
+        xy: pd.DataFrame,
+        use_side_hint: bool,
+        group_field: Optional[str],
+        prediction_resolver: Optional["PredictionToPosition"],
+    ) -> Tuple[str, Optional["ScreenerBacktester._PreparedFrame"]]:
+        """Helper for parallel preparation of patterns. Must be static for pickling."""
+        if xy is None or xy.empty:
+            return key, None
+
+        try:
+            # Create a temporary backtester instance for preparation
+            temp_backtester = ScreenerBacktester()
+            prepared = temp_backtester._prepare_frame_for_backtest(
+                xy,
+                use_side_hint=use_side_hint,
+                group_field=group_field,
+                prediction_resolver=prediction_resolver,
+            )
+            return key, prepared
+        except Exception:
+            return key, None
 
     @staticmethod
     def _drop_duplicate_rows(frame: pd.DataFrame) -> pd.DataFrame:
