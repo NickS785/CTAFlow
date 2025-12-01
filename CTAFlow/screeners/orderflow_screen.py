@@ -266,14 +266,14 @@ def _calculate_vpin(
             imb_sum = gpu_rolling_window(
                 bucket_df['Imbalance'].abs().values,
                 window=window,
-                func='sum',
+                operation='sum',
                 use_gpu=True,
                 device_id=device_id
             )
             vol_sum = gpu_rolling_window(
                 bucket_df['Volume'].values,
                 window=window,
-                func='sum',
+                operation='sum',
                 use_gpu=True,
                 device_id=device_id
             )
@@ -289,6 +289,36 @@ def _calculate_vpin(
     vol_rolling = bucket_df['Volume'].rolling(window, min_periods=1).sum()
     # Avoid division by zero
     return imb_rolling / vol_rolling.replace(0, np.nan)
+
+
+def _cpu_group_statistics(group_data: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """CPU helper for group-level statistics when GPU is unavailable."""
+    t_stats = []
+    p_values = []
+    means = []
+    counts = []
+
+    for data in group_data:
+        n = len(data)
+        counts.append(n)
+        mean_val = np.mean(data)
+        std_val = np.std(data, ddof=1)
+        means.append(mean_val)
+        if std_val > 0:
+            t_stat = mean_val / (std_val / np.sqrt(n))
+            p_val = 2 * stats.t.sf(abs(t_stat), df=n - 1)
+        else:
+            t_stat = 0.0
+            p_val = 1.0
+        t_stats.append(t_stat)
+        p_values.append(p_val)
+
+    return (
+        np.array(t_stats, dtype=float),
+        np.array(p_values, dtype=float),
+        np.array(means, dtype=float),
+        np.array(counts, dtype=float),
+    )
 
 
 def _vectorized_seasonality_table(
@@ -334,7 +364,7 @@ def _vectorized_seasonality_table(
         Combined seasonality table with columns:
         [groupby_cols, ticker, metric, mean, t_stat, p_value, q_value, sig_fdr_5pct, n, exploratory]
     """
-    from ..utils.gpu_utils import gpu_batch_ttest
+    from ..utils.gpu_utils import gpu_batch_mean_std, gpu_batch_ttest
 
     # Stack all metrics into long-form DataFrame
     stacked_list = []
@@ -356,13 +386,6 @@ def _vectorized_seasonality_table(
 
     stacked = pd.concat(stacked_list, ignore_index=True)
 
-    # Single groupby operation across all metrics and groups
-    grouped = stacked.groupby(groupby_cols + ['metric'])['value']
-
-    # Batch aggregations
-    stats_df = grouped.agg(['mean', 'std', 'count']).reset_index()
-    stats_df.columns = groupby_cols + ['metric', 'mean', 'std', 'n']
-
     # Prepare data for GPU batch t-test
     group_data = []
     group_keys = []
@@ -380,6 +403,8 @@ def _vectorized_seasonality_table(
         )
 
     # Compute t-statistics and p-values
+    mean_values: np.ndarray
+    counts: np.ndarray
     if use_gpu and len(group_data) > 1:
         try:
             # Pad arrays to same length for batch processing
@@ -397,43 +422,21 @@ def _vectorized_seasonality_table(
                 use_gpu=True,
                 device_id=device_id
             )
+
+            # GPU batch means for record construction
+            mean_values, _ = gpu_batch_mean_std(
+                padded,
+                use_gpu=True,
+                device_id=device_id,
+                nan_policy="omit",
+            )
+            counts = np.sum(~np.isnan(padded), axis=1)
         except Exception as e:
             warnings.warn(f"GPU batch t-test failed: {e}. Falling back to CPU.")
-            # CPU fallback
-            t_stats = []
-            p_values = []
-            for data in group_data:
-                n = len(data)
-                mean_val = np.mean(data)
-                std_val = np.std(data, ddof=1)
-                if std_val > 0:
-                    t_stat = mean_val / (std_val / np.sqrt(n))
-                    p_val = 2 * stats.t.sf(abs(t_stat), df=n - 1)
-                else:
-                    t_stat = 0.0
-                    p_val = 1.0
-                t_stats.append(t_stat)
-                p_values.append(p_val)
-            t_stats = np.array(t_stats)
-            p_values = np.array(p_values)
+            t_stats, p_values, mean_values, counts = _cpu_group_statistics(group_data)
     else:
         # CPU processing for small datasets or when GPU disabled
-        t_stats = []
-        p_values = []
-        for data in group_data:
-            n = len(data)
-            mean_val = np.mean(data)
-            std_val = np.std(data, ddof=1)
-            if std_val > 0:
-                t_stat = mean_val / (std_val / np.sqrt(n))
-                p_val = 2 * stats.t.sf(abs(t_stat), df=n - 1)
-            else:
-                t_stat = 0.0
-                p_val = 1.0
-            t_stats.append(t_stat)
-            p_values.append(p_val)
-        t_stats = np.array(t_stats)
-        p_values = np.array(p_values)
+        t_stats, p_values, mean_values, counts = _cpu_group_statistics(group_data)
 
     # Create results DataFrame
     records = []
@@ -446,24 +449,17 @@ def _vectorized_seasonality_table(
             group_vals = {col: val for col, val in zip(groupby_cols, group_key[:-1])}
             metric_name = group_key[-1]
 
-        # Find corresponding row in stats_df
-        mask = stats_df['metric'] == metric_name
-        for col in groupby_cols:
-            mask &= stats_df[col] == group_vals[col]
-
-        if mask.any():
-            row = stats_df[mask].iloc[0]
-            record = {
-                **group_vals,
-                "ticker": ticker,
-                "metric": metric_name,
-                "mean": float(row['mean']),
-                "t_stat": float(t_stats[i]),
-                "p_value": float(p_values[i]),
-                "n": int(row['n']),
-                "exploratory": exploratory
-            }
-            records.append(record)
+        record = {
+            **group_vals,
+            "ticker": ticker,
+            "metric": metric_name,
+            "mean": float(mean_values[i]),
+            "t_stat": float(t_stats[i]),
+            "p_value": float(p_values[i]),
+            "n": int(counts[i]),
+            "exploratory": exploratory
+        }
+        records.append(record)
 
     if not records:
         return pd.DataFrame(

@@ -396,6 +396,7 @@ def gpu_batch_mean_std(
     use_gpu: bool = True,
     device_id: int = 0,
     stream: Optional[object] = None,
+    nan_policy: str = "omit",
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Compute mean and standard deviation in batch on GPU.
 
@@ -414,6 +415,12 @@ def gpu_batch_mean_std(
     stream : object, optional
         CUDA stream
 
+    Parameters
+    ----------
+    nan_policy : {'omit', 'propagate'}
+        How to handle NaN values. When 'omit', NaNs are ignored similar to pandas
+        aggregations. When 'propagate', any NaN in a series results in NaN outputs.
+
     Returns
     -------
     means : ndarray
@@ -426,9 +433,12 @@ def gpu_batch_mean_std(
     else:
         batch_arr = np.asarray(data_batch)
 
+    nan_safe_mean = np.nanmean if nan_policy == "omit" else np.mean
+    nan_safe_std = np.nanstd if nan_policy == "omit" else np.std
+
     if not use_gpu or not GPU_AVAILABLE:
-        means = np.mean(batch_arr, axis=axis)
-        stds = np.std(batch_arr, axis=axis, ddof=ddof)
+        means = nan_safe_mean(batch_arr, axis=axis)
+        stds = nan_safe_std(batch_arr, axis=axis, ddof=ddof)
         return means, stds
 
     try:
@@ -438,8 +448,11 @@ def gpu_batch_mean_std(
             with stream_cm:
                 batch_gpu, xp = to_backend_array(batch_arr, use_gpu=True, device_id=device_id, stream=stream)
 
-                means_gpu = xp.mean(batch_gpu, axis=axis)
-                stds_gpu = xp.std(batch_gpu, axis=axis, ddof=ddof)
+                mean_func = xp.nanmean if nan_policy == "omit" else xp.mean
+                std_func = xp.nanstd if nan_policy == "omit" else xp.std
+
+                means_gpu = mean_func(batch_gpu, axis=axis)
+                stds_gpu = std_func(batch_gpu, axis=axis, ddof=ddof)
 
                 means = to_cpu(means_gpu)
                 stds = to_cpu(stds_gpu)
@@ -448,8 +461,8 @@ def gpu_batch_mean_std(
 
     except Exception as e:
         warnings.warn(f"GPU mean/std failed ({e}), falling back to CPU")
-        means = np.mean(batch_arr, axis=axis)
-        stds = np.std(batch_arr, axis=axis, ddof=ddof)
+        means = nan_safe_mean(batch_arr, axis=axis)
+        stds = nan_safe_std(batch_arr, axis=axis, ddof=ddof)
         return means, stds
 
 
@@ -620,37 +633,29 @@ def gpu_rolling_window(
     if min_periods is None:
         min_periods = window
 
-    # For now, use pandas for CPU (it's optimized)
-    # GPU implementation would require custom CUDA kernels
+    # CPU path using pandas for performance
     if not use_gpu or not GPU_AVAILABLE or pd is None:
-        if pd is not None:
-            s = pd.Series(data_arr)
-            if operation == 'mean':
-                return s.rolling(window, min_periods=min_periods).mean().values
-            elif operation == 'std':
-                return s.rolling(window, min_periods=min_periods).std().values
-            elif operation == 'min':
-                return s.rolling(window, min_periods=min_periods).min().values
-            elif operation == 'max':
-                return s.rolling(window, min_periods=min_periods).max().values
-            elif operation == 'sum':
-                return s.rolling(window, min_periods=min_periods).sum().values
-            else:
-                raise ValueError(f"Unknown operation: {operation}")
-        else:
+        if pd is None:
             # Simple numpy fallback
             from numpy.lib.stride_tricks import sliding_window_view
-            windows = sliding_window_view(data_arr, window)
-            if operation == 'mean':
-                return np.concatenate([np.full(window-1, np.nan), np.mean(windows, axis=1)])
-            elif operation == 'std':
-                return np.concatenate([np.full(window-1, np.nan), np.std(windows, axis=1)])
-            else:
-                raise NotImplementedError(f"Operation '{operation}' not implemented in numpy fallback")
 
-    # GPU implementation (simplified - full implementation would need custom kernels)
-    warnings.warn("GPU rolling operations not yet optimized, using CPU")
-    if pd is not None:
+            if len(data_arr) < window:
+                return np.full_like(data_arr, np.nan, dtype=float)
+
+            windows = sliding_window_view(data_arr, window)
+            pad = np.full(window - 1, np.nan)
+            if operation == 'mean':
+                return np.concatenate([pad, np.nanmean(windows, axis=1)])
+            elif operation == 'std':
+                return np.concatenate([pad, np.nanstd(windows, axis=1)])
+            elif operation == 'min':
+                return np.concatenate([pad, np.nanmin(windows, axis=1)])
+            elif operation == 'max':
+                return np.concatenate([pad, np.nanmax(windows, axis=1)])
+            elif operation == 'sum':
+                return np.concatenate([pad, np.nansum(windows, axis=1)])
+            raise ValueError(f"Unknown operation: {operation}")
+
         s = pd.Series(data_arr)
         if operation == 'mean':
             return s.rolling(window, min_periods=min_periods).mean().values
@@ -662,8 +667,54 @@ def gpu_rolling_window(
             return s.rolling(window, min_periods=min_periods).max().values
         elif operation == 'sum':
             return s.rolling(window, min_periods=min_periods).sum().values
+        raise ValueError(f"Unknown operation: {operation}")
 
-    raise NotImplementedError("Rolling operations require pandas")
+    # GPU implementation
+    try:
+        with cp.cuda.Device(device_id):
+            stream_cm = stream if stream is not None else nullcontext()
+            with stream_cm:
+                data_gpu, xp = to_backend_array(data_arr, use_gpu=True, device_id=device_id, stream=stream)
+
+                if data_gpu.size < window:
+                    return np.full_like(data_arr, np.nan, dtype=float)
+
+                windows = xp.lib.stride_tricks.sliding_window_view(data_gpu, window)
+                counts = xp.sum(~xp.isnan(windows), axis=1)
+
+                if operation == 'mean':
+                    core = xp.nanmean(windows, axis=1)
+                elif operation == 'std':
+                    core = xp.nanstd(windows, axis=1)
+                elif operation == 'min':
+                    core = xp.nanmin(windows, axis=1)
+                elif operation == 'max':
+                    core = xp.nanmax(windows, axis=1)
+                elif operation == 'sum':
+                    core = xp.nansum(windows, axis=1)
+                else:
+                    raise ValueError(f"Unknown operation: {operation}")
+
+                pad = xp.full(window - 1, xp.nan)
+                result = xp.concatenate([pad, core])
+
+                if min_periods > window:
+                    min_periods = window
+                invalid = counts < min_periods
+                if invalid.any():
+                    result = result.copy()
+                    result[window - 1:][invalid] = xp.nan
+
+                return to_cpu(result)
+    except Exception as e:
+        warnings.warn(f"GPU rolling operations failed ({e}), falling back to CPU")
+        return gpu_rolling_window(
+            data_arr,
+            window,
+            operation=operation,
+            min_periods=min_periods,
+            use_gpu=False,
+        )
 
 
 def gpu_batch_spearmanr(
