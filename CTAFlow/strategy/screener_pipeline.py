@@ -541,13 +541,27 @@ class ScreenerPipeline:
         prepared = self._prepare_bars(bars)
         results: Dict[str, Dict[str, Any]] = {}
         build_xy_params = dict(build_xy_kwargs) if build_xy_kwargs else {}
+        combined_meta: List[str] = []
+
+        def _extend_meta(source: Any) -> None:
+            if source is None:
+                return
+            if isinstance(source, str):
+                combined_meta.append(source)
+                return
+            combined_meta.extend(list(source))
+
+        _extend_meta(build_xy_params.pop("include_metadata", None))
+        _extend_meta(include_metadata)
+        combined_meta.append("correlation")
+        build_xy_params["include_metadata"] = list(dict.fromkeys(filter(None, combined_meta)))
 
         total_patterns = len(items)
         completed_count = 0
         start_time = time_module.time()
 
         if verbose:
-            execution_mode = "GPU Sequential" if (self.use_gpu and GPU_AVAILABLE and (max_workers is None or max_workers == 1)) else f"ThreadPool ({max_workers or 'auto'} workers)"
+            execution_mode = "GPU Batched" if (self.use_gpu and GPU_AVAILABLE and (max_workers is None or max_workers == 1)) else f"ThreadPool ({max_workers or 'auto'} workers)"
             print(f"\n{'='*70}")
             print(f"Starting concurrent backtests for {total_patterns} patterns")
             print(f"Threshold: {threshold}, GPU: {self.use_gpu}, Mode: {execution_mode}")
@@ -569,53 +583,74 @@ class ScreenerPipeline:
             prepared_df=prepared,
             max_workers=worker_count,
         )
+        tester = ScreenerBacktester(
+            annualisation=annualisation,
+            risk_free_rate=risk_free_rate,
+            use_gpu=self.use_gpu,
+            gpu_device_id=self.gpu_device_id,
+        )
+        resolver = prediction_resolver if prediction_resolver is not None else PredictionToPosition()
+
+        policy_map = {"auto": "auto", "hms": "second", "hmsf": "microsecond"}
+        mapper_time_match = policy_map.get(self.time_match, "auto")
+        if "time_match" in build_xy_params:
+            override = build_xy_params["time_match"]
+            if override in policy_map:
+                build_xy_params["time_match"] = policy_map[override]
+
+        mapper = self._get_horizon_mapper(mapper_time_match)
+
+        def _build_xy_for_pattern(key: str, featured: pd.DataFrame, pattern: Mapping[str, Any]) -> pd.DataFrame:
+            return mapper.build_xy(featured, {key: pattern}, **build_xy_params)
 
         def _run_single(key: str, featured: pd.DataFrame, pattern: Mapping[str, Any]) -> Tuple[str, Dict[str, Any]]:
-            outcome = self.backtest_threshold(
-                featured,
-                {key: pattern},
+            xy = _build_xy_for_pattern(key, featured, pattern)
+            outcome = tester.threshold(
+                xy,
                 threshold=threshold,
                 use_side_hint=use_side_hint,
-                annualisation=annualisation,
-                risk_free_rate=risk_free_rate,
-                include_metadata=include_metadata,
-                prediction_resolver=prediction_resolver,
-                **build_xy_params,
+                prediction_resolver=resolver,
             )
             return key, outcome
 
-        # When GPU is enabled, run sequentially to avoid thread/GPU contention
-        # ThreadPoolExecutor adds overhead and can cause GPU serialization issues
+        # When GPU is enabled, batch patterns to share transfers and allow simultaneous runs
         if self.use_gpu and GPU_AVAILABLE and (max_workers is None or max_workers == 1):
-            # Sequential GPU execution with progress updates
+            xy_map: Dict[str, pd.DataFrame] = {}
             for key, pattern in items:
                 if key not in feature_sets:
                     continue
                 try:
-                    pat_key, result = _run_single(key, feature_sets[key], pattern)
-                    completed_count += 1
-
-                    # Print progress if verbose
-                    if verbose:
-                        summary = result.get('summary')
-                        if summary:
-                            elapsed = time_module.time() - start_time
-                            rate = completed_count / elapsed if elapsed > 0 else 0
-
-                            print(f"[{completed_count}/{total_patterns}] {pat_key}")
-                            print(f"  Return: {summary.total_return:>8.2%}  Sharpe: {summary.sharpe:>6.2f}  "
-                                  f"MaxDD: {summary.max_drawdown:>8.2%}  Trades: {summary.trades:>4d}")
-                            print(f"  Elapsed: {elapsed:.1f}s  Rate: {rate:.2f} patterns/sec\n")
-                        else:
-                            print(f"[{completed_count}/{total_patterns}] {pat_key} - No summary available\n")
-
+                    xy_map[key] = _build_xy_for_pattern(key, feature_sets[key], pattern)
                 except Exception as exc:  # pragma: no cover - defensive path
-                    completed_count += 1
                     if verbose:
-                        print(f"[{completed_count}/{total_patterns}] {key} - FAILED: {exc}\n")
+                        print(f"[{completed_count + 1}/{total_patterns}] {key} - FAILED: {exc}\n")
                     if self.log is not None and hasattr(self.log, "warning"):
                         self.log.warning("[screener_pipeline] backtest failed for '%s': %s", key, exc)
                     continue
+
+            batched = tester.batch_patterns(
+                xy_map,
+                threshold=threshold,
+                use_side_hint=use_side_hint,
+                group_field=None,
+                prediction_resolver=resolver,
+            )
+
+            for pat_key, result in batched.items():
+                completed_count += 1
+                if verbose:
+                    summary = result.get("summary")
+                    if summary:
+                        elapsed = time_module.time() - start_time
+                        rate = completed_count / elapsed if elapsed > 0 else 0
+                        print(f"[{completed_count}/{total_patterns}] {pat_key}")
+                        print(
+                            f"  Return: {summary.total_return:>8.2%}  Sharpe: {summary.sharpe:>6.2f}  "
+                            f"MaxDD: {summary.max_drawdown:>8.2%}  Trades: {summary.trades:>4d}"
+                        )
+                        print(f"  Elapsed: {elapsed:.1f}s  Rate: {rate:.2f} patterns/sec\n")
+                    else:
+                        print(f"[{completed_count}/{total_patterns}] {pat_key} - No summary available\n")
                 results[pat_key] = result
         else:
             # Use ThreadPoolExecutor for CPU or when explicitly requested
