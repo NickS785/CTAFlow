@@ -16,6 +16,12 @@ from zoneinfo import ZoneInfo
 
 from .screener_types import SCREEN_EVENT
 from .params import EventParams
+from ..strategy.gpu_acceleration import (
+    GPU_AVAILABLE,
+    get_array_module,
+    to_cpu,
+    to_gpu,
+)
 
 
 @dataclass
@@ -51,6 +57,8 @@ def run_event_screener(
     symbol: str,
     instrument_tz: str,
     orderflow: Optional[pd.DataFrame] = None,
+    use_gpu: bool = False,
+    gpu_device_id: int = 0,
 ) -> EventScreenerResult:
     """
     Compute event-window and multi-horizon returns around scheduled data releases.
@@ -225,16 +233,21 @@ def run_event_screener(
             continue
 
         def _mean_t(x: pd.Series) -> Tuple[float, float]:
-            x = x.replace([np.inf, -np.inf], np.nan).dropna()
-            if len(x) < 3:
+            clean = x.replace([np.inf, -np.inf], np.nan).dropna()
+            if len(clean) < 3:
                 return np.nan, np.nan
-            m = float(x.mean())
-            s = float(x.std(ddof=1))
-            if s == 0:
-                return m, np.nan
-            t = m / (s / np.sqrt(len(x)))
-            p = 2 * (1 - stats.t.cdf(abs(t), df=len(x) - 1))
-            return m, p
+            arr = clean.to_numpy(dtype=float)
+            if use_gpu and GPU_AVAILABLE:
+                arr = to_gpu(arr, device_id=gpu_device_id)
+            xp = get_array_module(arr)
+            m = xp.mean(arr)
+            s = xp.std(arr, ddof=1)
+            if float(to_cpu(s)) == 0:
+                return float(to_cpu(m)), np.nan
+            n = arr.size
+            t = float(to_cpu(m) / (to_cpu(s) / np.sqrt(n)))
+            p = 2 * (1 - stats.t.cdf(abs(t), df=n - 1))
+            return float(to_cpu(m)), p
 
         mean_r_event, p_event = _mean_t(g["r_event"])
         mean_r_T0, p_T0 = _mean_t(g["r_T0"])
@@ -244,8 +257,24 @@ def run_event_screener(
             df = pd.DataFrame({"a": a, "b": b}).replace([np.inf, -np.inf], np.nan).dropna()
             if len(df) < 5:
                 return np.nan, np.nan
-            r, p = stats.pearsonr(df["a"], df["b"])
-            return float(r), float(p)
+            a_arr = df["a"].to_numpy(dtype=float)
+            b_arr = df["b"].to_numpy(dtype=float)
+            if use_gpu and GPU_AVAILABLE:
+                a_arr = to_gpu(a_arr, device_id=gpu_device_id)
+                b_arr = to_gpu(b_arr, device_id=gpu_device_id)
+            xp = get_array_module(a_arr)
+            mask = (~xp.isnan(a_arr)) & (~xp.isnan(b_arr))
+            a_arr = a_arr[mask]
+            b_arr = b_arr[mask]
+            if a_arr.size < 5:
+                return np.nan, np.nan
+            r = xp.corrcoef(a_arr, b_arr)[0, 1]
+            r_float = float(to_cpu(r))
+            if not -1 <= r_float <= 1:
+                return np.nan, np.nan
+            t_val = r_float * np.sqrt((a_arr.size - 2) / max(1e-12, 1 - r_float**2))
+            p_val = 2 * (1 - stats.t.cdf(abs(t_val), df=a_arr.size - 2))
+            return r_float, float(p_val)
 
         rho_e_T0, p_rho_e_T0 = _corr(g["r_event"], g["r_T0"])
         rho_e_T1, p_rho_e_T1 = _corr(g["r_event"], g["r_T1"]) if params.include_t1_close else (np.nan, np.nan)
