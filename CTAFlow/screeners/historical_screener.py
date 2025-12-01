@@ -687,6 +687,8 @@ class HistoricalScreener:
             except Exception as e:
                 if self.verbose:
                     self.logger.error(f"Error processing ticker {t}: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
                 return (t, {'error': str(e), 'ticker': t})
 
         worker_count = self._resolve_workers(max_workers)
@@ -1811,8 +1813,14 @@ class HistoricalScreener:
 
         # Pre-calculate minutes from midnight ONCE if not already done
         if 'minutes_from_midnight' not in data.columns:
-            if not isinstance(data.index, pd.DatetimeIndex) or data.index.tz is None:
-                raise ValueError("Data must have a localized DatetimeIndex to calculate session times.")
+            if not isinstance(data.index, pd.DatetimeIndex):
+                data = data.copy()
+                data.index = pd.to_datetime(data.index, errors='coerce')
+
+            # If tz-naive, localize to default timezone
+            if data.index.tz is None:
+                data = data.copy()
+                data.index = data.index.tz_localize("America/Chicago", ambiguous='infer', nonexistent='shift_forward')
 
             data['minutes_from_midnight'] = data.index.hour * 60 + data.index.minute
 
@@ -2203,7 +2211,7 @@ class HistoricalScreener:
                 stats_df['p_value'] = stats.t.sf(np.abs(stats_df['t_stat']), stats_df['count'] - 1) * 2
 
             # Map weekday integer to name for display
-            stats_df['day_of_week'] = stats_df['day_of_week'].map(calendar.day_name)
+            stats_df['day_of_week'] = stats_df['day_of_week'].map(lambda x: calendar.day_name[x])
 
             results[col_name] = stats_df
 
@@ -2377,11 +2385,11 @@ class HistoricalScreener:
             'vol_correlation_significant': corr_pvalue < 0.05,
             'vol_correlation_interpretation': interpretation,
             'high_volatility_days': [
-                {'date': date, 'volatility': float(vol), 'z_score': float(vol_df.loc[pd.to_datetime(date), 'z_score'])}
+                {'date': date, 'volatility': float(vol), 'z_score': float(vol_df.loc[date, 'z_score'])}
                 for date, vol in zip(high_vol_days, high_vol_values)
             ],
             'low_volatility_days': [
-                {'date': date, 'volatility': float(vol), 'z_score': float(vol_df.loc[pd.to_datetime(date), 'z_score'])}
+                {'date': date, 'volatility': float(vol), 'z_score': float(vol_df.loc[date, 'z_score'])}
                 for date, vol in zip(low_vol_days, low_vol_values)
             ],
             'n_high_vol_days': len(high_vol_days),
@@ -3251,9 +3259,9 @@ class HistoricalScreener:
             idx = pd.to_datetime(idx, errors="coerce")
 
         if idx.tz is None:
-            # Naive index: localize it
+            # Naive index: localize it with DST handling
             try:
-                data.index = idx.tz_localize(tz)
+                data.index = idx.tz_localize(tz, ambiguous='infer', nonexistent='shift_forward')
             except Exception as e:
                 # Handle cases where localization fails (e.g., ambiguous times during DST)
                 print(f"Warning: Failed to tz_localize index: {e}. Using naive index.")
@@ -3291,7 +3299,7 @@ class HistoricalScreener:
         if tz:
             try:
                 if dt_index.tz is None:
-                    dt_index = dt_index.tz_localize(tz)
+                    dt_index = dt_index.tz_localize(tz, ambiguous='infer', nonexistent='shift_forward')
                 else:
                     dt_index = dt_index.tz_convert(tz)
             except (TypeError, ValueError):

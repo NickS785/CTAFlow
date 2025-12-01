@@ -63,7 +63,7 @@ def _ensure_series_tz(series: pd.Series, tz: str) -> pd.Series:
         localized = series
 
     if localized.dt.tz is None:
-        localized = localized.dt.tz_localize(tz)
+        localized = localized.dt.tz_localize(tz, ambiguous='infer', nonexistent='shift_forward')
     else:
         localized = localized.dt.tz_convert(tz)
     return localized
