@@ -33,7 +33,16 @@ class PredictionToPosition:
             raise KeyError("PredictionToPosition requires a 'ts_decision' column")
 
         frame = xy.copy()
-        returns_x = pd.to_numeric(frame["returns_x"], errors="coerce")
+        base_signal = pd.to_numeric(frame["returns_x"], errors="coerce").fillna(0.0)
+
+        if "gate_direction" in frame.columns:
+            gate_dir = pd.to_numeric(frame["gate_direction"], errors="coerce").fillna(0.0)
+            base_signal = base_signal.abs() * np.sign(gate_dir)
+
+        if "strength" in frame.columns:
+            gate_strength = pd.to_numeric(frame["strength"], errors="coerce").fillna(1.0)
+            base_signal = base_signal * gate_strength
+
         weights_source = frame.get(self.correlation_field)
         if weights_source is None:
             weights = pd.Series(1.0, index=frame.index, dtype=float)
@@ -41,7 +50,7 @@ class PredictionToPosition:
             weights = pd.to_numeric(weights_source, errors="coerce").fillna(1.0)
         if self.min_abs_correlation > 0:
             weights = weights.where(weights.abs() >= self.min_abs_correlation, 0.0)
-        frame["_ptp_score"] = returns_x * weights
+        frame["_ptp_score"] = base_signal * weights
 
         grouped = frame.groupby("ts_decision", sort=True)
         records = []
@@ -105,12 +114,24 @@ class PredictionToPosition:
             return frame.copy()
 
         working = frame.copy()
-        working["_ptp_score"] = pd.to_numeric(working["returns_x"], errors="coerce").fillna(0.0)
+        signal = pd.to_numeric(working["returns_x"], errors="coerce").fillna(0.0)
+
+        if "gate_direction" in working.columns:
+            gate_dir = pd.to_numeric(working["gate_direction"], errors="coerce").fillna(0.0)
+            signal = signal.abs() * np.sign(gate_dir)
+
+        if "strength" in working.columns:
+            gate_strength = pd.to_numeric(working["strength"], errors="coerce").fillna(1.0)
+            signal = signal * gate_strength
+
+        working["_ptp_score"] = signal
         weights_source = working.get(self.correlation_field)
         if weights_source is None:
             weights = pd.Series(1.0, index=working.index, dtype=float)
         else:
             weights = pd.to_numeric(weights_source, errors="coerce").fillna(1.0)
+        if self.min_abs_correlation > 0:
+            weights = weights.where(weights.abs() >= self.min_abs_correlation, 0.0)
         working["_ptp_score"] *= weights
 
         # Mark weekday bias patterns
