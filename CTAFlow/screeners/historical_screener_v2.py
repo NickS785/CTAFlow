@@ -23,6 +23,7 @@ from .orderflow_engine import OrderflowScreenEngine
 from .event_engine import EventScreenEngine
 from ..features.regime_classification import BaseRegimeClassifier
 from ..data import ResultsClient
+from ..strategy.gpu_acceleration import GPU_AVAILABLE, GPU_DEVICE_COUNT
 
 
 class HistoricalScreenerV2:
@@ -73,9 +74,18 @@ class HistoricalScreenerV2:
         self.auto_write_results = auto_write_results
         self.regime_classifier = regime_classifier
         self.logger = logger or logging.getLogger(__name__)
-        self.use_gpu = use_gpu
+        self.use_gpu = bool(use_gpu and GPU_AVAILABLE)
         self.gpu_device_id = gpu_device_id
         self.max_workers = max_workers
+
+        if use_gpu and not self.use_gpu:
+            self.logger.info("GPU requested but unavailable; defaulting to CPU execution")
+        elif self.use_gpu:
+            self.logger.info(
+                "GPU acceleration enabled (device %s, %s GPUs detected)",
+                self.gpu_device_id,
+                GPU_DEVICE_COUNT,
+            )
 
         self.engines: Dict[str, BaseScreenEngine] = engines or {
             SCREEN_MOMENTUM: MomentumScreenEngine(),
@@ -116,6 +126,17 @@ class HistoricalScreenerV2:
             return results
         return self._flatten_results(results)
 
+    def _resolve_workers(self) -> int:
+        if self.max_workers is not None and self.max_workers > 0:
+            return int(self.max_workers)
+
+        if self.use_gpu and GPU_AVAILABLE:
+            gpu_workers = GPU_DEVICE_COUNT or 1
+            return max(1, min(len(self.ticker_data), gpu_workers))
+
+        n_tickers = len(self.ticker_data)
+        return min(max(1, n_tickers), 8)
+
     def _run_screen_parallel(
         self,
         screen_name: str,
@@ -151,8 +172,8 @@ class HistoricalScreenerV2:
 
             # Add GPU settings to context if GPU is enabled
             if self.use_gpu:
-                ctx['use_gpu'] = self.use_gpu
-                ctx['gpu_device_id'] = self.gpu_device_id
+                ctx["use_gpu"] = self.use_gpu
+                ctx["gpu_device_id"] = self.gpu_device_id
 
             # Run screen
             res = engine.run(
@@ -169,11 +190,7 @@ class HistoricalScreenerV2:
             return ticker, res
 
         # Determine number of workers
-        max_workers = self.max_workers
-        if max_workers is None:
-            # Auto-determine based on ticker count (cap at 8 workers)
-            n_tickers = len(self.ticker_data)
-            max_workers = min(n_tickers, 8)
+        max_workers = self._resolve_workers()
 
         # Parallel execution if multiple workers and multiple tickers
         if max_workers > 1 and len(self.ticker_data) > 1:
