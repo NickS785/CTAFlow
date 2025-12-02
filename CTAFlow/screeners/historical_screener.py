@@ -18,6 +18,11 @@ from ..features.regime_classification import (
     build_regime_classifier,
 )
 from ..strategy.gpu_acceleration import GPU_AVAILABLE, GPU_DEVICE_COUNT
+from .calendar_effects import (
+    CalendarEffectParams,
+    run_calendar_edge_tests,
+    run_calendar_lead_lag_tests,
+)
 
 
 @dataclass
@@ -1083,6 +1088,184 @@ class HistoricalScreener:
         if self.verbose:
             successful = sum(1 for r in results.values() if 'error' not in r)
             self.logger.info(f"Completed seasonality screen: {successful}/{len(results)} successful")
+
+        return results
+
+    def calendar_effects_screen(
+        self,
+        price_col: str = "close",
+        horizons: Optional[Dict[str, int]] = None,
+        min_obs: int = 50,
+        week_len: int = 5,
+        max_workers: Optional[int] = None,
+        show_progress: bool = True,
+    ) -> Dict[str, Dict[str, pd.DataFrame]]:
+        """
+        Screen for calendar effects in daily price data.
+
+        Tests for:
+        - First/last 1, 3, 5 trading days of month/quarter effects
+        - First/last week of month effects
+        - Lead-lag: previous month/year weeks predicting current month
+
+        Args:
+            price_col: Column name for price data (default: 'close')
+            horizons: Dict mapping horizon labels to trading days
+                     (default: {'1d': 1, '3d': 3, '5d': 5})
+            min_obs: Minimum observations for reliable statistics (default: 50)
+                    Below this threshold, patterns flagged as exploratory
+            week_len: Trading days per 'week of month' (default: 5)
+            max_workers: Number of parallel workers (default: CPU count)
+            show_progress: Show progress bar (default: True)
+
+        Returns:
+            Dict[str, Dict[str, pd.DataFrame]]:
+                Results dictionary with calendar analysis for each ticker.
+                Each ticker entry contains:
+                    - 'calendar_edges': DataFrame with edge effects
+                    - 'calendar_lead_lag': DataFrame with predictive patterns
+                    - 'metadata': Processing metadata
+
+        Examples:
+            # Run calendar effects screen with defaults
+            results = screener.calendar_effects_screen()
+
+            # Customize horizons and minimum observations
+            results = screener.calendar_effects_screen(
+                horizons={'1d': 1, '5d': 5, '10d': 10},
+                min_obs=80
+            )
+
+            # Access results for a specific ticker
+            es_results = results['ES']
+            edge_effects = es_results['calendar_edges']
+            lead_lag = es_results['calendar_lead_lag']
+
+            # Filter to significant patterns
+            significant = edge_effects[edge_effects['sig_fdr_5pct']]
+        """
+        params = CalendarEffectParams(
+            price_col=price_col,
+            horizons=horizons,
+            min_obs=min_obs,
+            week_len=week_len,
+        )
+
+        if self.verbose:
+            self.logger.info(f"Starting calendar effects screen for {len(self.tickers)} tickers")
+            self.logger.info(f"  Horizons: {params.horizons}")
+            self.logger.info(f"  Minimum observations: {params.min_obs}")
+
+        results = {}
+
+        def _process_single_ticker(ticker: str) -> Tuple[str, Dict[str, any]]:
+            try:
+                # Get daily data for this ticker
+                is_synthetic = self.synthetic_tickers.get(ticker, False)
+
+                if is_synthetic:
+                    synthetic_obj = self.data[ticker]
+                    data = synthetic_obj.price if hasattr(synthetic_obj, 'price') else synthetic_obj.data_engine.build_spread_series(return_ohlc=True)
+                else:
+                    data = self.data[ticker]
+
+                if data.empty:
+                    return (ticker, {'error': 'No data available'})
+
+                # Resample to daily if needed
+                if not isinstance(data.index, pd.DatetimeIndex):
+                    if 'date' in data.columns:
+                        data = data.set_index('date')
+                    else:
+                        return (ticker, {'error': 'No DatetimeIndex or date column'})
+
+                # Ensure we have daily data - resample if higher frequency
+                if hasattr(data.index.inferred_freq, '__call__'):
+                    freq = data.index.inferred_freq()
+                else:
+                    freq = data.index.inferred_freq
+
+                if freq and freq not in ['D', 'B', 'C']:  # Not daily/business day
+                    # Resample to daily close
+                    data_daily = data.resample('D')[price_col].last().to_frame(name=price_col)
+                    data_daily = data_daily.dropna()
+                else:
+                    data_daily = data[[price_col]].copy() if price_col in data.columns else data.copy()
+
+                if data_daily.empty:
+                    return (ticker, {'error': 'No daily data after resampling'})
+
+                # Run calendar edge tests
+                df_edges = run_calendar_edge_tests(data_daily, params)
+
+                # Run lead-lag tests
+                df_lead_lag = run_calendar_lead_lag_tests(data_daily, params)
+
+                result = {
+                    'calendar_edges': df_edges,
+                    'calendar_lead_lag': df_lead_lag,
+                    'metadata': {
+                        'ticker': ticker,
+                        'n_days': len(data_daily),
+                        'date_range': f"{data_daily.index.min()} to {data_daily.index.max()}",
+                        'price_col': price_col,
+                        'horizons': params.horizons,
+                    }
+                }
+
+                return (ticker, result)
+
+            except Exception as e:
+                return (ticker, {'error': str(e)})
+
+        # Process tickers
+        if max_workers and max_workers > 1:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(_process_single_ticker, ticker) for ticker in self.tickers]
+
+                iterator = as_completed(futures)
+                if show_progress:
+                    iterator = tqdm(iterator, total=len(self.tickers), desc="Calendar Effects")
+
+                for future in iterator:
+                    ticker_sym, result = future.result()
+                    results[ticker_sym] = result
+        else:
+            iterator = self.tickers
+            if show_progress:
+                iterator = tqdm(iterator, desc="Calendar Effects")
+
+            for ticker in iterator:
+                ticker_sym, result = _process_single_ticker(ticker)
+                results[ticker_sym] = result
+
+        if self.verbose:
+            successful = sum(1 for r in results.values() if 'error' not in r)
+            self.logger.info(f"Completed calendar effects screen: {successful}/{len(results)} successful")
+
+            # Log summary statistics
+            if successful > 0:
+                total_edge_patterns = sum(
+                    len(r['calendar_edges']) for r in results.values()
+                    if 'calendar_edges' in r
+                )
+                total_lead_lag = sum(
+                    len(r['calendar_lead_lag']) for r in results.values()
+                    if 'calendar_lead_lag' in r
+                )
+                sig_edges = sum(
+                    r['calendar_edges']['sig_fdr_5pct'].sum() for r in results.values()
+                    if 'calendar_edges' in r and not r['calendar_edges'].empty
+                )
+                sig_lead_lag = sum(
+                    r['calendar_lead_lag']['sig_fdr_5pct'].sum() for r in results.values()
+                    if 'calendar_lead_lag' in r and not r['calendar_lead_lag'].empty
+                )
+
+                self.logger.info(f"  Total edge patterns tested: {total_edge_patterns}")
+                self.logger.info(f"  Significant edge patterns (FDR 5%): {sig_edges}")
+                self.logger.info(f"  Total lead-lag tests: {total_lead_lag}")
+                self.logger.info(f"  Significant lead-lag (FDR 5%): {sig_lead_lag}")
 
         return results
 
