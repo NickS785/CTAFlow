@@ -84,6 +84,9 @@ class SeasonalityParams(BaseScreenParams):
     dayofweek_screen: bool = True
     seasonality_session_start: Optional[str] = None
     seasonality_session_end: Optional[str] = None
+    include_calendar_effects: bool = True
+    calendar_horizons: Optional[dict] = None
+    calendar_min_obs: int = 50
 
 
 @dataclass
