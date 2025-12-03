@@ -38,6 +38,8 @@ def _ensure_tz_aware(ts: pd.Series, tz: str) -> pd.Series:
 
     if not len(ts):
         return ts
+    if isinstance(ts, pd.DatetimeIndex):
+        ts = pd.Series(ts)
     if ts.dt.tz is None:
         return ts.dt.tz_localize(ZoneInfo(tz))
     return ts.dt.tz_convert(ZoneInfo(tz))
@@ -71,9 +73,19 @@ def run_event_screener(
     else:
         bar_ts = pd.to_datetime(bars.index)
 
+
+
     bar_ts = _ensure_tz_aware(bar_ts, instrument_tz)
     bars = bars.copy()
     bars["ts"] = bar_ts
+    if 'close' not in bars.columns:
+        try:
+            bars.rename({
+                'Close':'close'
+            }, axis=1, inplace=True)
+        except:
+            print("Failed to find price column")
+
     bars = bars.sort_values("ts").reset_index(drop=True)
 
     events = events.copy()

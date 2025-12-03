@@ -766,6 +766,9 @@ class HistoricalScreener:
         regime_col: Optional[str] = None,
         target_regimes: Optional[List[int]] = None,
         regime_settings: Optional[RegimeSpecificationLike] = None,
+        include_calendar_effects: bool = True,
+        calendar_horizons: Optional[Dict[str, int]] = None,
+        calendar_min_obs: int = 50,
     ) -> Dict[str, Dict[str, any]]:
         """
         Screen for seasonality patterns in intraday data.
@@ -776,6 +779,7 @@ class HistoricalScreener:
         - Lag autocorrelations at specific times
         - Volatility seasonality
         - Month-specific and seasonal patterns
+        - Calendar effects (first/last days of month/quarter, lead-lag patterns)
 
         Parameters:
         -----------
@@ -796,13 +800,21 @@ class HistoricalScreener:
             - spring: Mar, Apr, May (3, 4, 5)
             - summer: Jun, Jul, Aug (6, 7, 8)
             - fall: Sep, Oct, Nov (9, 10, 11)
+        include_calendar_effects : bool
+            Whether to include calendar effects analysis (default: True)
+            Tests for first/last 1/3/5 days of month/quarter and lead-lag patterns
+        calendar_horizons : Optional[Dict[str, int]]
+            Horizons for calendar effects (default: {'1d': 1, '3d': 3, '5d': 5})
+        calendar_min_obs : int
+            Minimum observations for calendar effects (default: 50)
 
         Returns:
         --------
         Dict[str, Dict[str, any]]
             Results dictionary with seasonality analysis for each ticker. Each ticker
             entry includes metadata describing the session window and the number of
-            sessions available after filtering.
+            sessions available after filtering. If include_calendar_effects=True,
+            also includes 'calendar_edge_effects' and 'calendar_lead_lag' DataFrames.
 
         Examples:
         ---------
@@ -1049,10 +1061,83 @@ class HistoricalScreener:
                     month_analysis = self._analyze_by_month(session_data, price_col, is_synthetic, selected_months)
                     ticker_results['month_breakdown'] = month_analysis
 
-                # Rank strongest patterns
+                # Rank strongest patterns (must be done before calendar effects)
                 strongest = self._rank_seasonal_strength(ticker_results)
                 if weekend_pattern is not None:
                     strongest.append(weekend_pattern)
+
+                # Calendar effects analysis (edge days, lead-lag)
+                calendar_patterns = []
+                if include_calendar_effects:
+                    try:
+                        cal_params = CalendarEffectParams(
+                            price_col=price_col,
+                            horizons=calendar_horizons,
+                            min_obs=calendar_min_obs,
+                            week_len=5,
+                        )
+
+                        # Resample to daily for calendar analysis
+                        if not isinstance(data.index, pd.DatetimeIndex):
+                            data_with_index = data.set_index('date') if 'date' in data.columns else data
+                        else:
+                            data_with_index = data
+
+                        # Resample to daily if higher frequency
+                        freq = data_with_index.index.inferred_freq
+                        if freq and freq not in ['D', 'B', 'C']:
+                            data_daily = data_with_index.resample('D')[price_col].last().to_frame(name=price_col)
+                            data_daily = data_daily.dropna()
+                        else:
+                            data_daily = data_with_index[[price_col]].copy() if price_col in data_with_index.columns else data_with_index.copy()
+
+                        if not data_daily.empty:
+                            # Run calendar edge and lead-lag tests
+                            edge_df = run_calendar_edge_tests(data_daily, cal_params)
+                            leadlag_df = run_calendar_lead_lag_tests(data_daily, cal_params)
+
+                            ticker_results['calendar_edge_effects'] = edge_df
+                            ticker_results['calendar_lead_lag'] = leadlag_df
+
+                            # Extract significant calendar patterns for strongest_patterns
+                            if not edge_df.empty:
+                                sig_edges = edge_df[edge_df['sig_fdr_5pct']].copy()
+                                for _, row in sig_edges.iterrows():
+                                    calendar_patterns.append({
+                                        'pattern_type': f"calendar_{row['pattern']}",
+                                        'event': row['event'],
+                                        'horizon': row['horizon'],
+                                        'mean_return': row['mean'],
+                                        't_stat': row['t_stat'],
+                                        'p_value': row['p_value'],
+                                        'q_value': row['q_value'],
+                                        'n_obs': row['n_obs'],
+                                        'exploratory': row['exploratory']
+                                    })
+
+                            if not leadlag_df.empty:
+                                sig_leadlag = leadlag_df[leadlag_df['sig_fdr_5pct']].copy()
+                                for _, row in sig_leadlag.iterrows():
+                                    calendar_patterns.append({
+                                        'pattern_type': f"calendar_{row['pattern']}",
+                                        'predictor': row['predictor'],
+                                        'response': row['response'],
+                                        'beta': row['slope'],
+                                        't_stat': row['t_stat'],
+                                        'p_value': row['p_value'],
+                                        'q_value': row['q_value'],
+                                        'r2': row['r2'],
+                                        'n_obs': row['n_obs'],
+                                        'exploratory': row['exploratory']
+                                    })
+                    except Exception as e:
+                        if self.verbose:
+                            self.logger.warning(f"Calendar effects analysis failed for {ticker}: {str(e)}")
+                        ticker_results['calendar_edge_effects'] = pd.DataFrame()
+                        ticker_results['calendar_lead_lag'] = pd.DataFrame()
+
+                # Combine all patterns
+                strongest.extend(calendar_patterns)
                 ticker_results['strongest_patterns'] = strongest
 
                 return (ticker, ticker_results)

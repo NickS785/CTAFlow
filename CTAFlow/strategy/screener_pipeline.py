@@ -153,6 +153,8 @@ class ScreenerPipeline:
         "time_predictive_nextday",
         "time_predictive_nextweek",
         "weekend_hedging",
+        # Calendar effects - all patterns starting with "calendar_"
+        # Examples: calendar_month_end_1d, calendar_quarter_start_5d, calendar_lead_lag_*
     }
 
     #: Pattern types handled by the orderflow extractor branch
@@ -1170,6 +1172,10 @@ class ScreenerPipeline:
         if not pattern_type:
             return []
 
+        # Check for calendar effects patterns (prefixed with "calendar_")
+        if pattern_type.startswith("calendar_"):
+            return self._dispatch_calendar(df, pattern, key, pattern_type)
+
         if pattern_type in self._SEASONAL_TYPES:
             return self._dispatch_seasonal(df, pattern, key, pattern_type)
         if pattern_type in self._ORDERFLOW_TYPES:
@@ -1218,6 +1224,80 @@ class ScreenerPipeline:
             return self._extract_weekend_hedging(df, pattern, payload, key, months)
 
         return []
+
+    def _dispatch_calendar(
+        self,
+        df: pd.DataFrame,
+        pattern: Mapping[str, Any],
+        key: Optional[str],
+        pattern_type: str,
+    ) -> List[str]:
+        """Dispatch calendar effects patterns (edge days, lead-lag).
+
+        Calendar patterns are triggered on specific trading days based on calendar position:
+        - Edge patterns: first/last N days of month/quarter
+        - Lead-lag patterns: use previous period returns to gate current period
+
+        Args:
+            df: Bar data with datetime index and session_date column
+            pattern: Pattern dict with event/horizon info
+            key: Optional pattern key
+            pattern_type: Pattern type string (starts with "calendar_")
+
+        Returns:
+            List of gate column names added to df
+        """
+        from ..screeners.calendar_effects import _attach_calendar_flags
+
+        # Extract pattern info
+        horizon = pattern.get('horizon', '1d')
+        event = pattern.get('event', '')
+
+        # For lead-lag patterns, we need predictor/response
+        predictor = pattern.get('predictor', '')
+        response = pattern.get('response', '')
+
+        # Get session dates (daily level)
+        if 'session_date' not in df.columns:
+            # Infer session_date from index if not present
+            df_daily = df.groupby(df.index.date).first()
+            session_dates = pd.DatetimeIndex(df_daily.index)
+        else:
+            df_daily = df.groupby('session_date').first()
+            session_dates = df_daily.index
+
+        # Attach calendar flags to daily data
+        daily_with_flags = _attach_calendar_flags(session_dates.to_frame(name='date').set_index('date'))
+
+        # Create gate column based on pattern type
+        if 'lead_lag' in pattern_type:
+            # Lead-lag patterns need special handling - gate on response days
+            # This is a simplified version - may need refinement
+            gate_col = f"gate_calendar_{predictor}_to_{response}_{key or ''}"
+            # For now, gate all days (lead-lag logic handled in feature engineering)
+            df[gate_col] = True
+        else:
+            # Edge pattern - gate on specific days
+            gate_col = f"gate_calendar_{event}_{horizon}_{key or ''}"
+
+            # Map session dates to gate values
+            if event in daily_with_flags.columns:
+                # Create a mapping from session_date to gate value
+                gate_map = daily_with_flags[event].to_dict()
+
+                # Apply mapping to bars
+                if 'session_date' in df.columns:
+                    df[gate_col] = df['session_date'].map(gate_map).fillna(False).astype(bool)
+                else:
+                    # Map based on index date
+                    df[gate_col] = pd.Series(df.index.date).map(
+                        {k.date(): v for k, v in gate_map.items()}
+                    ).fillna(False).astype(bool).values
+            else:
+                # Unknown event, no gate
+                df[gate_col] = False
+
+        return [gate_col]
 
     def _dispatch_orderflow(
         self,
@@ -1928,6 +2008,7 @@ class HorizonSpec(NamedTuple):
 
     name: str
     delta_minutes: Optional[int] = None
+    delta_days: Optional[int] = None  # For multi-day horizons (calendar effects, etc.)
 
 
 class HorizonError(Exception):
@@ -2322,6 +2403,28 @@ class HorizonMapper:
     # Horizon selection
     # ------------------------------------------------------------------
     def pattern_horizon(self, pattern_type: str, default_intraday_minutes: int = 10) -> HorizonSpec:
+        # Calendar effects patterns: extract horizon from pattern type
+        if pattern_type.startswith("calendar_"):
+            # Pattern format: calendar_<event>_<horizon> or calendar_lead_lag_<predictor>
+            # Examples: calendar_month_end_1d, calendar_quarter_start_5d
+            parts = pattern_type.split('_')
+
+            # Look for horizon suffix (e.g., '1d', '3d', '5d')
+            for part in reversed(parts):
+                if part.endswith('d') and len(part) <= 3:
+                    try:
+                        days = int(part[:-1])
+                        if days == 1:
+                            return HorizonSpec(name="next_day_cc", delta_days=1)
+                        else:
+                            # Multi-day horizons use next_week_cc with custom delta_days
+                            return HorizonSpec(name="next_week_cc", delta_days=days)
+                    except (ValueError, IndexError):
+                        pass
+
+            # Default to next day for calendar patterns without clear horizon
+            return HorizonSpec(name="next_day_cc", delta_days=1)
+
         if pattern_type in {"weekday_mean", "orderflow_weekly", "orderflow_week_of_month"}:
             return HorizonSpec(name="same_day_oc")
         if pattern_type == "time_predictive_nextday":
@@ -3018,14 +3121,21 @@ class HorizonMapper:
                     if inferred_minutes is not None:
                         effective_delta = inferred_minutes
 
-                cache_key = (spec.name, effective_delta if spec.name == "intraday_delta" else None)
+                # Include delta_days in cache key for calendar patterns
+                cache_key = (
+                    spec.name,
+                    effective_delta if spec.name == "intraday_delta" else None,
+                    spec.delta_days if spec.delta_days is not None else None,
+                )
                 if cache_key not in horizon_cache:
                     if spec.name == "same_day_oc":
                         horizon_cache[cache_key] = self._same_day_open_to_close(df)
                     elif spec.name == "next_day_cc":
                         horizon_cache[cache_key] = self._next_day_close_to_close(df)
                     elif spec.name == "next_week_cc":
-                        horizon_cache[cache_key] = self._next_week_close_to_close(df, days=5)
+                        # Use delta_days if specified (for calendar patterns), otherwise default to 5
+                        days = spec.delta_days if spec.delta_days is not None else 5
+                        horizon_cache[cache_key] = self._next_week_close_to_close(df, days=days)
                     elif spec.name == "intraday_delta":
                         horizon_cache[cache_key] = self._intraday_delta_minutes(
                             df,
