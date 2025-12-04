@@ -1104,7 +1104,8 @@ class HistoricalScreener:
                                 sig_edges = edge_df[edge_df['sig_fdr_5pct']].copy()
                                 for _, row in sig_edges.iterrows():
                                     calendar_patterns.append({
-                                        'pattern_type': f"calendar_{row['pattern']}",
+                                        'pattern_type': 'calendar',
+                                        'calendar_pattern': row['pattern'],
                                         'event': row['event'],
                                         'horizon': row['horizon'],
                                         'mean_return': row['mean'],
@@ -1119,7 +1120,8 @@ class HistoricalScreener:
                                 sig_leadlag = leadlag_df[leadlag_df['sig_fdr_5pct']].copy()
                                 for _, row in sig_leadlag.iterrows():
                                     calendar_patterns.append({
-                                        'pattern_type': f"calendar_{row['pattern']}",
+                                        'pattern_type': 'calendar',
+                                        'calendar_pattern': row['pattern'],
                                         'predictor': row['predictor'],
                                         'response': row['response'],
                                         'beta': row['slope'],

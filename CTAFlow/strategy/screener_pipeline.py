@@ -1172,8 +1172,8 @@ class ScreenerPipeline:
         if not pattern_type:
             return []
 
-        # Check for calendar effects patterns (prefixed with "calendar_")
-        if pattern_type.startswith("calendar_"):
+        # Check for calendar effects patterns
+        if pattern_type == "calendar":
             return self._dispatch_calendar(df, pattern, key, pattern_type)
 
         if pattern_type in self._SEASONAL_TYPES:
@@ -1242,7 +1242,7 @@ class ScreenerPipeline:
             df: Bar data with datetime index and session_date column
             pattern: Pattern dict with event/horizon info
             key: Optional pattern key
-            pattern_type: Pattern type string (starts with "calendar_")
+            pattern_type: Pattern type string (should be "calendar")
 
         Returns:
             List of gate column names added to df
@@ -1250,6 +1250,7 @@ class ScreenerPipeline:
         from ..screeners.calendar_effects import _attach_calendar_flags
 
         # Extract pattern info
+        calendar_pattern = pattern.get('calendar_pattern', '')
         horizon = pattern.get('horizon', '1d')
         event = pattern.get('event', '')
 
@@ -1269,8 +1270,8 @@ class ScreenerPipeline:
         # Attach calendar flags to daily data
         daily_with_flags = _attach_calendar_flags(session_dates.to_frame(name='date').set_index('date'))
 
-        # Create gate column based on pattern type
-        if 'lead_lag' in pattern_type:
+        # Create gate column based on calendar pattern type
+        if 'lead_lag' in calendar_pattern:
             # Lead-lag patterns need special handling - gate on response days
             # This is a simplified version - may need refinement
             gate_col = f"gate_calendar_{predictor}_to_{response}_{key or ''}"
@@ -2402,25 +2403,32 @@ class HorizonMapper:
     # ------------------------------------------------------------------
     # Horizon selection
     # ------------------------------------------------------------------
-    def pattern_horizon(self, pattern_type: str, default_intraday_minutes: int = 10) -> HorizonSpec:
-        # Calendar effects patterns: extract horizon from pattern type
-        if pattern_type.startswith("calendar_"):
-            # Pattern format: calendar_<event>_<horizon> or calendar_lead_lag_<predictor>
-            # Examples: calendar_month_end_1d, calendar_quarter_start_5d
-            parts = pattern_type.split('_')
+    def pattern_horizon(
+        self,
+        pattern_type: str,
+        default_intraday_minutes: int = 10,
+        pattern: Optional[Mapping[str, Any]] = None
+    ) -> HorizonSpec:
+        # Calendar effects patterns: extract horizon from pattern data
+        if pattern_type == "calendar":
+            # Get horizon from pattern dictionary
+            horizon = None
+            if pattern is not None:
+                horizon = pattern.get('horizon', '1d')
+            else:
+                horizon = '1d'  # Default
 
-            # Look for horizon suffix (e.g., '1d', '3d', '5d')
-            for part in reversed(parts):
-                if part.endswith('d') and len(part) <= 3:
-                    try:
-                        days = int(part[:-1])
-                        if days == 1:
-                            return HorizonSpec(name="next_day_cc", delta_days=1)
-                        else:
-                            # Multi-day horizons use next_week_cc with custom delta_days
-                            return HorizonSpec(name="next_week_cc", delta_days=days)
-                    except (ValueError, IndexError):
-                        pass
+            # Parse horizon (e.g., '1d', '3d', '5d')
+            if isinstance(horizon, str) and horizon.endswith('d'):
+                try:
+                    days = int(horizon[:-1])
+                    if days == 1:
+                        return HorizonSpec(name="next_day_cc", delta_days=1)
+                    else:
+                        # Multi-day horizons use next_week_cc with custom delta_days
+                        return HorizonSpec(name="next_week_cc", delta_days=days)
+                except (ValueError, IndexError):
+                    pass
 
             # Default to next day for calendar patterns without clear horizon
             return HorizonSpec(name="next_day_cc", delta_days=1)
@@ -3113,7 +3121,9 @@ class HorizonMapper:
                 returns_x_series, returns_y = self._weekend_hedging_returns(df, pattern)
             else:
                 spec = self.pattern_horizon(
-                    pattern_type, default_intraday_minutes=default_intraday_minutes
+                    pattern_type,
+                    default_intraday_minutes=default_intraday_minutes,
+                    pattern=pattern
                 )
                 effective_delta = spec.delta_minutes
                 if spec.name == "intraday_delta":

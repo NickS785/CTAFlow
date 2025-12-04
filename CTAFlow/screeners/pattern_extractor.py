@@ -1838,61 +1838,66 @@ class PatternExtractor:
         session_data: Mapping[str, Any],
         params: Optional[ScreenParamLike],
     ) -> Iterable[Dict[str, Any]]:
-        volatility = session_data.get("volatility")
-        if not isinstance(volatility, Mapping):
-            return
-
-        context = self._momentum_pattern_context(
-            ticker_result=ticker_result,
-            session_key=session_key,
-            session_data=session_data,
-            params=params,
-        )
-
-        if volatility.get("vol_correlation_significant"):
-            pattern: Dict[str, Any] = {
-                "pattern_type": "vol_persistence",
-                "description": volatility.get(
-                    "vol_correlation_interpretation",
-                    "Opening volatility predicts closing volatility",
-                ),
-                "correlation": self._coerce_optional_float(volatility.get("opening_closing_vol_correlation")),
-                "p_value": self._coerce_optional_float(volatility.get("vol_correlation_pvalue")),
-                "n": (volatility.get("overall_stats") or {}).get("n_observations"),
-                "n_high_vol_days": volatility.get("n_high_vol_days"),
-                "n_low_vol_days": volatility.get("n_low_vol_days"),
-            }
-            self._apply_momentum_context(pattern, context)
-            yield pattern
-
-        weekday_breakdown = volatility.get("volatility_by_dayofweek")
-        if not isinstance(weekday_breakdown, Mapping):
-            return
-
-        counts: List[Tuple[str, Mapping[str, Any]]] = [
-            (weekday, stats)
-            for weekday, stats in weekday_breakdown.items()
-            if isinstance(stats, Mapping)
-        ]
-        if not counts:
-            return
-        total_high = sum(int(stats.get("high_vol_days_count") or 0) for _, stats in counts)
-        if total_high <= 0:
-            return
-        avg_high = total_high / len(counts)
-        for weekday, stats in counts:
-            high_count = int(stats.get("high_vol_days_count") or 0)
-            if high_count < avg_high * 1.25 or high_count < 5:
-                continue
-            pattern = {
-                "pattern_type": "volatility_weekday_bias",
-                "weekday": weekday,
-                "description": f"High volatility disproportionately occurs on {weekday}",
-                "high_vol_days_count": high_count,
-                "volatility_bias_ratio": high_count / avg_high if avg_high else None,
-            }
-            self._apply_momentum_context(pattern, context)
-            yield pattern
+        # Volatility patterns (vol_persistence and volatility_weekday_bias) have been
+        # removed from significant patterns as they are no longer needed.
+        # This method now returns an empty iterator.
+        return
+        # Suppressed code below - keeping for reference only
+        # volatility = session_data.get("volatility")
+        # if not isinstance(volatility, Mapping):
+        #     return
+        #
+        # context = self._momentum_pattern_context(
+        #     ticker_result=ticker_result,
+        #     session_key=session_key,
+        #     session_data=session_data,
+        #     params=params,
+        # )
+        #
+        # if volatility.get("vol_correlation_significant"):
+        #     pattern: Dict[str, Any] = {
+        #         "pattern_type": "vol_persistence",
+        #         "description": volatility.get(
+        #             "vol_correlation_interpretation",
+        #             "Opening volatility predicts closing volatility",
+        #         ),
+        #         "correlation": self._coerce_optional_float(volatility.get("opening_closing_vol_correlation")),
+        #         "p_value": self._coerce_optional_float(volatility.get("vol_correlation_pvalue")),
+        #         "n": (volatility.get("overall_stats") or {}).get("n_observations"),
+        #         "n_high_vol_days": volatility.get("n_high_vol_days"),
+        #         "n_low_vol_days": volatility.get("n_low_vol_days"),
+        #     }
+        #     self._apply_momentum_context(pattern, context)
+        #     yield pattern
+        #
+        # weekday_breakdown = volatility.get("volatility_by_dayofweek")
+        # if not isinstance(weekday_breakdown, Mapping):
+        #     return
+        #
+        # counts: List[Tuple[str, Mapping[str, Any]]] = [
+        #     (weekday, stats)
+        #     for weekday, stats in weekday_breakdown.items()
+        #     if isinstance(stats, Mapping)
+        # ]
+        # if not counts:
+        #     return
+        # total_high = sum(int(stats.get("high_vol_days_count") or 0) for _, stats in counts)
+        # if total_high <= 0:
+        #     return
+        # avg_high = total_high / len(counts)
+        # for weekday, stats in counts:
+        #     high_count = int(stats.get("high_vol_days_count") or 0)
+        #     if high_count < avg_high * 1.25 or high_count < 5:
+        #         continue
+        #     pattern = {
+        #         "pattern_type": "volatility_weekday_bias",
+        #         "weekday": weekday,
+        #         "description": f"High volatility disproportionately occurs on {weekday}",
+        #         "high_vol_days_count": high_count,
+        #         "volatility_bias_ratio": high_count / avg_high if avg_high else None,
+        #     }
+        #     self._apply_momentum_context(pattern, context)
+        #     yield pattern
 
     @classmethod
     def _iter_weekday_stats(

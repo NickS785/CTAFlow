@@ -653,16 +653,18 @@ def test_pattern_extractor_extracts_momentum_correlation_and_volatility_patterns
         params.period_length
     )
 
-    vol_pattern = next(
-        summary for summary in patterns.values() if summary["pattern_type"] == "vol_persistence"
-    )
-    assert vol_pattern["p_value"] < 0.05
-    bias_pattern = next(
-        summary
-        for summary in patterns.values()
-        if summary["pattern_type"] == "volatility_weekday_bias"
-    )
-    assert bias_pattern["metadata"]["weekday"] == "Monday"
+    # vol_persistence and volatility_weekday_bias patterns have been removed
+    # These patterns are no longer extracted by PatternExtractor
+    # vol_pattern = next(
+    #     summary for summary in patterns.values() if summary["pattern_type"] == "vol_persistence"
+    # )
+    # assert vol_pattern["p_value"] < 0.05
+    # bias_pattern = next(
+    #     summary
+    #     for summary in patterns.values()
+    #     if summary["pattern_type"] == "volatility_weekday_bias"
+    # )
+    # assert bias_pattern["metadata"]["weekday"] == "Monday"
 
 
 def test_pattern_extractor_detects_momentum_without_params():
