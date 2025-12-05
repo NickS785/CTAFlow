@@ -2416,13 +2416,13 @@ class HistoricalScreener:
                 'st_momentum': pd.DataFrame()
             }
 
-        # Add weekday column
-        if isinstance(combined.index, pd.DatetimeIndex):
-            combined['weekday'] = combined.index.weekday()
-        else:
+        # Ensure index is DatetimeIndex before accessing weekday
+        if not isinstance(combined.index, pd.DatetimeIndex):
             # Convert index to datetime if it isn't already
             combined.index = pd.to_datetime(combined.index)
-            combined['weekday'] = combined.index.weekday()
+
+        # Now safely access weekday property
+        combined['weekday'] = combined.index.weekday
 
         results = {}
 
@@ -2816,6 +2816,10 @@ class HistoricalScreener:
             returns[valid_mask] = np.log(prices / prices.shift(1))
 
         returns = returns.dropna()
+
+        # Ensure returns has DatetimeIndex before accessing dayofweek
+        if not isinstance(returns.index, pd.DatetimeIndex):
+            returns.index = pd.to_datetime(returns.index)
 
         # Add weekday labels
         df = pd.DataFrame({'return': returns, 'weekday': returns.index.dayofweek})
