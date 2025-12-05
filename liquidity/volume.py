@@ -67,7 +67,7 @@ def _filter_calendar(
         df = df[df.index.month.isin(months)]
     if weekdays is not None:
         weekdays = {int(w) for w in weekdays}
-        df = df[df.index.weekday().isin(weekdays)]
+        df = df[df.index.weekday.isin(weekdays)]
     return df
 
 
@@ -218,7 +218,7 @@ def compute_volume_seasonality(daily: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_index()
     df["volume"] = _winsorize(df["volume"], 0.01)
     df["month"] = df.index.month
-    df["weekday"] = df.index.weekday()
+    df["weekday"] = df.index.weekday
     outputs = []
     for bucket, col in ("month", "month"), ("weekday", "weekday"):
         grouped = df.groupby(col)

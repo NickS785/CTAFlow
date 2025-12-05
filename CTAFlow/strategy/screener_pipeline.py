@@ -466,6 +466,209 @@ class ScreenerPipeline:
         )
         return featured, backtest_result
 
+    def batch_multi_ticker_backtest(
+        self,
+        ticker_data: Mapping[str, Tuple[pd.DataFrame, Any]],
+        *,
+        threshold: float = 0.0,
+        use_side_hint: bool = True,
+        annualisation: int = 252,
+        risk_free_rate: float = 0.0,
+        allowed_months: Optional[Iterable[int]] = None,
+        include_metadata: Optional[Iterable[str]] = None,
+        prediction_resolver: Optional[PredictionToPosition] = None,
+        parallel_prep: bool = False,
+        max_workers: Optional[int] = None,
+        build_xy_kwargs: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        End-to-end multi-ticker GPU-accelerated backtesting.
+
+        Processes multiple tickers from raw bars through feature building, XY frame
+        construction, and GPU-batched backtesting in a single optimized pipeline.
+
+        Parameters
+        ----------
+        ticker_data:
+            Dictionary mapping ticker symbols to (bars, patterns) tuples.
+            Example: {'CL': (cl_bars, cl_patterns), 'GC': (gc_bars, gc_patterns)}
+        threshold:
+            Signal threshold for position entry
+        use_side_hint:
+            Whether to use correlation-based directional hints
+        annualisation:
+            Trading days per year for Sharpe calculation (default: 252)
+        risk_free_rate:
+            Annual risk-free rate for Sharpe calculation
+        allowed_months:
+            Optional list of calendar months to include (1-12)
+        include_metadata:
+            Pattern metadata fields to include in decision rows
+        prediction_resolver:
+            Custom position sizing logic
+        parallel_prep:
+            Enable parallel CPU preprocessing for 20+ tickers
+        max_workers:
+            CPU worker count for parallel preprocessing
+        build_xy_kwargs:
+            Additional arguments passed to build_xy
+
+        Returns
+        -------
+        Dict[str, Dict[str, Any]]
+            Dictionary mapping ticker symbols to backtest result dictionaries.
+            Each result contains: total_return, sharpe, max_drawdown, trade_count, etc.
+
+        Examples
+        --------
+        >>> pipeline = ScreenerPipeline(tz='UTC', use_gpu=True)
+        >>>
+        >>> # Prepare ticker data
+        >>> ticker_data = {
+        ...     'CL': (cl_bars, cl_patterns),
+        ...     'GC': (gc_bars, gc_patterns),
+        ...     'ES': (es_bars, es_patterns),
+        ... }
+        >>>
+        >>> # Run end-to-end GPU-batched backtest
+        >>> results = pipeline.batch_multi_ticker_backtest(
+        ...     ticker_data,
+        ...     threshold=0.0,
+        ...     use_side_hint=True
+        ... )
+        >>>
+        >>> # View results
+        >>> for ticker, summary in results.items():
+        ...     print(f"{ticker}: Return={summary['total_return']:.4f}, "
+        ...           f"Sharpe={summary['sharpe']:.2f}")
+
+        Notes
+        -----
+        - Automatically groups tickers by sample size for optimal GPU batching
+        - For maximum GPU efficiency, align all tickers to same date range
+        - GPU acceleration provides 10-20x speedup for aligned data
+        - Set parallel_prep=True for 20+ tickers to parallelize CPU work
+        - Requires CuPy for GPU acceleration (gracefully falls back to CPU)
+        """
+
+        if not ticker_data:
+            return {}
+
+        # Step 1: Build features for each ticker
+        if self.log is not None and hasattr(self.log, "info"):
+            self.log.info(
+                "[batch_multi_ticker] Building features for %d tickers",
+                len(ticker_data),
+            )
+
+        featured_map: Dict[str, pd.DataFrame] = {}
+        for ticker, (bars, patterns) in ticker_data.items():
+            try:
+                prepared = self._prepare_bars(bars)
+                featured = self.build_features(
+                    prepared,
+                    patterns,
+                    allowed_months=allowed_months,
+                    prepared_df=prepared,
+                )
+                featured_map[ticker] = featured
+            except Exception as exc:
+                if self.log is not None and hasattr(self.log, "warning"):
+                    self.log.warning(
+                        "[batch_multi_ticker] Failed to build features for %s: %s",
+                        ticker,
+                        exc,
+                    )
+                continue
+
+        if not featured_map:
+            return {}
+
+        # Step 2: Build XY decision frames for each ticker
+        if self.log is not None and hasattr(self.log, "info"):
+            self.log.info(
+                "[batch_multi_ticker] Building XY frames for %d tickers",
+                len(featured_map),
+            )
+
+        policy_map = {"auto": "auto", "hms": "second", "hmsf": "microsecond"}
+        mapper_time_match = policy_map.get(self.time_match, "auto")
+
+        xy_kwargs = dict(build_xy_kwargs) if build_xy_kwargs else {}
+        combined_meta: List[str] = []
+
+        def _extend_meta(source: Any) -> None:
+            if source is None:
+                return
+            if isinstance(source, str):
+                combined_meta.append(source)
+                return
+            combined_meta.extend(list(source))
+
+        _extend_meta(xy_kwargs.pop("include_metadata", None))
+        _extend_meta(include_metadata)
+        combined_meta.append("correlation")
+        xy_kwargs["include_metadata"] = list(dict.fromkeys(filter(None, combined_meta)))
+
+        if "time_match" in xy_kwargs:
+            override = xy_kwargs["time_match"]
+            if override in policy_map:
+                xy_kwargs["time_match"] = policy_map[override]
+
+        mapper = self._get_horizon_mapper(mapper_time_match)
+
+        xy_map: Dict[str, pd.DataFrame] = {}
+        for ticker, featured_bars in featured_map.items():
+            try:
+                _, patterns = ticker_data[ticker]
+                xy = mapper.build_xy(featured_bars, patterns, **xy_kwargs)
+                if not xy.empty:
+                    xy_map[ticker] = xy
+            except Exception as exc:
+                if self.log is not None and hasattr(self.log, "warning"):
+                    self.log.warning(
+                        "[batch_multi_ticker] Failed to build XY for %s: %s",
+                        ticker,
+                        exc,
+                    )
+                continue
+
+        if not xy_map:
+            return {}
+
+        # Step 3: GPU-batched backtest
+        if self.log is not None and hasattr(self.log, "info"):
+            self.log.info(
+                "[batch_multi_ticker] Running GPU-batched backtest on %d tickers",
+                len(xy_map),
+            )
+
+        tester = ScreenerBacktester(
+            annualisation=annualisation,
+            risk_free_rate=risk_free_rate,
+            use_gpu=self.use_gpu,
+            gpu_device_id=self.gpu_device_id,
+        )
+
+        resolver = prediction_resolver if prediction_resolver is not None else PredictionToPosition()
+
+        results = tester.batch_patterns(
+            xy_map,
+            threshold=threshold,
+            use_side_hint=use_side_hint,
+            prediction_resolver=resolver,
+            parallel_prep=parallel_prep,
+            max_workers=max_workers,
+        )
+
+        if self.log is not None and hasattr(self.log, "info"):
+            self.log.info(
+                "[batch_multi_ticker] Completed backtests for %d tickers",
+                len(results),
+            )
+
+        return results
+
     def build_feature_sets(
         self,
         bars: pd.DataFrame,
@@ -1268,7 +1471,9 @@ class ScreenerPipeline:
             session_dates = df_daily.index
 
         # Attach calendar flags to daily data
-        daily_with_flags = _attach_calendar_flags(session_dates.to_frame(name='date').set_index('date'))
+        from ..screeners.calendar_effects import CalendarEffectParams
+        params = CalendarEffectParams()
+        daily_with_flags = _attach_calendar_flags(session_dates.to_frame(name='date').set_index('date'), params)
 
         # Create gate column based on calendar pattern type
         if 'lead_lag' in calendar_pattern:
@@ -3032,7 +3237,10 @@ class HorizonMapper:
         side_hint = 1 if bias_normalized == "buy" else (-1 if bias_normalized == "sell" else 0)
 
         if mode == "mean":
-            if pattern_type in {"weekday_mean", "orderflow_weekly", "orderflow_week_of_month"}:
+            if pattern_type == "calendar":
+                # Calendar patterns store mean directly in pattern dict
+                value = pattern.get("mean")
+            elif pattern_type in {"weekday_mean", "orderflow_weekly", "orderflow_week_of_month"}:
                 value = payload.get("mean")
             elif pattern_type == "orderflow_peak_pressure":
                 value = payload.get("intraday_mean", payload.get("mean"))
@@ -3567,6 +3775,12 @@ class HorizonMapper:
             for suffix in order:
                 if weekday_norm and suffix:
                     candidates.append(f"oflow_peak_{weekday_norm}_{suffix}_{metric}_{bias}_gate")
+        elif pattern_type == "calendar":
+            # Calendar patterns use gate_calendar_{event}_{horizon}_{key} format
+            event = pattern.get("event", "")
+            horizon = pattern.get("horizon", "")
+            if event and horizon and slug_key:
+                candidates.append(f"gate_calendar_{event}_{horizon}_{slug_key}")
         elif pattern_type in ScreenerPipeline._MOMENTUM_TYPES:
             _, suffix = ScreenerPipeline._momentum_base_suffix(
                 payload, metadata, pattern_type
