@@ -174,8 +174,11 @@ def _attach_calendar_flags(df: pd.DataFrame, params: CalendarEffectParams) -> pd
     out = out.sort_index()
     dates = out.index
 
-    month_key = dates.to_period("M")
-    quarter_key = dates.to_period("Q")
+    # Remove timezone info before converting to period to avoid warnings
+    dates_tz_naive = dates.tz_localize(None) if hasattr(dates, 'tz') and dates.tz is not None else dates
+
+    month_key = dates_tz_naive.to_period("M")
+    quarter_key = dates_tz_naive.to_period("Q")
 
     out["month_key"] = month_key
     out["quarter_key"] = quarter_key

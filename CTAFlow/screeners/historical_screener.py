@@ -2417,7 +2417,12 @@ class HistoricalScreener:
             }
 
         # Add weekday column
-        combined['weekday'] = combined.index.weekday
+        if isinstance(combined.index, pd.DatetimeIndex):
+            combined['weekday'] = combined.index.weekday()
+        else:
+            # Convert index to datetime if it isn't already
+            combined.index = pd.to_datetime(combined.index)
+            combined['weekday'] = combined.index.weekday()
 
         results = {}
 
