@@ -1397,8 +1397,10 @@ class ScreenerPipeline:
             return
 
         if self.use_gpu and GPU_AVAILABLE:
+            # Convert DataFrame to NumPy array before GPU transfer
+            gate_array = df[gate_columns].to_numpy()
             gate_backend, xp = to_backend_array(
-                df[gate_columns], use_gpu=True, device_id=self.gpu_device_id
+                gate_array, use_gpu=True, device_id=self.gpu_device_id
             )
             any_active_backend = xp.any(gate_backend, axis=1)
             any_active = to_cpu(any_active_backend)
