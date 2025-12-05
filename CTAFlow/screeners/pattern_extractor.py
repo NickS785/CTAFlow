@@ -1841,7 +1841,7 @@ class PatternExtractor:
         # Volatility patterns (vol_persistence and volatility_weekday_bias) have been
         # removed from significant patterns as they are no longer needed.
         # This method now returns an empty iterator.
-        return
+        return iter([])
         # Suppressed code below - keeping for reference only
         # volatility = session_data.get("volatility")
         # if not isinstance(volatility, Mapping):
