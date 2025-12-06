@@ -1397,8 +1397,9 @@ class ScreenerPipeline:
             return
 
         if self.use_gpu and GPU_AVAILABLE:
-            # Convert DataFrame to NumPy array before GPU transfer
-            gate_array = df[gate_columns].to_numpy()
+            # Convert DataFrame to NumPy array with explicit numeric dtype
+            # Gate columns may be bool/int/float - ensure float64 for GPU compatibility
+            gate_array = df[gate_columns].to_numpy(dtype=np.float64)
             gate_backend, xp = to_backend_array(
                 gate_array, use_gpu=True, device_id=self.gpu_device_id
             )
