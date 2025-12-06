@@ -1455,10 +1455,11 @@ class ScreenerPipeline:
         """
         from ..screeners.calendar_effects import _attach_calendar_flags
 
-        # Extract pattern info
-        calendar_pattern = pattern.get('calendar_pattern', '')
-        horizon = pattern.get('horizon', '1d')
-        event = pattern.get('event', '')
+        # Extract pattern info - check both top-level and nested pattern_payload
+        payload = pattern.get('pattern_payload', {}) or {}
+        calendar_pattern = pattern.get('calendar_pattern') or payload.get('calendar_pattern', '')
+        horizon = pattern.get('horizon') or payload.get('horizon', '1d')
+        event = pattern.get('event') or payload.get('event', '')
 
         # For lead-lag patterns, we need predictor/response
         predictor = pattern.get('predictor', '')
@@ -1487,7 +1488,9 @@ class ScreenerPipeline:
             df[gate_col] = True
         else:
             # Edge pattern - gate on specific days
-            gate_col = f"gate_calendar_{event}_{horizon}_{key or ''}"
+            # Slugify key to ensure consistent naming with _infer_gate_column_name
+            slug_key = ScreenerPipeline._slugify(key) if key else ''
+            gate_col = f"gate_calendar_{event}_{horizon}_{slug_key}"
 
             # Map session dates to gate values
             if event in daily_with_flags.columns:
@@ -2619,10 +2622,11 @@ class HorizonMapper:
     ) -> HorizonSpec:
         # Calendar effects patterns: extract horizon from pattern data
         if pattern_type == "calendar":
-            # Get horizon from pattern dictionary
+            # Get horizon from pattern dictionary - check both top-level and nested pattern_payload
             horizon = None
             if pattern is not None:
-                horizon = pattern.get('horizon', '1d')
+                payload = pattern.get('pattern_payload', {}) or {}
+                horizon = pattern.get('horizon') or payload.get('horizon', '1d')
             else:
                 horizon = '1d'  # Default
 
@@ -3241,8 +3245,13 @@ class HorizonMapper:
 
         if mode == "mean":
             if pattern_type == "calendar":
-                # Calendar patterns store mean directly in pattern dict
-                value = pattern.get("mean")
+                # Calendar patterns store mean in various locations: top-level or pattern_payload
+                # Also check for mean_return as alternative field name
+                value = (
+                    pattern.get("mean") or
+                    payload.get("mean") or
+                    payload.get("mean_return")
+                )
             elif pattern_type in {"weekday_mean", "orderflow_weekly", "orderflow_week_of_month"}:
                 value = payload.get("mean")
             elif pattern_type == "orderflow_peak_pressure":
@@ -3780,8 +3789,9 @@ class HorizonMapper:
                     candidates.append(f"oflow_peak_{weekday_norm}_{suffix}_{metric}_{bias}_gate")
         elif pattern_type == "calendar":
             # Calendar patterns use gate_calendar_{event}_{horizon}_{key} format
-            event = pattern.get("event", "")
-            horizon = pattern.get("horizon", "")
+            # Check both top-level and nested pattern_payload for event/horizon
+            event = pattern.get("event") or payload.get("event", "")
+            horizon = pattern.get("horizon") or payload.get("horizon", "")
             if event and horizon and slug_key:
                 candidates.append(f"gate_calendar_{event}_{horizon}_{slug_key}")
         elif pattern_type in ScreenerPipeline._MOMENTUM_TYPES:
