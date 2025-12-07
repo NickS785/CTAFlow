@@ -52,46 +52,49 @@ class PredictionToPosition:
             weights = weights.where(weights.abs() >= self.min_abs_correlation, 0.0)
         frame["_ptp_score"] = base_signal * weights
 
-        grouped = frame.groupby("ts_decision", sort=True)
-        records = []
-        for ts_value, subset in grouped:
-            # Separate weekday_bias patterns from other patterns
-            has_pattern_type = "pattern_type" in subset.columns
-            if has_pattern_type:
-                weekday_bias_mask = subset["pattern_type"].isin(["weekday_mean", "weekday_bias_intraday"])
-                weekday_bias_subset = subset[weekday_bias_mask]
-                other_subset = subset[~weekday_bias_mask]
-            else:
-                weekday_bias_subset = pd.DataFrame()
-                other_subset = subset
+        # Identify weekday bias patterns (vectorized)
+        if "pattern_type" in frame.columns:
+            weekday_bias_mask = frame["pattern_type"].isin(["weekday_mean", "weekday_bias_intraday"])
+        else:
+            weekday_bias_mask = pd.Series(False, index=frame.index)
 
-            # Calculate score from non-bias patterns
-            if not other_subset.empty:
-                score = other_subset["_ptp_score"].sum(min_count=1)
-            else:
-                score = 0.0
+        # Separate bias and non-bias scores
+        frame["_is_bias"] = weekday_bias_mask
+        frame["_bias_score"] = frame["_ptp_score"].where(weekday_bias_mask, 0.0)
+        frame["_other_score"] = frame["_ptp_score"].where(~weekday_bias_mask, 0.0)
 
-            # Add weekday bias contribution (always additive)
-            if not weekday_bias_subset.empty:
-                weekday_bias_contribution = weekday_bias_subset["_ptp_score"].sum(min_count=1)
-                if np.isfinite(weekday_bias_contribution):
-                    score += weekday_bias_contribution
+        # Aggregate scores per timestamp (vectorized)
+        grouped = frame.groupby("ts_decision", sort=False)
+        agg_scores = pd.DataFrame({
+            "other_score_sum": grouped["_other_score"].sum(),
+            "bias_score_sum": grouped["_bias_score"].sum(),
+        })
 
-            # Determine position based on combined score
-            if not np.isfinite(score) or abs(score) <= self.neutral_tolerance:
-                position = 0
-            elif score > 0:
-                position = 1
-            else:
-                position = -1
+        # Calculate combined score and position
+        agg_scores["combined_score"] = agg_scores["other_score_sum"] + agg_scores["bias_score_sum"]
+        agg_scores["prediction_position"] = 0
+        valid_scores = agg_scores["combined_score"].notna() & (agg_scores["combined_score"].abs() > self.neutral_tolerance)
+        agg_scores.loc[valid_scores & (agg_scores["combined_score"] > 0), "prediction_position"] = 1
+        agg_scores.loc[valid_scores & (agg_scores["combined_score"] < 0), "prediction_position"] = -1
 
-            base = subset.iloc[0].copy()
-            base["returns_x"] = pd.to_numeric(subset["returns_x"], errors="coerce").mean()
-            base["returns_y"] = pd.to_numeric(subset["returns_y"], errors="coerce").mean()
-            base["prediction_position"] = position
-            records.append(base)
+        # Aggregate returns (vectorized)
+        returns_x_num = pd.to_numeric(frame["returns_x"], errors="coerce")
+        returns_y_num = pd.to_numeric(frame["returns_y"], errors="coerce")
+        agg_returns = pd.DataFrame({
+            "returns_x_mean": grouped[returns_x_num.name if hasattr(returns_x_num, 'name') else "returns_x"].mean(),
+            "returns_y_mean": grouped[returns_y_num.name if hasattr(returns_y_num, 'name') else "returns_y"].mean(),
+        })
 
-        result = pd.DataFrame(records).drop(columns=["_ptp_score"], errors="ignore")
+        # Take first row per timestamp as base and update with aggregated values
+        base_rows = frame.sort_values("ts_decision").drop_duplicates(subset=["ts_decision"], keep="first").set_index("ts_decision")
+
+        # Update with aggregated values
+        base_rows["returns_x"] = agg_returns["returns_x_mean"]
+        base_rows["returns_y"] = agg_returns["returns_y_mean"]
+        base_rows["prediction_position"] = agg_scores["prediction_position"]
+
+        # Cleanup temporary columns
+        result = base_rows.drop(columns=["_ptp_score", "_is_bias", "_bias_score", "_other_score"], errors="ignore")
         return result.reset_index(drop=True)
 
     def resolve(
@@ -189,79 +192,50 @@ class PredictionToPosition:
         return resolved
 
     def _resolve_with_grouping(self, working: pd.DataFrame, group_field: str) -> pd.DataFrame:
-        """Optimized resolve with group_field (requires iteration but minimized)."""
-        # This path still needs iteration but is much faster than before
-        collapsed_rows = []
-        grouped = working.groupby("ts_decision", sort=True)
+        """Vectorized resolve with group_field using pre-sorted groupby operations."""
+        # Calculate weekday bias contribution per timestamp (vectorized)
+        bias_contrib = working[working["_is_weekday_bias"]].groupby("ts_decision")["_ptp_score"].sum()
 
-        for _, subset in grouped:
-            # Extract weekday bias contribution for this timestamp
-            weekday_bias_contrib = 0.0
-            if "_is_weekday_bias" in subset.columns:
-                bias_subset = subset[subset["_is_weekday_bias"]]
-                if not bias_subset.empty:
-                    weekday_bias_contrib = bias_subset["_ptp_score"].sum()
+        # Filter out weekday bias rows for selection
+        non_bias = working[~working["_is_weekday_bias"]].copy()
 
-            if include_grouping:
-                values = subset[group_field].tolist()
-                order = []
-                seen_keys = set()
-                for value in values:
-                    key = "__nan__" if pd.isna(value) else value
-                    if key not in seen_keys:
-                        seen_keys.add(key)
-                        order.append(value)
+        if non_bias.empty:
+            # Only bias patterns exist, use them
+            non_bias = working.copy()
+            bias_contrib = pd.Series(0.0, index=working["ts_decision"].unique())
 
-                members = [value for value in values if not pd.isna(value)]
-                if members:
-                    members = list(dict.fromkeys(members))
+        # Create ranking columns for vectorized best-row selection
+        non_bias["_abs_score"] = non_bias["_ptp_score"].abs()
+        non_bias["_abs_return"] = pd.to_numeric(non_bias["returns_x"], errors="coerce").abs().fillna(0.0)
 
-                for value in order:
-                    if pd.isna(value):
-                        per_subset = subset[subset[group_field].isna()]
-                    else:
-                        per_subset = subset[subset[group_field] == value]
+        # Sort by (ts_decision, group_field, _abs_score desc, _abs_return desc)
+        # This ensures we can pick the first row per (ts_decision, group_field) pair as the best
+        non_bias.sort_values(
+            by=["ts_decision", group_field, "_abs_score", "_abs_return"],
+            ascending=[True, True, False, False],
+            inplace=True
+        )
 
-                    if per_subset.empty:
-                        continue
+        # Keep first (best) row per (ts_decision, group_field) pair
+        resolved = non_bias.drop_duplicates(subset=["ts_decision", group_field], keep="first").copy()
 
-                    # Filter out weekday bias from per_subset for best row selection
-                    if "_is_weekday_bias" in per_subset.columns:
-                        non_bias_subset = per_subset[~per_subset["_is_weekday_bias"]]
-                        if not non_bias_subset.empty:
-                            row = self._select_best_row(non_bias_subset)
-                        else:
-                            row = self._select_best_row(per_subset)
-                    else:
-                        row = self._select_best_row(per_subset)
+        # Add weekday bias contribution back
+        resolved["_ptp_score"] = resolved["_ptp_score"] + resolved["ts_decision"].map(bias_contrib).fillna(0.0)
 
-                    # Add weekday bias contribution to the score
-                    if np.isfinite(weekday_bias_contrib) and weekday_bias_contrib != 0.0:
-                        current_score = row.get("_ptp_score", 0.0)
-                        row["_ptp_score"] = current_score + weekday_bias_contrib
+        # Build group_members column: for each timestamp, collect all unique group values
+        # Group by ts_decision and aggregate all group_field values
+        members_map = (
+            resolved.groupby("ts_decision")[group_field]
+            .apply(lambda x: list(x.dropna().unique()))
+            .to_dict()
+        )
 
-                    if members:
-                        row["_group_members"] = members
-                    collapsed_rows.append(row)
-            else:
-                # Filter out weekday bias for best row selection
-                if "_is_weekday_bias" in subset.columns:
-                    non_bias_subset = subset[~subset["_is_weekday_bias"]]
-                    if not non_bias_subset.empty:
-                        row = self._select_best_row(non_bias_subset)
-                    else:
-                        row = self._select_best_row(subset)
-                else:
-                    row = self._select_best_row(subset)
+        # Add _group_members to each row
+        resolved["_group_members"] = resolved["ts_decision"].map(members_map)
 
-                # Add weekday bias contribution to the score
-                if np.isfinite(weekday_bias_contrib) and weekday_bias_contrib != 0.0:
-                    current_score = row.get("_ptp_score", 0.0)
-                    row["_ptp_score"] = current_score + weekday_bias_contrib
+        # Cleanup temporary columns
+        resolved.drop(columns=["_abs_score", "_abs_return", "_ptp_score", "_is_weekday_bias"], errors="ignore", inplace=True)
 
-                collapsed_rows.append(row)
-
-        resolved = pd.DataFrame(collapsed_rows).drop(columns=["_ptp_score", "_is_weekday_bias"], errors="ignore")
         return resolved.reset_index(drop=True)
 
     @staticmethod
