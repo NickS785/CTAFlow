@@ -769,6 +769,7 @@ class HistoricalScreener:
         include_calendar_effects: bool = True,
         calendar_horizons: Optional[Dict[str, int]] = None,
         calendar_min_obs: int = 50,
+        include_return_series: bool = False,
     ) -> Dict[str, Dict[str, any]]:
         """
         Screen for seasonality patterns in intraday data.
@@ -807,6 +808,10 @@ class HistoricalScreener:
             Horizons for calendar effects (default: {'1d': 1, '3d': 3, '5d': 5})
         calendar_min_obs : int
             Minimum observations for calendar effects (default: 50)
+        include_return_series : bool
+            When True, attach the predictor/response return series used in the
+            time-of-day predictability tests so downstream tools can reuse them
+            without recomputing.
 
         Returns:
         --------
@@ -1039,6 +1044,7 @@ class HistoricalScreener:
                         is_synthetic,
                         period_length,
                         tz,
+                        include_return_series=include_return_series,
                     )
                     enriched_stats = dict(pattern_context)
                     enriched_stats.update(pred_stats)
@@ -3002,6 +3008,7 @@ class HistoricalScreener:
         is_synthetic: bool,
         period_length: Optional[timedelta] = None,
         tz: Optional[str] = None,
+        include_return_series: bool = False,
     ) -> Dict[str, any]:
         """
         Test if returns at a specific time predict future returns.
@@ -3023,7 +3030,10 @@ class HistoricalScreener:
 
         Returns:
         --------
-        Dict with correlation statistics for various lags and weekday breakdown for next-week correlation
+        Dict with correlation statistics for various lags and weekday breakdown for next-week correlation.
+        When ``include_return_series`` is True, also includes the exact return
+        series used for each correlation test to enable downstream reuse without
+        recomputation.
         """
         from ..utils.seasonal import tod_mask, aggregate_window, log_returns
 
@@ -3131,6 +3141,35 @@ class HistoricalScreener:
         # Add weekday prevalence if available
         if weekday_analysis is not None:
             result['weekday_prevalence'] = weekday_analysis
+
+        if include_return_series:
+            def _serialize(series: pd.Series) -> Dict[str, float]:
+                return {
+                    str(idx): float(val)
+                    for idx, val in series.dropna().items()
+                }
+
+            serialized: Dict[str, Any] = {
+                'daily_returns': _serialize(daily_returns),
+                'target_time': target_time.strftime("%H:%M"),
+            }
+
+            x_1d_series = pd.Series(x_1d, index=daily_returns.index[:-1]) if len(x_1d) else pd.Series(dtype=float)
+            y_1d_series = pd.Series(y_1d, index=daily_returns.index[1:]) if len(y_1d) else pd.Series(dtype=float)
+            serialized['next_day'] = {
+                'predictor': _serialize(x_1d_series),
+                'response': _serialize(y_1d_series),
+            }
+
+            if len(x_1w) and len(y_1w):
+                x_1w_series = pd.Series(x_1w, index=daily_returns.index[:len(x_1w)])
+                y_1w_series = pd.Series(y_1w, index=daily_returns.index[lag_week:lag_week + len(y_1w)])
+                serialized['next_week'] = {
+                    'predictor': _serialize(x_1w_series),
+                    'response': _serialize(y_1w_series),
+                }
+
+            result['predictor_returns'] = serialized
 
         return result
 
@@ -3458,6 +3497,13 @@ class HistoricalScreener:
                 time_label = str(pred_stats.get('time') or time_key)
                 # Next-day prediction
                 if pred_stats.get('next_day_significant', False):
+                    payload = {
+                        'correlation': pred_stats['next_day_corr'],
+                        'mean': pred_stats.get('mean_return'),
+                    }
+                    if 'predictor_returns' in pred_stats:
+                        payload['predictor_returns'] = pred_stats['predictor_returns']
+
                     pattern_entry = {
                         'type': 'time_predictive_nextday',
                         'time': time_label,
@@ -3471,11 +3517,19 @@ class HistoricalScreener:
                         'target_times_hhmm': pred_stats.get('target_times_hhmm'),
                         'period_length_min': pred_stats.get('period_length_min'),
                         'regime_filter': pred_stats.get('regime_filter', regime_meta),
+                        'pattern_payload': payload,
                     }
                     patterns.append(pattern_entry)
 
                 # Next-week prediction
                 if pred_stats.get('next_week_significant', False):
+                    payload = {
+                        'correlation': pred_stats['next_week_corr'],
+                        'mean': pred_stats.get('mean_return'),
+                    }
+                    if 'predictor_returns' in pred_stats:
+                        payload['predictor_returns'] = pred_stats['predictor_returns']
+
                     pattern_entry = {
                         'type': 'time_predictive_nextweek',
                         'time': time_label,

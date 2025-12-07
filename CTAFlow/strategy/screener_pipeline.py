@@ -19,6 +19,7 @@ import time as time_module
 from collections.abc import Iterable as IterableABC, Sequence as SequenceABC
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import time as time_cls
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -52,12 +53,44 @@ from .prediction_to_position import PredictionToPosition
 
 __all__ = [
     "ScreenerPipeline",
+    "PipelineParams",
     "extract_ticker_patterns",
     "HorizonMapper",
     "HorizonSpec",
     "ScreenerBacktester",
     "PredictionToPosition",
 ]
+
+
+@dataclass
+class PipelineParams:
+    """Shared configuration for screener pipelines and backtests.
+
+    Attributes
+    ----------
+    use_gpu:
+        Enable GPU acceleration when available.
+    gpu_device_id:
+        Target GPU id for GPU-enabled operations.
+    max_workers:
+        Default worker count used when parallelising screener feature builds.
+    thresholds:
+        Thresholds tested when invoking convenience backtests.
+    use_side_hint:
+        Whether to respect correlation/side_hint fields when backtesting.
+    group_field:
+        Optional grouping column used for trade counting.
+    prediction_resolver:
+        Optional resolver for overlapping predictions.
+    """
+
+    use_gpu: bool = True
+    gpu_device_id: int = 0
+    max_workers: Optional[int] = None
+    thresholds: Tuple[float, ...] = (0.0,)
+    use_side_hint: bool = True
+    group_field: Optional[str] = None
+    prediction_resolver: Optional["PredictionToPosition"] = None
 
 
 def _is_numeric(value: Any) -> bool:
@@ -179,8 +212,11 @@ class ScreenerPipeline:
         tz: str = "America/Chicago",
         time_match: str = "auto",
         log: Any = None,
-        use_gpu: bool = True,
-        gpu_device_id: int = 0,
+        use_gpu: Optional[bool] = None,
+        gpu_device_id: Optional[int] = None,
+        *,
+        params: Optional[PipelineParams] = None,
+        max_workers: Optional[int] = None,
     ) -> None:
         """Configure the pipeline.
 
@@ -206,11 +242,15 @@ class ScreenerPipeline:
         if time_match not in {"auto", "hms", "hmsf"}:
             raise ValueError("time_match must be one of {'auto', 'hms', 'hmsf'}")
 
+        self.params = params or PipelineParams()
+
         self.tz = tz
         self.time_match = time_match
         self.log = log
-        self.use_gpu = use_gpu
-        self.gpu_device_id = gpu_device_id
+        self.use_gpu = self.params.use_gpu if use_gpu is None else use_gpu
+        self.gpu_device_id = (
+            self.params.gpu_device_id if gpu_device_id is None else gpu_device_id
+        )
         self.allow_naive_ts = False
         self.nan_policy = "drop"
         self.asof_tolerance = None
@@ -218,6 +258,7 @@ class ScreenerPipeline:
         self.sessionizer = None
         self.weekend_exit_policy = "last"
         self.data_clean_policy = "ffill"  # Policy for cleaning numeric columns: 'ffill', 'drop', 'zero'
+        self.max_workers = self.params.max_workers if max_workers is None else max_workers
         self._mapper_cache: Dict[Tuple[Any, ...], HorizonMapper] = {}
 
     # ------------------------------------------------------------------
@@ -277,7 +318,7 @@ class ScreenerPipeline:
             return created_cols, {col: local_df[col] for col in created_cols}
 
         # Auto-determine worker count for GPU-enabled batching
-        worker_count = max_workers
+        worker_count = max_workers if max_workers is not None else self.max_workers
         if (
             worker_count is None
             and self.use_gpu
@@ -334,6 +375,48 @@ class ScreenerPipeline:
 
         return df
 
+    def run_screeners(
+        self,
+        runners: Mapping[str, Any],
+        *,
+        max_workers: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Execute screener callables and collect their results.
+
+        Parameters
+        ----------
+        runners:
+            Mapping of screener names to callables (or already-evaluated
+            results). Each callable should return the screener's result
+            dictionary when invoked with no arguments.
+        max_workers:
+            Optional override for parallel execution. Defaults to the pipeline's
+            configured ``max_workers`` when provided.
+        """
+
+        if not runners:
+            return {}
+
+        worker_count = max_workers if max_workers is not None else self.max_workers
+        resolved: Dict[str, Any] = {}
+
+        def _execute(name: str, candidate: Any) -> Any:
+            return candidate() if callable(candidate) else candidate
+
+        if worker_count and len(runners) > 1:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                future_map = {
+                    executor.submit(_execute, name, func): name for name, func in runners.items()
+                }
+                for future in as_completed(future_map):
+                    name = future_map[future]
+                    resolved[name] = future.result()
+        else:
+            for name, func in runners.items():
+                resolved[name] = _execute(name, func)
+
+        return resolved
+
     def backtest_threshold(
         self,
         bars_with_features: pd.DataFrame,
@@ -389,6 +472,74 @@ class ScreenerPipeline:
             threshold=threshold,
             use_side_hint=use_side_hint,
             prediction_resolver=resolver,
+        )
+
+    def backtest_patterns(
+        self,
+        bars: pd.DataFrame,
+        patterns: Any,
+        *,
+        thresholds: Optional[Sequence[float]] = None,
+        build_xy_kwargs: Optional[Mapping[str, Any]] = None,
+        precomputed_returns: Optional[Mapping[str, Mapping[str, pd.Series]]] = None,
+        use_side_hint: Optional[bool] = None,
+        group_field: Optional[str] = None,
+        prediction_resolver: Optional[PredictionToPosition] = None,
+        backtester: Optional[ScreenerBacktester] = None,
+    ) -> Dict[float, Dict[str, Any]]:
+        """Build features, construct decision rows, and run batched backtests.
+
+        This helper stitches together :meth:`build_features`, :meth:`build_xy`,
+        and :class:`ScreenerBacktester` so callers can evaluate a set of patterns
+        with a single function call.
+        """
+
+        featured = self.build_features(bars, patterns, max_workers=self.max_workers)
+        xy_params = dict(build_xy_kwargs or {})
+        xy_params.setdefault("precomputed_returns", precomputed_returns)
+
+        mapper = self._get_horizon_mapper(self._translate_time_match(self.time_match))
+        xy = mapper.build_xy(featured, patterns, **xy_params)
+
+        thresholds_resolved: Tuple[float, ...]
+        if thresholds is None:
+            thresholds_resolved = tuple(self.params.thresholds)
+        else:
+            thresholds_resolved = tuple(thresholds)
+        if not thresholds_resolved:
+            thresholds_resolved = (0.0,)
+
+        tester = backtester or ScreenerBacktester(
+            use_gpu=self.use_gpu,
+            gpu_device_id=self.gpu_device_id,
+        )
+
+        resolved_side_hint = (
+            self.params.use_side_hint if use_side_hint is None else use_side_hint
+        )
+        resolved_group = group_field if group_field is not None else self.params.group_field
+        resolved_resolver = prediction_resolver or self.params.prediction_resolver
+
+        if len(thresholds_resolved) == 1:
+            threshold_val = float(thresholds_resolved[0])
+            return {
+                threshold_val: tester.threshold(
+                    xy,
+                    threshold=threshold_val,
+                    use_side_hint=resolved_side_hint,
+                    group_field=resolved_group,
+                    prediction_resolver=resolved_resolver,
+                    cache_prepared=True,
+                )
+            }
+
+        return tester.batch_threshold_sweep(
+            xy,
+            thresholds_resolved,
+            use_side_hint=resolved_side_hint,
+            group_field=resolved_group,
+            prediction_resolver=resolved_resolver,
+            cache_prepared=True,
         )
 
     # ------------------------------------------------------------------
@@ -3290,6 +3441,7 @@ class HorizonMapper:
         weekly_x_policy: str,
         time_match: str,
         tolerance: Optional[str],
+        precomputed_returns: Optional[Mapping[str, Mapping[str, pd.Series]]] = None,
     ) -> Iterable[Tuple[str, str, pd.Series, pd.Series, int, List[str], Mapping[str, Any]]]:
         if patterns is None:
             return
@@ -3314,6 +3466,7 @@ class HorizonMapper:
             if not pattern_type:
                 continue
 
+            payload = pattern.get("pattern_payload") or {}
             gate_col, candidates = self._infer_gate_column_name(
                 df, key, pattern, time_match=time_match
             )
@@ -3327,6 +3480,41 @@ class HorizonMapper:
                     candidates=candidates,
                 )
                 continue
+
+            if precomputed_returns and key in precomputed_returns:
+                cached = precomputed_returns[key] or {}
+                returns_x_series = cached.get("returns_x") or cached.get("predictor")
+                returns_y = cached.get("returns_y") or cached.get("response")
+                if isinstance(returns_x_series, pd.Series) and isinstance(returns_y, pd.Series):
+                    aligned_x = returns_x_series.reindex(df.index)
+                    aligned_y = returns_y.reindex(df.index)
+                    _, side_hint = self._predictor_from_payload(pattern, pattern_type, mode="bias")
+                    yield gate_col, pattern_type, aligned_x, aligned_y, side_hint, candidates, pattern
+                    continue
+
+            precomputed_payload = payload.get("predictor_returns")
+            if isinstance(precomputed_payload, Mapping):
+                branch: Optional[Mapping[str, Any]]
+                if pattern_type == "time_predictive_nextday":
+                    branch = precomputed_payload.get("next_day")
+                elif pattern_type == "time_predictive_nextweek":
+                    branch = precomputed_payload.get("next_week")
+                else:
+                    branch = None
+
+                if isinstance(branch, Mapping):
+                    rx_dict = branch.get("predictor")
+                    ry_dict = branch.get("response")
+                    if isinstance(rx_dict, Mapping) and isinstance(ry_dict, Mapping):
+                        rx_series = pd.Series(rx_dict, dtype=float)
+                        ry_series = pd.Series(ry_dict, dtype=float)
+                        rx_series.index = pd.to_datetime(rx_series.index)
+                        ry_series.index = pd.to_datetime(ry_series.index)
+                        aligned_x = rx_series.reindex(df.index)
+                        aligned_y = ry_series.reindex(df.index)
+                        _, side_hint = self._predictor_from_payload(pattern, pattern_type, mode="bias")
+                        yield gate_col, pattern_type, aligned_x, aligned_y, side_hint, candidates, pattern
+                        continue
 
             if pattern_type in ScreenerPipeline._MOMENTUM_TYPES:
                 returns_x_series, returns_y = self._momentum_xy_series(
@@ -3416,6 +3604,7 @@ class HorizonMapper:
         default_intraday_minutes: int = 10,
         predictor_minutes: int = 5,
         weekly_x_policy: str = "mean",
+        precomputed_returns: Optional[Mapping[str, Mapping[str, pd.Series]]] = None,
     ) -> pd.DataFrame:
         """Return ``bars_with_features`` with per-pattern predictor columns appended."""
 
@@ -3440,6 +3629,7 @@ class HorizonMapper:
             weekly_x_policy=weekly_x_policy,
             time_match=self.time_match,
             tolerance=self.asof_tolerance,
+            precomputed_returns=precomputed_returns,
         ):
             signal_col = self._signal_column_name(gate_col)
             signal = pd.Series(np.nan, index=result.index, dtype=float)
@@ -3472,6 +3662,7 @@ class HorizonMapper:
         asof_tolerance: Optional[str] = None,
         debug: bool = False,
         include_metadata: Optional[Iterable[str]] = None,
+        precomputed_returns: Optional[Mapping[str, Mapping[str, pd.Series]]] = None,
     ) -> pd.DataFrame:
         """Construct tidy decision rows for screener ``patterns``.
 
@@ -3572,6 +3763,7 @@ class HorizonMapper:
             weekly_x_policy=weekly_x_policy,
             time_match=effective_time_match,
             tolerance=effective_tolerance,
+            precomputed_returns=precomputed_returns,
         ):
             gate_series = df.get(gate_col)
             if gate_series is None:
