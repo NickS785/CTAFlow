@@ -1640,7 +1640,12 @@ class ScreenerPipeline:
         else:
             # Edge pattern - gate on specific days
             # Slugify key to ensure consistent naming with _infer_gate_column_name
-            slug_key = ScreenerPipeline._slugify(key) if key else ''
+            # If no key provided, use event_horizon as the unique identifier
+            if key:
+                slug_key = ScreenerPipeline._slugify(key)
+            else:
+                # Generate unique key from event and horizon
+                slug_key = f"{event}_{horizon}"
             gate_col = f"gate_calendar_{event}_{horizon}_{slug_key}"
 
             # Map session dates to gate values
@@ -3984,8 +3989,10 @@ class HorizonMapper:
             # Check both top-level and nested pattern_payload for event/horizon
             event = pattern.get("event") or payload.get("event", "")
             horizon = pattern.get("horizon") or payload.get("horizon", "")
-            if event and horizon and slug_key:
-                candidates.append(f"gate_calendar_{event}_{horizon}_{slug_key}")
+            if event and horizon:
+                # If no slug_key provided, use event_horizon as unique identifier
+                effective_key = slug_key if slug_key else f"{event}_{horizon}"
+                candidates.append(f"gate_calendar_{event}_{horizon}_{effective_key}")
         elif pattern_type in ScreenerPipeline._MOMENTUM_TYPES:
             _, suffix = ScreenerPipeline._momentum_base_suffix(
                 payload, metadata, pattern_type

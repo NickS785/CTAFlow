@@ -515,6 +515,17 @@ class ScreenerBacktester:
 
         return result
 
+
+
+
+
+
+
+
+
+
+
+
     def batch_patterns(
         self,
         xy_map: Mapping[str, pd.DataFrame],
