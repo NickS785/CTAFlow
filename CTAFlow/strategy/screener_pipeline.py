@@ -1616,6 +1616,10 @@ class ScreenerPipeline:
         predictor = pattern.get('predictor', '')
         response = pattern.get('response', '')
 
+        # Apply month filtering (like momentum patterns)
+        months = self._resolve_months(key, pattern)
+        month_mask = self._months_mask(df, months)
+
         # Get session dates (daily level)
         if 'session_date' not in df.columns:
             # Infer session_date from index if not present
@@ -1635,17 +1639,18 @@ class ScreenerPipeline:
             # Lead-lag patterns need special handling - gate on response days
             # This is a simplified version - may need refinement
             gate_col = f"gate_calendar_{predictor}_to_{response}_{key or ''}"
-            # For now, gate all days (lead-lag logic handled in feature engineering)
-            df[gate_col] = True
+            # Apply month mask
+            df[gate_col] = month_mask
         else:
             # Edge pattern - gate on specific days
             # Slugify key to ensure consistent naming with _infer_gate_column_name
-            # If no key provided, use event_horizon as the unique identifier
+            # If no key provided, use event_horizon_months as the unique identifier
             if key:
                 slug_key = ScreenerPipeline._slugify(key)
             else:
-                # Generate unique key from event and horizon
-                slug_key = f"{event}_{horizon}"
+                # Generate unique key from event, horizon, and months
+                month_suffix = f"_m{'_'.join(map(str, months))}" if months else ""
+                slug_key = f"{event}_{horizon}{month_suffix}"
             gate_col = f"gate_calendar_{event}_{horizon}_{slug_key}"
 
             # Map session dates to gate values
@@ -1655,12 +1660,16 @@ class ScreenerPipeline:
 
                 # Apply mapping to bars
                 if 'session_date' in df.columns:
-                    df[gate_col] = df['session_date'].map(gate_map).fillna(False).astype(bool)
+                    calendar_gate = df['session_date'].map(gate_map).fillna(False).astype(bool)
                 else:
                     # Map based on index date
-                    df[gate_col] = pd.Series(df.index.date).map(
+                    calendar_gate = pd.Series(df.index.date).map(
                         {k.date(): v for k, v in gate_map.items()}
-                    ).fillna(False).astype(bool).values
+                    ).fillna(False).astype(bool)
+                    calendar_gate.index = df.index
+
+                # Combine calendar gate with month mask
+                df[gate_col] = calendar_gate & month_mask
             else:
                 # Unknown event, no gate
                 df[gate_col] = False
