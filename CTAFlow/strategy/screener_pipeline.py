@@ -667,8 +667,9 @@ class ScreenerPipeline:
         Returns
         -------
         Dict[str, Dict[str, Any]]
-            Dictionary mapping ticker symbols to backtest result dictionaries.
-            Each result contains: total_return, sharpe, max_drawdown, trade_count, etc.
+            Dictionary mapping ticker|pattern keys to backtest result dictionaries.
+            Keys are formatted as "TICKER|pattern_details" (e.g., "CL|usa_all|calendar|month_end|1d").
+            Each result contains: summary (BacktestSummary), pnl, positions, cumulative, etc.
 
         Examples
         --------
@@ -688,10 +689,11 @@ class ScreenerPipeline:
         ...     use_side_hint=True
         ... )
         >>>
-        >>> # View results
-        >>> for ticker, summary in results.items():
-        ...     print(f"{ticker}: Return={summary['total_return']:.4f}, "
-        ...           f"Sharpe={summary['sharpe']:.2f}")
+        >>> # View results (each ticker-pattern combination)
+        >>> for key, result in results.items():
+        ...     summary = result['summary']
+        ...     print(f"{key}: Return={summary.total_return:.4f}, "
+        ...           f"Sharpe={summary.sharpe:.2f}, Trades={summary.trades}")
 
         Notes
         -----
@@ -772,13 +774,30 @@ class ScreenerPipeline:
         for ticker, featured_bars in featured_map.items():
             try:
                 _, patterns = ticker_data[ticker]
-                xy = mapper.build_xy(featured_bars, patterns, **xy_kwargs)
-                if not xy.empty:
-                    xy_map[ticker] = xy
+
+                # Build separate XY frames for each pattern
+                items = list(self._items_from_patterns(patterns))
+                for pattern_key, pattern_dict in items:
+                    try:
+                        # Build XY for this specific pattern
+                        xy = mapper.build_xy(featured_bars, {pattern_key: pattern_dict}, **xy_kwargs)
+                        if not xy.empty:
+                            # Use ticker|pattern as key for unique identification
+                            combined_key = f"{ticker}|{pattern_key}"
+                            xy_map[combined_key] = xy
+                    except Exception as pattern_exc:
+                        if self.log is not None and hasattr(self.log, "warning"):
+                            self.log.warning(
+                                "[batch_multi_ticker] Failed to build XY for %s pattern %s: %s",
+                                ticker,
+                                pattern_key,
+                                pattern_exc,
+                            )
+                        continue
             except Exception as exc:
                 if self.log is not None and hasattr(self.log, "warning"):
                     self.log.warning(
-                        "[batch_multi_ticker] Failed to build XY for %s: %s",
+                        "[batch_multi_ticker] Failed to process patterns for %s: %s",
                         ticker,
                         exc,
                     )
