@@ -1257,10 +1257,99 @@ class ScreenerPipeline:
 
     @staticmethod
     def _select_pattern_key(pattern: Mapping[str, Any], key_hint: Optional[str]) -> str:
-        for candidate in (pattern.get("key"), pattern.get("id"), key_hint, pattern.get("description")):
+        # First check if explicit key/id/description is provided
+        for candidate in (pattern.get("key"), pattern.get("id")):
             if candidate:
                 return str(candidate)
-        return "pattern"
+
+        # If no explicit key, generate descriptive key from pattern details
+        pattern_type = pattern.get("pattern_type") or pattern.get("type")
+
+        # Build descriptive key based on pattern type
+        if pattern_type == "calendar":
+            event = pattern.get("event", "")
+            horizon = pattern.get("horizon", "")
+            calendar_pattern = pattern.get("calendar_pattern", "")
+            parts = [key_hint] if key_hint else []
+            parts.append("calendar")
+            if event:
+                parts.append(str(event))
+            if horizon:
+                parts.append(str(horizon))
+            if calendar_pattern and calendar_pattern != event:
+                parts.append(str(calendar_pattern))
+            # Add months if specified
+            months = pattern.get("months")
+            if months and isinstance(months, (list, tuple)) and len(months) < 12:
+                month_str = "_".join(map(str, sorted(months)))
+                parts.append(f"m{month_str}")
+            return "|".join(parts)
+
+        elif pattern_type in {"momentum_weekday", "momentum_oc", "momentum_cc", "momentum_sc"}:
+            payload = pattern.get("pattern_payload", {})
+            metadata = pattern.get("metadata", {})
+            parts = [key_hint] if key_hint else []
+            parts.append(pattern_type)
+
+            # Add momentum type
+            momentum_type = payload.get("momentum_type") or metadata.get("momentum_type")
+            if momentum_type:
+                parts.append(str(momentum_type))
+
+            # Add weekday if specified
+            weekday = payload.get("weekday") or metadata.get("weekday") or metadata.get("best_weekday")
+            if weekday is not None:
+                parts.append(str(weekday))
+
+            # Add session info if available
+            session_key = metadata.get("session_key") or payload.get("session_key")
+            if session_key:
+                parts.append(str(session_key))
+
+            return "|".join(parts)
+
+        elif pattern_type in {"weekday_mean", "weekday_returns", "weekday_bias_intraday"}:
+            parts = [key_hint] if key_hint else []
+            parts.append(pattern_type)
+
+            # Add weekday
+            weekday = pattern.get("weekday") or pattern.get("day")
+            if weekday is not None:
+                parts.append(str(weekday))
+
+            # Add horizon/trading window
+            horizon = pattern.get("horizon") or pattern.get("trading_window")
+            if horizon:
+                parts.append(str(horizon))
+
+            return "|".join(parts)
+
+        elif pattern_type in {"orderflow_week_of_month", "orderflow_weekly", "orderflow_peak_pressure"}:
+            parts = [key_hint] if key_hint else []
+            parts.append(pattern_type)
+
+            # Add orderflow-specific details
+            week = pattern.get("week_of_month")
+            if week is not None:
+                parts.append(f"week{week}")
+
+            horizon = pattern.get("horizon")
+            if horizon:
+                parts.append(str(horizon))
+
+            return "|".join(parts)
+
+        # Default: use key_hint if available, otherwise description
+        if key_hint:
+            if pattern_type:
+                return f"{key_hint}|{pattern_type}"
+            return str(key_hint)
+
+        description = pattern.get("description")
+        if description:
+            return str(description)
+
+        return pattern_type or "pattern"
 
     # ------------------------------------------------------------------
     # Column helpers

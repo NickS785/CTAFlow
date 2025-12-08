@@ -181,6 +181,94 @@ class BacktestReportGenerator:
         self.scoring_fn = scoring_fn or ScreenerBacktester.ranking_score
         self.top_n = top_n
 
+    def generate_report_from_ticker_dict(
+        self,
+        ticker_results: Mapping[str, Mapping[str, Mapping[str, Any]]],
+        *,
+        include_global_summary: bool = True,
+    ) -> BacktestReport:
+        """Generate a backtest report from nested ticker→pattern→results structure.
+
+        This method handles results from calling concurrent_pattern_backtests()
+        separately for each ticker, producing a structure like:
+        {
+            'CL': {'pattern1': {...}, 'pattern2': {...}},
+            'GC': {'pattern1': {...}, 'pattern2': {...}},
+        }
+
+        Args:
+            ticker_results: Nested dict {ticker: {pattern: result}}
+            include_global_summary: Whether to compute global statistics
+
+        Returns:
+            BacktestReport object containing organized results
+
+        Example:
+            >>> screener_tgts = {}
+            >>> for ticker, data in hs.data.items():
+            ...     screener_tgts[ticker] = sp.concurrent_pattern_backtests(
+            ...         data, patterns, verbose=True
+            ...     )
+            >>> generator = BacktestReportGenerator(top_n=5)
+            >>> report = generator.generate_report_from_ticker_dict(screener_tgts)
+        """
+        ticker_reports = {}
+
+        for ticker, pattern_results in ticker_results.items():
+            patterns_list = []
+
+            for pattern_name, result in pattern_results.items():
+                # Extract summary
+                summary = result.get('summary')
+                if not isinstance(summary, BacktestSummary):
+                    continue
+
+                # Calculate score
+                score = self.scoring_fn(summary)
+                if not np.isfinite(score):
+                    score = float('-inf')
+
+                patterns_list.append((pattern_name, summary, score))
+
+            if not patterns_list:
+                continue
+
+            # Sort by score descending
+            patterns_list.sort(key=lambda x: x[2], reverse=True)
+
+            # Calculate statistics
+            total_patterns = len(patterns_list)
+            returns = [p[1].total_return for p in patterns_list]
+            sharpes = [p[1].sharpe for p in patterns_list if np.isfinite(p[1].sharpe)]
+
+            avg_return = float(np.mean(returns)) if returns else 0.0
+            avg_sharpe = float(np.mean(sharpes)) if sharpes else np.nan
+
+            best_pattern = patterns_list[0][0] if patterns_list else None
+            best_score = patterns_list[0][2] if patterns_list else float('-inf')
+
+            # Create ticker report
+            ticker_reports[ticker] = TickerReport(
+                ticker=ticker,
+                top_patterns=patterns_list[:self.top_n],
+                total_patterns=total_patterns,
+                avg_return=avg_return,
+                avg_sharpe=avg_sharpe,
+                best_pattern=best_pattern,
+                best_score=best_score,
+            )
+
+        # Global summary
+        global_summary = {}
+        if include_global_summary:
+            global_summary = self._compute_global_summary(ticker_reports)
+
+        return BacktestReport(
+            ticker_reports=ticker_reports,
+            global_summary=global_summary,
+            report_timestamp=pd.Timestamp.now(),
+        )
+
     def generate_report(
         self,
         results: Mapping[str, Mapping[str, Any]],
