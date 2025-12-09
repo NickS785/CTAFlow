@@ -2200,9 +2200,29 @@ class PatternExtractor:
         description = str(pattern.get("description", pattern_type))
 
         qualifiers: List[str] = [pattern_type]
-        for key in ("day", "weekday", "time", "lag", "month", "momentum_type", "session_key"):
-            if key in pattern and pattern[key] is not None:
-                qualifiers.append(str(pattern[key]))
+
+        # For calendar patterns, prioritize calendar_pattern field for descriptive naming
+        if pattern_type == "calendar":
+            calendar_pattern = pattern.get("calendar_pattern", "")
+            if calendar_pattern:
+                # Remove "calendar_" prefix if present for cleaner keys
+                if calendar_pattern.startswith("calendar_"):
+                    calendar_pattern = calendar_pattern[9:]
+                qualifiers = [calendar_pattern]  # Replace pattern_type with specific pattern name
+            else:
+                # Fallback to event + horizon if calendar_pattern not available
+                event = pattern.get("event", "")
+                horizon = pattern.get("horizon", "")
+                if event:
+                    qualifiers = [event]
+                if horizon and str(horizon) not in qualifiers[0]:
+                    qualifiers.append(str(horizon))
+        else:
+            # For non-calendar patterns, use existing logic
+            for key in ("day", "weekday", "time", "lag", "month", "momentum_type", "session_key"):
+                if key in pattern and pattern[key] is not None:
+                    qualifiers.append(str(pattern[key]))
+
         key = "|".join([screen_name, *qualifiers])
 
         summary_key = "|".join([screen_name, *qualifiers])

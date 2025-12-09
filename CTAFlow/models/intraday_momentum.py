@@ -24,6 +24,7 @@ class IntradayMomentumLight(CTALight):
         session_end: time = time(15, 0),
         session_open: time = time(8, 30),
         closing_length: timedelta = timedelta(minutes=60),
+        tz = "America/Chicago",
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)

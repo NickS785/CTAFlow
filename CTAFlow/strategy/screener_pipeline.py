@@ -1288,8 +1288,10 @@ class ScreenerPipeline:
         if pattern_type == "calendar":
             # calendar_pattern contains the full pattern name from calendar_effects.py
             # e.g., "calendar_month_start_1d", "calendar_quarter_end_3d", etc.
-            calendar_pattern = pattern.get("calendar_pattern", "")
-            horizon = pattern.get("horizon", "")
+            # Check both top level and inside pattern_payload (PatternExtractor stores it there)
+            payload = pattern.get("pattern_payload", {})
+            calendar_pattern = pattern.get("calendar_pattern") or payload.get("calendar_pattern", "")
+            horizon = pattern.get("horizon") or payload.get("horizon", "")
 
             parts = [key_hint] if key_hint else []
 
@@ -1304,7 +1306,7 @@ class ScreenerPipeline:
                 parts.append(pattern_desc)
             else:
                 # Fallback: build from event + horizon
-                event = pattern.get("event", "")
+                event = pattern.get("event") or payload.get("event", "")
                 if event:
                     parts.append(str(event))
 
@@ -1312,8 +1314,9 @@ class ScreenerPipeline:
             if horizon and (not calendar_pattern or str(horizon) not in calendar_pattern):
                 parts.append(str(horizon))
 
-            # Add months if specified
-            months = pattern.get("months")
+            # Add months if specified (check metadata and payload)
+            metadata = pattern.get("metadata", {})
+            months = pattern.get("months") or metadata.get("months") or payload.get("months")
             if months and isinstance(months, (list, tuple)) and len(months) < 12:
                 month_str = "_".join(map(str, sorted(months)))
                 parts.append(f"m{month_str}")
