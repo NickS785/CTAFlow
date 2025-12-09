@@ -2,8 +2,35 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 import pandas as pd
+
+
+def detect_date_column(bars: pd.DataFrame) -> Optional[str]:
+    """Auto-detect the date column in a DataFrame.
+
+    Args:
+        bars: DataFrame to inspect
+
+    Returns:
+        Name of the date column, or None if using index
+
+    Raises:
+        KeyError: If no suitable date column found
+    """
+    # Try common date column names
+    for candidate in ['date', 'Date', 'session_date', 'ts', 'timestamp', 'datetime']:
+        if candidate in bars.columns:
+            return candidate
+
+    # Check if index is a DatetimeIndex
+    if isinstance(bars.index, pd.DatetimeIndex):
+        return None  # Signals to use index
+
+    raise KeyError(
+        f"No date column found. Available columns: {list(bars.columns)}. "
+        f"Index type: {type(bars.index).__name__}"
+    )
 
 
 def align_ticker_data(
@@ -74,12 +101,38 @@ def _align_intersection(
 ) -> Dict[str, Tuple[pd.DataFrame, Any]]:
     """Align to dates common to all tickers (intersection)."""
 
+    # Auto-detect date column if the provided one doesn't exist
+    first_bars = next((bars for bars, _ in ticker_data.values() if not bars.empty), None)
+    if first_bars is not None and date_col not in first_bars.columns:
+        # Try common date column names
+        for candidate in ['date', 'Date', 'session_date', 'ts', 'timestamp', 'datetime']:
+            if candidate in first_bars.columns:
+                if verbose:
+                    print(f"Auto-detected date column: '{candidate}' ('{date_col}' not found)")
+                date_col = candidate
+                break
+        else:
+            # Try index if it's a datetime
+            if isinstance(first_bars.index, pd.DatetimeIndex):
+                if verbose:
+                    print(f"Using DataFrame index as date column ('{date_col}' not found)")
+                date_col = None  # Signal to use index
+            else:
+                raise KeyError(f"Date column '{date_col}' not found and no suitable alternative detected. "
+                              f"Available columns: {list(first_bars.columns)}")
+
     # Find common dates across all tickers
     common_dates = None
     for ticker, (bars, _) in ticker_data.items():
         if bars.empty:
             continue
-        dates = set(pd.to_datetime(bars[date_col]))
+
+        # Get dates from column or index
+        if date_col is None:
+            dates = set(pd.to_datetime(bars.index))
+        else:
+            dates = set(pd.to_datetime(bars[date_col]))
+
         common_dates = dates if common_dates is None else common_dates.intersection(dates)
 
     if common_dates is None or not common_dates:
@@ -104,7 +157,15 @@ def _align_intersection(
             continue
 
         original_len = len(bars)
-        mask = pd.to_datetime(bars[date_col]).isin(common_dates)
+
+        # Filter based on column or index
+        if date_col is None:
+            # Use index
+            mask = pd.to_datetime(bars.index).isin(common_dates)
+        else:
+            # Use column
+            mask = pd.to_datetime(bars[date_col]).isin(common_dates)
+
         aligned_bars = bars[mask].copy()
 
         if verbose:
@@ -123,12 +184,37 @@ def _align_union(
 ) -> Dict[str, Tuple[pd.DataFrame, Any]]:
     """Align to all dates from any ticker (union)."""
 
+    # Auto-detect date column if the provided one doesn't exist
+    first_bars = next((bars for bars, _ in ticker_data.values() if not bars.empty), None)
+    if first_bars is not None and date_col not in first_bars.columns:
+        # Try common date column names
+        for candidate in ['date', 'Date', 'session_date', 'ts', 'timestamp', 'datetime']:
+            if candidate in first_bars.columns:
+                if verbose:
+                    print(f"Auto-detected date column: '{candidate}' ('{date_col}' not found)")
+                date_col = candidate
+                break
+        else:
+            # Try index if it's a datetime
+            if isinstance(first_bars.index, pd.DatetimeIndex):
+                if verbose:
+                    print(f"Using DataFrame index as date column ('{date_col}' not found)")
+                date_col = None  # Signal to use index
+            else:
+                raise KeyError(f"Date column '{date_col}' not found and no suitable alternative detected. "
+                              f"Available columns: {list(first_bars.columns)}")
+
     # Get all unique dates
     all_dates = set()
     for ticker, (bars, _) in ticker_data.items():
         if bars.empty:
             continue
-        all_dates.update(pd.to_datetime(bars[date_col]))
+
+        # Get dates from column or index
+        if date_col is None:
+            all_dates.update(pd.to_datetime(bars.index))
+        else:
+            all_dates.update(pd.to_datetime(bars[date_col]))
 
     if not all_dates:
         if verbose:
@@ -154,7 +240,13 @@ def _align_union(
         original_len = len(bars)
 
         # Set index to dates for reindexing
-        bars_indexed = bars.set_index(pd.to_datetime(bars[date_col]))
+        if date_col is None:
+            # Already using index
+            bars_indexed = bars.copy()
+            bars_indexed.index = pd.to_datetime(bars_indexed.index)
+        else:
+            # Set date column as index
+            bars_indexed = bars.set_index(pd.to_datetime(bars[date_col]))
 
         # Reindex to full date range
         aligned_bars = bars_indexed.reindex(full_index)
@@ -167,9 +259,10 @@ def _align_union(
         else:
             raise ValueError(f"Invalid fill_method '{fill_method}'. Use 'ffill' or 'bfill'.")
 
-        # Reset index
-        aligned_bars = aligned_bars.reset_index(drop=False)
-        aligned_bars.rename(columns={'index': date_col}, inplace=True)
+        # Reset index if we created it from a column
+        if date_col is not None:
+            aligned_bars = aligned_bars.reset_index(drop=False)
+            aligned_bars.rename(columns={'index': date_col}, inplace=True)
 
         if verbose:
             filled_count = len(aligned_bars) - original_len
