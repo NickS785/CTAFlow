@@ -1,6 +1,7 @@
 import datetime
 import os.path
 from pathlib import Path
+from typing import Any, Dict, Optional, Union
 
 from ..features.signals_processing import COTAnalyzer, TechnicalAnalysis
 from ..data.retrieval import fetch_data_sync
@@ -9,7 +10,7 @@ import numpy as np
 from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score, ParameterGrid, GridSearchCV
-from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error, log_loss
 from sklearn.ensemble import RandomForestRegressor
 import lightgbm as lgb
 from xgboost import XGBRegressor
@@ -17,6 +18,7 @@ import warnings
 import pickle
 from ..config import MODEL_DATA_PATH
 from ..features import IntradayFeatures
+from .config import build_default_params, infer_task_from_target
 
 warnings.filterwarnings('ignore')
 data_load_func = fetch_data_sync
@@ -1188,46 +1190,68 @@ class CTALinear:
 
 class CTALight:
     """LightGBM model optimized for CTA positioning prediction"""
-    
-    def __init__(self, **lgb_params):
+
+    def __init__(
+        self,
+        *,
+        task: str = 'regression',
+        use_gpu: bool = False,
+        config_path: Optional[Union[str, Path]] = None,
+        **lgb_params,
+    ):
         """
         Initialize LightGBM model with CTA-optimized defaults
-        
+
         Args:
-            **lgb_params: LightGBM parameters to override defaults
+            task: Learning task type ('regression', 'binary_classification', or 'multiclass').
+            use_gpu: Enable GPU acceleration when True.
+            config_path: Optional JSON file containing base LightGBM parameters.
+            **lgb_params: LightGBM parameters to override defaults.
         """
-        # CTA-optimized default parameters
-        default_params = {
-            'objective': 'regression',
-            'metric': 'rmse',
-            'boosting_type': 'gbdt',
-            'num_leaves': 31,
-            'learning_rate': 0.1,
-            'feature_fraction': 0.8,
-            'bagging_fraction': 0.8,
-            'bagging_freq': 5,
-            'min_child_samples': 20,
-            'min_child_weight': 0.001,
-            'min_split_gain': 0.0,
-            'subsample': 0.8,
-            'subsample_freq': 1,
-            'colsample_bytree': 0.8,
-            'reg_alpha': 0.1,
-            'reg_lambda': 0.1,
-            'random_state': 42,
-            'n_jobs': -1,
-            'verbosity': -1,
-            'force_col_wise': True
-        }
-        
+        task_normalized = (task or 'regression').lower()
+        self.use_gpu = bool(use_gpu)
+        self.config_path = config_path
+        self._user_params = dict(lgb_params)
+        self.requested_task = task_normalized
+
+        resolved_task = infer_task_from_target(None, task_normalized)
+        default_params = build_default_params(
+            task=resolved_task,
+            use_gpu=self.use_gpu,
+            config_path=self.config_path,
+        )
+
         # Update with user parameters
-        self.params = {**default_params, **lgb_params}
-        
+        self.params: Dict[str, Any] = {**default_params, **lgb_params}
+        self.task = resolved_task
+
         self.model = None
         self.is_fitted = False
         self.feature_names = None
         self.feature_importance = None
         self.train_history = None
+
+    def _maybe_update_task_from_y(self, y: Union[pd.Series, np.ndarray, list, tuple]) -> np.ndarray:
+        if isinstance(y, pd.Series):
+            y_values = y.values
+        else:
+            y_values = np.asarray(y)
+
+        resolved_task = infer_task_from_target(y_values, self.requested_task)
+        if resolved_task != self.task:
+            base_params = build_default_params(
+                task=resolved_task,
+                use_gpu=self.use_gpu,
+                config_path=self.config_path,
+            )
+            self.params = {**base_params, **self._user_params}
+            self.task = resolved_task
+
+        if self.task == 'multiclass' and 'num_class' not in self.params:
+            unique_classes = np.unique(y_values[~np.isnan(y_values)])
+            self.params['num_class'] = int(len(unique_classes))
+
+        return y_values
         
     def fit(self, X, y, eval_set=None, early_stopping_rounds=50, num_boost_round=1000):
         """Fit the LightGBM model
@@ -1245,15 +1269,14 @@ class CTALight:
             X = X.values
         else:
             self.feature_names = [f'feature_{i}' for i in range(X.shape[1])]
-            
-        if isinstance(y, pd.Series):
-            y = y.values
-            
+
+        y = self._maybe_update_task_from_y(y)
+
         # Remove rows with NaN values
         mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
         X_clean = X[mask]
         y_clean = y[mask]
-        
+
         if len(X_clean) == 0:
             raise ValueError("No valid samples after removing NaN values")
         
@@ -1353,9 +1376,8 @@ class CTALight:
             X = X.values
         else:
             feature_names = [f'feature_{i}' for i in range(X.shape[1])]
-            
-        if isinstance(y, pd.Series):
-            y = y.values
+
+        y = self._maybe_update_task_from_y(y)
             
         # Remove rows with NaN values
         mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
@@ -1365,10 +1387,10 @@ class CTALight:
         # Use TimeSeriesSplit for proper temporal validation
         from sklearn.model_selection import TimeSeriesSplit
         tscv = TimeSeriesSplit(n_splits=cv_folds)
-        
+
         cv_scores = []
         feature_importances = []
-        
+
         for train_idx, val_idx in tscv.split(X_clean):
             X_train, X_val = X_clean[train_idx], X_clean[val_idx]
             y_train, y_val = y_clean[train_idx], y_clean[val_idx]
@@ -1389,8 +1411,15 @@ class CTALight:
             
             # Make predictions and calculate score
             pred = model.predict(X_val)
-            mse = mean_squared_error(y_val, pred)
-            cv_scores.append(mse)
+            if self.task in {'binary_classification', 'multiclass'}:
+                try:
+                    score_val = log_loss(y_val, pred)
+                except ValueError:
+                    score_val = mean_squared_error(y_val, pred)
+            else:
+                score_val = mean_squared_error(y_val, pred)
+
+            cv_scores.append(score_val)
             
             # Store feature importance
             importance = pd.Series(
@@ -1466,7 +1495,7 @@ class CTALight:
             
         return importance.head(top_n)
     
-    def grid_search(self, X, y, param_grid=None, cv_folds=5, scoring='neg_mean_squared_error', 
+    def grid_search(self, X, y, param_grid=None, cv_folds=5, scoring='neg_mean_squared_error',
                    early_stopping_rounds=50, num_boost_round=1000, verbose=True):
         """Perform grid search for hyperparameter optimization
         
@@ -1486,13 +1515,14 @@ class CTALight:
         # Default parameter grid if none provided
         if param_grid is None:
             param_grid = {
-                'num_leaves': [ 31, 50],
-                'learning_rate':  [0.05, 0.1],
+                'num_leaves': [31, 63],
+                'learning_rate': [0.03, 0.07, 0.12],
                 'feature_fraction': [0.7, 0.9],
-                'bagging_fraction': [0.7, 0.8, 0.9],
-                'min_child_samples': [10, 30],
-                'reg_alpha': [0.1, 0.2],
-                'reg_lambda': [0.1, 0.2]
+                'bagging_fraction': [0.8, 1.0],
+                'min_child_samples': [10, 25],
+                'min_split_gain': [0.0, 0.1],
+                'reg_alpha': [0.0, 0.2],
+                'reg_lambda': [0.1, 0.5],
             }
         
         # Convert to numpy arrays
@@ -1502,8 +1532,10 @@ class CTALight:
         else:
             feature_names = [f'feature_{i}' for i in range(X.shape[1])]
             
-        if isinstance(y, pd.Series):
-            y = y.values
+        y = self._maybe_update_task_from_y(y)
+
+        if scoring is None:
+            scoring = 'neg_log_loss' if self.task in {'binary_classification', 'multiclass'} else 'neg_mean_squared_error'
             
         # Remove rows with NaN values
         mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
@@ -1522,9 +1554,23 @@ class CTALight:
         # Time series cross-validation
         tscv = TimeSeriesSplit(n_splits=cv_folds)
         
-        best_score = float('-inf') if scoring == 'r2' else float('inf')
+        best_score = float('-inf')
         best_params = None
         all_results = []
+
+        def _compute_score(y_true, preds):
+            if scoring == 'neg_mean_squared_error':
+                return -mean_squared_error(y_true, preds)
+            if scoring == 'neg_mean_absolute_error':
+                return -mean_absolute_error(y_true, preds)
+            if scoring == 'r2':
+                return r2_score(y_true, preds)
+            if scoring == 'neg_log_loss':
+                try:
+                    return -log_loss(y_true, preds)
+                except ValueError:
+                    return -mean_squared_error(y_true, preds)
+            raise ValueError(f"Unsupported scoring metric: {scoring}")
         
         for i, param_combo in enumerate(param_combinations):
             # Create parameter dictionary for this combination
@@ -1557,15 +1603,8 @@ class CTALight:
                 # Make predictions and calculate score
                 pred = model.predict(X_val)
                 
-                if scoring == 'neg_mean_squared_error':
-                    score = -mean_squared_error(y_val, pred)
-                elif scoring == 'neg_mean_absolute_error':
-                    score = -mean_absolute_error(y_val, pred)
-                elif scoring == 'r2':
-                    score = r2_score(y_val, pred)
-                else:
-                    raise ValueError(f"Unsupported scoring metric: {scoring}")
-                
+                score = _compute_score(y_val, pred)
+
                 cv_scores.append(score)
             
             # Calculate mean CV score
@@ -1582,9 +1621,7 @@ class CTALight:
             all_results.append(result)
             
             # Check if this is the best score
-            is_better = (mean_cv_score > best_score) if scoring == 'r2' else (mean_cv_score < abs(best_score))
-            
-            if is_better:
+            if mean_cv_score > best_score:
                 best_score = mean_cv_score
                 best_params = current_params
             
@@ -1595,8 +1632,10 @@ class CTALight:
             print(f"\nGrid search completed!")
             print(f"Best parameters: {best_params}")
             print(f"Best {scoring}: {best_score:.4f}")
-        
+
         # Update model parameters with best found
+        if best_params:
+            self._user_params.update(best_params)
         self.params.update(best_params)
         
         return {

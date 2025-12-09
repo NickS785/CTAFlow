@@ -13,11 +13,13 @@ This module contains:
 
 from .base_models import (
     CTAForecast,
-    CTALinear, 
+    CTALinear,
     CTALight,
     CTAXGBoost,
-    CTARForest
+    CTARForest,
 )
+from .intraday_momentum import IntradayMomentumLight
+from .volatility import RVForecast
 
 __all__ = [
     # Main forecasting class
@@ -25,7 +27,9 @@ __all__ = [
     
     # Individual model classes
     'CTALinear',
-    'CTALight', 
+    'CTALight',
     'CTAXGBoost',
     'CTARForest',
+    'IntradayMomentumLight',
+    'RVForecast',
 ]

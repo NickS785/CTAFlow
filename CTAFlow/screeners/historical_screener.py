@@ -1093,6 +1093,7 @@ class HistoricalScreener:
 
                 # Time-of-day predictability
                 time_predictions = {}
+                return_series_map: Dict[str, pd.Series] = {}
                 for target_time in converted_times:
                     pred_stats = self._test_time_predictability(
                         session_data,
@@ -1103,11 +1104,18 @@ class HistoricalScreener:
                         tz,
                         include_return_series=include_return_series,
                     )
+                    daily_returns = pred_stats.pop('daily_returns_series', None)
+                    if daily_returns is not None:
+                        return_series_map[str(target_time)] = daily_returns
+
                     enriched_stats = dict(pattern_context)
                     enriched_stats.update(pred_stats)
                     time_predictions[str(target_time)] = enriched_stats
 
                 ticker_results['time_predictability'] = time_predictions
+
+                if len(return_series_map) >= 2:
+                    ticker_results['time_correlation_matrix'] = self._build_time_correlation_matrix(return_series_map)
 
                 weekend_pattern = self._compute_weekend_hedging_pattern(
                     session_data,
@@ -3361,9 +3369,31 @@ class HistoricalScreener:
                 'next_day_pvalue': np.nan,
                 'next_week_corr': np.nan,
                 'next_week_pvalue': np.nan,
+                'eod_corr': np.nan,
+                'eod_pvalue': np.nan,
+                'eod_significant': False,
                 'error': 'Insufficient data',
                 **months_meta,
+                'daily_returns_series': daily_returns,
             }
+
+        eod_corr = np.nan
+        eod_pvalue = np.nan
+        eod_significant = False
+
+        if isinstance(data.index, pd.DatetimeIndex):
+            eod_prices = data[price_col].resample('1D').last()
+            eod_returns = eod_prices.pct_change().dropna()
+
+            aligned_eod = pd.concat(
+                [daily_returns.rename('intraday'), eod_returns.rename('eod')],
+                axis=1,
+                join='inner',
+            ).dropna()
+
+            if len(aligned_eod) >= 15:
+                eod_corr, eod_pvalue = stats.pearsonr(aligned_eod['intraday'], aligned_eod['eod'])
+                eod_significant = bool(abs(eod_corr) > 0.1 and eod_pvalue < 0.05)
 
         # Batch correlations for next-day and next-week using GPU
         from ..utils.gpu_utils import gpu_batch_pearsonr
@@ -3424,7 +3454,11 @@ class HistoricalScreener:
             'next_week_corr': float(r_1w) if not np.isnan(r_1w) else np.nan,
             'next_week_pvalue': float(p_1w) if not np.isnan(p_1w) else np.nan,
             'next_week_significant': p_1w < 0.05 if not np.isnan(p_1w) else False,
+            'eod_corr': float(eod_corr) if not np.isnan(eod_corr) else np.nan,
+            'eod_pvalue': float(eod_pvalue) if not np.isnan(eod_pvalue) else np.nan,
+            'eod_significant': eod_significant,
             **months_meta,
+            'daily_returns_series': daily_returns,
         }
 
         # Add weekday prevalence if available
@@ -3461,6 +3495,52 @@ class HistoricalScreener:
             result['predictor_returns'] = serialized
 
         return result
+
+    def _build_time_correlation_matrix(
+        self, return_series_map: Dict[str, pd.Series]
+    ) -> Dict[str, Any]:
+        """
+        Build a correlation matrix for target-time return series.
+
+        Highlights correlations stronger than 0.1 in absolute value when the
+        Pearson test is statistically significant (p < 0.05).
+        """
+
+        time_keys = sorted(return_series_map.keys())
+        pair_results: List[Dict[str, Any]] = []
+
+        for idx, time_a in enumerate(time_keys):
+            for time_b in time_keys[idx + 1:]:
+                series_a = return_series_map[time_a].dropna()
+                series_b = return_series_map[time_b].dropna()
+
+                aligned = pd.concat([series_a.rename('a'), series_b.rename('b')], axis=1, join='inner').dropna()
+
+                corr_val = np.nan
+                p_value = np.nan
+                if len(aligned) >= 15:
+                    corr_val, p_value = stats.pearsonr(aligned['a'], aligned['b'])
+
+                significant = bool(np.isfinite(corr_val) and abs(corr_val) > 0.1 and np.isfinite(p_value) and p_value < 0.05)
+
+                pair_results.append(
+                    {
+                        'time_a': time_a,
+                        'time_b': time_b,
+                        'correlation': float(corr_val) if np.isfinite(corr_val) else np.nan,
+                        'p_value': float(p_value) if np.isfinite(p_value) else np.nan,
+                        'significant': significant,
+                        'n': int(len(aligned)),
+                    }
+                )
+
+        significant_pairs = [pair for pair in pair_results if pair['significant']]
+
+        return {
+            'pairs': pair_results,
+            'significant_pairs': significant_pairs,
+            'n_pairs': len(pair_results),
+        }
 
     def _compute_weekend_hedging_pattern(
         self,
@@ -3810,6 +3890,30 @@ class HistoricalScreener:
                     }
                     patterns.append(pattern_entry)
 
+                if pred_stats.get('eod_significant', False):
+                    payload = {
+                        'correlation': pred_stats['eod_corr'],
+                        'mean': pred_stats.get('mean_return'),
+                    }
+
+                    pattern_entry = {
+                        'type': 'time_predictive_eod',
+                        'time': time_label,
+                        'description': f'{time_label} correlates with EOD return',
+                        'correlation': pred_stats['eod_corr'],
+                        'p_value': pred_stats['eod_pvalue'],
+                        'strength': abs(pred_stats['eod_corr']),
+                        'months_active': pred_stats.get('months_active'),
+                        'months_mask_12': pred_stats.get('months_mask_12'),
+                        'months_names': pred_stats.get('months_names'),
+                        'target_times_hhmm': pred_stats.get('target_times_hhmm'),
+                        'period_length_min': pred_stats.get('period_length_min'),
+                        'regime_filter': pred_stats.get('regime_filter', regime_meta),
+                        'pattern_payload': payload,
+                    }
+
+                    patterns.append(pattern_entry)
+
                 # Next-week prediction
                 if pred_stats.get('next_week_significant', False):
                     payload = {
@@ -3850,6 +3954,24 @@ class HistoricalScreener:
                             )
 
                     patterns.append(pattern_entry)
+
+        if 'time_correlation_matrix' in ticker_results:
+            matrix = ticker_results['time_correlation_matrix'] or {}
+            for pair in matrix.get('significant_pairs', []):
+                time_label = f"{pair['time_a']} -> {pair['time_b']}"
+                pattern_entry = {
+                    'type': 'time_predictive_intraday',
+                    'time': time_label,
+                    'description': f"Intraday linkage {time_label}",
+                    'correlation': pair.get('correlation'),
+                    'p_value': pair.get('p_value'),
+                    'strength': abs(pair.get('correlation', 0.0) or 0.0),
+                    'n': pair.get('n'),
+                    'target_times_hhmm': pattern_context.get('target_times_hhmm'),
+                    'period_length_min': pattern_context.get('period_length_min'),
+                    'regime_filter': pattern_context.get('regime_filter'),
+                }
+                patterns.append(pattern_entry)
 
         # Sort by strength (descending)
         patterns.sort(key=lambda x: x.get('strength', 0), reverse=True)
