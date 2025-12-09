@@ -11,7 +11,7 @@ This module contains:
 - Grid search hyperparameter optimization
 """
 
-from .forecast import (
+from .base_models import (
     CTAForecast,
     CTALinear, 
     CTALight,

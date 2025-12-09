@@ -304,10 +304,10 @@ class CTAForecast:
         Examples:
         ---------
         # Resample to weekly Friday closes
-        weekly_features = forecaster.resample_features_weekly(daily_features, 'Friday')
+        weekly_features = models.resample_features_weekly(daily_features, 'Friday')
         
         # Resample to weekly Wednesday with mean aggregation
-        weekly_features = forecaster.resample_features_weekly(
+        weekly_features = models.resample_features_weekly(
             daily_features, 'Wednesday', aggregation_method='mean'
         )
         """
