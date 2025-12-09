@@ -194,8 +194,8 @@ class IntradayMomentumLight(CTALight):
         intraday_features = []
         for t in target_times:
             intraday_returns = self.target_time_returns(
-                data,
                 target_time=t,
+                intraday_df=data,
                 price_col=price_col,
             )
             intraday_features.append(intraday_returns.rename(f"ret_{t.strftime('%H%M')}") )
