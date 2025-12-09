@@ -59,14 +59,68 @@ class TickerReport:
         }
 
     def to_dataframe(self) -> pd.DataFrame:
-        """Convert top patterns to DataFrame."""
+        """Convert top patterns to DataFrame with parsed pattern components."""
         if not self.top_patterns:
             return pd.DataFrame()
 
-        return pd.DataFrame([
-            {
-                'ticker': self.ticker,
-                'pattern': name,
+        rows = []
+        for name, summary, score in self.top_patterns:
+            # Parse pattern name: "TICKER|screen|pattern_details..."
+            # Examples:
+            #   "CL|usa_spring|month_start_1d"
+            #   "NG|momentum_generic|momentum_so|st_momentum|session_0"
+            #   "PL|usa_winter|weekday_mean|Wednesday"
+            parts = name.split('|')
+
+            ticker = parts[0] if len(parts) > 0 else self.ticker
+            screen_name = parts[1] if len(parts) > 1 else ''
+
+            # Extract pattern_name and pattern_type
+            # For calendar patterns: "month_start_1d" -> pattern_name
+            # For momentum patterns: "momentum_so|st_momentum|session_0" -> pattern_name
+            # Pattern type is inferred from structure
+            if len(parts) > 2:
+                # Determine pattern type based on common keywords
+                pattern_type = ''
+                remaining_parts = parts[2:]
+
+                # Check if it's a momentum pattern
+                if any(p.startswith('momentum_') for p in remaining_parts):
+                    pattern_type = 'momentum_generic'
+                    pattern_name = '|'.join(remaining_parts)
+                # Check if it's a calendar pattern
+                elif any(keyword in '|'.join(remaining_parts) for keyword in ['month_', 'quarter_', 'week']):
+                    pattern_type = 'calendar'
+                    pattern_name = '|'.join(remaining_parts)
+                # Check if it's a weekday pattern
+                elif 'weekday' in '|'.join(remaining_parts):
+                    pattern_type = remaining_parts[0] if remaining_parts else ''
+                    pattern_name = '|'.join(remaining_parts[1:]) if len(remaining_parts) > 1 else ''
+                # Check if it's a time predictive pattern
+                elif 'time_predictive' in '|'.join(remaining_parts):
+                    pattern_type = remaining_parts[0] if remaining_parts else ''
+                    pattern_name = '|'.join(remaining_parts[1:]) if len(remaining_parts) > 1 else ''
+                # Check if it's an orderflow pattern
+                elif 'orderflow' in '|'.join(remaining_parts):
+                    pattern_type = remaining_parts[0] if remaining_parts else ''
+                    pattern_name = '|'.join(remaining_parts[1:]) if len(remaining_parts) > 1 else ''
+                # Weekend hedging
+                elif 'weekend_hedging' in '|'.join(remaining_parts):
+                    pattern_type = 'weekend_hedging'
+                    pattern_name = '|'.join(remaining_parts[1:]) if len(remaining_parts) > 1 else ''
+                else:
+                    # Generic: first part is pattern type, rest is pattern name
+                    pattern_type = remaining_parts[0] if remaining_parts else ''
+                    pattern_name = '|'.join(remaining_parts[1:]) if len(remaining_parts) > 1 else ''
+            else:
+                pattern_type = ''
+                pattern_name = name
+
+            row = {
+                'ticker': ticker,
+                'screen_name': screen_name,
+                'pattern_name': pattern_name,
+                'pattern_type': pattern_type,
                 'total_return': summary.total_return,
                 'mean_return': summary.mean_return,
                 'sharpe': summary.sharpe,
@@ -75,8 +129,9 @@ class TickerReport:
                 'trades': summary.trades,
                 'score': score,
             }
-            for name, summary, score in self.top_patterns
-        ])
+            rows.append(row)
+
+        return pd.DataFrame(rows)
 
 
 @dataclass
@@ -328,8 +383,14 @@ class BacktestReportGenerator:
                         ticker_data[ticker] = []
                     ticker_data[ticker].append((pattern_name, ticker_summary, ticker_score))
             else:
-                # No breakdown - treat as single group
-                ticker = '__overall__'
+                # No breakdown - extract ticker from pattern name
+                # Pattern name format: "TICKER|screen|pattern|details..."
+                parts = pattern_name.split('|')
+                if len(parts) >= 1 and parts[0] and parts[0] != '__overall__':
+                    ticker = parts[0]
+                else:
+                    ticker = '__overall__'
+
                 if ticker not in ticker_data:
                     ticker_data[ticker] = []
                 ticker_data[ticker].append((pattern_name, summary, score))

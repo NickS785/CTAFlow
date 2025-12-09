@@ -1286,22 +1286,38 @@ class ScreenerPipeline:
 
         # Build descriptive key based on pattern type
         if pattern_type == "calendar":
-            event = pattern.get("event", "")
-            horizon = pattern.get("horizon", "")
+            # calendar_pattern contains the full pattern name from calendar_effects.py
+            # e.g., "calendar_month_start_1d", "calendar_quarter_end_3d", etc.
             calendar_pattern = pattern.get("calendar_pattern", "")
+            horizon = pattern.get("horizon", "")
+
             parts = [key_hint] if key_hint else []
-            parts.append("calendar")
-            if event:
-                parts.append(str(event))
-            if horizon:
+
+            # Use the full calendar_pattern name if available (preferred)
+            if calendar_pattern:
+                # Calendar pattern already includes descriptive name like "calendar_month_start_1d"
+                # Extract just the descriptive part after "calendar_"
+                if calendar_pattern.startswith("calendar_"):
+                    pattern_desc = calendar_pattern[9:]  # Remove "calendar_" prefix
+                else:
+                    pattern_desc = calendar_pattern
+                parts.append(pattern_desc)
+            else:
+                # Fallback: build from event + horizon
+                event = pattern.get("event", "")
+                if event:
+                    parts.append(str(event))
+
+            # Add horizon if not already in pattern name
+            if horizon and (not calendar_pattern or str(horizon) not in calendar_pattern):
                 parts.append(str(horizon))
-            if calendar_pattern and calendar_pattern != event:
-                parts.append(str(calendar_pattern))
+
             # Add months if specified
             months = pattern.get("months")
             if months and isinstance(months, (list, tuple)) and len(months) < 12:
                 month_str = "_".join(map(str, sorted(months)))
                 parts.append(f"m{month_str}")
+
             return "|".join(parts)
 
         elif pattern_type in {"momentum_weekday", "momentum_oc", "momentum_cc", "momentum_sc"}:
