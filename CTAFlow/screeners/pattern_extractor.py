@@ -2368,6 +2368,9 @@ class PatternExtractor:
         except Exception:  # pragma: no cover - defensive guard
             return None
 
+        if normalised is None:
+            return None
+
         text = normalised.isoformat()
         if not normalised.microsecond:
             return normalised.strftime("%H:%M:%S")
