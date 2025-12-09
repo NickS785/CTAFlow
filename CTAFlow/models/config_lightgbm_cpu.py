@@ -1,0 +1,25 @@
+"""Default LightGBM CPU configuration for CTA models."""
+
+DEFAULT_LGBM_CPU_CONFIG = {
+    'objective': 'regression',
+    'metric': 'rmse',
+    'boosting_type': 'gbdt',
+    'num_leaves': 63,
+    'learning_rate': 0.05,
+    'feature_fraction': 0.85,
+    'bagging_fraction': 0.85,
+    'bagging_freq': 5,
+    'min_child_samples': 25,
+    'min_child_weight': 0.001,
+    'min_split_gain': 0.0,
+    'subsample': 0.85,
+    'subsample_freq': 1,
+    'colsample_bytree': 0.85,
+    'reg_alpha': 0.1,
+    'reg_lambda': 0.1,
+    'random_state': 42,
+    'n_jobs': -1,
+    'verbosity': -1,
+    'force_col_wise': True,
+    'device': 'cpu',
+}

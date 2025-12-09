@@ -1091,9 +1091,30 @@ class HistoricalScreener:
                     ticker_results['dayofweek_returns'] = dow_results['returns']
                     ticker_results['dayofweek_volatility'] = dow_results['volatility']
 
+                full_session_returns = self._calculate_full_session_returns(
+                    session_data,
+                    session_start_time,
+                    session_end_time,
+                    price_col,
+                    is_synthetic,
+                )
+
                 # Time-of-day predictability
                 time_predictions = {}
+                time_returns: Dict[str, pd.Series] = {}
                 for target_time in converted_times:
+                    daily_returns = self._compute_time_window_returns(
+                        session_data,
+                        price_col,
+                        target_time,
+                        is_synthetic,
+                        period_length,
+                        tz,
+                    )
+                    if daily_returns is not None:
+                        time_key = target_time.strftime("%H:%M")
+                        time_returns[time_key] = daily_returns
+
                     pred_stats = self._test_time_predictability(
                         session_data,
                         price_col,
@@ -1102,12 +1123,21 @@ class HistoricalScreener:
                         period_length,
                         tz,
                         include_return_series=include_return_series,
+                        precomputed_returns=daily_returns,
                     )
                     enriched_stats = dict(pattern_context)
                     enriched_stats.update(pred_stats)
                     time_predictions[str(target_time)] = enriched_stats
 
                 ticker_results['time_predictability'] = time_predictions
+
+                correlation_report = self._build_time_return_correlations(
+                    time_returns,
+                    full_session_returns,
+                    normalized_times,
+                )
+                if correlation_report:
+                    ticker_results['time_return_correlations'] = correlation_report
 
                 weekend_pattern = self._compute_weekend_hedging_pattern(
                     session_data,
@@ -3289,6 +3319,40 @@ class HistoricalScreener:
             'volatility': volatility_stats
         }
 
+    def _compute_time_window_returns(
+        self,
+        data: pd.DataFrame,
+        price_col: str,
+        target_time: time,
+        is_synthetic: bool,
+        period_length: Optional[timedelta] = None,
+        tz: Optional[str] = None,
+    ) -> Optional[pd.Series]:
+        """Return aggregated returns at a specific time (or window) for each session."""
+        from ..utils.seasonal import tod_mask, aggregate_window, log_returns
+
+        if data.empty:
+            return None
+
+        if is_synthetic:
+            ret = data[price_col].diff()
+        else:
+            ret = log_returns(data[price_col])
+
+        ret = ret.dropna()
+        mask = tod_mask(ret.index, target_time.strftime("%H:%M"))
+
+        if period_length:
+            window_bars = int(period_length.total_seconds() / 60 / 5)
+            daily_returns = aggregate_window(ret, mask, window_bars)
+        else:
+            daily_returns = ret[mask]
+
+        if not isinstance(daily_returns.index, pd.DatetimeIndex):
+            daily_returns.index = pd.to_datetime(daily_returns.index)
+
+        return daily_returns.groupby(pd.Grouper(freq='1D')).sum()
+
     def _test_time_predictability(
         self,
         data: pd.DataFrame,
@@ -3298,6 +3362,7 @@ class HistoricalScreener:
         period_length: Optional[timedelta] = None,
         tz: Optional[str] = None,
         include_return_series: bool = False,
+        precomputed_returns: Optional[pd.Series] = None,
     ) -> Dict[str, any]:
         """
         Test if returns at a specific time predict future returns.
@@ -3324,33 +3389,28 @@ class HistoricalScreener:
         series used for each correlation test to enable downstream reuse without
         recomputation.
         """
-        from ..utils.seasonal import tod_mask, aggregate_window, log_returns
 
-        # Calculate returns
-        if is_synthetic:
-            ret = data[price_col].diff()
+        if precomputed_returns is not None:
+            daily_returns = precomputed_returns.copy()
         else:
-            ret = log_returns(data[price_col])
+            daily_returns = self._compute_time_window_returns(
+                data,
+                price_col,
+                target_time,
+                is_synthetic,
+                period_length,
+                tz,
+            )
 
-        ret = ret.dropna()
-
-        # Extract returns at target time
-        mask = tod_mask(ret.index, target_time.strftime("%H:%M"))
-
-        if period_length:
-            # Aggregate window
-            window_bars = int(period_length.total_seconds() / 60 / 5)  # Assuming 5-min bars
-            daily_returns = aggregate_window(ret, mask, window_bars)
-        else:
-            # Single bar at target time
-            daily_returns = ret[mask]
-
-        # Ensure we have a DatetimeIndex before grouping by date
-        if not isinstance(daily_returns.index, pd.DatetimeIndex):
-            daily_returns.index = pd.to_datetime(daily_returns.index)
-
-        # Group by date
-        daily_returns = daily_returns.groupby(pd.Grouper(freq='1D')).sum()
+        if daily_returns is None:
+            return {
+                'n': 0,
+                'next_day_corr': np.nan,
+                'next_day_pvalue': np.nan,
+                'next_week_corr': np.nan,
+                'next_week_pvalue': np.nan,
+                'error': 'Insufficient data',
+            }
 
         months_meta = self._build_months_metadata(daily_returns.index, tz)
 
@@ -3461,6 +3521,84 @@ class HistoricalScreener:
             result['predictor_returns'] = serialized
 
         return result
+
+    def _build_time_return_correlations(
+        self,
+        time_returns: Dict[str, pd.Series],
+        full_session_returns: Optional[pd.Series],
+        time_order: Optional[Sequence[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Create correlation matrix for target-time returns and optional EOD returns."""
+
+        if not time_returns:
+            return None
+
+        series_map: Dict[str, pd.Series] = {
+            label: series.dropna()
+            for label, series in time_returns.items()
+            if series is not None and len(series) > 0
+        }
+
+        if full_session_returns is not None and len(full_session_returns) > 0:
+            series_map['EOD'] = full_session_returns.dropna()
+
+        if not series_map:
+            return None
+
+        labels = list(series_map.keys())
+        corr_matrix = pd.DataFrame(np.nan, index=labels, columns=labels)
+        significance_mask = pd.DataFrame(False, index=labels, columns=labels)
+        pair_stats: List[Dict[str, Any]] = []
+
+        for i, label_i in enumerate(labels):
+            series_i = series_map[label_i]
+            for j in range(i, len(labels)):
+                label_j = labels[j]
+                series_j = series_map[label_j]
+
+                aligned = pd.concat([series_i, series_j], axis=1, join='inner').dropna()
+                aligned.columns = ['x', 'y']
+
+                corr_val = np.nan
+                p_val = np.nan
+                if len(aligned) >= 5 and aligned['x'].nunique() > 1 and aligned['y'].nunique() > 1:
+                    corr_val, p_val = stats.pearsonr(aligned['x'], aligned['y'])
+
+                corr_matrix.loc[label_i, label_j] = corr_val
+                corr_matrix.loc[label_j, label_i] = corr_val
+
+                is_significant = (
+                    label_i != label_j
+                    and not np.isnan(corr_val)
+                    and abs(corr_val) > 0.1
+                )
+                significance_mask.loc[label_i, label_j] = is_significant
+                significance_mask.loc[label_j, label_i] = is_significant
+
+                pair_stats.append({
+                    'series_x': label_i,
+                    'series_y': label_j,
+                    'correlation': float(corr_val) if not np.isnan(corr_val) else np.nan,
+                    'p_value': float(p_val) if not np.isnan(p_val) else np.nan,
+                    'n': int(len(aligned)),
+                    'significant': bool(is_significant),
+                })
+
+        significant_pairs = [
+            pair
+            for pair in pair_stats
+            if pair['series_x'] != pair['series_y']
+            and not np.isnan(pair['correlation'])
+            and abs(pair['correlation']) > 0.1
+        ]
+
+        return {
+            'matrix': corr_matrix.to_dict(),
+            'significance_mask': significance_mask.to_dict(),
+            'pair_stats': pair_stats,
+            'significant_pairs': significant_pairs,
+            'time_order': list(time_order) if time_order else labels,
+        }
 
     def _compute_weekend_hedging_pattern(
         self,
@@ -3850,6 +3988,58 @@ class HistoricalScreener:
                             )
 
                     patterns.append(pattern_entry)
+
+        # Correlations with EOD and across target times
+        if 'time_return_correlations' in ticker_results:
+            correlation_meta = ticker_results['time_return_correlations'] or {}
+            time_order = correlation_meta.get('time_order') or []
+
+            def _ordered_sequence(first: str, second: str) -> List[str]:
+                if not time_order:
+                    return [first, second]
+                try:
+                    idx_first = time_order.index(first)
+                    idx_second = time_order.index(second)
+                    return [first, second] if idx_first <= idx_second else [second, first]
+                except ValueError:
+                    return [first, second]
+
+            for pair in correlation_meta.get('significant_pairs', []):
+                corr_value = pair['correlation']
+                p_value = pair.get('p_value')
+                time_meta = {
+                    'months_active': ticker_results.get('months_active'),
+                    'months_mask_12': ticker_results.get('months_mask_12'),
+                    'months_names': ticker_results.get('months_names'),
+                    'target_times_hhmm': pattern_context.get('target_times_hhmm'),
+                    'period_length_min': pattern_context.get('period_length_min'),
+                    'regime_filter': pattern_context.get('regime_filter') or regime_meta,
+                }
+
+                if 'EOD' in (pair['series_x'], pair['series_y']):
+                    time_label = pair['series_y'] if pair['series_x'] == 'EOD' else pair['series_x']
+                    patterns.append({
+                        'type': 'time_predictive_eod',
+                        'time': time_label,
+                        'description': f'{time_label} return correlates with EOD session return',
+                        'correlation': corr_value,
+                        'p_value': p_value,
+                        'strength': abs(corr_value),
+                        **time_meta,
+                    })
+                else:
+                    sequence = _ordered_sequence(pair['series_x'], pair['series_y'])
+                    sequence_label = " -> ".join(sequence)
+                    patterns.append({
+                        'type': 'time_predictive_intraday',
+                        'time': sequence_label,
+                        'time_sequence': sequence,
+                        'description': f"{sequence[0]} then {sequence[1]} intraday relationship",
+                        'correlation': corr_value,
+                        'p_value': p_value,
+                        'strength': abs(corr_value),
+                        **time_meta,
+                    })
 
         # Sort by strength (descending)
         patterns.sort(key=lambda x: x.get('strength', 0), reverse=True)
