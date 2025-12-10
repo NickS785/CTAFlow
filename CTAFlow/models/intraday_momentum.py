@@ -19,19 +19,49 @@ class IntradayMomentumLight(CTALight):
     """
 
     def __init__(
-        self,
-        intraday_data: pd.DataFrame,
-        session_end: time = time(15, 0),
-        session_open: time = time(8, 30),
-        closing_length: timedelta = timedelta(minutes=60),
-        tz = "America/Chicago",
-        **kwargs,
+            self,
+            intraday_data: pd.DataFrame,
+            session_end: time = time(15, 0),
+            session_open: time = time(8, 30),
+            closing_length: timedelta = timedelta(minutes=60),
+            tz="America/Chicago",  # TZ is necessary to track timestamps accurately
+            price_col="Close",
+            **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.intraday_data = intraday_data
+        self.price = intraday_data[price_col]
+        self.training_data = None  # Daily df which contains the training variables
         self.session_end = session_end
         self.session_open = session_open
         self.closing_length = closing_length
+        self.feature_names = []  # Track feature names for model training
+        self.tz = tz
+
+    def _add_feature(self, data: pd.Series, feature_name: str, tf='1d'):
+        """Add a feature to the training dataset and track it.
+
+        Parameters
+        ----------
+        data : pd.Series
+            Feature data with datetime index
+        feature_name : str
+            Name for the feature column
+        tf : str, default '1d'
+            Timeframe: 'intraday' for intraday_data, '1d' for training_data
+        """
+        if tf == 'intraday':
+            self.intraday_data[feature_name] = data
+            if feature_name not in self.feature_names:
+                self.feature_names.append(feature_name)
+        else:
+            if isinstance(self.training_data, pd.DataFrame):
+                dates = self.training_data.index.normalize()
+                common = set(dates).intersection(set(data.index.normalize()))
+                self.training_data[feature_name] = data.loc[common]
+                if feature_name not in self.feature_names:
+                    self.feature_names.append(feature_name)
+        return
 
     @staticmethod
     def _coerce_price(df: pd.DataFrame, price_col: str) -> pd.Series:
@@ -40,12 +70,14 @@ class IntradayMomentumLight(CTALight):
         return df[price_col].copy()
 
     def opening_range_volatility(
-        self,
-        intraday_df: Optional[pd.DataFrame] = None,
-        price_col: str = "Close",
-        period_length: Optional[timedelta] = None,
+            self,
+            intraday_df: Optional[pd.DataFrame] = None,
+            price_col: str = "Close",
+            period_length: Optional[timedelta] = None,
     ) -> pd.DataFrame:
         """Compute opening range realised volatility and semivariance.
+
+        Uses vectorized operations for improved performance compared to iterative approach.
 
         Parameters
         ----------
@@ -56,6 +88,16 @@ class IntradayMomentumLight(CTALight):
         period_length : Optional[timedelta]
             Optional override for the opening window. Defaults to
             ``closing_length`` if not provided.
+
+        Returns
+        -------
+        pd.DataFrame
+            Daily features with columns: rv_open, rsv_pos_open, rsv_neg_open
+
+        Notes
+        -----
+        Vectorized implementation avoids explicit loops over days, improving
+        performance for large datasets. Uses pandas groupby aggregations.
         """
 
         data = intraday_df if intraday_df is not None else self.intraday_data
@@ -66,46 +108,56 @@ class IntradayMomentumLight(CTALight):
         prices = self._coerce_price(data, price_col)
         returns = prices.pct_change().dropna()
 
-        grouped = returns.groupby(pd.Grouper(freq="1D"))
-        records = []
-        index_vals = []
+        # Vectorized approach: compute session times for all rows at once
         session_open_offset = pd.Timedelta(
             hours=self.session_open.hour,
             minutes=self.session_open.minute,
             seconds=self.session_open.second,
         )
 
-        for day, day_series in grouped:
-            if day_series.empty:
-                continue
+        # Create working dataframe with date and time offsets
+        work_df = pd.DataFrame({'returns': returns})
+        work_df['date'] = work_df.index.normalize()
+        work_df['session_start'] = work_df['date'] + session_open_offset
+        work_df['session_end'] = work_df['session_start'] + window
 
-            session_start = day.normalize() + session_open_offset
-            session_end = session_start + window
-            opening_slice = day_series[(day_series.index >= session_start) & (day_series.index < session_end)]
-            if opening_slice.empty:
-                continue
+        # Filter to opening range in one vectorized operation
+        in_opening_range = (work_df.index >= work_df['session_start']) & (work_df.index < work_df['session_end'])
+        opening_data = work_df[in_opening_range].copy()
 
-            rv = float(np.sqrt((opening_slice ** 2).sum()))
-            pos = opening_slice[opening_slice > 0]
-            neg = opening_slice[opening_slice < 0]
-            rsv_pos = float(np.sqrt((pos ** 2).sum())) if not pos.empty else np.nan
-            rsv_neg = float(np.sqrt((neg ** 2).sum())) if not neg.empty else np.nan
-            records.append(
-                {
-                    "rv_open": rv,
-                    "rsv_pos_open": rsv_pos,
-                    "rsv_neg_open": rsv_neg,
-                }
-            )
-            index_vals.append(day.normalize())
+        if opening_data.empty:
+            return pd.DataFrame(columns=['rv_open', 'rsv_pos_open', 'rsv_neg_open'])
 
-        feature_df = pd.DataFrame(records, index=index_vals)
+        # Prepare columns for aggregation
+        opening_data['ret_squared'] = opening_data['returns'] ** 2
+        opening_data['ret_pos_squared'] = np.where(opening_data['returns'] > 0, opening_data['ret_squared'], 0)
+        opening_data['ret_neg_squared'] = np.where(opening_data['returns'] < 0, opening_data['ret_squared'], 0)
+        opening_data['has_pos'] = opening_data['returns'] > 0
+        opening_data['has_neg'] = opening_data['returns'] < 0
+
+        # Vectorized aggregation by date
+        agg_dict = {
+            'ret_squared': 'sum',
+            'ret_pos_squared': 'sum',
+            'ret_neg_squared': 'sum',
+            'has_pos': 'any',
+            'has_neg': 'any'
+        }
+        grouped = opening_data.groupby('date').agg(agg_dict)
+
+        # Compute volatility measures
+        grouped['rv_open'] = np.sqrt(grouped['ret_squared'])
+        grouped['rsv_pos_open'] = np.where(grouped['has_pos'], np.sqrt(grouped['ret_pos_squared']), np.nan)
+        grouped['rsv_neg_open'] = np.where(grouped['has_neg'], np.sqrt(grouped['ret_neg_squared']), np.nan)
+
+        # Return only the feature columns
+        feature_df = grouped[['rv_open', 'rsv_pos_open', 'rsv_neg_open']]
         return feature_df
 
     def har_volatility_features(
-        self,
-        intraday_df: Optional[pd.DataFrame] = None,
-        horizons: Sequence[int] = (1, 5, 22),
+            self,
+            intraday_df: Optional[pd.DataFrame] = None,
+            horizons: Sequence[int] = (1, 5, 22),
     ) -> pd.DataFrame:
         """Generate HAR-style realised volatility features for 1d ahead forecasts."""
 
@@ -114,11 +166,11 @@ class IntradayMomentumLight(CTALight):
         return forecaster.har_features(horizons=horizons)
 
     def target_time_returns(
-        self,
-        target_time: time,
-        intraday_df: Optional[pd.DataFrame] = None,
-        period_length: Optional[timedelta] = None,
-        price_col: str = "Close",
+            self,
+            target_time: time,
+            intraday_df: Optional[pd.DataFrame] = None,
+            period_length: Optional[timedelta] = None,
+            price_col: str = "Close",
     ) -> pd.Series:
         """Return series for a specific target time window."""
 
@@ -137,10 +189,10 @@ class IntradayMomentumLight(CTALight):
         return ret[mask]
 
     def market_structure_features(
-        self,
-        daily_df: pd.DataFrame,
-        lookbacks: Iterable[int] = (5, 10, 20),
-        price_col: str = "Close",
+            self,
+            daily_df: pd.DataFrame,
+            lookbacks: Iterable[int] = (5, 10, 20),
+            price_col: str = "Close",
     ) -> pd.DataFrame:
         """Build multi-horizon market structure context (high/low/VAH/VAL)."""
 
@@ -160,9 +212,9 @@ class IntradayMomentumLight(CTALight):
         return pd.DataFrame(feats)
 
     def microstructure_features(
-        self,
-        intraday_df: Optional[pd.DataFrame] = None,
-        price_col: str = "Close",
+            self,
+            intraday_df: Optional[pd.DataFrame] = None,
+            price_col: str = "Close",
     ) -> pd.DataFrame:
         """Add microstructure proxies such as imbalance and realised range."""
 
@@ -180,11 +232,11 @@ class IntradayMomentumLight(CTALight):
         return features
 
     def assemble_training_frame(
-        self,
-        daily_df: pd.DataFrame,
-        target_times: Sequence[time],
-        intraday_df: Optional[pd.DataFrame] = None,
-        price_col: str = "Close",
+            self,
+            daily_df: pd.DataFrame,
+            target_times: Sequence[time],
+            intraday_df: Optional[pd.DataFrame] = None,
+            price_col: str = "Close",
     ) -> pd.DataFrame:
         """Convenience constructor for a full training feature matrix."""
 
@@ -199,7 +251,7 @@ class IntradayMomentumLight(CTALight):
                 target_time=t,
                 price_col=price_col,
             )
-            intraday_features.append(intraday_returns.rename(f"ret_{t.strftime('%H%M')}") )
+            intraday_features.append(intraday_returns.rename(f"ret_{t.strftime('%H%M')}"))
 
         intraday_frame = pd.concat(intraday_features, axis=1)
         combined = pd.concat([har, market_struct, intraday_frame], axis=1)

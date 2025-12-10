@@ -1393,6 +1393,24 @@ class ScreenerPipeline:
 
             return "|".join(parts)
 
+        elif pattern_type in {"time_predictive_eod", "time_predictive_intraday", "time_predictive_nextday", "time_predictive_nextweek"}:
+            # Time-based predictive patterns from historical_screener
+            parts = [key_hint] if key_hint else []
+            parts.append(pattern_type)
+
+            # Add time label (e.g., "09:30", "14:00", or "09:30 -> 14:00")
+            time_label = pattern.get("time")
+            if time_label:
+                parts.append(str(time_label))
+
+            # Add months if pattern is seasonal
+            months_active = pattern.get("months_active") or pattern.get("months_names")
+            if months_active and isinstance(months_active, (list, tuple)) and len(months_active) < 12:
+                month_str = "_".join(map(str, sorted(months_active) if all(isinstance(m, int) for m in months_active) else months_active))
+                parts.append(f"m{month_str}")
+
+            return "|".join(parts)
+
         # Default: use key_hint if available, otherwise description
         if key_hint:
             if pattern_type:
