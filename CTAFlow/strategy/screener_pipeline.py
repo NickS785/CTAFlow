@@ -777,25 +777,39 @@ class ScreenerPipeline:
             try:
                 _, patterns = ticker_data[ticker]
 
-                # Build separate XY frames for each pattern
-                items = list(self._items_from_patterns(patterns))
-                for pattern_key, pattern_dict in items:
-                    try:
-                        # Build XY for this specific pattern
-                        xy = mapper.build_xy(featured_bars, {pattern_key: pattern_dict}, **xy_kwargs)
-                        if not xy.empty:
-                            # Use ticker|pattern as key for unique identification
-                            combined_key = f"{ticker}|{pattern_key}"
-                            xy_map[combined_key] = xy
-                    except Exception as pattern_exc:
-                        if self.log is not None and hasattr(self.log, "warning"):
-                            self.log.warning(
-                                "[batch_multi_ticker] Failed to build XY for %s pattern %s: %s",
-                                ticker,
-                                pattern_key,
-                                pattern_exc,
-                            )
-                        continue
+                # Build gate-to-pattern-key mapping first
+                pattern_items = list(self._items_from_patterns(patterns))
+                gate_to_pattern_key: Dict[str, str] = {}
+
+                for pattern_key, pattern_dict in pattern_items:
+                    # Infer gate column for this pattern
+                    gate_col, _ = mapper._infer_gate_column_name(
+                        featured_bars,
+                        pattern_key,
+                        pattern_dict,
+                        time_match=mapper_time_match,
+                    )
+                    if gate_col:
+                        gate_to_pattern_key[gate_col] = pattern_key
+
+                # Build XY for ALL patterns at once (much more efficient)
+                xy_all = mapper.build_xy(featured_bars, patterns, **xy_kwargs)
+
+                if not xy_all.empty:
+                    # Split by gate column to separate patterns
+                    if 'gate' in xy_all.columns:
+                        for gate_val in xy_all['gate'].unique():
+                            pattern_xy = xy_all[xy_all['gate'] == gate_val].copy()
+                            if not pattern_xy.empty:
+                                # Map gate back to original pattern key
+                                pattern_key = gate_to_pattern_key.get(gate_val, gate_val)
+                                # Use ticker|pattern_key for unique identification
+                                combined_key = f"{ticker}|{pattern_key}"
+                                xy_map[combined_key] = pattern_xy
+                    else:
+                        # No gate column separation needed
+                        xy_map[ticker] = xy_all
+
             except Exception as exc:
                 if self.log is not None and hasattr(self.log, "warning"):
                     self.log.warning(

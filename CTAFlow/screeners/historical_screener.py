@@ -1617,8 +1617,8 @@ class HistoricalScreener:
         """
         composite_results = {}
         momentum_cache: Dict[
-            Tuple[
-                Tuple[time, ...],
+            Tuple[                Tuple[time, ...],
+
                 Tuple[time, ...],
                 Optional[Tuple[int, ...]],
                 Optional[Tuple[str, Tuple[int, ...]]],
@@ -3383,73 +3383,77 @@ class HistoricalScreener:
 
         if isinstance(data.index, pd.DatetimeIndex):
             # Calculate closing period return: from end of predictor period to EOD
-            # Strategy:
-            # 1. For each day, find the timestamp at/after target_time (end of predictor window)
-            # 2. Get price at that time
-            # 3. Get EOD (last) price for that day
-            # 4. Calculate return from predictor end to EOD
+            # OPTIMIZED: Use vectorized operations instead of looping over days
 
-            # Group data by date to process each session separately
-            data_with_date = data.copy()
-            data_with_date['date'] = data_with_date.index.normalize()
+            # Calculate predictor end time
+            if period_length:
+                # Predictor ends period_length after target_time
+                predictor_end_offset = period_length
+            else:
+                # Single bar predictor - end time is target_time
+                predictor_end_offset = pd.Timedelta(0)
 
-            closing_period_returns = []
-            predictor_returns = []
+            # Add date column without copying entire DataFrame
+            dates = data.index.normalize()
 
-            for date, day_data in data_with_date.groupby('date'):
-                if len(day_data) < 2:
-                    continue
+            # Get EOD prices (last price of each day)
+            eod_prices = data.groupby(dates)[price_col].last()
 
-                # Find rows at or after the target time (end of predictor window)
-                if period_length:
-                    # If we have a period_length, the predictor ends period_length after target_time
-                    predictor_end_time = (
-                        pd.Timestamp.combine(date, target_time) + period_length
-                    ).time()
-                else:
-                    # Single bar predictor ends at target_time
-                    predictor_end_time = target_time
+            # Find prices at/after predictor end time for each day
+            # Create a time filter based on target_time + offset
+            predictor_end_seconds = (
+                target_time.hour * 3600 +
+                target_time.minute * 60 +
+                target_time.second +
+                predictor_end_offset.total_seconds()
+            )
 
-                # Find first timestamp at or after predictor end time
-                day_times = day_data.index.time
-                after_predictor = [t >= predictor_end_time for t in day_times]
+            # Convert to time of day in seconds
+            tod_seconds = (
+                data.index.hour * 3600 +
+                data.index.minute * 60 +
+                data.index.second
+            )
 
-                if not any(after_predictor):
-                    continue
+            # Filter to bars at or after predictor end time
+            after_predictor = tod_seconds >= predictor_end_seconds
+            data_after_pred = data.loc[after_predictor].copy()
 
-                first_after_idx = next(i for i, v in enumerate(after_predictor) if v)
+            if not data_after_pred.empty:
+                # Get first price after predictor end for each day
+                data_after_pred['date'] = data_after_pred.index.normalize()
+                predictor_end_prices = data_after_pred.groupby('date')[price_col].first()
 
-                # Get price at predictor end and at EOD (last bar)
-                predictor_end_price = day_data.iloc[first_after_idx][price_col]
-                eod_price = day_data.iloc[-1][price_col]
+                # Align both series to same dates
+                common_dates = predictor_end_prices.index.intersection(eod_prices.index)
 
-                if predictor_end_price > 0 and eod_price > 0:
-                    # Calculate closing period return (predictor end to EOD)
+                if len(common_dates) >= 15:
+                    pred_end_aligned = predictor_end_prices.loc[common_dates]
+                    eod_aligned = eod_prices.loc[common_dates]
+
+                    # Calculate closing period returns vectorized
                     if is_synthetic:
-                        closing_return = eod_price - predictor_end_price
+                        closing_returns = eod_aligned - pred_end_aligned
                     else:
-                        closing_return = np.log(eod_price / predictor_end_price)
+                        closing_returns = np.log(eod_aligned / pred_end_aligned)
 
-                    closing_period_returns.append(closing_return)
+                    # Get predictor returns for same dates
+                    predictor_aligned = daily_returns.reindex(common_dates)
 
-                    # Get corresponding predictor return for this date
-                    if date in daily_returns.index:
-                        predictor_returns.append(daily_returns.loc[date])
-
-            # Calculate correlation between predictor and closing period returns
-            if len(closing_period_returns) >= 15 and len(predictor_returns) >= 15:
-                aligned_length = min(len(closing_period_returns), len(predictor_returns))
-                closing_arr = np.array(closing_period_returns[:aligned_length])
-                predictor_arr = np.array(predictor_returns[:aligned_length])
-
-                # Remove any NaN values
-                valid_mask = np.isfinite(closing_arr) & np.isfinite(predictor_arr)
-                if valid_mask.sum() >= 15:
-                    eod_corr, eod_pvalue = stats.pearsonr(
-                        predictor_arr[valid_mask],
-                        closing_arr[valid_mask]
+                    # Remove NaN and infinite values
+                    valid_mask = (
+                        np.isfinite(closing_returns) &
+                        np.isfinite(predictor_aligned) &
+                        (pred_end_aligned > 0) &
+                        (eod_aligned > 0)
                     )
-                    eod_significant = bool(abs(eod_corr) > 0.1 and eod_pvalue < 0.05)
+
+                    if valid_mask.sum() >= 15:
+                        eod_corr, eod_pvalue = stats.pearsonr(
+                            predictor_aligned[valid_mask],
+                            closing_returns[valid_mask]
+                        )
+                        eod_significant = bool(abs(eod_corr) > 0.1 and eod_pvalue < 0.05)
 
         # Batch correlations for next-day and next-week using GPU
         from ..utils.gpu_utils import gpu_batch_pearsonr
