@@ -185,6 +185,8 @@ class ScreenerPipeline:
         "weekday_returns",
         "time_predictive_nextday",
         "time_predictive_nextweek",
+        "time_predictive_eod",
+        "time_predictive_intraday",
         "weekend_hedging",
         # Calendar effects - all patterns starting with "calendar_"
         # Examples: calendar_month_end_1d, calendar_quarter_start_5d, calendar_lead_lag_*
@@ -2943,6 +2945,26 @@ class HorizonMapper:
             return HorizonSpec(name="next_day_cc")
         if pattern_type == "time_predictive_nextweek":
             return HorizonSpec(name="next_week_cc")
+        if pattern_type == "time_predictive_eod":
+            # Correlates a specific time period with the closing period return
+            # Extract period_length_min from pattern to calculate forward window to EOD
+            if pattern is not None:
+                payload = pattern.get('pattern_payload', {}) or {}
+                period_min = payload.get('period_length_min')
+                if period_min and isinstance(period_min, (int, float)) and period_min > 0:
+                    # Use intraday_delta with period_min to get forward return to EOD
+                    return HorizonSpec(name="intraday_delta", delta_minutes=int(period_min))
+            # Fallback to default intraday window
+            return HorizonSpec(name="intraday_delta", delta_minutes=default_intraday_minutes)
+        if pattern_type == "time_predictive_intraday":
+            # Correlates one intraday period with another
+            # Extract period_length_min from pattern
+            if pattern is not None:
+                payload = pattern.get('pattern_payload', {}) or {}
+                period_min = payload.get('period_length_min')
+                if period_min and isinstance(period_min, (int, float)) and period_min > 0:
+                    return HorizonSpec(name="intraday_delta", delta_minutes=int(period_min))
+            return HorizonSpec(name="intraday_delta", delta_minutes=default_intraday_minutes)
         if pattern_type == "orderflow_peak_pressure":
             return HorizonSpec(name="intraday_delta", delta_minutes=default_intraday_minutes)
         if pattern_type == "weekend_hedging":
@@ -3599,7 +3621,13 @@ class HorizonMapper:
         momentum_forward_cache: Dict[int, pd.Series] = {}
         momentum_trend_cache: Dict[int, pd.Series] = {}
         session_return_cache: Dict[str, Any] = {}
-        time_bearing_types = {"time_predictive_nextday", "time_predictive_nextweek", "orderflow_peak_pressure"}
+        time_bearing_types = {
+            "time_predictive_nextday",
+            "time_predictive_nextweek",
+            "time_predictive_eod",
+            "time_predictive_intraday",
+            "orderflow_peak_pressure"
+        }
         weekly_types = {"weekday_mean", "weekday_bias_intraday", "orderflow_weekly", "orderflow_week_of_month"}
 
         for key, pattern in ScreenerPipeline._items_from_patterns(patterns):
@@ -4083,6 +4111,26 @@ class HorizonMapper:
             for suffix in order:
                 if suffix:
                     candidates.append(f"time_nextweek_{suffix}_gate")
+
+        elif pattern_type == "time_predictive_eod":
+            time_value = payload.get("time")
+            effective = self._resolve_time_match(df, time_match, time_value)
+            suffix_second = self._format_time_suffix(time_value, "second")
+            suffix_micro = self._format_time_suffix(time_value, "microsecond")
+            order = [suffix_micro, suffix_second] if effective == "microsecond" else [suffix_second, suffix_micro]
+            for suffix in order:
+                if suffix:
+                    candidates.append(f"time_eod_{suffix}_gate")
+
+        elif pattern_type == "time_predictive_intraday":
+            time_value = payload.get("time")
+            effective = self._resolve_time_match(df, time_match, time_value)
+            suffix_second = self._format_time_suffix(time_value, "second")
+            suffix_micro = self._format_time_suffix(time_value, "microsecond")
+            order = [suffix_micro, suffix_second] if effective == "microsecond" else [suffix_second, suffix_micro]
+            for suffix in order:
+                if suffix:
+                    candidates.append(f"time_intraday_{suffix}_gate")
 
         elif pattern_type == "orderflow_weekly":
             weekday_norm = ScreenerPipeline._normalize_weekday(payload.get("weekday"))

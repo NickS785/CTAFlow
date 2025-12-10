@@ -3382,18 +3382,74 @@ class HistoricalScreener:
         eod_significant = False
 
         if isinstance(data.index, pd.DatetimeIndex):
-            eod_prices = data[price_col].resample('1D').last()
-            eod_returns = eod_prices.pct_change().dropna()
+            # Calculate closing period return: from end of predictor period to EOD
+            # Strategy:
+            # 1. For each day, find the timestamp at/after target_time (end of predictor window)
+            # 2. Get price at that time
+            # 3. Get EOD (last) price for that day
+            # 4. Calculate return from predictor end to EOD
 
-            aligned_eod = pd.concat(
-                [daily_returns.rename('intraday'), eod_returns.rename('eod')],
-                axis=1,
-                join='inner',
-            ).dropna()
+            # Group data by date to process each session separately
+            data_with_date = data.copy()
+            data_with_date['date'] = data_with_date.index.normalize()
 
-            if len(aligned_eod) >= 15:
-                eod_corr, eod_pvalue = stats.pearsonr(aligned_eod['intraday'], aligned_eod['eod'])
-                eod_significant = bool(abs(eod_corr) > 0.1 and eod_pvalue < 0.05)
+            closing_period_returns = []
+            predictor_returns = []
+
+            for date, day_data in data_with_date.groupby('date'):
+                if len(day_data) < 2:
+                    continue
+
+                # Find rows at or after the target time (end of predictor window)
+                if period_length:
+                    # If we have a period_length, the predictor ends period_length after target_time
+                    predictor_end_time = (
+                        pd.Timestamp.combine(date, target_time) + period_length
+                    ).time()
+                else:
+                    # Single bar predictor ends at target_time
+                    predictor_end_time = target_time
+
+                # Find first timestamp at or after predictor end time
+                day_times = day_data.index.time
+                after_predictor = [t >= predictor_end_time for t in day_times]
+
+                if not any(after_predictor):
+                    continue
+
+                first_after_idx = next(i for i, v in enumerate(after_predictor) if v)
+
+                # Get price at predictor end and at EOD (last bar)
+                predictor_end_price = day_data.iloc[first_after_idx][price_col]
+                eod_price = day_data.iloc[-1][price_col]
+
+                if predictor_end_price > 0 and eod_price > 0:
+                    # Calculate closing period return (predictor end to EOD)
+                    if is_synthetic:
+                        closing_return = eod_price - predictor_end_price
+                    else:
+                        closing_return = np.log(eod_price / predictor_end_price)
+
+                    closing_period_returns.append(closing_return)
+
+                    # Get corresponding predictor return for this date
+                    if date in daily_returns.index:
+                        predictor_returns.append(daily_returns.loc[date])
+
+            # Calculate correlation between predictor and closing period returns
+            if len(closing_period_returns) >= 15 and len(predictor_returns) >= 15:
+                aligned_length = min(len(closing_period_returns), len(predictor_returns))
+                closing_arr = np.array(closing_period_returns[:aligned_length])
+                predictor_arr = np.array(predictor_returns[:aligned_length])
+
+                # Remove any NaN values
+                valid_mask = np.isfinite(closing_arr) & np.isfinite(predictor_arr)
+                if valid_mask.sum() >= 15:
+                    eod_corr, eod_pvalue = stats.pearsonr(
+                        predictor_arr[valid_mask],
+                        closing_arr[valid_mask]
+                    )
+                    eod_significant = bool(abs(eod_corr) > 0.1 and eod_pvalue < 0.05)
 
         # Batch correlations for next-day and next-week using GPU
         from ..utils.gpu_utils import gpu_batch_pearsonr
