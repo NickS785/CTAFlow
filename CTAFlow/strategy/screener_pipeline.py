@@ -3602,7 +3602,8 @@ class HorizonMapper:
                 value = payload.get("mean")
             elif pattern_type == "orderflow_peak_pressure":
                 value = payload.get("intraday_mean", payload.get("mean"))
-            elif pattern_type in {"time_predictive_nextday", "time_predictive_nextweek"}:
+            elif pattern_type in {"time_predictive_nextday", "time_predictive_nextweek",
+                                  "time_predictive_eod", "time_predictive_intraday"}:
                 value = payload.get("mean")
                 if value is None:
                     value = payload.get("correlation")

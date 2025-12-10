@@ -928,7 +928,8 @@ class PatternExtractor:
         if summary.pattern_type in {"weekday_mean", "weekday_returns"}:
             return self._extract_weekday_series(symbol, summary)
 
-        if summary.pattern_type in {"time_predictive_nextday", "time_predictive_nextweek"}:
+        if summary.pattern_type in {"time_predictive_nextday", "time_predictive_nextweek",
+                                      "time_predictive_eod", "time_predictive_intraday"}:
             return self._extract_time_of_day_series(symbol, summary)
 
         if summary.pattern_type == "weekend_hedging":
