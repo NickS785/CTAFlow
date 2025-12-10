@@ -93,9 +93,9 @@ class PredictionToPosition:
         base_rows["returns_y"] = agg_returns["returns_y_mean"]
         base_rows["prediction_position"] = agg_scores["prediction_position"]
 
-        # Cleanup temporary columns
+        # Cleanup temporary columns while preserving decision timestamps
         result = base_rows.drop(columns=["_ptp_score", "_is_bias", "_bias_score", "_other_score"], errors="ignore")
-        return result.reset_index(drop=True)
+        return result.reset_index()
 
     def resolve(
         self,
