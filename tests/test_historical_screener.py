@@ -290,3 +290,22 @@ def test_intraday_momentum_screen_includes_analysis_params(historical_screener):
     assert session_payload is not None
     assert session_payload["momentum_params"]["st_momentum_days"] == 4
     assert session_payload["momentum_params"]["period_length_min"] == pytest.approx(30.0)
+
+
+def test_convert_times_validates_session_lengths(historical_screener):
+    screener = historical_screener
+
+    with pytest.raises(ValueError, match="session_starts and session_ends must be the same length"):
+        screener._convert_times(["02:30", "08:30"], ["10:30"])
+
+
+def test_generic_momentum_screen_matches_screenparams_schema():
+    from CTAFlow.screeners.historical_screener import ScreenParams
+    from CTAFlow.screeners.generic import make_momentum_screen
+
+    params = make_momentum_screen(name="alignment_test", session="usa")
+
+    assert isinstance(params, ScreenParams)
+    assert params.session_starts is not None
+    assert params.session_ends is not None
+    assert len(params.session_starts) == len(params.session_ends)

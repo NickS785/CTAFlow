@@ -4901,21 +4901,45 @@ class HistoricalScreener:
         return patterns
 
 
-    def _convert_times(self,session_starts:List, session_ends:Optional[List]=None) -> datetime:
-        s_start = []
-        if session_ends:
-            s_end = []
+    def _convert_times(
+        self,
+        session_starts: List,
+        session_ends: Optional[List] = None,
+    ) -> datetime:
+        if session_ends is not None and len(session_starts) != len(session_ends):
+            raise ValueError(
+                "session_starts and session_ends must be the same length; "
+                f"got {len(session_starts)} starts and {len(session_ends)} ends"
+            )
+
+        s_start: List[time] = []
+        s_end: List[time] = []
+
         for i, session in enumerate(session_starts):
             s_start.append(
-                session_starts[i] if isinstance(session_starts[i], time) else datetime.strptime(session_starts[i],
-                                                                                                "%H:%M").time())
-            if session_ends:
-                s_end.append(session_ends[i] if isinstance(session_ends[i], time) else datetime.strptime(session_ends[i],
-                                                                                                     "%H:%M").time())
-        if session_ends:
+                session
+                if isinstance(session, time)
+                else datetime.strptime(session, "%H:%M").time()
+            )
+
+            if session_ends is not None:
+                try:
+                    end_value = session_ends[i]
+                except IndexError as exc:
+                    raise ValueError(
+                        "session_ends is missing an entry for index "
+                        f"{i}; ensure it matches session_starts length"
+                    ) from exc
+
+                s_end.append(
+                    end_value
+                    if isinstance(end_value, time)
+                    else datetime.strptime(end_value, "%H:%M").time()
+                )
+
+        if session_ends is not None:
             return s_start, s_end
-        else:
-            return s_start
+        return s_start
 
     @staticmethod
     def _time_in_session(target: time, session_start: time, session_end: time) -> bool:
