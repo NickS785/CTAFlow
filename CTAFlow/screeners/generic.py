@@ -1,190 +1,733 @@
+"""Generic screen parameter generators for seasonality, momentum, and orderflow screens.
+
+This module provides factory functions for creating screen parameters instead of
+module-level constants, reducing import overhead and improving flexibility.
+"""
+
 from ..data import SyntheticSymbol, IntradayLeg, IntradayFileManager, DataClient
 from ..features import VolatilityRegimeClassifier
 from . import HistoricalScreener, ScreenParams, OrderflowParams
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, time
+from typing import List, Dict, Optional
 
 from ..config import DLY_DATA_PATH
 
-vol_clf = VolatilityRegimeClassifier(method='rv', window=10)
-two_h = timedelta(hours=2)
-energy_tickers = ["HO", "RB", "CL", "NG"]
-period_time = timedelta(hours=1, minutes=30)
-london_start, london_end = time(hour=2, minute=30), time(hour=11, minute=30)
-usa_start, usa_end = time(hour=8, minute=30), time(hour=15, minute=30)
-winter, spring, summer, fall = {'months': [12, 1, 2, 3]}, {'months': [3, 4, 5]}, {'months': [5, 6, 7, 8]}, {
-    'months': [9, 10, 11]}
-def seasons():
-    winter, spring, summer, fall = {'months': [12, 1, 2, 3]}, {'months': [3, 4, 5]}, {'months': [5, 6, 7, 8]}, {
-        'months': [9, 10, 11]}
 
-    return [v['months'] for v in [winter, spring, summer, fall]]
-livestock_session = dict(seasonality_session_start=time(hour=8, minute=30),
-                         seasonality_session_end=time(hour=13, minute=0), session_starts=["08:30"],
-                         session_ends=["13:00"])
-livestock_tgt_times = ["9:00", "9:30", "11:00", "12:00"]
-seasonal_livestock_params = dict(screen_type="seasonality", target_times=livestock_tgt_times, period_length=period_time)
-momentum_livestock_params = dict(screen_type="momentum", sess_start_hrs=1, sess_start_minutes=30, st_momentum_days=5)
-livestock_seasonal = ScreenParams(name="livestock_seasonal", **seasonal_livestock_params, **livestock_session)
-livestock_winter = ScreenParams(name="livestock_seasonal_winter", **seasonal_livestock_params, **livestock_session,
-                                **winter)
-livestock_summer = ScreenParams(name="livestock_seasonal_summer", **seasonal_livestock_params, **livestock_session,
-                                **summer)
-livestock_fall = ScreenParams(name="livestock_seasonal_fall", **seasonal_livestock_params, **livestock_session, **fall)
-livestock_spring = ScreenParams(name="livestock_seasonal_spring", **seasonal_livestock_params, **livestock_session,
-                                **spring)
-livestock_momentum = ScreenParams(name="livestock_momentum", **momentum_livestock_params, **livestock_session)
-livestock_winter_momentum = ScreenParams(name="livestock_winter_momo", **momentum_livestock_params, **livestock_session,
-                                         **winter)
-livestock_spring_momentum = ScreenParams(name="livestock_spring_momo", **momentum_livestock_params, **livestock_session,
-                                         **spring)
-livestock_fall_momentum = ScreenParams(name="livestock_fall_momo", **momentum_livestock_params, **livestock_session,
-                                       **fall)
-livestock_summer_momentum = ScreenParams(name="livestock_summer_momo", **momentum_livestock_params, **livestock_session,
-                                         **summer)
-livestock_seasonals = [livestock_seasonal, livestock_spring, livestock_fall, livestock_winter, livestock_summer]
-livestock_momentums = [livestock_momentum, livestock_spring_momentum, livestock_fall_momentum,
-                       livestock_winter_momentum, livestock_summer_momentum]
-london_tgt_times = ["03:00", "03:30", "02:30", "07:30", "09:30"]
-usa_tgt_times = ["08:30", "10:30", "9:00", "13:30"]
+# ============================================================================
+# Constants and shared settings
+# ============================================================================
+
+def _get_vol_classifier():
+    """Get default volatility regime classifier."""
+    return VolatilityRegimeClassifier(method='rv', window=10)
 
 
-def make_grain_screen(screen_type="seasonality",
-                      screen_name="grain_session",
-                      target_times=None,
-                      period_length=timedelta(hours=1, minutes=30),
-                      sess_start_hrs=1,
-                      sess_start_minute=30, months=None, **kwargs):
+def _default_period_length():
+    """Default period length for time-of-day screens."""
+    return timedelta(hours=1, minutes=30)
+
+
+def _season_months():
+    """Return standard seasonal month mappings."""
+    return {
+        'winter': [12, 1, 2, 3],
+        'spring': [3, 4, 5],
+        'summer': [5, 6, 7, 8],
+        'fall': [9, 10, 11],
+        'q1': [1, 2, 3],
+        'q2': [4, 5, 6],
+        'q3': [7, 8, 9],
+        'q4': [10, 11, 12],
+    }
+
+
+# ============================================================================
+# Session definitions
+# ============================================================================
+
+def _session_times():
+    """Return session time definitions for major trading regions."""
+    return {
+        'london': {
+            'start': time(hour=2, minute=30),
+            'end': time(hour=11, minute=30),
+            'target_times': ["03:00", "03:30", "02:30", "07:30", "09:30"],
+        },
+        'usa': {
+            'start': time(hour=8, minute=30),
+            'end': time(hour=15, minute=30),
+            'target_times': ["08:30", "10:30", "9:00", "13:30"],
+        },
+        'asia': {
+            'start': time(hour=18, minute=0),  # 18:00 CST = Asia morning
+            'end': time(hour=2, minute=0),     # 02:00 CST = Asia close
+            'target_times': ["18:30", "19:00", "20:00", "23:00", "01:00"],
+        },
+        'livestock': {
+            'start': time(hour=8, minute=30),
+            'end': time(hour=13, minute=0),
+            'target_times': ["9:00", "9:30", "11:00", "12:00"],
+        },
+        'grain': {
+            'start': time(hour=7, minute=0),
+            'end': time(hour=13, minute=0),
+            'target_times': ["07:30", "09:30", "11:00", "12:00"],
+        },
+    }
+
+
+# ============================================================================
+# Factory functions for seasonality screens
+# ============================================================================
+
+def make_seasonality_screen(
+    name: str,
+    session: str = 'usa',
+    months: Optional[List[int]] = None,
+    target_times: Optional[List[str]] = None,
+    period_length: Optional[timedelta] = None,
+    **kwargs
+) -> ScreenParams:
+    """Create a seasonality screen with standardized parameters.
+
+    Parameters
+    ----------
+    name : str
+        Screen name
+    session : str
+        Session type: 'london', 'usa', 'asia', 'livestock', 'grain'
+    months : Optional[List[int]]
+        Month filter (1-12), None for all months
+    target_times : Optional[List[str]]
+        Override default target times for session
+    period_length : Optional[timedelta]
+        Override default period length
+    **kwargs
+        Additional parameters passed to ScreenParams
+
+    Returns
+    -------
+    ScreenParams
+        Configured seasonality screen parameters
+    """
+    sessions = _session_times()
+    session_info = sessions.get(session, sessions['usa'])
 
     if target_times is None:
-        target_times = ["07:30", "09:30", "11:00", "12:00"]
-    session_starts = ["18:00", "07:00"]
-    session_ends = ["13:00", "13:00"]
+        target_times = session_info['target_times']
+
+    if period_length is None:
+        period_length = _default_period_length()
+
+    return ScreenParams(
+        screen_type="seasonality",
+        name=name,
+        months=months,
+        target_times=target_times,
+        period_length=period_length,
+        seasonality_session_start=session_info['start'],
+        seasonality_session_end=session_info['end'],
+        **kwargs
+    )
 
 
-    return ScreenParams(screen_type=screen_type,
-                        name=screen_name,
-                        months=months,
-                        session_starts=session_starts,
-                        session_ends=session_ends,
-                        period_length=period_length,
-                        target_times=target_times,
-                        seasonality_session_start=time(hour=7, minute=0),
-                        seasonality_session_end=time(hour=13, minute=0), **kwargs)
+def make_momentum_screen(
+    name: str,
+    session: str = 'usa',
+    months: Optional[List[int]] = None,
+    sess_start_hrs: int = 1,
+    sess_start_minutes: int = 30,
+    st_momentum_days: int = 5,
+    use_regime: bool = True,
+    target_regimes: Optional[List[int]] = None,
+    **kwargs
+) -> ScreenParams:
+    """Create a momentum screen with standardized parameters.
+
+    Parameters
+    ----------
+    name : str
+        Screen name
+    session : str
+        Session type: 'london', 'usa', 'asia', 'livestock', 'grain'
+    months : Optional[List[int]]
+        Month filter (1-12), None for all months
+    sess_start_hrs : int
+        Hours from session start for momentum calculation
+    sess_start_minutes : int
+        Minutes from session start for momentum calculation
+    st_momentum_days : int
+        Days for short-term momentum calculation
+    use_regime : bool
+        Whether to use volatility regime filtering
+    target_regimes : Optional[List[int]]
+        Target volatility regimes (default: [0, 1])
+    **kwargs
+        Additional parameters passed to ScreenParams
+
+    Returns
+    -------
+    ScreenParams
+        Configured momentum screen parameters
+    """
+    sessions = _session_times()
+    session_info = sessions.get(session, sessions['usa'])
+
+    # For momentum screens, we typically use multiple session starts/ends
+    # Default to London + USA sessions for multi-session support
+    if 'session_starts' not in kwargs:
+        if session == 'asia':
+            kwargs['session_starts'] = ["18:00", "02:00"]
+            kwargs['session_ends'] = ["02:00", "08:00"]
+        elif session == 'livestock' or session == 'grain':
+            kwargs['session_starts'] = [session_info['start'].strftime("%H:%M")]
+            kwargs['session_ends'] = [session_info['end'].strftime("%H:%M")]
+        else:
+            kwargs['session_starts'] = ["02:30", "08:30"]
+            kwargs['session_ends'] = ["10:30", "15:00"]
+
+    params = {
+        'screen_type': "momentum",
+        'name': name,
+        'months': months,
+        'sess_start_hrs': sess_start_hrs,
+        'sess_start_minutes': sess_start_minutes,
+        'st_momentum_days': st_momentum_days,
+    }
+
+    if use_regime:
+        params['regime_settings'] = _get_vol_classifier()
+        params['target_regimes'] = target_regimes or [0, 1]
+
+    params.update(kwargs)
+    return ScreenParams(**params)
 
 
-def seasonal_grain_screens(screen_type="seasonality", screen_name="grain_session",):
-    return [make_grain_screen(screen_type=screen_type,screen_name=f"{screen_name}_months_{''.join([str(i)+'_' for i in m])}", months=m) for m in seasons()]
+def make_orderflow_screen(
+    name: str,
+    session: str = 'usa',
+    months: Optional[List[int]] = None,
+    vpin_window: int = 25,
+    **kwargs
+) -> OrderflowParams:
+    """Create an orderflow screen with standardized parameters.
 
-def livestock_screens():
-    return {'seasonal':livestock_seasonals}
-session_starts = ["02:30", "08:30"]
+    Parameters
+    ----------
+    name : str
+        Screen name
+    session : str
+        Session type: 'london', 'usa', 'asia'
+    months : Optional[List[int]]
+        Month filter (1-12), None for all months
+    vpin_window : int
+        VPIN calculation window
+    **kwargs
+        Additional parameters passed to OrderflowParams
 
-session_ends = ["10:30", "15:00"]
+    Returns
+    -------
+    OrderflowParams
+        Configured orderflow screen parameters
+    """
+    sessions = _session_times()
+    session_info = sessions.get(session, sessions['usa'])
 
-default_london_settings = {"screen_type": "seasonality", "target_times": london_tgt_times, "period_length": period_time,
-                           "seasonality_session_start": london_start, "seasonality_session_end": london_end}
-default_usa_settings = {"screen_type": "seasonality", "target_times": usa_tgt_times, "period_length": period_time,
-                        "seasonality_session_start": usa_start, "seasonality_session_end": usa_end}
-london_winter_seasonality = ScreenParams("seasonality", name="london_winter", months=[12, 1, 2, 3],
-                                         target_times=london_tgt_times, period_length=period_time,
-                                         seasonality_session_start=london_start, seasonality_session_end=london_end)
+    return OrderflowParams(
+        name=name,
+        session_start=session_info['start'].strftime("%H:%M"),
+        session_end=session_info['end'].strftime("%H:%M"),
+        month_filter=months,
+        vpin_window=vpin_window,
+        **kwargs
+    )
 
-london_spring_seasonality = ScreenParams("seasonality", name="london_spring", months=[3, 4, 5, ],
-                                         target_times=london_tgt_times, period_length=period_time,
-                                         seasonality_session_start=london_start, seasonality_session_end=london_end)
 
-london_fall_seasonality = ScreenParams("seasonality", name="london_fall", months=[9, 10, 11],
-                                       target_times=london_tgt_times, period_length=period_time,
-                                       seasonality_session_start=london_start, seasonality_session_end=london_end)
+# ============================================================================
+# Screen generators by region
+# ============================================================================
 
-london_summer_seasonality = ScreenParams("seasonality", name="london_summer", months=[5, 6, 7, 8],
-                                         target_times=london_tgt_times, period_length=period_time,
-                                         seasonality_session_start=london_start, seasonality_session_end=london_end)
+def usa_seasonality_screens(quarterly: bool = True) -> List[ScreenParams]:
+    """Generate USA seasonality screens.
 
-usa_winter_seasonality = ScreenParams("seasonality", name="usa_winter", months=[12, 1, 2, 3],
-                                      target_times=usa_tgt_times, period_length=period_time,
-                                      seasonality_session_start=usa_start, seasonality_session_end=usa_end)
-usa_q1 = ScreenParams(name="usa_q1", months=[1, 2, 3], **default_usa_settings)
-usa_q2 = ScreenParams(name="usa_q2", months=[4, 5, 6], **default_usa_settings)
-usa_q3 = ScreenParams(name="usa_q3", months=[7, 8, 9], **default_usa_settings)
-usa_q4 = ScreenParams(name="usa_q4", months=[10, 11, 12], **default_usa_settings)
-usa_all = ScreenParams(name="usa_all", **default_usa_settings)
-usa_quarterly_params = [usa_q1, usa_q2, usa_q3, usa_q4, usa_all]
+    Parameters
+    ----------
+    quarterly : bool
+        If True, use quarterly splits (Q1-Q4). If False, use seasonal splits (winter/spring/summer/fall)
 
-london_q1 = ScreenParams(**default_london_settings, name="london_q1", months=[1, 2, 3])
-london_q2 = ScreenParams(**default_london_settings, name="london_q2", months=[4, 5, 6])
-london_q3 = ScreenParams(**default_london_settings, name="london_q3", months=[7, 8, 9])
-london_q4 = ScreenParams(**default_london_settings, name="london_q4", months=[10, 11, 12])
-london_all = ScreenParams(**default_london_settings)
-london_quarterly_params = [london_q1, london_q2, london_q3, london_q4, london_all]
+    Returns
+    -------
+    List[ScreenParams]
+        List of USA seasonality screen parameters
+    """
+    seasons = _season_months()
 
-usa_spring_seasonality = ScreenParams("seasonality", name="usa_spring", months=[3, 4, 5], target_times=usa_tgt_times,
-                                      period_length=period_time, seasonality_session_start=usa_start,
-                                      seasonality_session_end=usa_end)
+    if quarterly:
+        periods = ['q1', 'q2', 'q3', 'q4']
+    else:
+        periods = ['winter', 'spring', 'summer', 'fall']
 
-usa_fall_seasonality = ScreenParams("seasonality", name="usa_fall", months=[9, 10, 11], target_times=usa_tgt_times,
-                                    period_length=period_time, seasonality_session_start=usa_start,
-                                    seasonality_session_end=usa_end)
+    screens = []
+    for period in periods:
+        screens.append(make_seasonality_screen(
+            name=f"usa_{period}",
+            session='usa',
+            months=seasons[period]
+        ))
 
-usa_summer_seasonality = ScreenParams("seasonality", name="usa_summer", months=[5, 6, 7, 8], target_times=usa_tgt_times,
-                                      period_length=period_time, seasonality_session_start=usa_start,
-                                      seasonality_session_end=usa_end)
+    # Add all-months screen
+    screens.append(make_seasonality_screen(name="usa_all", session='usa'))
 
-london_seasonality = ScreenParams("seasonality", name="london_all", target_times=london_tgt_times,
-                                  period_length=period_time, seasonality_session_end=london_end,
-                                  seasonality_session_start=london_start)
+    return screens
 
-usa_seasonality = ScreenParams("seasonality", name="usa_all", target_times=usa_tgt_times, period_length=period_time,
-                               seasonality_session_start=usa_start, seasonality_session_end=usa_end)
 
-summer_momentum = ScreenParams("momentum", name="usa_summer_momentum", months=[5, 6, 7, 8],
-                               session_starts=session_starts, session_ends=session_ends,
-                               sess_start_hrs=1, sess_start_minutes=30, regime_settings=vol_clf, target_regimes=[0, 1])
+def london_seasonality_screens(quarterly: bool = True) -> List[ScreenParams]:
+    """Generate London seasonality screens.
 
-spring_momentum = ScreenParams("momentum", name="usa_spring_momentum", months=[3, 4, 5], session_starts=session_starts,
-                               session_ends=session_ends,
-                               sess_start_hrs=1, sess_start_minutes=30, regime_settings=vol_clf, target_regimes=[0, 1])
+    Parameters
+    ----------
+    quarterly : bool
+        If True, use quarterly splits. If False, use seasonal splits
 
-fall_momentum = ScreenParams("momentum", name="usa_fall_momentum", months=[9, 10, 11], session_starts=session_starts,
-                             session_ends=session_ends,
-                             sess_start_hrs=1, sess_start_minutes=30, regime_settings=vol_clf, target_regimes=[0, 1])
+    Returns
+    -------
+    List[ScreenParams]
+        List of London seasonality screen parameters
+    """
+    seasons = _season_months()
 
-winter_momentum = ScreenParams("momentum", name="usa_winter_momentum", months=[12, 1, 2, 3],
-                               session_starts=session_starts, session_ends=session_ends, sess_start_hrs=1,
-                               sess_start_minutes=30, regime_settings=vol_clf, target_regimes=[0, 1])
+    if quarterly:
+        periods = ['q1', 'q2', 'q3', 'q4']
+    else:
+        periods = ['winter', 'spring', 'summer', 'fall']
 
-momentum_generic = ScreenParams("momentum", name="momentum_generic", session_starts=session_starts,
-                                session_ends=session_ends, sess_start_hrs=1, sess_start_minutes=30,
-                                regime_settings=vol_clf, target_regimes=[0, 1])
+    screens = []
+    for period in periods:
+        screens.append(make_seasonality_screen(
+            name=f"london_{period}",
+            session='london',
+            months=seasons[period]
+        ))
 
-usa_seasonals = [usa_winter_seasonality, usa_summer_seasonality, usa_spring_seasonality, usa_fall_seasonality,
-                 usa_seasonality]
+    # Add all-months screen
+    screens.append(make_seasonality_screen(name="london_all", session='london'))
 
-london_seasonals = [london_fall_seasonality, london_winter_seasonality, london_spring_seasonality,
-                    london_summer_seasonality, london_seasonality]
+    return screens
 
-momentums = [spring_momentum, summer_momentum, fall_momentum, winter_momentum, momentum_generic]
-us_session = {'session_start': "08:30", 'session_end': "15:30"}
-london_session = {'session_start': "02:30", "session_end": "10:30"}
 
-fall = {'month_filter': [9, 10, 11]}
-spring = {'month_filter': [3, 4, 5]}
-winter = {'month_filter': [12, 1, 2, 3]}
-summer = {'month_filter': [5, 6, 7, 8]}
-us_of_screen = OrderflowParams(session_start="08:30", session_end="15:30")
-us_of_fall = OrderflowParams(**us_session, **fall, vpin_window=25, name="us_of_fall")
-us_of_spring = OrderflowParams(**us_session, **spring, vpin_window=25, name="us_of_spring")
-us_of_winter = OrderflowParams(session_start="08:30", session_end="15:30", month_filter=[11, 12, 1, 2, 3],
-                               name="us_winter")
-us_of_summer = OrderflowParams(session_start="08:30", session_end="15:30", month_filter=[5, 6, 7, 8], name="us_summer")
-london_of = OrderflowParams(session_start="02:30", session_end="10:30", vpin_window=30, name="london_of")
-london_of_winter = OrderflowParams(session_start="02:30", session_end="10:30", month_filter=[11, 12, 1, 2, 3],
-                                   name="london_winter")
-london_of_summer = OrderflowParams(session_start="02:30", session_end="10:30", month_filter=[5, 6, 7, 8],
-                                   name="london_summer")
-london_of_spring = OrderflowParams(**london_session, **spring, vpin_window=25, name="london_of_spring")
-london_of_fall = OrderflowParams(**london_session, **fall, vpin_window=25, name="london_of_fall")
-london_of_all = [london_of, london_of_winter, london_of_summer, london_of_spring, london_of_fall]
-us_of_all = [us_of_screen, us_of_fall, us_of_summer, us_of_spring, us_of_winter]
+def asia_seasonality_screens(quarterly: bool = True) -> List[ScreenParams]:
+    """Generate Asia session seasonality screens.
+
+    Asia session runs 18:00 CST - 02:00 CST, covering Tokyo, Hong Kong, Singapore markets.
+
+    Parameters
+    ----------
+    quarterly : bool
+        If True, use quarterly splits. If False, use seasonal splits
+
+    Returns
+    -------
+    List[ScreenParams]
+        List of Asia seasonality screen parameters
+    """
+    seasons = _season_months()
+
+    if quarterly:
+        periods = ['q1', 'q2', 'q3', 'q4']
+    else:
+        periods = ['winter', 'spring', 'summer', 'fall']
+
+    screens = []
+    for period in periods:
+        screens.append(make_seasonality_screen(
+            name=f"asia_{period}",
+            session='asia',
+            months=seasons[period]
+        ))
+
+    # Add all-months screen
+    screens.append(make_seasonality_screen(name="asia_all", session='asia'))
+
+    return screens
+
+
+def usa_momentum_screens(seasonal: bool = True) -> List[ScreenParams]:
+    """Generate USA momentum screens.
+
+    Parameters
+    ----------
+    seasonal : bool
+        If True, create seasonal splits. If False, only create all-months screen
+
+    Returns
+    -------
+    List[ScreenParams]
+        List of USA momentum screen parameters
+    """
+    screens = []
+    seasons = _season_months()
+
+    if seasonal:
+        for season_name in ['winter', 'spring', 'summer', 'fall']:
+            screens.append(make_momentum_screen(
+                name=f"usa_{season_name}_momentum",
+                session='usa',
+                months=seasons[season_name]
+            ))
+
+    # Add all-months screen
+    screens.append(make_momentum_screen(name="momentum_generic", session='usa'))
+
+    return screens
+
+
+def asia_momentum_screens(seasonal: bool = True) -> List[ScreenParams]:
+    """Generate Asia session momentum screens.
+
+    Parameters
+    ----------
+    seasonal : bool
+        If True, create seasonal splits. If False, only create all-months screen
+
+    Returns
+    -------
+    List[ScreenParams]
+        List of Asia momentum screen parameters
+    """
+    screens = []
+    seasons = _season_months()
+
+    if seasonal:
+        for season_name in ['winter', 'spring', 'summer', 'fall']:
+            screens.append(make_momentum_screen(
+                name=f"asia_{season_name}_momentum",
+                session='asia',
+                months=seasons[season_name]
+            ))
+
+    # Add all-months screen
+    screens.append(make_momentum_screen(name="asia_momentum_generic", session='asia'))
+
+    return screens
+
+
+def livestock_screens() -> Dict[str, List[ScreenParams]]:
+    """Generate livestock-specific screens (seasonal and momentum).
+
+    Returns
+    -------
+    Dict[str, List[ScreenParams]]
+        Dictionary with 'seasonal' and 'momentum' keys containing screen lists
+    """
+    seasons = _season_months()
+
+    seasonal_screens = []
+    momentum_screens = []
+
+    # Seasonal screens
+    for season_name in ['winter', 'spring', 'summer', 'fall']:
+        seasonal_screens.append(make_seasonality_screen(
+            name=f"livestock_seasonal_{season_name}",
+            session='livestock',
+            months=seasons[season_name]
+        ))
+    seasonal_screens.append(make_seasonality_screen(
+        name="livestock_seasonal",
+        session='livestock'
+    ))
+
+    # Momentum screens
+    for season_name in ['winter', 'spring', 'summer', 'fall']:
+        momentum_screens.append(make_momentum_screen(
+            name=f"livestock_{season_name}_momo",
+            session='livestock',
+            months=seasons[season_name]
+        ))
+    momentum_screens.append(make_momentum_screen(
+        name="livestock_momentum",
+        session='livestock'
+    ))
+
+    return {
+        'seasonal': seasonal_screens,
+        'momentum': momentum_screens
+    }
+
+
+def grain_screens(seasonal: bool = True) -> List[ScreenParams]:
+    """Generate grain-specific screens.
+
+    Parameters
+    ----------
+    seasonal : bool
+        If True, create seasonal splits. If False, only create all-months screen
+
+    Returns
+    -------
+    List[ScreenParams]
+        List of grain screen parameters
+    """
+    screens = []
+    seasons = _season_months()
+
+    if seasonal:
+        for season_name in ['winter', 'spring', 'summer', 'fall']:
+            screens.append(ScreenParams(
+                screen_type="seasonality",
+                name=f"grain_{season_name}",
+                months=seasons[season_name],
+                session_starts=["18:00", "07:00"],
+                session_ends=["13:00", "13:00"],
+                period_length=_default_period_length(),
+                target_times=["07:30", "09:30", "11:00", "12:00"],
+                seasonality_session_start=time(hour=7, minute=0),
+                seasonality_session_end=time(hour=13, minute=0)
+            ))
+
+    # Add all-months screen
+    screens.append(ScreenParams(
+        screen_type="seasonality",
+        name="grain_all",
+        session_starts=["18:00", "07:00"],
+        session_ends=["13:00", "13:00"],
+        period_length=_default_period_length(),
+        target_times=["07:30", "09:30", "11:00", "12:00"],
+        seasonality_session_start=time(hour=7, minute=0),
+        seasonality_session_end=time(hour=13, minute=0)
+    ))
+
+    return screens
+
+
+def usa_orderflow_screens(seasonal: bool = True) -> List[OrderflowParams]:
+    """Generate USA orderflow screens.
+
+    Parameters
+    ----------
+    seasonal : bool
+        If True, create seasonal splits. If False, only create all-months screen
+
+    Returns
+    -------
+    List[OrderflowParams]
+        List of USA orderflow screen parameters
+    """
+    screens = []
+    seasons = _season_months()
+
+    if seasonal:
+        for season_name in ['winter', 'spring', 'summer', 'fall']:
+            screens.append(make_orderflow_screen(
+                name=f"us_of_{season_name}",
+                session='usa',
+                months=seasons[season_name]
+            ))
+
+    # Add all-months screen
+    screens.append(make_orderflow_screen(name="us_of", session='usa'))
+
+    return screens
+
+
+def london_orderflow_screens(seasonal: bool = True) -> List[OrderflowParams]:
+    """Generate London orderflow screens.
+
+    Parameters
+    ----------
+    seasonal : bool
+        If True, create seasonal splits. If False, only create all-months screen
+
+    Returns
+    -------
+    List[OrderflowParams]
+        List of London orderflow screen parameters
+    """
+    screens = []
+    seasons = _season_months()
+
+    if seasonal:
+        for season_name in ['winter', 'spring', 'summer', 'fall']:
+            screens.append(make_orderflow_screen(
+                name=f"london_of_{season_name}",
+                session='london',
+                months=seasons[season_name],
+                vpin_window=30 if season_name == 'winter' else 25
+            ))
+
+    # Add all-months screen
+    screens.append(make_orderflow_screen(
+        name="london_of",
+        session='london',
+        vpin_window=30
+    ))
+
+    return screens
+
+
+def asia_orderflow_screens(seasonal: bool = True) -> List[OrderflowParams]:
+    """Generate Asia session orderflow screens.
+
+    Parameters
+    ----------
+    seasonal : bool
+        If True, create seasonal splits. If False, only create all-months screen
+
+    Returns
+    -------
+    List[OrderflowParams]
+        List of Asia orderflow screen parameters
+    """
+    screens = []
+    seasons = _season_months()
+
+    if seasonal:
+        for season_name in ['winter', 'spring', 'summer', 'fall']:
+            screens.append(make_orderflow_screen(
+                name=f"asia_of_{season_name}",
+                session='asia',
+                months=seasons[season_name]
+            ))
+
+    # Add all-months screen
+    screens.append(make_orderflow_screen(name="asia_of", session='asia'))
+
+    return screens
+
+
+# ============================================================================
+# Convenience getters for common configurations
+# ============================================================================
+
+def get_all_seasonality_screens(regions: Optional[List[str]] = None) -> List[ScreenParams]:
+    """Get all seasonality screens for specified regions.
+
+    Parameters
+    ----------
+    regions : Optional[List[str]]
+        List of regions: 'usa', 'london', 'asia', 'livestock', 'grain'
+        If None, returns all regions
+
+    Returns
+    -------
+    List[ScreenParams]
+        Combined list of seasonality screens
+    """
+    if regions is None:
+        regions = ['usa', 'london', 'asia', 'livestock', 'grain']
+
+    all_screens = []
+    for region in regions:
+        if region == 'usa':
+            all_screens.extend(usa_seasonality_screens())
+        elif region == 'london':
+            all_screens.extend(london_seasonality_screens())
+        elif region == 'asia':
+            all_screens.extend(asia_seasonality_screens())
+        elif region == 'livestock':
+            all_screens.extend(livestock_screens()['seasonal'])
+        elif region == 'grain':
+            all_screens.extend(grain_screens())
+
+    return all_screens
+
+
+def get_all_momentum_screens(regions: Optional[List[str]] = None) -> List[ScreenParams]:
+    """Get all momentum screens for specified regions.
+
+    Parameters
+    ----------
+    regions : Optional[List[str]]
+        List of regions: 'usa', 'asia', 'livestock'
+        If None, returns all regions
+
+    Returns
+    -------
+    List[ScreenParams]
+        Combined list of momentum screens
+    """
+    if regions is None:
+        regions = ['usa', 'asia', 'livestock']
+
+    all_screens = []
+    for region in regions:
+        if region == 'usa':
+            all_screens.extend(usa_momentum_screens())
+        elif region == 'asia':
+            all_screens.extend(asia_momentum_screens())
+        elif region == 'livestock':
+            all_screens.extend(livestock_screens()['momentum'])
+
+    return all_screens
+
+
+def get_all_orderflow_screens(regions: Optional[List[str]] = None) -> List[OrderflowParams]:
+    """Get all orderflow screens for specified regions.
+
+    Parameters
+    ----------
+    regions : Optional[List[str]]
+        List of regions: 'usa', 'london', 'asia'
+        If None, returns all regions
+
+    Returns
+    -------
+    List[OrderflowParams]
+        Combined list of orderflow screens
+    """
+    if regions is None:
+        regions = ['usa', 'london', 'asia']
+
+    all_screens = []
+    for region in regions:
+        if region == 'usa':
+            all_screens.extend(usa_orderflow_screens())
+        elif region == 'london':
+            all_screens.extend(london_orderflow_screens())
+        elif region == 'asia':
+            all_screens.extend(asia_orderflow_screens())
+
+    return all_screens
+
+
+# ============================================================================
+# Backward compatibility - lazy instantiation
+# ============================================================================
+
+# Only create instances when explicitly requested to maintain backward compatibility
+# without incurring the cost of creating all objects at import time
+
+def get_usa_quarterly_params() -> List[ScreenParams]:
+    """Backward compatibility: USA quarterly seasonality screens."""
+    return usa_seasonality_screens(quarterly=True)
+
+
+def get_london_quarterly_params() -> List[ScreenParams]:
+    """Backward compatibility: London quarterly seasonality screens."""
+    return london_seasonality_screens(quarterly=True)
+
+
+def get_usa_seasonals() -> List[ScreenParams]:
+    """Backward compatibility: USA seasonal screens."""
+    return usa_seasonality_screens(quarterly=False)
+
+
+def get_london_seasonals() -> List[ScreenParams]:
+    """Backward compatibility: London seasonal screens."""
+    return london_seasonality_screens(quarterly=False)
+
+
+def get_momentums() -> List[ScreenParams]:
+    """Backward compatibility: USA momentum screens."""
+    return usa_momentum_screens(seasonal=True)
+
+
+def get_us_of_all() -> List[OrderflowParams]:
+    """Backward compatibility: USA orderflow screens."""
+    return usa_orderflow_screens(seasonal=True)
+
+
+def get_london_of_all() -> List[OrderflowParams]:
+    """Backward compatibility: London orderflow screens."""
+    return london_orderflow_screens(seasonal=True)
