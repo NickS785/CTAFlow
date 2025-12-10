@@ -8,13 +8,13 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-__all__ = ["PatternDataset", "PatternMLBuilder"]
+__all__ = ["ModelDataset", "PatternMLBuilder"]
 
 from pandas import Series
 
 
 @dataclass
-class PatternDataset:
+class ModelDataset:
     """Container for ML-ready data derived from a pattern specification.
 
     Attributes
@@ -94,7 +94,7 @@ class PatternMLBuilder:
             features_df: Optional[pd.DataFrame] = None,
             vol_features_df: Optional[pd.DataFrame] = None,
             vol_persistence: bool = False,
-    ) -> PatternDataset:
+    ) -> ModelDataset:
         """Dispatch to the appropriate builder based on pattern type.
 
         Parameters
@@ -159,7 +159,7 @@ class PatternMLBuilder:
         else:
             raise NotImplementedError(f"Pattern type '{ptype}' is not supported yet.")
 
-        return PatternDataset(X=X, y=y, meta=dict(pattern_meta), info=info)
+        return ModelDataset(X=X, y=y, meta=dict(pattern_meta), info=info)
 
 
     # ------------------------------------------------------------------
