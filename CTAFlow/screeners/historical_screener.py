@@ -64,6 +64,10 @@ class ScreenParams:
     # Seasonality screen parameters
     target_times : Optional[List[Union[str, time]]]
         Times to analyze for seasonality screen (e.g., ["09:30", "14:00"])
+    min_target_spacing_minutes : Optional[int]
+        Minimum spacing between target times (in minutes). When provided,
+        overlapping or closely spaced target times closer than this interval
+        are skipped for intraday predictability tests.
     period_length : Optional[Union[int, timedelta]]
         Length of period to aggregate for seasonality (default: None)
     dayofweek_screen : bool
@@ -127,6 +131,7 @@ class ScreenParams:
 
     # Seasonality screen parameters
     target_times: Optional[List[Union[str, time]]] = None
+    min_target_spacing_minutes: Optional[int] = None
     period_length: Optional[Union[int, timedelta]] = None
     dayofweek_screen: bool = True
     seasonality_session_start: Union[str, time] = "00:00"
@@ -168,7 +173,7 @@ class ScreenParams:
             self.target_regimes = regimes
 
         if self.target_times:
-            normalised: List[str] = []
+            clocks: List[time] = []
             for raw in self.target_times:
                 if isinstance(raw, time):
                     clock = raw
@@ -177,8 +182,40 @@ class ScreenParams:
                         clock = pd.to_datetime(str(raw)).time()
                     except (TypeError, ValueError) as exc:
                         raise ValueError(f"Invalid target time value: {raw!r}") from exc
-                normalised.append(clock.strftime("%H:%M"))
-            self.target_times_hhmm = sorted(dict.fromkeys(normalised))
+                clocks.append(clock)
+
+            spacing = self.min_target_spacing_minutes
+            if spacing is not None:
+                try:
+                    spacing_int = int(spacing)
+                except (TypeError, ValueError):
+                    spacing_int = None
+                else:
+                    if spacing_int <= 0:
+                        spacing_int = None
+                if spacing_int:
+                    clocks_sorted = sorted(
+                        dict.fromkeys(clocks),
+                        key=lambda c: (c.hour, c.minute, c.second, c.microsecond),
+                    )
+                    filtered: List[time] = []
+                    last_seconds: Optional[int] = None
+                    spacing_seconds = spacing_int * 60
+                    for clock in clocks_sorted:
+                        seconds = clock.hour * 3600 + clock.minute * 60 + clock.second
+                        seconds += clock.microsecond // 1_000_000
+                        if last_seconds is None or (seconds - last_seconds) >= spacing_seconds:
+                            filtered.append(clock)
+                            last_seconds = seconds
+                    clocks = filtered
+
+            self.target_times_hhmm = [
+                clock.strftime("%H:%M")
+                for clock in sorted(
+                    dict.fromkeys(clocks),
+                    key=lambda c: (c.hour, c.minute, c.second, c.microsecond),
+                )
+            ]
 
         # Auto-generate name if not provided
         if self.name is None:
@@ -806,9 +843,43 @@ class HistoricalScreener:
             params['period_length_min'] = period_minutes
         return params
 
+    @staticmethod
+    def _filter_times_by_spacing(
+        target_times: List[time], min_spacing_minutes: Optional[int]
+    ) -> List[time]:
+        if not target_times:
+            return target_times
+
+        try:
+            spacing = int(min_spacing_minutes) if min_spacing_minutes is not None else None
+        except (TypeError, ValueError):
+            spacing = None
+
+        if spacing is None or spacing <= 0:
+            return sorted(
+                dict.fromkeys(target_times),
+                key=lambda t: (t.hour, t.minute, t.second, t.microsecond),
+            )
+
+        spacing_seconds = spacing * 60
+        filtered: List[time] = []
+        last_seconds: Optional[int] = None
+        for clock in sorted(
+            dict.fromkeys(target_times),
+            key=lambda t: (t.hour, t.minute, t.second, t.microsecond),
+        ):
+            seconds = clock.hour * 3600 + clock.minute * 60 + clock.second
+            seconds += clock.microsecond // 1_000_000
+            if last_seconds is None or (seconds - last_seconds) >= spacing_seconds:
+                filtered.append(clock)
+                last_seconds = seconds
+
+        return filtered
+
     def st_seasonality_screen(
         self,
         target_times: List[Union[str, time]],
+        min_target_spacing_minutes: Optional[int] = None,
         period_length: Optional[Union[int, timedelta]] = None,
         dayofweek_screen: bool = True,
         months: Optional[List[int]] = None,
@@ -843,6 +914,10 @@ class HistoricalScreener:
         -----------
         target_times : List[Union[str, time]]
             List of times to analyze (e.g., ["09:30", "14:00"])
+        min_target_spacing_minutes : Optional[int]
+            Minimum spacing (in minutes) enforced between successive target times.
+            When provided, overlapping intraday windows closer than this spacing
+            are skipped.
         period_length : Optional[Union[int, timedelta]]
             Length of period to aggregate (e.g., timedelta(minutes=30))
             If None, uses single-bar returns at target times
@@ -919,6 +994,26 @@ class HistoricalScreener:
         # Convert times to time objects
         converted_times = self._convert_times(target_times)
         self._validate_target_times(converted_times, session_start_time, session_end_time)
+
+        period_minutes: Optional[int]
+        if period_length is None:
+            period_minutes = None
+        elif isinstance(period_length, timedelta):
+            period_minutes = int(period_length.total_seconds() // 60)
+        else:
+            try:
+                period_minutes = int(period_length)
+            except (TypeError, ValueError):
+                period_minutes = None
+
+        min_spacing = min_target_spacing_minutes if min_target_spacing_minutes is not None else period_minutes
+        filtered_times = self._filter_times_by_spacing(converted_times, min_spacing)
+        if len(filtered_times) < len(converted_times) and self.verbose:
+            self.logger.info(
+                "Filtered overlapping target times",
+                extra={"kept": [t.strftime('%H:%M') for t in filtered_times]},
+            )
+        converted_times = filtered_times
 
         # Determine which months to analyze
         selected_months = self._parse_season_months(months, season)
@@ -1059,17 +1154,6 @@ class HistoricalScreener:
                 ticker_results['metadata'].update(months_meta)
                 ticker_results['metadata']['regime_filter'] = regime_meta
 
-                period_minutes: Optional[int]
-                if period_length is None:
-                    period_minutes = None
-                elif isinstance(period_length, timedelta):
-                    period_minutes = int(period_length.total_seconds() // 60)
-                else:
-                    try:
-                        period_minutes = int(period_length)
-                    except (TypeError, ValueError):
-                        period_minutes = None
-
                 normalized_times = [clock.strftime("%H:%M") for clock in converted_times]
 
                 pattern_context = {
@@ -1079,6 +1163,7 @@ class HistoricalScreener:
                     'months_mask_12': months_meta['months_mask_12'],
                     'months_names': months_meta['months_names'],
                     'regime_filter': regime_meta,
+                    'min_target_spacing_min': min_spacing if min_spacing is not None else 0,
                 }
                 ticker_results['pattern_context'] = pattern_context
                 ticker_results['months_active'] = months_meta['months_active']

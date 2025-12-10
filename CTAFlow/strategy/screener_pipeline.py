@@ -2884,6 +2884,55 @@ class HorizonMapper:
 
         return None
 
+    @classmethod
+    def _intraday_response_delta_minutes(cls, pattern: Mapping[str, Any]) -> Optional[int]:
+        """Infer predictor→response gap for time_predictive_intraday patterns."""
+
+        payload = pattern.get("pattern_payload") or {}
+
+        predictor = payload.get("predictor_time") or pattern.get("predictor_time")
+        response = payload.get("response_time") or pattern.get("response_time")
+        time_value = payload.get("time") or pattern.get("time")
+
+        if (predictor is None or response is None) and isinstance(time_value, str) and "->" in time_value:
+            predictor, response = [part.strip() for part in time_value.split("->", 1)]
+
+        if predictor is None or response is None:
+            return None
+
+        def _coerce_clock(value: Any) -> Optional[time_cls]:
+            try:
+                if isinstance(value, time_cls):
+                    return value
+                return pd.to_datetime(str(value)).time()
+            except Exception:
+                return None
+
+        start_clock = _coerce_clock(predictor)
+        end_clock = _coerce_clock(response)
+        if start_clock is None or end_clock is None:
+            return None
+
+        start_seconds = (
+            start_clock.hour * 3600
+            + start_clock.minute * 60
+            + start_clock.second
+            + start_clock.microsecond / 1_000_000
+        )
+        end_seconds = (
+            end_clock.hour * 3600
+            + end_clock.minute * 60
+            + end_clock.second
+            + end_clock.microsecond / 1_000_000
+        )
+
+        delta_seconds = end_seconds - start_seconds
+        if delta_seconds <= 0:
+            delta_seconds += 24 * 3600
+
+        delta_minutes = int(delta_seconds // 60)
+        return delta_minutes if delta_minutes > 0 else None
+
     # ------------------------------------------------------------------
     # Configuration helpers
     # ------------------------------------------------------------------
@@ -3079,10 +3128,14 @@ class HorizonMapper:
             # Correlates one intraday period with another
             # Extract period_length_min from pattern
             if pattern is not None:
-                payload = pattern.get('pattern_payload', {}) or {}
-                period_min = payload.get('period_length_min')
-                if period_min and isinstance(period_min, (int, float)) and period_min > 0:
-                    return HorizonSpec(name="intraday_delta", delta_minutes=int(period_min))
+                delta = self._intraday_response_delta_minutes(pattern)
+                if delta is None:
+                    payload = pattern.get('pattern_payload', {}) or {}
+                    period_min = payload.get('period_length_min')
+                    if period_min and isinstance(period_min, (int, float)) and period_min > 0:
+                        delta = int(period_min)
+                if delta:
+                    return HorizonSpec(name="intraday_delta", delta_minutes=int(delta))
             return HorizonSpec(name="intraday_delta", delta_minutes=default_intraday_minutes)
         if pattern_type == "orderflow_peak_pressure":
             return HorizonSpec(name="intraday_delta", delta_minutes=default_intraday_minutes)
@@ -3828,7 +3881,9 @@ class HorizonMapper:
                 )
                 effective_delta = spec.delta_minutes
                 if spec.name == "intraday_delta":
-                    inferred_minutes = self._extract_period_minutes(pattern)
+                    inferred_minutes = self._intraday_response_delta_minutes(pattern)
+                    if inferred_minutes is None:
+                        inferred_minutes = self._extract_period_minutes(pattern)
                     if inferred_minutes is not None:
                         effective_delta = inferred_minutes
 
