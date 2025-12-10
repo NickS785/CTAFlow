@@ -1735,9 +1735,13 @@ class ScreenerPipeline:
         if pattern_type in {"weekday_mean", "weekday_returns"}:
             return self._extract_weekday_mean(df, payload, key, months)
         if pattern_type == "time_predictive_nextday":
-            return self._extract_time_nextday(df, payload, key, months)
+            return self._extract_time_nextday(df, payload, key, months, pattern)
         if pattern_type == "time_predictive_nextweek":
-            return self._extract_time_nextweek(df, payload, key, months)
+            return self._extract_time_nextweek(df, payload, key, months, pattern)
+        if pattern_type == "time_predictive_eod":
+            return self._extract_time_eod(df, payload, key, months, pattern)
+        if pattern_type == "time_predictive_intraday":
+            return self._extract_time_intraday(df, payload, key, months, pattern)
         if pattern_type == "weekend_hedging":
             return self._extract_weekend_hedging(df, pattern, payload, key, months)
 
@@ -2070,8 +2074,13 @@ class ScreenerPipeline:
         payload: Mapping[str, Any],
         key: Optional[str],
         months: Optional[List[int]],
+        pattern: Optional[Mapping[str, Any]] = None,
     ) -> List[str]:
-        hms, hmsf = self._time_to_strings(payload.get("time"))
+        time_value = payload.get("time") if payload else None
+        if time_value is None and pattern is not None:
+            time_value = pattern.get("time")
+
+        hms, hmsf = self._time_to_strings(time_value)
         if hms is None:
             return []
 
@@ -2096,8 +2105,13 @@ class ScreenerPipeline:
         payload: Mapping[str, Any],
         key: Optional[str],
         months: Optional[List[int]],
+        pattern: Optional[Mapping[str, Any]] = None,
     ) -> List[str]:
-        hms, hmsf = self._time_to_strings(payload.get("time"))
+        time_value = payload.get("time") if payload else None
+        if time_value is None and pattern is not None:
+            time_value = pattern.get("time")
+
+        hms, hmsf = self._time_to_strings(time_value)
         if hms is None:
             return []
 
@@ -2121,6 +2135,79 @@ class ScreenerPipeline:
             "correlation": payload.get("correlation"),
             "p": payload.get("p_value"),
             "strongest_days": list(strongest_days) if strongest_days else None,
+        }
+        return self._add_feature(df, base, mask, sidecars)
+
+    def _extract_time_eod(
+        self,
+        df: pd.DataFrame,
+        payload: Mapping[str, Any],
+        key: Optional[str],
+        months: Optional[List[int]],
+        pattern: Optional[Mapping[str, Any]] = None,
+    ) -> List[str]:
+        raw_time = payload.get("time") if payload else None
+        if raw_time is None and pattern is not None:
+            raw_time = pattern.get("time")
+        if isinstance(raw_time, str) and "->" in raw_time:
+            raw_time = raw_time.split("->", 1)[0].strip()
+
+        hms, hmsf = self._time_to_strings(raw_time)
+        if hms is None:
+            return []
+
+        use_us = self._use_microseconds(df, raw_time)
+        column = "clock_time_us" if use_us else "clock_time"
+        target = hmsf if use_us else hms
+
+        mask = df[column] == target
+        mask &= self._months_mask(df, months)
+
+        base = self._feature_base_name(key, f"time_eod_{target}")
+        sidecars = {
+            "time": pattern.get("time") if pattern is not None else payload.get("time"),
+            "correlation": payload.get("correlation"),
+            "p": payload.get("p_value"),
+            "period_length_min": payload.get("period_length_min"),
+        }
+        return self._add_feature(df, base, mask, sidecars)
+
+    def _extract_time_intraday(
+        self,
+        df: pd.DataFrame,
+        payload: Mapping[str, Any],
+        key: Optional[str],
+        months: Optional[List[int]],
+        pattern: Optional[Mapping[str, Any]] = None,
+    ) -> List[str]:
+        raw_time = payload.get("time") if payload else None
+        if raw_time is None and pattern is not None:
+            raw_time = pattern.get("time")
+        predictor_time: Any = raw_time
+        response_time: Optional[str] = None
+        if isinstance(raw_time, str) and "->" in raw_time:
+            predictor_time, response_time = [part.strip() for part in raw_time.split("->", 1)]
+
+        hms, hmsf = self._time_to_strings(predictor_time)
+        if hms is None:
+            return []
+
+        use_us = self._use_microseconds(df, predictor_time)
+        column = "clock_time_us" if use_us else "clock_time"
+        target = hmsf if use_us else hms
+
+        mask = df[column] == target
+        mask &= self._months_mask(df, months)
+
+        base = self._feature_base_name(key, f"time_intraday_{target}")
+        sidecars = {
+            "time": pattern.get("time") if pattern is not None else payload.get("time"),
+            "predictor_time": predictor_time,
+            "response_time": response_time,
+            "correlation": payload.get("correlation"),
+            "p": payload.get("p_value"),
+            "n": payload.get("n"),
+            "period_length_min": payload.get("period_length_min"),
         }
         return self._add_feature(df, base, mask, sidecars)
 
@@ -2797,6 +2884,55 @@ class HorizonMapper:
 
         return None
 
+    @classmethod
+    def _intraday_response_delta_minutes(cls, pattern: Mapping[str, Any]) -> Optional[int]:
+        """Infer predictor→response gap for time_predictive_intraday patterns."""
+
+        payload = pattern.get("pattern_payload") or {}
+
+        predictor = payload.get("predictor_time") or pattern.get("predictor_time")
+        response = payload.get("response_time") or pattern.get("response_time")
+        time_value = payload.get("time") or pattern.get("time")
+
+        if (predictor is None or response is None) and isinstance(time_value, str) and "->" in time_value:
+            predictor, response = [part.strip() for part in time_value.split("->", 1)]
+
+        if predictor is None or response is None:
+            return None
+
+        def _coerce_clock(value: Any) -> Optional[time_cls]:
+            try:
+                if isinstance(value, time_cls):
+                    return value
+                return pd.to_datetime(str(value)).time()
+            except Exception:
+                return None
+
+        start_clock = _coerce_clock(predictor)
+        end_clock = _coerce_clock(response)
+        if start_clock is None or end_clock is None:
+            return None
+
+        start_seconds = (
+            start_clock.hour * 3600
+            + start_clock.minute * 60
+            + start_clock.second
+            + start_clock.microsecond / 1_000_000
+        )
+        end_seconds = (
+            end_clock.hour * 3600
+            + end_clock.minute * 60
+            + end_clock.second
+            + end_clock.microsecond / 1_000_000
+        )
+
+        delta_seconds = end_seconds - start_seconds
+        if delta_seconds <= 0:
+            delta_seconds += 24 * 3600
+
+        delta_minutes = int(delta_seconds // 60)
+        return delta_minutes if delta_minutes > 0 else None
+
     # ------------------------------------------------------------------
     # Configuration helpers
     # ------------------------------------------------------------------
@@ -2992,10 +3128,14 @@ class HorizonMapper:
             # Correlates one intraday period with another
             # Extract period_length_min from pattern
             if pattern is not None:
-                payload = pattern.get('pattern_payload', {}) or {}
-                period_min = payload.get('period_length_min')
-                if period_min and isinstance(period_min, (int, float)) and period_min > 0:
-                    return HorizonSpec(name="intraday_delta", delta_minutes=int(period_min))
+                delta = self._intraday_response_delta_minutes(pattern)
+                if delta is None:
+                    payload = pattern.get('pattern_payload', {}) or {}
+                    period_min = payload.get('period_length_min')
+                    if period_min and isinstance(period_min, (int, float)) and period_min > 0:
+                        delta = int(period_min)
+                if delta:
+                    return HorizonSpec(name="intraday_delta", delta_minutes=int(delta))
             return HorizonSpec(name="intraday_delta", delta_minutes=default_intraday_minutes)
         if pattern_type == "orderflow_peak_pressure":
             return HorizonSpec(name="intraday_delta", delta_minutes=default_intraday_minutes)
@@ -3701,6 +3841,10 @@ class HorizonMapper:
                     branch = precomputed_payload.get("next_day")
                 elif pattern_type == "time_predictive_nextweek":
                     branch = precomputed_payload.get("next_week")
+                elif pattern_type == "time_predictive_eod":
+                    branch = precomputed_payload.get("eod")
+                elif pattern_type == "time_predictive_intraday":
+                    branch = precomputed_payload.get("intraday")
                 else:
                     branch = None
 
@@ -3737,7 +3881,9 @@ class HorizonMapper:
                 )
                 effective_delta = spec.delta_minutes
                 if spec.name == "intraday_delta":
-                    inferred_minutes = self._extract_period_minutes(pattern)
+                    inferred_minutes = self._intraday_response_delta_minutes(pattern)
+                    if inferred_minutes is None:
+                        inferred_minutes = self._extract_period_minutes(pattern)
                     if inferred_minutes is not None:
                         effective_delta = inferred_minutes
 

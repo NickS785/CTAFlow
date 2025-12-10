@@ -52,6 +52,7 @@ class SeasonalityScreenEngine(BaseScreenEngine):
         )
         results = screener.st_seasonality_screen(
             target_times=params.target_times or [],
+            min_target_spacing_minutes=params.min_target_spacing_minutes,
             period_length=params.period_length,
             dayofweek_screen=params.dayofweek_screen,
             months=params.months,
