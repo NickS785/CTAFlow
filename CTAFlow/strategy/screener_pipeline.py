@@ -3305,6 +3305,17 @@ class HorizonMapper:
         session_last_prices.index = session_last_idx.index
         session_last_map = session_last_prices.to_dict()
 
+        # Get Monday's open prices for entry
+        session_first_idx = (
+            df.loc[df["session_id"].notna(), ["session_id", "ts"]]
+            .groupby("session_id")["ts"]
+            .idxmin()
+        )
+        open_series = df["open"].astype(float)
+        session_first_opens = open_series.loc[session_first_idx.values].astype(float)
+        session_first_opens.index = session_first_idx.index
+        session_first_open_map = session_first_opens.to_dict()
+
         returns_y = pd.Series(np.nan, index=df.index, dtype=float)
         for idx in gate_series[gate_series].index:
             session_id = df.at[idx, "session_id"]
@@ -3313,8 +3324,10 @@ class HorizonMapper:
             next_session = next_session_map.get(session_id)
             if not next_session:
                 continue
-            entry_price = close_series.loc[idx]
-            if pd.isna(entry_price) or entry_price <= 0:
+
+            # Entry at Monday's open (not Friday's close)
+            entry_price = session_first_open_map.get(next_session)
+            if entry_price is None or pd.isna(entry_price) or entry_price <= 0:
                 continue
 
             if policy == "average":

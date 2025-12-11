@@ -79,7 +79,12 @@ class TickerReport:
             # For calendar patterns: "month_start_1d" -> pattern_name
             # For momentum patterns: "momentum_so|st_momentum|session_0" -> pattern_name
             # Pattern type is inferred from structure
-            if len(parts) > 2:
+
+            # Check for weekend_hedging first (can be in screen_name with only 2 parts)
+            if 'weekend_hedging' in screen_name:
+                pattern_type = 'weekend_hedging'
+                pattern_name = screen_name
+            elif len(parts) > 2:
                 # Determine pattern type based on common keywords
                 pattern_type = ''
                 remaining_parts = parts[2:]
@@ -103,10 +108,6 @@ class TickerReport:
                 # Check if it's an orderflow pattern
                 elif 'orderflow' in '|'.join(remaining_parts):
                     pattern_type = remaining_parts[0] if remaining_parts else ''
-                    pattern_name = '|'.join(remaining_parts[1:]) if len(remaining_parts) > 1 else ''
-                # Weekend hedging
-                elif 'weekend_hedging' in '|'.join(remaining_parts):
-                    pattern_type = 'weekend_hedging'
                     pattern_name = '|'.join(remaining_parts[1:]) if len(remaining_parts) > 1 else ''
                 else:
                     # Generic: first part is pattern type, rest is pattern name
