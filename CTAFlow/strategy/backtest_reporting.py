@@ -84,6 +84,20 @@ class TickerReport:
             if 'weekend_hedging' in screen_name:
                 pattern_type = 'weekend_hedging'
                 pattern_name = screen_name
+            # Check for time_predictive patterns in screen_name
+            elif 'time_predictive' in screen_name:
+                # Extract the specific time_predictive type
+                if 'time_predictive_nextday' in screen_name:
+                    pattern_type = 'time_predictive_nextday'
+                elif 'time_predictive_nextweek' in screen_name:
+                    pattern_type = 'time_predictive_nextweek'
+                elif 'time_predictive_eod' in screen_name:
+                    pattern_type = 'time_predictive_eod'
+                elif 'time_predictive_intraday' in screen_name:
+                    pattern_type = 'time_predictive_intraday'
+                else:
+                    pattern_type = 'time_predictive'
+                pattern_name = screen_name
             elif len(parts) > 2:
                 # Determine pattern type based on common keywords
                 pattern_type = ''
