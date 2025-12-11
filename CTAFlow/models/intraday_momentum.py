@@ -243,6 +243,7 @@ class IntradayMomentumLight(CTALight):
 
         return pd.DataFrame(features)
 
+
     def target_time_returns(
             self,
             target_time: time,
@@ -374,26 +375,12 @@ class IntradayMomentumLight(CTALight):
 
     def assemble_training_frame(
             self,
-            daily_df: pd.DataFrame,
-            target_times: Sequence[time],
+            target_times : Sequence[str]= None,
             intraday_df: Optional[pd.DataFrame] = None,
             price_col: str = "Close",
     ) -> pd.DataFrame:
         """Convenience constructor for a full training feature matrix."""
 
-        data = intraday_df if intraday_df is not None else self.intraday_data
-        har = self.har_volatility_features(data)
-        market_struct = self.market_structure_features(daily_df, price_col=price_col)
-
-        intraday_features = []
-        for t in target_times:
-            intraday_returns = self.target_time_returns(
-                data,
-                target_time=t,
-                price_col=price_col,
-            )
-            intraday_features.append(intraday_returns.rename(f"ret_{t.strftime('%H%M')}"))
-
-        intraday_frame = pd.concat(intraday_features, axis=1)
-        combined = pd.concat([har, market_struct, intraday_frame], axis=1)
         return combined.dropna()
+
+
