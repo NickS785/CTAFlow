@@ -136,13 +136,13 @@ def filter_session_bars(
     mask = _session_mask(localized, session_start, session_end)
     if not mask.any():
         empty = bars.iloc[0:0].copy()
-        empty_index = pd.DatetimeIndex(localized.loc[mask].to_numpy())
+        empty_index = pd.DatetimeIndex(localized.values[mask.values])
         empty.index = empty_index
         empty["ts"] = empty_index
         return empty
 
     filtered = bars.loc[mask.values].copy()
-    filtered_index = pd.DatetimeIndex(localized.loc[mask].to_numpy())
+    filtered_index = pd.DatetimeIndex(localized.values[mask.values])
     filtered.index = filtered_index
     filtered["ts"] = filtered_index
     return filtered
