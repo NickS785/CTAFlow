@@ -3454,8 +3454,16 @@ class HistoricalScreener:
         if not isinstance(daily_returns.index, pd.DatetimeIndex):
             daily_returns.index = pd.to_datetime(daily_returns.index)
 
-        # Group by date
-        daily_returns = daily_returns.groupby(pd.Grouper(freq='1D')).sum()
+        # Group by date - for overnight sessions, adjust to trading day
+        # If target_time is before 12:00, it might be part of previous day's session
+        if target_time.hour < 12:
+            # Shift timestamps back by 12 hours before grouping to keep overnight sessions together
+            adjusted_index = daily_returns.index - pd.Timedelta(hours=12)
+            daily_returns = daily_returns.groupby(adjusted_index.date).sum()
+            daily_returns.index = pd.to_datetime(daily_returns.index)
+        else:
+            # Normal grouping by calendar day
+            daily_returns = daily_returns.groupby(pd.Grouper(freq='1D')).sum()
 
         months_meta = self._build_months_metadata(daily_returns.index, tz)
 
@@ -3583,12 +3591,20 @@ class HistoricalScreener:
                     device_id=self.gpu_device_id,
                     return_pvalues=True
                 )
-                r_1d, p_1d = corrs[0], pvals[0]
-                r_1w, p_1w = corrs[1], pvals[1]
+                # Bounds checking for GPU results
+                if len(corrs) >= 2 and len(pvals) >= 2:
+                    r_1d, p_1d = corrs[0], pvals[0]
+                    r_1w, p_1w = corrs[1], pvals[1]
+                else:
+                    raise ValueError("GPU returned insufficient results")
             except Exception as e:
                 # CPU fallback
-                r_1d, p_1d = stats.pearsonr(x_1d, y_1d)
-                r_1w, p_1w = stats.pearsonr(x_1w, y_1w)
+                try:
+                    r_1d, p_1d = stats.pearsonr(x_1d, y_1d) if len(x_1d) > 0 and len(y_1d) > 0 else (np.nan, np.nan)
+                    r_1w, p_1w = stats.pearsonr(x_1w, y_1w) if len(x_1w) > 0 and len(y_1w) > 0 else (np.nan, np.nan)
+                except Exception:
+                    r_1d, p_1d = np.nan, np.nan
+                    r_1w, p_1w = np.nan, np.nan
         elif len(x_1d) >= 20:
             r_1d, p_1d = stats.pearsonr(x_1d, y_1d)
             r_1w, p_1w = np.nan, np.nan
