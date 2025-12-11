@@ -272,12 +272,9 @@ class IntradayMomentumLight(CTALight):
         prices = self._coerce_price(daily_df, price_col)
         feats: Dict[str, pd.Series] = {}
 
-        # Calculate log returns
-        returns = np.log(prices / prices.shift(1))
-
         for lb in lookbacks:
-            # Calculate cumulative return over lookback period
-            momentum = returns.rolling(lb).sum()
+            # Calculate total log return over lookback period
+            momentum = np.log(prices / prices.shift(lb))
             # Lag by 1 to avoid using current day's return
             momentum_lagged = momentum.shift(1)
             feature_name = f"momentum_{lb}d"
