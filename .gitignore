@@ -40,7 +40,6 @@ sample_dly/
 screens/agricultural_historical_screener.py
 screens/energy_seasonal_screen.py
 screens/f_year.txt
-screens/futures_screens.py
 screens/metals_2.py
 tests/CL_F_continuous_m0.parquet
 tests/check_available_tickers.py

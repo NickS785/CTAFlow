@@ -1121,7 +1121,16 @@ class HistoricalScreener:
 
                 session_data = self._ensure_intraday_time_metadata(session_data)
 
-                # Determine price column
+                # Determine price column - check if we have any columns
+                if len(session_data.columns) == 0:
+                    return (ticker, {
+                        'error': 'No data columns available after filtering',
+                        'session_start': session_start_time.strftime("%H:%M:%S"),
+                        'session_end': session_end_time.strftime("%H:%M:%S"),
+                        'tz': tz,
+                        'regime_filter': regime_meta_template,
+                    })
+
                 price_col = 'Close' if 'Close' in session_data.columns else session_data.columns[0]
 
                 ticker_results = {
@@ -1716,6 +1725,7 @@ class HistoricalScreener:
             use_concurrent
             and len(screen_params) > 1
             and GPU_AVAILABLE
+            and self.use_gpu
         )
 
         if should_use_concurrent:
@@ -1724,10 +1734,12 @@ class HistoricalScreener:
                 max_workers = GPU_DEVICE_COUNT if GPU_DEVICE_COUNT > 0 else 4
 
             if self.logger:
+                gpu_status = "GPU-accelerated" if self.use_gpu else "CPU"
                 self.logger.info(
-                    "Running %d screens concurrently with %d workers (GPU-accelerated)",
+                    "Running %d screens concurrently with %d workers (%s)",
                     len(screen_params),
                     max_workers,
+                    gpu_status,
                 )
 
             def process_single_screen(params: ScreenParams) -> Tuple[str, Dict[str, Dict[str, Any]]]:

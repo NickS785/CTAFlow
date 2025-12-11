@@ -5,27 +5,20 @@ from CTAFlow.screeners import( HistoricalScreener,
                                PatternExtractor,
                                PatternSummary)
 
-from CTAFlow.screeners.generic import(usa_fall_seasonality,
-                                      usa_quarterly_params,
-                                      london_quarterly_params,
-                                      london_fall_seasonality,
-                                      london_seasonals,
-                                      london_of_spring,
-                                      london_of_fall,
-                                      london_winter_seasonality,
-                                      usa_winter_seasonality, fall_momentum, winter_momentum,
-                                      us_of_spring,
-                                      us_of_fall,
-                                      london_of_summer,
-                                      london_of_winter,
-                                      us_of_summer,
-                                      us_of_winter,
-                                      usa_seasonals,
-                                      usa_seasonality,
-                                      us_of_screen, us_of_all,
-                                      momentums,
-                                      energy_tickers,
-                                      london_of, london_of_all, livestock_seasonals, livestock_momentums, seasonal_grain_screens )
+from CTAFlow.screeners.generic import (
+    get_usa_seasonals,
+    get_london_seasonals,
+    get_momentums,
+    usa_seasonality_screens,
+    london_seasonality_screens,
+    usa_momentum_screens,
+    livestock_screens,
+    grain_screens,
+    usa_orderflow_screens,
+    london_orderflow_screens,
+    get_us_of_all,
+    get_london_of_all
+)
 
 from CTAFlow.strategy import ScreenerPipeline
 from CTAFlow.data import IntradayLeg, IntradayFileManager, SyntheticSymbol, DataClient, AsyncParquetWriter, read_synthetic_csv, read_exported_df
@@ -47,9 +40,9 @@ def grain_screen(start_date="2020-05-01", add_synthetics=False, ):
         base_data["ZLM"] = read_exported_df(INTRADAY_DATA_PATH / "synthetics/soy_crush_spread.csv")
 
     screener = HistoricalScreener(base_data)
-    result["USA"] =screener.run_screens(seasonal_grain_screens() + [usa_seasonality])
-    result["London"] = screener, screener.run_screens(london_seasonals)
-    result['momentum'] = screener.run_screens(seasonal_grain_screens(screen_type="momentum", screen_name="grain_momentum"))
+    result["USA"] = screener.run_screens(grain_screens(seasonal=True))
+    result["London"] = screener.run_screens(get_london_seasonals())
+    result['momentum'] = screener.run_screens(grain_screens(seasonal=False))
 
 
     return result, screener
@@ -64,8 +57,9 @@ def livestock_screen(start_date="2020-05-01"):
     data = {t:read_exported_df(INTRADAY_DATA_PATH / f'CSV/{t}_5min.csv').loc[start_date:] for t in tickers}
 
     hs = HistoricalScreener(data)
-    result["seasonal"] = hs.run_screens(livestock_seasonals)
-    result["momentum"] = hs.run_screens(livestock_momentums)
+    livestock_params = livestock_screens()
+    result["seasonal"] = hs.run_screens(livestock_params['seasonal'])
+    result["momentum"] = hs.run_screens(livestock_params['momentum'])
 
 
     return result, hs
@@ -77,9 +71,9 @@ def metals_screen(start_date="2019-01-01"):
     data = {t:read_exported_df(INTRADAY_DATA_PATH/f"CSV/{t}_5min.csv").loc[start_date:] for t in tickers}
 
     hs = HistoricalScreener(data)
-    res["seasonal"] = hs.run_screens(usa_seasonals)
-    res["seasonal_london"] = hs.run_screens(london_seasonals)
-    res["momentum"] = hs.run_screens(momentums)
+    res["seasonal"] = hs.run_screens(get_usa_seasonals())
+    res["seasonal_london"] = hs.run_screens(get_london_seasonals())
+    res["momentum"] = hs.run_screens(get_momentums())
 
     return res, hs
 
@@ -134,10 +128,10 @@ def energy_screen(start_date="2020-05-01", add_synthetics=True):
         base_data["CS"] = crack.loc[start_date:]
 
     screener = HistoricalScreener(base_data)
-    result['momentum'] = screener.run_screens(momentums)
+    result['momentum'] = screener.run_screens(get_momentums())
 
-    result["USA"] =screener.run_screens(usa_seasonals)
-    result["London"] = screener.run_screens(london_seasonals)
+    result["USA"] = screener.run_screens(get_usa_seasonals())
+    result["London"] = screener.run_screens(get_london_seasonals())
 
     return result, screener
 
@@ -148,38 +142,41 @@ def run_screeners(tickers,id_data_path=INTRADAY_DATA_PATH, hdf_path="F:\\Data\\i
     mgr = AsyncParquetWriter(id_data_path)
     data = mgr.batch_read_to_dict_sync(tickers, start=datetime(2020,4,1))
     data_5m = {k:cli._resample_ohlc_data(v, '5min') for k,v in data.items()}
-    sessions = {'USA': [us_of_spring, us_of_fall, us_of_summer, us_of_winter],
-                'London': [london_of_spring, london_of_fall, london_of_winter, london_of_summer]
+
+    # Get orderflow screens
+    usa_of_screens = usa_orderflow_screens(seasonal=True)
+    london_of_screens = london_orderflow_screens(seasonal=True)
+    sessions = {'USA': usa_of_screens,
+                'London': london_of_screens
                 }
 
     OF_radar = OrderflowScanner(hdf_path=hdf_path)
     HS_screener = HistoricalScreener(data_5m)
     res['OF'] = {k:OF_radar.run_scans(sessions[k], data) for k in sessions.keys()}
-    res['Hist']  = HS_screener.run_screens(usa_seasonals)
+    res['Hist']  = HS_screener.run_screens(get_usa_seasonals())
     return res, OF_radar, HS_screener
 
 
 if __name__ == "__main__":
     BACKTEST_PATTERN_TYPES = ["time_predictive_eod", "time_predictive_intraday", "momentum_sc", "momentum_oc", "time_predictive_nextweek", "time_predictive_nextday", "weekend_hedging", "weekday_mean", "calendar"]
     tickers = ["PL", "PA", "SI"]
+    start_date = "2019-01-01"
 
     data = {t: read_exported_df(INTRADAY_DATA_PATH / f"CSV/{t}_5min.csv").loc[start_date:] for t in tickers}
 
     hs = HistoricalScreener(data)
-    res["seasonal"] = hs.run_screens(usa_seasonals)
-    res["seasonal_london"] = hs.run_screens(london_seasonals)
-    res["momentum"] = hs.run_screens(momentums)
+    res = {}
+    res["seasonal"] = hs.run_screens(get_usa_seasonals())
+    res["seasonal_london"] = hs.run_screens(get_london_seasonals())
+    res["momentum"] = hs.run_screens(get_momentums())
     print("\n" + "="*70)
     print("DEBUGGING CALENDAR PATTERN STRUCTURE")
     print("="*70)
 
-    # Check what's in result["USA"]
-    print(f"\nKeys in result['USA']: {list(result['USA'].keys())}")
-
     # Look at one ticker's calendar patterns
     for ticker in ['PA', 'PL', 'SI']:
-        if ticker in result["seasonal"]:
-            ticker_result = result["seasonal"][ticker]
+        if ticker in res["seasonal"]:
+            ticker_result = res["seasonal"][ticker]
             print(f"\n{ticker} result keys: {list(ticker_result.keys())}")
 
             # Check strongest_patterns
@@ -198,9 +195,9 @@ if __name__ == "__main__":
     print("TESTING PATTERN EXTRACTION")
     print("="*70)
 
-    pe_usa = PatternExtractor(screener, result["seasonal"])
-    pe_london = PatternExtractor(screener, result["seasonal_london"])
-    pe_mom = PatternExtractor(screener, result['momentum'])
+    pe_usa = PatternExtractor(hs, res["seasonal"])
+    pe_london = PatternExtractor(hs, res["seasonal_london"])
+    pe_mom = PatternExtractor(hs, res['momentum'])
 
     # Check how PatternExtractor organizes patterns
     print(f"\npe_usa.patterns keys: {list(pe_usa.patterns.keys())[:10]}")
@@ -213,6 +210,9 @@ if __name__ == "__main__":
         if isinstance(pa_patterns, dict):
             print(f"  Keys: {list(pa_patterns.keys())}")
             # Check calendar patterns
+
+
+
             for screen_name in ['usa_winter', 'usa_spring', 'usa_all']:
                 if screen_name in pa_patterns:
                     screen_pats = pa_patterns[screen_name]
@@ -236,7 +236,7 @@ if __name__ == "__main__":
     pe_final.concat(pe_london, inplace=True)
     ranked = pe_final.rank_patterns()
     ticker = "PA"
-    data = screener.data[ticker]
+    ticker_data = hs.data[ticker]
     patterns = pe_final.filter_patterns(symbol=ticker, pattern_types=BACKTEST_PATTERN_TYPES, screen_names=["usa_winter", "momentum_generic", "london_all", "usa_all"])
 
     print(f"\nFiltered patterns type: {type(patterns)}")
@@ -255,8 +255,8 @@ if __name__ == "__main__":
     print("="*70)
 
     # Use batch_multi_ticker_backtest instead
-    ticker_data = {ticker: (data, patterns)}
-    results = sp.batch_multi_ticker_backtest(ticker_data, threshold=0.0)
+    ticker_backtest_data = {ticker: (ticker_data, patterns)}
+    results = sp.batch_multi_ticker_backtest(ticker_backtest_data, threshold=0.0)
 
     print(f"\nBacktest results: {len(results)} patterns")
     print("\nFirst 10 result keys:")
