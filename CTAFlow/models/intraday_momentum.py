@@ -26,17 +26,32 @@ class IntradayMomentumLight(CTALight):
             closing_length: timedelta = timedelta(minutes=60),
             tz="America/Chicago",  # TZ is necessary to track timestamps accurately
             price_col="Close",
+            session_target="close",
             **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.intraday_data = intraday_data
         self.price = intraday_data[price_col]
-        self.training_data = None  # Daily df which contains the training variables
+        self.training_data = pd.DataFrame()  # Daily df which contains the training variables
         self.session_end = session_end
         self.session_open = session_open
         self.closing_length = closing_length
         self.feature_names = []  # Track feature names for model training
         self.tz = tz
+
+        if session_target == "open":
+            close_hrs = int(closing_length.total_seconds() // (60 * 60))
+            tgt_hour = session_open.hour + close_hrs
+            tgt_mins = session_open.minute
+            self.target_time = time(hour=tgt_hour, minute=tgt_mins)
+        else:
+            self.target_time = session_end
+
+        self.target_data = self.target_time_returns(self.target_time, intraday_data, period_length=closing_length)
+        self.target_data.set_index(self.target_data.index.date, inplace=True)
+
+        return
+
 
     def _add_feature(self, data: pd.Series, feature_name: str, tf='1d'):
         """Add a feature to the training dataset and track it.
@@ -152,6 +167,7 @@ class IntradayMomentumLight(CTALight):
 
         # Return only the feature columns
         feature_df = grouped[['rv_open', 'rsv_pos_open', 'rsv_neg_open']]
+
         return feature_df
 
     def har_volatility_features(
@@ -171,6 +187,7 @@ class IntradayMomentumLight(CTALight):
             intraday_df: Optional[pd.DataFrame] = None,
             period_length: Optional[timedelta] = None,
             price_col: str = "Close",
+            add_as_feature=False,
     ) -> pd.Series:
         """Return series for a specific target time window."""
 
@@ -186,6 +203,10 @@ class IntradayMomentumLight(CTALight):
         if window:
             bars = max(int(window.total_seconds() // 60 // 5), 1)
             ret = ret.rolling(bars).sum()
+        if add_as_feature:
+            feature_time_return = ret[mask] if target_time.hour < self.target_time.hour else ret[mask].shift(1)
+            self._add_feature(feature_time_return, f'{target_time.strftime("%h:%m")}_return')
+
         return ret[mask]
 
     def market_structure_features(
