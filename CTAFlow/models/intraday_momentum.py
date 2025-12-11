@@ -231,6 +231,64 @@ class IntradayMomentumLight(CTALight):
         features["abs_ret"] = diffs.abs()
         return features
 
+    def add_daily_momentum_features(
+            self,
+            daily_df: pd.DataFrame,
+            lookbacks: Sequence[int] = (1, 5, 10, 20),
+            price_col: str = "Close",
+    ) -> pd.DataFrame:
+        """Add lagged daily momentum/returns features.
+
+        Calculates cumulative log returns over various lookback periods and lags
+        them by 1 day to avoid lookahead bias. Features are named as momentum_{d}d
+        where d is the lookback period in days.
+
+        Parameters
+        ----------
+        daily_df : pd.DataFrame
+            Daily OHLCV data with DatetimeIndex
+        lookbacks : Sequence[int], default (1, 5, 10, 20)
+            Lookback periods in days for momentum calculation
+        price_col : str, default "Close"
+            Column containing the price series
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with momentum features named as momentum_{d}d
+
+        Notes
+        -----
+        All features are lagged by 1 day to avoid lookahead bias - they do not
+        include the target date's (present day) return. For example, momentum_5d
+        on day T represents the cumulative return from day T-6 to day T-1.
+
+        Examples
+        --------
+        >>> model = IntradayMomentumLight(intraday_data, ...)
+        >>> momentum_feats = model.add_daily_momentum_features(daily_df, lookbacks=[5, 10, 20])
+        >>> # momentum_5d contains returns from T-6 to T-1 (5 days, lagged by 1)
+        """
+        prices = self._coerce_price(daily_df, price_col)
+        feats: Dict[str, pd.Series] = {}
+
+        # Calculate log returns
+        returns = np.log(prices / prices.shift(1))
+
+        for lb in lookbacks:
+            # Calculate cumulative return over lookback period
+            momentum = returns.rolling(lb).sum()
+            # Lag by 1 to avoid using current day's return
+            momentum_lagged = momentum.shift(1)
+            feature_name = f"momentum_{lb}d"
+            feats[feature_name] = momentum_lagged
+
+            # Add to training data if it exists
+            if isinstance(self.training_data, pd.DataFrame):
+                self._add_feature(momentum_lagged, feature_name, tf='1d')
+
+        return pd.DataFrame(feats)
+
     def assemble_training_frame(
             self,
             daily_df: pd.DataFrame,
