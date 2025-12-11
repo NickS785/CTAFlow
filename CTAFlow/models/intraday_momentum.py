@@ -87,10 +87,10 @@ class IntradayMomentumLight(CTALight):
         return df[price_col].copy()
 
     def prev_hl(self, horizon=5, add_as_feature=True, normalize=False):
-        daily_ohlc = self.intraday_data.resample('1d', offset=f"-{(24-self.session_end.hour)}h").agg({"Open":"first", "High":"max", "Low":"min", "Close":"last"})
+        daily_ohlc = self.intraday_data.resample('1d', offset=f"-{self.target_time.hour}h").agg({"Open":"first", "High":"max", "Low":"min", "Close":"last"})
 
-        h = daily_ohlc['High'].max(horizon).shift(1)
-        l = daily_ohlc["Low"].min(horizon).shift(1)
+        h = daily_ohlc['High'].max(horizon)
+        l = daily_ohlc["Low"].min(horizon)
 
         if normalize or add_as_feature:
             prices = self.intraday_data.loc[self.target_time]['Close']
@@ -104,7 +104,6 @@ class IntradayMomentumLight(CTALight):
 
             return h_norm, l_norm
         else:
-
             return h, l
 
     def opening_range_volatility(
