@@ -86,6 +86,27 @@ class IntradayMomentumLight(CTALight):
             raise KeyError(f"Price column '{price_col}' not found")
         return df[price_col].copy()
 
+    def prev_hl(self, horizon=5, add_as_feature=True, normalize=False):
+        daily_ohlc = self.intraday_data.resample('1d', offset=f"-{(24-self.session_end.hour)}h").agg({"Open":"first", "High":"max", "Low":"min", "Close":"last"})
+
+        h = daily_ohlc['High'].max(horizon).shift(1)
+        l = daily_ohlc["Low"].min(horizon).shift(1)
+
+        if normalize or add_as_feature:
+            prices = self.intraday_data.loc[self.target_time]['Close']
+            for srs in [prices, h, l]:
+                srs.index = srs.index.normalize()
+            h_norm = (h - prices)/prices
+            l_norm = (prices - l)/prices
+            if add_as_feature:
+                self._add_feature(h_norm, f"{horizon}_high")
+                self._add_feature(l_norm, feature_name=f"{horizon}_low")
+
+            return h_norm, l_norm
+        else:
+
+            return h, l
+
     def opening_range_volatility(
             self,
             intraday_df: Optional[pd.DataFrame] = None,
