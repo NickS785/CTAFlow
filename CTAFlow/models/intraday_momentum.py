@@ -7,7 +7,6 @@ import numpy as np
 import pandas as pd
 
 from .base_models import CTALight
-from .volatility import RVForecast
 
 
 class IntradayMomentumLight(CTALight):
@@ -32,7 +31,6 @@ class IntradayMomentumLight(CTALight):
         super().__init__(**kwargs)
         self.intraday_data = intraday_data
         self.price = intraday_data[price_col]
-        self.training_data = pd.DataFrame()  # Daily df which contains the training variables
         self.session_end = session_end
         self.session_open = session_open
         self.closing_length = closing_length
@@ -47,8 +45,12 @@ class IntradayMomentumLight(CTALight):
         else:
             self.target_time = session_end
 
-        self.target_data = self.target_time_returns(self.target_time, intraday_data, period_length=closing_length)
-        self.target_data.set_index(self.target_data.index.date, inplace=True)
+        self.target_data = self.target_time_returns(
+            self.target_time,
+            intraday_data,
+            period_length=closing_length,
+        )
+        self.training_data = pd.DataFrame(index=self.target_data.index)
 
         return
 
@@ -89,6 +91,7 @@ class IntradayMomentumLight(CTALight):
             intraday_df: Optional[pd.DataFrame] = None,
             price_col: str = "Close",
             period_length: Optional[timedelta] = None,
+            add_as_feature: bool = True,
     ) -> pd.DataFrame:
         """Compute opening range realised volatility and semivariance.
 
@@ -165,8 +168,25 @@ class IntradayMomentumLight(CTALight):
         grouped['rsv_pos_open'] = np.where(grouped['has_pos'], np.sqrt(grouped['ret_pos_squared']), np.nan)
         grouped['rsv_neg_open'] = np.where(grouped['has_neg'], np.sqrt(grouped['ret_neg_squared']), np.nan)
 
-        # Return only the feature columns
+        # Return only the feature columns with normalized daily index
         feature_df = grouped[['rv_open', 'rsv_pos_open', 'rsv_neg_open']]
+        feature_df.index = pd.to_datetime(feature_df.index).normalize()
+
+        window_end_time = (
+            pd.Timestamp("1970-01-01")
+            + pd.Timedelta(
+                hours=self.session_open.hour,
+                minutes=self.session_open.minute,
+                seconds=self.session_open.second,
+            )
+            + window
+        ).time()
+        if window_end_time > self.target_time:
+            feature_df = feature_df.shift(1)
+
+        if add_as_feature and isinstance(self.training_data, pd.DataFrame):
+            for col in feature_df.columns:
+                self._add_feature(feature_df[col], col, tf='1d')
 
         return feature_df
 
@@ -174,12 +194,34 @@ class IntradayMomentumLight(CTALight):
             self,
             intraday_df: Optional[pd.DataFrame] = None,
             horizons: Sequence[int] = (1, 5, 22),
+            add_as_feature: bool = True,
     ) -> pd.DataFrame:
         """Generate HAR-style realised volatility features for 1d ahead forecasts."""
 
         data = intraday_df if intraday_df is not None else self.intraday_data
-        forecaster = RVForecast(intraday_df=data)
-        return forecaster.har_features(horizons=horizons)
+        if data is None or data.empty:
+            raise ValueError("Intraday data is required for HAR volatility features")
+
+        prices = self._coerce_price(data, "Close")
+        returns = prices.pct_change().dropna()
+        if returns.empty:
+            return pd.DataFrame({f"rv_lag_{h}d": pd.Series(dtype=float) for h in horizons})
+
+        rv = returns.pow(2).groupby(pd.Grouper(freq="1D")).sum()
+        rv.index = rv.index.normalize()
+        uses_post_target = (returns.index.time > self.target_time).any()
+
+        features: Dict[str, pd.Series] = {}
+        for horizon in horizons:
+            feature_name = f"rv_lag_{horizon}d"
+            feature_series = rv.rolling(horizon).mean()
+            if uses_post_target:
+                feature_series = feature_series.shift(1)
+            features[feature_name] = feature_series
+            if add_as_feature and isinstance(self.training_data, pd.DataFrame):
+                self._add_feature(feature_series, feature_name, tf='1d')
+
+        return pd.DataFrame(features)
 
     def target_time_returns(
             self,
@@ -203,11 +245,14 @@ class IntradayMomentumLight(CTALight):
         if window:
             bars = max(int(window.total_seconds() // 60 // 5), 1)
             ret = ret.rolling(bars).sum()
-        if add_as_feature:
-            feature_time_return = ret[mask] if target_time.hour < self.target_time.hour else ret[mask].shift(1)
-            self._add_feature(feature_time_return, f'{target_time.strftime("%h:%m")}_return')
+        target_returns = ret[mask]
+        target_returns.index = pd.to_datetime(target_returns.index).normalize()
 
-        return ret[mask]
+        if add_as_feature:
+            feature_time_return = target_returns if target_time.hour < self.target_time.hour else target_returns.shift(1)
+            self._add_feature(feature_time_return, f'{target_time.strftime("%H:%M")}_return')
+
+        return target_returns
 
     def market_structure_features(
             self,
