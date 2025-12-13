@@ -34,7 +34,6 @@ class IntradayMomentumLight(CTALight):
         self.session_end = session_end
         self.session_open = session_open
         self.closing_length = closing_length
-        self.feature_names = []  # Track feature names for model training
         self.tz = tz
 
         if session_target == "open":
@@ -61,7 +60,7 @@ class IntradayMomentumLight(CTALight):
 
 
     def _add_feature(self, data: pd.Series, feature_name: str, tf='1d'):
-        """Add a feature to the training dataset and track it.
+        """Add a feature to the training dataset.
 
         Parameters
         ----------
@@ -71,11 +70,14 @@ class IntradayMomentumLight(CTALight):
             Name for the feature column
         tf : str, default '1d'
             Timeframe: 'intraday' for intraday_data, '1d' for training_data
+
+        Note
+        ----
+        Feature names are managed by the fit() method, not tracked here.
+        The fit() method automatically extracts feature names from X.columns.
         """
         if tf == 'intraday':
             self.intraday_data[feature_name] = data
-            if feature_name not in self.feature_names:
-                self.feature_names.append(feature_name)
         else:
             if isinstance(self.training_data, pd.DataFrame):
                 # Use pandas Index.intersection instead of set operations
@@ -83,8 +85,6 @@ class IntradayMomentumLight(CTALight):
                 data_dates = pd.DatetimeIndex(data.index).normalize()
                 common = dates.intersection(data_dates)
                 self.training_data[feature_name] = data.loc[common]
-                if feature_name not in self.feature_names:
-                    self.feature_names.append(feature_name)
         return
 
     @staticmethod

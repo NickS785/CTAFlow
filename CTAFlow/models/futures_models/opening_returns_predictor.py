@@ -174,7 +174,7 @@ def main():
         print(f"\n4. Combining features...")
         model.training_data = pd.concat([momentum_feats, har_feats, opening_vol], axis=1).dropna()
         print(f"   Combined features shape: {model.training_data.shape}")
-        print(f"   Feature names tracked: {model.feature_names}")
+        print(f"   Feature columns: {list(model.training_data.columns)}")
 
         # Calculate target variable
         print(f"\n5. Calculating target (opening returns)...")
