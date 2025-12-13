@@ -38,10 +38,15 @@ class IntradayMomentumLight(CTALight):
         self.tz = tz
 
         if session_target == "open":
-            close_hrs = int(closing_length.total_seconds() // (60 * 60))
-            tgt_hour = session_open.hour + close_hrs
-            tgt_mins = session_open.minute
-            self.target_time = time(hour=tgt_hour, minute=tgt_mins)
+            # Calculate target_time as session_open + closing_length
+            # Use timedelta arithmetic to handle any period length correctly
+            start_datetime = pd.Timestamp('1970-01-01') + pd.Timedelta(
+                hours=session_open.hour,
+                minutes=session_open.minute,
+                seconds=session_open.second
+            )
+            end_datetime = start_datetime + closing_length
+            self.target_time = end_datetime.time()
         else:
             self.target_time = session_end
 
