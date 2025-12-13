@@ -78,8 +78,10 @@ class IntradayMomentumLight(CTALight):
                 self.feature_names.append(feature_name)
         else:
             if isinstance(self.training_data, pd.DataFrame):
+                # Use pandas Index.intersection instead of set operations
                 dates = self.training_data.index.normalize()
-                common = set(dates).intersection(set(data.index.normalize()))
+                data_dates = pd.DatetimeIndex(data.index).normalize()
+                common = dates.intersection(data_dates)
                 self.training_data[feature_name] = data.loc[common]
                 if feature_name not in self.feature_names:
                     self.feature_names.append(feature_name)

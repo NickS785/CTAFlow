@@ -28,6 +28,7 @@ project_root = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 from CTAFlow.models.intraday_momentum import IntradayMomentumLight
+from CTAFlow.data import read_exported_df
 from CTAFlow.config import INTRADAY_DATA_PATH
 
 
@@ -105,14 +106,14 @@ def main():
 
     # Load single ticker data directly from CSV
     print(f"\nLoading ticker data...")
-    ticker = "CL"
+    ticker = "PL"
 
     # Load intraday data from CSV (same path as gather_tickers uses)
-    csv_path = INTRADAY_DATA_PATH / f"{ticker}_intraday.csv"
+    csv_path = INTRADAY_DATA_PATH / f"CSV/{ticker}_5min.csv"
     print(f"  Loading {ticker} from {csv_path}")
 
     try:
-        intraday_data = pd.read_csv(csv_path, parse_dates=['timestamp'])
+        intraday_data = pd.read_csv(read_exported_df(csv_path), parse_dates=['timestamp'])
         intraday_data.set_index('timestamp', inplace=True)
         intraday_data.sort_index(inplace=True)
 
