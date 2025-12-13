@@ -278,7 +278,7 @@ class IntradayMomentumLight(CTALight):
 
         if add_as_feature:
             feature_time_return = target_returns if target_time.hour < self.target_time.hour else target_returns.shift(1)
-            self._add_feature(feature_time_return, f'{target_time.strftime("%H:%M")}_return')
+            self._add_feature(feature_time_return, f'{target_time.strftime("%H%M")}_return')
 
         return target_returns
 
