@@ -139,14 +139,8 @@ class IntradayMomentumLight:
         l = daily_ohlc["Low"].shift(1).rolling(horizon).min()
 
         if normalize or add_as_feature:
-            # Filter intraday data to target_time and get daily prices
-            mask = self.intraday_data.index.time == self.target_time
-            prices = self.intraday_data[mask]['Close'].copy()
-            prices.index = prices.index.normalize()
-
-            # Normalize h and l indices for alignment
-            h.index = h.index.normalize()
-            l.index = l.index.normalize()
+            # Use daily_ohlc Close prices for perfect alignment with h and l
+            prices = daily_ohlc['Close']
 
             h_norm = (h - prices)/prices
             l_norm = (prices - l)/prices
