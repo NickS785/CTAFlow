@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 from datetime import time, timedelta
-from typing import Dict, Iterable, Optional, Sequence
+from typing import Dict, Iterable, Optional, Sequence, Type, Union
 
 import numpy as np
 import pandas as pd
 
+from . import base_models
 from .base_models import CTALight
 
 
-class IntradayMomentumLight(CTALight):
+class IntradayMomentumLight:
     """LightGBM wrapper focused on intraday momentum and volatility features.
 
     The model is tailored to predict session-end behaviour (default 15:00 CST)
@@ -26,9 +27,15 @@ class IntradayMomentumLight(CTALight):
             tz="America/Chicago",  # TZ is necessary to track timestamps accurately
             price_col="Close",
             session_target="close",
+            base_model: Union[str, Type[object], object] = CTALight,
             **kwargs,
     ) -> None:
-        super().__init__(**kwargs)
+        self.base_model = base_model
+        self.model_kwargs = kwargs
+        self.model: Optional[object] = None
+        if not isinstance(base_model, (str, type)):
+            self.model = base_model
+            self.base_model = base_model.__class__
         self.intraday_data = intraday_data
         self.price = intraday_data[price_col]
         self.session_end = session_end
@@ -58,6 +65,38 @@ class IntradayMomentumLight(CTALight):
         self.training_data = pd.DataFrame(index=self.target_data.index)
 
         return
+
+    def _resolve_model_class(self) -> Type[object]:
+        if isinstance(self.base_model, str):
+            try:
+                return getattr(base_models, self.base_model)
+            except AttributeError as exc:
+                raise ValueError(f"Unknown base_model '{self.base_model}'") from exc
+        if isinstance(self.base_model, type):
+            return self.base_model
+        raise TypeError("base_model must be a model class or the name of a base_models class")
+
+    def _get_model(self) -> object:
+        if self.model is None:
+            model_cls = self._resolve_model_class()
+            self.model = model_cls(**self.model_kwargs)
+        return self.model
+
+    @staticmethod
+    def _filter_kwargs(method, kwargs: Dict) -> Dict:
+        import inspect
+
+        signature = inspect.signature(method)
+        return {k: v for k, v in kwargs.items() if k in signature.parameters}
+
+    def _normalize_predictions(self, predictions: object) -> np.ndarray:
+        preds = np.asarray(predictions)
+        if preds.ndim > 1:
+            if preds.shape[1] == 1:
+                return preds.ravel()
+            if hasattr(self.model, "task") and getattr(self.model, "task", None) in {"binary_classification", "multiclass"}:
+                return np.argmax(preds, axis=1)
+        return preds
 
 
     def _add_feature(self, data: pd.Series, feature_name: str, tf='1d'):
@@ -217,6 +256,55 @@ class IntradayMomentumLight(CTALight):
 
         return feature_df
 
+    def create_clf_target(
+            self,
+            n_classes: int = 2,
+            lower_bound: float = 0.0,
+            upper_bound: float = 0.0,
+            add_as_feature: bool = False,
+            feature_name: str = "target",
+    ) -> pd.Series:
+        """Create a classification target from session returns.
+
+        Parameters
+        ----------
+        n_classes : int, default 2
+            Number of classes to generate (2 or 3).
+        lower_bound : float, default 0.0
+            Lower threshold for the neutral band when ``n_classes=3``.
+        upper_bound : float, default 0.0
+            Upper threshold for the neutral band when ``n_classes=3``.
+        add_as_feature : bool, default False
+            When True, attach the generated target to ``training_data``.
+        feature_name : str, default "target"
+            Column name used when adding the target to ``training_data``.
+
+        Returns
+        -------
+        pd.Series
+            Classification labels aligned to ``target_data`` index.
+        """
+        if self.target_data is None or self.target_data.empty:
+            raise ValueError("target_data is required to create classification targets")
+
+        returns = self.target_data
+
+        if n_classes == 2:
+            labels = np.where(np.sign(returns) > 0, 1, 0)
+        elif n_classes == 3:
+            if upper_bound < lower_bound:
+                raise ValueError("upper_bound must be greater than or equal to lower_bound")
+            labels = np.where(returns >= upper_bound, 2, np.where(returns <= lower_bound, 0, 1))
+        else:
+            raise ValueError("n_classes must be either 2 or 3")
+
+        target = pd.Series(labels, index=returns.index, name=feature_name)
+
+        if add_as_feature and isinstance(self.training_data, pd.DataFrame):
+            self._add_feature(target, feature_name, tf='1d')
+
+        return target
+
     def har_volatility_features(
             self,
             intraday_df: Optional[pd.DataFrame] = None,
@@ -304,6 +392,37 @@ class IntradayMomentumLight(CTALight):
             feats["val_prev"] = val.shift(1)
 
         return pd.DataFrame(feats)
+
+    def fit(self, X, y, **kwargs):
+        """Fit the configured base model with compatible parameters."""
+        model = self._get_model()
+        fit_kwargs = self._filter_kwargs(model.fit, kwargs)
+        return model.fit(X, y, **fit_kwargs)
+
+    def predict(self, X, **kwargs):
+        if self.model is None:
+            raise ValueError("Model must be fitted before making predictions")
+        predict_kwargs = self._filter_kwargs(self.model.predict, kwargs)
+        predictions = self.model.predict(X, **predict_kwargs)
+        return self._normalize_predictions(predictions)
+
+    def evaluate(self, X_test, y_test, **kwargs):
+        if self.model is None:
+            raise ValueError("Model must be fitted before evaluation")
+        if not hasattr(self.model, "evaluate"):
+            raise AttributeError(f"Model {self.model.__class__.__name__} does not support evaluation")
+        eval_kwargs = self._filter_kwargs(self.model.evaluate, kwargs)
+        return self.model.evaluate(X_test, y_test, **eval_kwargs)
+
+    def fit_with_grid_search(self, X, y, **kwargs):
+        model = self._get_model()
+        if hasattr(model, "fit_with_grid_search"):
+            fit_grid_kwargs = self._filter_kwargs(model.fit_with_grid_search, kwargs)
+            return model.fit_with_grid_search(X, y, **fit_grid_kwargs)
+        if hasattr(model, "grid_search"):
+            grid_kwargs = self._filter_kwargs(model.grid_search, kwargs)
+            return model.grid_search(X, y, **grid_kwargs)
+        raise AttributeError(f"Model {model.__class__.__name__} does not support grid search")
 
     def microstructure_features(
             self,
