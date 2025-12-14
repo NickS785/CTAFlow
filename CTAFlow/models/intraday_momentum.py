@@ -66,6 +66,14 @@ class IntradayMomentumLight:
 
         return
 
+    def __getattr__(self, item):
+        """Delegate missing attributes to the configured base model."""
+
+        model = self._get_model()
+        if hasattr(model, item):
+            return getattr(model, item)
+        raise AttributeError(f"{self.__class__.__name__} object has no attribute '{item}'")
+
     def _resolve_model_class(self) -> Type[object]:
         if isinstance(self.base_model, str):
             try:
