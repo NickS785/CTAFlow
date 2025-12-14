@@ -7,7 +7,7 @@ This model uses:
 
 Target: Returns during the opening period (first 60 minutes of session)
 
-The model demonstrates proper use of IntradayMomentumLight which inherits from CTALight:
+The model demonstrates proper use of IntradayMomentumLight which wraps CTALight for fitting:
 - Build features using IntradayMomentumLight methods
 - Features are automatically added via _add_feature() method
 - Use built-in .fit() or .fit_with_grid_search() methods (LightGBM)
@@ -123,7 +123,7 @@ def main():
         print(f"PROCESSING {ticker}")
         print(f"{'='*70}")
 
-        # Initialize IntradayMomentumLight (inherits from CTALight)
+        # Initialize IntradayMomentumLight (uses CTALight internally for fitting)
         print(f"\n1. Initializing IntradayMomentumLight...")
         model = IntradayMomentumLight(
             intraday_data=intraday_data,
@@ -133,7 +133,7 @@ def main():
             tz="America/Chicago",
             price_col="Close"
         )
-        print(f"   Model initialized (inherits LightGBM functionality from CTALight)")
+        print(f"   Model initialized (uses CTALight LightGBM functionality for fitting)")
 
         # Prepare daily data
         print(f"\n2. Preparing daily data...")
