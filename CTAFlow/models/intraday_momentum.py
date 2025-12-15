@@ -371,6 +371,223 @@ class IntradayMomentumLight:
 
         return target_returns
 
+    def target_time_volume(
+            self,
+            target_time: time,
+            intraday_df: Optional[pd.DataFrame] = None,
+            period_length: Optional[timedelta] = None,
+            volume_col: str = "Volume",
+            add_as_feature: bool = False,
+            aggregation: str = "sum",
+    ) -> pd.Series:
+        """Calculate volume at a specific target time over a given period.
+
+        Parameters
+        ----------
+        target_time : time
+            The target time to extract volume for (e.g., time(9, 30) for 9:30 AM)
+        intraday_df : Optional[pd.DataFrame]
+            Intraday OHLCV data with DatetimeIndex. Uses self.intraday_data if None.
+        period_length : Optional[timedelta]
+            Length of the period to aggregate volume over. Uses self.closing_length if None.
+        volume_col : str, default "Volume"
+            Column name containing volume data
+        add_as_feature : bool, default False
+            If True, add the volume series to training_data with proper lagging
+        aggregation : str, default "sum"
+            Aggregation method: "sum" for total volume, "mean" for average
+
+        Returns
+        -------
+        pd.Series
+            Daily volume series aligned to the target time, indexed by date
+
+        Notes
+        -----
+        - Aggregates volume over a rolling window ending at target_time
+        - Properly lags the feature if target_time is before self.target_time
+        - Useful for analyzing volume patterns at specific times (e.g., opening/closing volume)
+        """
+        data = intraday_df if intraday_df is not None else self.intraday_data
+        if data is None or data.empty:
+            raise ValueError("Intraday data is required for target time volume")
+
+        if volume_col not in data.columns:
+            raise KeyError(f"Volume column '{volume_col}' not found in data")
+
+        window = period_length or self.closing_length
+        volume = data[volume_col].copy()
+
+        # Calculate rolling aggregation over the specified window
+        if window:
+            bars = max(int(window.total_seconds() // 60 // 5), 1)
+            if aggregation == "sum":
+                volume = volume.rolling(bars).sum()
+            elif aggregation == "mean":
+                volume = volume.rolling(bars).mean()
+            else:
+                raise ValueError(f"Aggregation must be 'sum' or 'mean', got '{aggregation}'")
+
+        # Extract volume at target time
+        mask = volume.index.time == target_time
+        target_volume = volume[mask]
+        target_volume.index = pd.to_datetime(target_volume.index).normalize()
+
+        if add_as_feature:
+            # Lag if target_time is before the session target time to avoid lookahead bias
+            feature_volume = target_volume if target_time.hour < self.target_time.hour else target_volume.shift(1)
+            feature_name = f'{target_time.strftime("%H%M")}_volume_{aggregation}'
+            self._add_feature(feature_volume, feature_name)
+
+        return target_volume
+
+    def bid_ask_volume_imbalance(
+            self,
+            intraday_df: Optional[pd.DataFrame] = None,
+            period_length: Optional[timedelta] = None,
+            bid_vol_col: str = "BidVolume",
+            ask_vol_col: str = "AskVolume",
+            add_as_feature: bool = True,
+            use_proxy: bool = False,
+    ) -> pd.DataFrame:
+        """Calculate cumulative bid-ask volume imbalance over a period.
+
+        Parameters
+        ----------
+        intraday_df : Optional[pd.DataFrame]
+            Intraday data with DatetimeIndex. Uses self.intraday_data if None.
+        period_length : Optional[timedelta]
+            Length of period to aggregate imbalance. Uses self.closing_length if None.
+        bid_vol_col : str, default "BidVolume"
+            Column name for bid volume data
+        ask_vol_col : str, default "AskVolume"
+            Column name for ask volume data
+        add_as_feature : bool, default True
+            If True, add imbalance features to training_data
+        use_proxy : bool, default False
+            If True and bid/ask columns not found, use price change to proxy direction:
+            - Volume on upticks attributed to ask (buyers)
+            - Volume on downticks attributed to bid (sellers)
+
+        Returns
+        -------
+        pd.DataFrame
+            Daily features with columns:
+            - ba_imbalance: cumulative (bid_vol - ask_vol) over period
+            - ba_ratio: bid_vol / ask_vol ratio
+            - ba_imbalance_norm: imbalance normalized by total volume
+
+        Notes
+        -----
+        Bid-ask imbalance measures buying vs selling pressure:
+        - Positive imbalance: more bid volume (selling pressure)
+        - Negative imbalance: more ask volume (buying pressure)
+
+        If bid/ask volume columns are not available and use_proxy=True, the method
+        will classify volume by price movement direction.
+        """
+        data = intraday_df if intraday_df is not None else self.intraday_data
+        if data is None or data.empty:
+            raise ValueError("Intraday data is required for bid-ask volume imbalance")
+
+        window = period_length or self.closing_length
+
+        # Check if bid/ask columns exist, otherwise use proxy if enabled
+        has_bid_ask = bid_vol_col in data.columns and ask_vol_col in data.columns
+
+        if not has_bid_ask and not use_proxy:
+            raise KeyError(
+                f"Bid/ask volume columns '{bid_vol_col}' and '{ask_vol_col}' not found. "
+                "Set use_proxy=True to estimate from price movements."
+            )
+
+        if has_bid_ask:
+            bid_volume = data[bid_vol_col].copy()
+            ask_volume = data[ask_vol_col].copy()
+        else:
+            # Proxy: classify volume by price direction
+            if "Volume" not in data.columns or "Close" not in data.columns:
+                raise KeyError("Volume and Close columns required for proxy estimation")
+
+            price_change = data["Close"].diff()
+            volume = data["Volume"]
+
+            # Upticks = ask volume (buyers), downticks = bid volume (sellers)
+            ask_volume = np.where(price_change > 0, volume, 0)
+            bid_volume = np.where(price_change < 0, volume, 0)
+            # Neutral ticks split evenly
+            neutral_mask = price_change == 0
+            ask_volume = np.where(neutral_mask, volume / 2, ask_volume)
+            bid_volume = np.where(neutral_mask, volume / 2, bid_volume)
+
+            ask_volume = pd.Series(ask_volume, index=data.index)
+            bid_volume = pd.Series(bid_volume, index=data.index)
+
+        # Vectorized approach: compute session times
+        session_open_offset = pd.Timedelta(
+            hours=self.session_open.hour,
+            minutes=self.session_open.minute,
+            seconds=self.session_open.second,
+        )
+
+        work_df = pd.DataFrame({
+            'bid_vol': bid_volume,
+            'ask_vol': ask_volume,
+        })
+        work_df['date'] = work_df.index.normalize()
+        work_df['session_start'] = work_df['date'] + session_open_offset
+        work_df['session_end'] = work_df['session_start'] + window
+
+        # Filter to target period
+        in_period = (work_df.index >= work_df['session_start']) & (work_df.index < work_df['session_end'])
+        period_data = work_df[in_period].copy()
+
+        if period_data.empty:
+            return pd.DataFrame(columns=['ba_imbalance', 'ba_ratio', 'ba_imbalance_norm'])
+
+        # Aggregate by date
+        daily_agg = period_data.groupby('date').agg({
+            'bid_vol': 'sum',
+            'ask_vol': 'sum'
+        })
+
+        # Calculate imbalance metrics
+        daily_agg['ba_imbalance'] = daily_agg['bid_vol'] - daily_agg['ask_vol']
+        daily_agg['total_vol'] = daily_agg['bid_vol'] + daily_agg['ask_vol']
+        daily_agg['ba_ratio'] = np.where(
+            daily_agg['ask_vol'] > 0,
+            daily_agg['bid_vol'] / daily_agg['ask_vol'],
+            np.nan
+        )
+        daily_agg['ba_imbalance_norm'] = np.where(
+            daily_agg['total_vol'] > 0,
+            daily_agg['ba_imbalance'] / daily_agg['total_vol'],
+            0
+        )
+
+        # Return only feature columns
+        feature_df = daily_agg[['ba_imbalance', 'ba_ratio', 'ba_imbalance_norm']].copy()
+        feature_df.index = pd.to_datetime(feature_df.index).normalize()
+
+        # Check if we need to lag the features
+        window_end_time = (
+            pd.Timestamp("1970-01-01")
+            + pd.Timedelta(
+                hours=self.session_open.hour,
+                minutes=self.session_open.minute,
+                seconds=self.session_open.second,
+            )
+            + window
+        ).time()
+        if window_end_time > self.target_time:
+            feature_df = feature_df.shift(1)
+
+        if add_as_feature and isinstance(self.training_data, pd.DataFrame):
+            for col in feature_df.columns:
+                self._add_feature(feature_df[col], col, tf='1d')
+
+        return feature_df
+
     def market_structure_features(
             self,
             daily_df: pd.DataFrame,
