@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import time, timedelta
-from typing import Dict, Iterable, List, Optional, Sequence, Type, Union
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Type, Union
 
 import numpy as np
 import pandas as pd
@@ -27,6 +27,7 @@ class IntradayMomentumLight:
             tz="America/Chicago",  # TZ is necessary to track timestamps accurately
             price_col="Close",
             session_target="close",
+            supplementary_intraday_data: Optional[Mapping[str, pd.DataFrame]] = None,
             base_model: Union[str, Type[object], object] = CTALight,
             **kwargs,
     ) -> None:
@@ -41,6 +42,7 @@ class IntradayMomentumLight:
         self.session_end = session_end
         self.session_open = session_open
         self.closing_length = closing_length
+        self.supplementary_intraday_data = supplementary_intraday_data or {}
         self.feature_names = []  # Track feature names for model training
         self.tz = tz
 
@@ -667,6 +669,149 @@ class IntradayMomentumLight:
                 self._add_feature(feature_imbalance, feature_name)
 
             return target_imbalance
+
+    def intraday_correlation(
+            self,
+            tickers: Union[str, List[str]],
+            target_time: time,
+            n_bars: int,
+            resample: bool = False,
+            resample_period: str = '1h',
+            price_col: str = "Close",
+            add_as_feature: bool = False,
+    ) -> Union[pd.Series, pd.DataFrame]:
+        """Calculate rolling correlation between main instrument and supplementary tickers.
+
+        Computes the rolling correlation of returns between the main intraday_data
+        and each ticker in supplementary_intraday_data, extracting the correlation
+        at a specific target_time each day.
+
+        Args:
+            tickers: Single ticker symbol or list of ticker symbols from supplementary_intraday_data
+            target_time: Time of day to extract correlation (e.g., time(14, 30))
+            n_bars: Number of bars to use for rolling correlation window
+            resample: If True, resample both series to resample_period before correlation
+            resample_period: Pandas resample frequency string (e.g., '1h', '30min')
+            price_col: Column name for prices (default: "Close")
+            add_as_feature: If True, add correlation(s) to feature_names
+
+        Returns:
+            pd.Series: If single ticker, returns Series indexed by date with correlations
+            pd.DataFrame: If multiple tickers, returns DataFrame with one column per ticker
+
+        Raises:
+            ValueError: If supplementary_intraday_data was not provided
+            KeyError: If requested ticker not found in supplementary_intraday_data
+
+        Example:
+            >>> # Calculate 60-bar correlation with ES at 2:30 PM
+            >>> corr = model.intraday_correlation('ES', time(14, 30), n_bars=60)
+            >>>
+            >>> # Multiple tickers with resampling to hourly
+            >>> corr_df = model.intraday_correlation(
+            ...     ['ES', 'NQ', 'GC'],
+            ...     time(14, 30),
+            ...     n_bars=4,  # 4 hourly bars
+            ...     resample=True,
+            ...     resample_period='1h'
+            ... )
+        """
+        if not self.supplementary_intraday_data:
+            raise ValueError(
+                "supplementary_intraday_data must be provided to IntradayMomentumLight "
+                "to use intraday_correlation()"
+            )
+
+        # Handle single ticker vs list of tickers
+        if isinstance(tickers, str):
+            tickers = [tickers]
+            return_series = True
+        else:
+            return_series = False
+
+        # Validate all tickers exist
+        missing_tickers = [t for t in tickers if t not in self.supplementary_intraday_data]
+        if missing_tickers:
+            raise KeyError(
+                f"Tickers {missing_tickers} not found in supplementary_intraday_data. "
+                f"Available: {list(self.supplementary_intraday_data.keys())}"
+            )
+
+        # Get main instrument data
+        if not isinstance(self.intraday_data.index, pd.DatetimeIndex):
+            main_data = self.intraday_data.copy()
+            main_data.index = pd.to_datetime(main_data.index)
+        else:
+            main_data = self.intraday_data
+
+        # Calculate main returns
+        main_prices = main_data[price_col]
+        if resample:
+            main_prices = main_prices.resample(resample_period).last().dropna()
+        main_returns = main_prices.pct_change()
+
+        # Dictionary to store correlation series for each ticker
+        correlations = {}
+
+        for ticker in tickers:
+            # Get supplementary ticker data
+            supp_data = self.supplementary_intraday_data[ticker]
+            if not isinstance(supp_data.index, pd.DatetimeIndex):
+                supp_data = supp_data.copy()
+                supp_data.index = pd.to_datetime(supp_data.index)
+
+            # Calculate supplementary returns
+            supp_prices = supp_data[price_col]
+            if resample:
+                supp_prices = supp_prices.resample(resample_period).last().dropna()
+            supp_returns = supp_prices.pct_change()
+
+            # Align the two return series
+            aligned_main, aligned_supp = main_returns.align(supp_returns, join='inner')
+
+            # Calculate rolling correlation
+            rolling_corr = aligned_main.rolling(window=n_bars).corr(aligned_supp)
+
+            # Extract correlation at target_time for each day
+            target_corr = []
+            dates = []
+
+            # Group by date
+            for date, group in rolling_corr.groupby(rolling_corr.index.date):
+                # Find the closest time to target_time on this date
+                group_times = group.index.time
+                target_idx = None
+
+                # Find exact match or closest time at or after target_time
+                for idx, t in enumerate(group_times):
+                    if t >= target_time:
+                        target_idx = idx
+                        break
+
+                # If no time >= target_time, use last time of day
+                if target_idx is None:
+                    target_idx = len(group) - 1
+
+                target_corr.append(group.iloc[target_idx])
+                dates.append(pd.Timestamp(date))
+
+            # Create Series for this ticker
+            corr_series = pd.Series(target_corr, index=pd.DatetimeIndex(dates))
+            correlations[ticker] = corr_series
+
+            # Add as feature if requested
+            if add_as_feature:
+                period_str = f'{n_bars}bar'
+                if resample:
+                    period_str = f'{n_bars}bar_{resample_period}'
+                feature_name = f'{target_time.strftime("%H%M")}_{period_str}_corr_{ticker}'
+                self._add_feature(corr_series, feature_name)
+
+        # Return Series if single ticker, DataFrame if multiple
+        if return_series:
+            return correlations[tickers[0]]
+        else:
+            return pd.DataFrame(correlations)
 
     def market_structure_features(
             self,
