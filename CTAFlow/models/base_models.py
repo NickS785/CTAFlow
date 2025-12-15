@@ -1873,7 +1873,7 @@ class CTAXGBoost:
         if param_grid is None:
             param_grid = {
                 'max_depth': [3, 6, 9],
-                'learning_rate': [0.01,0.03, 0.0, 0.1],
+                'learning_rate': [0.01,0.03, 0.07, 0.1],
                 'subsample': [0.8, 1.0],
                 'colsample_bytree': [0.8, 1.0],
                 'n_estimators': [100, 200]
