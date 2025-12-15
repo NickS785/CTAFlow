@@ -12,6 +12,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score, ParameterGrid, GridSearchCV
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error, log_loss
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.inspection import permutation_importance
 import lightgbm as lgb
 from xgboost import XGBRegressor
 import warnings
@@ -219,6 +220,35 @@ class CTAForecast:
             common_index = self.features.index.intersection(self.target.index)
             self.features = self.features.loc[common_index]
             self.target = self.target.loc[common_index]
+
+    def _compute_permutation_importance(self, model, X_val, y_val):
+        """Compute permutation importance on a validation slice using model-compatible data."""
+        if X_val is None or y_val is None or len(X_val) == 0:
+            return None
+
+        X_array = X_val.values if isinstance(X_val, pd.DataFrame) else np.asarray(X_val)
+        y_array = y_val.values if isinstance(y_val, pd.Series) else np.asarray(y_val)
+
+        # Respect any preprocessing baked into the model wrapper
+        if hasattr(model, 'scaler') and model.scaler is not None:
+            X_array = model.scaler.transform(X_array)
+
+        estimator = getattr(model, 'model', model)
+        feature_names = getattr(model, 'feature_names', None) or [f'feature_{i}' for i in range(X_array.shape[1])]
+
+        try:
+            perm = permutation_importance(
+                estimator,
+                X_array,
+                y_array,
+                n_repeats=5,
+                random_state=42,
+                n_jobs=-1
+            )
+            return pd.Series(perm.importances_mean, index=feature_names).sort_values(ascending=False)
+        except Exception as exc:
+            warnings.warn(f"Could not compute permutation importance: {exc}", RuntimeWarning)
+            return None
 
     def calculate_intraday_features(self, indicator_horizons=5, selected_intraday_features=None):
         if not selected_intraday_features:
@@ -592,6 +622,21 @@ class CTAForecast:
         X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
         y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
 
+        # Reserve a validation slice from the training data for hyperparameter choices
+        X_val = None
+        y_val = None
+        val_size = max(1, int(len(X_train) * 0.2))
+        if val_size >= len(X_train):
+            val_size = 0
+        if val_size > 0:
+            X_val = X_train.iloc[-val_size:]
+            y_val = y_train.iloc[-val_size:]
+            X_train_fit = X_train.iloc[:-val_size]
+            y_train_fit = y_train.iloc[:-val_size]
+        else:
+            X_train_fit = X_train
+            y_train_fit = y_train
+
         # Initialize model
         if model_type in ['linear', 'ridge', 'lasso', 'elastic_net']:
             model = CTALinear(model_type=model_type, **model_params)
@@ -605,13 +650,9 @@ class CTAForecast:
             raise ValueError(f"Unknown model_type: {model_type}")
 
         grid_search_results = None
+        validation_metrics = None
+        validation_importance = None
         if model_type in ['lightgbm', 'xgboost']:
-            val_size = int(len(X_train) * 0.2)
-            X_val = X_train.iloc[-val_size:]
-            y_val = y_train.iloc[-val_size:]
-            X_train_fit = X_train.iloc[:-val_size]
-            y_train_fit = y_train.iloc[:-val_size]
-
             if use_grid_search:
                 grid_results = model.fit_with_grid_search(
                     X_train_fit, y_train_fit,
@@ -628,7 +669,7 @@ class CTAForecast:
             # Random Forest doesn't need separate validation set for early stopping
             if use_grid_search:
                 grid_results = model.fit_with_grid_search(
-                    X_train, y_train,
+                    X_train_fit, y_train_fit,
                     param_grid=param_grid,
                     cv_folds=grid_search_cv,
                     scoring=grid_search_scoring,
@@ -636,22 +677,34 @@ class CTAForecast:
                 )
                 grid_search_results = grid_results['grid_search_results']
             else:
-                model.fit(X_train, y_train)
+                model.fit(X_train_fit, y_train_fit)
         else:
             if use_grid_search:
                 print("Warning: Grid search not supported for linear models. Using standard fit.")
-            model.fit(X_train, y_train)
+            model.fit(X_train_fit, y_train_fit)
 
-        train_pred = model.predict(X_train)
+        if X_val is not None and len(X_val) > 0:
+            validation_metrics = model.evaluate(X_val, y_val)
+            validation_importance = self._compute_permutation_importance(model, X_val, y_val)
+
+        train_eval_X = X_train_fit if X_val is not None else X_train
+        train_eval_y = y_train_fit if X_val is not None else y_train
+
+        train_pred = model.predict(train_eval_X)
         test_pred = model.predict(X_test)
 
         result = {
             'model': model,
             'train_predictions': train_pred,
             'test_predictions': test_pred,
-            'train_metrics': model.evaluate(X_train, y_train),
+            'train_metrics': model.evaluate(train_eval_X, train_eval_y),
             'test_metrics': model.evaluate(X_test, y_test),
             'feature_importance': model.get_feature_importance(),
+            'validation_metrics': validation_metrics,
+            'validation_feature_importance': validation_importance,
+            'hyperparameter_selection': 'cross_validation' if grid_search_results is not None else (
+                'validation_holdout' if validation_metrics is not None else 'train_only'
+            ),
             'data_split_info': {
                 'train_samples': len(X_train),
                 'test_samples': len(X_test),
@@ -1542,12 +1595,11 @@ class CTALight:
         # Default parameter grid if none provided
         if param_grid is None:
             param_grid = {
+                'learning_rate': [0.02, 0.05, 0.1],
                 'num_leaves': [31, 63],
-                'learning_rate': [0.03, 0.07, 0.12],
-                'feature_fraction': [0.7, 0.9],
-                'bagging_fraction': [0.8, 1.0],
+                'feature_fraction': [0.8, 0.95],
+                'bagging_fraction': [0.85, 1.0],
                 'min_child_samples': [10, 25],
-                'min_split_gain': [0.0, 0.1],
                 'reg_alpha': [0.0, 0.2],
                 'reg_lambda': [0.1, 0.5],
             }
@@ -1786,12 +1838,11 @@ class CTAXGBoost:
             default_params['tree_method'] = 'hist'  # Use CPU histogram
 
         self.default_grid = dict(
-            learning_rate=[0.01, 0.05, 0.1, 0.2],
-            max_depth=[3, 5, 7, 9],
-            subsample=[0.7, 0.8, 0.9, 1.0],
-            n_estimators=[100, 200, 300],
-            max_leaves=[0, 5, 7, 8],
-            colsample_bytree=[0.7, 0.8, 0.9, 1.0]
+            learning_rate=[0.03, 0.1],
+            max_depth=[4, 6, 8],
+            subsample=[0.85, 1.0],
+            n_estimators=[150, 300],
+            colsample_bytree=[0.8, 1.0]
         )
 
         self.params = {**default_params, **xgb_params}
@@ -1943,11 +1994,11 @@ class CTAXGBoost:
 
         if param_grid is None:
             param_grid = {
-                'max_depth': [3, 6, 9],
-                'learning_rate': [0.01, 0.03, 0.07, 0.1],
-                'subsample': [0.8, 1.0],
+                'learning_rate': [0.03, 0.1],
+                'max_depth': [4, 6, 8],
+                'subsample': [0.85, 1.0],
                 'colsample_bytree': [0.8, 1.0],
-                'n_estimators': [100, 200]
+                'n_estimators': [150, 300]
             }
 
         tscv = TimeSeriesSplit(n_splits=cv_folds)
@@ -2054,11 +2105,11 @@ class CTARForest:
 
         # Default parameter grid for grid search
         self.default_grid = {
-            'n_estimators': [100, 200, 300],
-            'max_depth': [5, 10, 15, None],
-            'min_samples_split': [2, 5, 10],
-            'min_samples_leaf': [1, 2, 4],
-            'max_features': ['sqrt', 'log2', None]
+            'n_estimators': [150, 300],
+            'max_depth': [6, None],
+            'min_samples_split': [2, 5],
+            'min_samples_leaf': [1, 2],
+            'max_features': ['sqrt', 'log2']
         }
 
         self.params = {**default_params, **rf_params}
@@ -2244,8 +2295,8 @@ class CTARForest:
         # Default parameter grid if none provided
         if param_grid is None:
             param_grid = {
-                'n_estimators': [100, 200],
-                'max_depth': [5, 10, None],
+                'n_estimators': [150, 300],
+                'max_depth': [6, None],
                 'min_samples_split': [2, 5],
                 'min_samples_leaf': [1, 2],
                 'max_features': ['sqrt', 'log2']
@@ -2359,6 +2410,3 @@ class CTARForest:
         except ImportError:
             print("matplotlib required for plotting. Install with: pip install matplotlib")
             return self.get_feature_importance(max_num_features)
-
-
-
