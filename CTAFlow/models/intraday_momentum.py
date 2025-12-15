@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import time, timedelta
-from typing import Dict, Iterable, Optional, Sequence, Type, Union
+from typing import Dict, Iterable, List, Optional, Sequence, Type, Union
 
 import numpy as np
 import pandas as pd
@@ -99,6 +99,25 @@ class IntradayMomentumLight:
         return preds
 
 
+    @staticmethod
+    def _format_period_length(period_length: Optional[timedelta]) -> str:
+        """Format period_length as a string for feature names.
+
+        Parameters
+        ----------
+        period_length : Optional[timedelta]
+            Period length to format
+
+        Returns
+        -------
+        str
+            Formatted string like "60min", "30min", etc.
+        """
+        if period_length is None:
+            return ""
+        total_minutes = int(period_length.total_seconds() / 60)
+        return f"{total_minutes}min"
+
     def _add_feature(self, data: pd.Series, feature_name: str, tf='1d'):
         """Add a feature to the training dataset and track it.
 
@@ -111,10 +130,15 @@ class IntradayMomentumLight:
         tf : str, default '1d'
             Timeframe: 'intraday' for intraday_data, '1d' for training_data
         """
+        # Check for duplicates before adding
+        if feature_name in self.feature_names:
+            import warnings
+            warnings.warn(f"Feature '{feature_name}' already exists, skipping duplicate", UserWarning)
+            return
+
         if tf == 'intraday':
             self.intraday_data[feature_name] = data
-            if feature_name not in self.feature_names:
-                self.feature_names.append(feature_name)
+            self.feature_names.append(feature_name)
         else:
             if isinstance(self.training_data, pd.DataFrame):
                 # Use pandas Index.intersection instead of set operations
@@ -122,8 +146,7 @@ class IntradayMomentumLight:
                 data_dates = pd.DatetimeIndex(data.index).normalize()
                 common = dates.intersection(data_dates)
                 self.training_data[feature_name] = data.loc[common]
-                if feature_name not in self.feature_names:
-                    self.feature_names.append(feature_name)
+                self.feature_names.append(feature_name)
         return
 
     @staticmethod
@@ -342,14 +365,44 @@ class IntradayMomentumLight:
 
     def target_time_returns(
             self,
-            target_time: time,
+            target_time: Union[time, List[time]],
             intraday_df: Optional[pd.DataFrame] = None,
             period_length: Optional[timedelta] = None,
             price_col: str = "Close",
             add_as_feature=False,
-    ) -> pd.Series:
-        """Return series for a specific target time window."""
+    ) -> Union[pd.Series, pd.DataFrame]:
+        """Return series for a specific target time window.
 
+        Parameters
+        ----------
+        target_time : time or List[time]
+            Single time or list of times to extract returns for
+        intraday_df : Optional[pd.DataFrame]
+            Intraday data with DatetimeIndex
+        period_length : Optional[timedelta]
+            Rolling window length
+        price_col : str
+            Price column name
+        add_as_feature : bool
+            If True, add to training_data with proper lagging
+
+        Returns
+        -------
+        pd.Series or pd.DataFrame
+            If single time: pd.Series
+            If list of times: pd.DataFrame with one column per time
+        """
+        # Handle list of times
+        if isinstance(target_time, (list, tuple)):
+            results = {}
+            for t in target_time:
+                result = self.target_time_returns(
+                    t, intraday_df, period_length, price_col, add_as_feature
+                )
+                results[f'{t.strftime("%H%M")}'] = result
+            return pd.DataFrame(results)
+
+        # Single time handling
         data = intraday_df if intraday_df is not None else self.intraday_data
         if data is None or data.empty:
             raise ValueError("Intraday data is required for target time returns")
@@ -367,25 +420,28 @@ class IntradayMomentumLight:
 
         if add_as_feature:
             feature_time_return = target_returns if target_time.hour < self.target_time.hour else target_returns.shift(1)
-            self._add_feature(feature_time_return, f'{target_time.strftime("%H%M")}_return')
+            # Include period_length in feature name
+            period_str = self._format_period_length(window)
+            feature_name = f'{target_time.strftime("%H%M")}_{period_str}_return' if period_str else f'{target_time.strftime("%H%M")}_return'
+            self._add_feature(feature_time_return, feature_name)
 
         return target_returns
 
     def target_time_volume(
             self,
-            target_time: time,
+            target_time: Union[time, List[time]],
             intraday_df: Optional[pd.DataFrame] = None,
             period_length: Optional[timedelta] = None,
             volume_col: str = "Volume",
             add_as_feature: bool = False,
             aggregation: str = "sum",
-    ) -> pd.Series:
+    ) -> Union[pd.Series, pd.DataFrame]:
         """Calculate volume at a specific target time over a given period.
 
         Parameters
         ----------
-        target_time : time
-            The target time to extract volume for (e.g., time(9, 30) for 9:30 AM)
+        target_time : time or List[time]
+            Single time or list of times to extract volume for
         intraday_df : Optional[pd.DataFrame]
             Intraday OHLCV data with DatetimeIndex. Uses self.intraday_data if None.
         period_length : Optional[timedelta]
@@ -399,8 +455,9 @@ class IntradayMomentumLight:
 
         Returns
         -------
-        pd.Series
-            Daily volume series aligned to the target time, indexed by date
+        pd.Series or pd.DataFrame
+            If single time: pd.Series with daily volume
+            If list of times: pd.DataFrame with one column per time
 
         Notes
         -----
@@ -408,6 +465,17 @@ class IntradayMomentumLight:
         - Properly lags the feature if target_time is before self.target_time
         - Useful for analyzing volume patterns at specific times (e.g., opening/closing volume)
         """
+        # Handle list of times
+        if isinstance(target_time, (list, tuple)):
+            results = {}
+            for t in target_time:
+                result = self.target_time_volume(
+                    t, intraday_df, period_length, volume_col, add_as_feature, aggregation
+                )
+                results[f'{t.strftime("%H%M")}'] = result
+            return pd.DataFrame(results)
+
+        # Single time handling
         data = intraday_df if intraday_df is not None else self.intraday_data
         if data is None or data.empty:
             raise ValueError("Intraday data is required for target time volume")
@@ -436,14 +504,16 @@ class IntradayMomentumLight:
         if add_as_feature:
             # Lag if target_time is before the session target time to avoid lookahead bias
             feature_volume = target_volume if target_time.hour < self.target_time.hour else target_volume.shift(1)
-            feature_name = f'{target_time.strftime("%H%M")}_volume_{aggregation}'
+            # Include period_length in feature name
+            period_str = self._format_period_length(window)
+            feature_name = f'{target_time.strftime("%H%M")}_{period_str}_volume_{aggregation}' if period_str else f'{target_time.strftime("%H%M")}_volume_{aggregation}'
             self._add_feature(feature_volume, feature_name)
 
         return target_volume
 
     def bid_ask_volume_imbalance(
             self,
-            target_time: time,
+            target_time: Union[time, List[time]],
             intraday_df: Optional[pd.DataFrame] = None,
             period_length: Optional[timedelta] = None,
             bid_vol_col: str = "BidVolume",
@@ -456,8 +526,8 @@ class IntradayMomentumLight:
 
         Parameters
         ----------
-        target_time : time
-            The target time to extract imbalance for (e.g., time(9, 30) for 9:30 AM)
+        target_time : time or List[time]
+            Single time or list of times to extract imbalance for
         intraday_df : Optional[pd.DataFrame]
             Intraday data with DatetimeIndex. Uses self.intraday_data if None.
         period_length : Optional[timedelta]
@@ -479,11 +549,9 @@ class IntradayMomentumLight:
         Returns
         -------
         pd.Series or pd.DataFrame
-            If return_components=False: Series with normalized imbalance (-1 to 1)
-            If return_components=True: DataFrame with columns:
-                - ba_imbalance: raw (bid_vol - ask_vol)
-                - ba_ratio: bid_vol / ask_vol ratio
-                - ba_imbalance_norm: normalized by total volume
+            If single time + return_components=False: Series with normalized imbalance
+            If single time + return_components=True: DataFrame with all metrics
+            If list of times: DataFrame with columns for each time
 
         Notes
         -----
@@ -493,6 +561,24 @@ class IntradayMomentumLight:
         - Negative imbalance: more ask volume (buying pressure)
         - Similar API to target_time_returns() for consistency
         """
+        # Handle list of times
+        if isinstance(target_time, (list, tuple)):
+            results = {}
+            for t in target_time:
+                result = self.bid_ask_volume_imbalance(
+                    t, intraday_df, period_length, bid_vol_col, ask_vol_col,
+                    add_as_feature, use_proxy, return_components
+                )
+                # If return_components=False, we get a Series
+                if isinstance(result, pd.Series):
+                    results[f'{t.strftime("%H%M")}'] = result
+                else:
+                    # If return_components=True, we get a DataFrame with multiple columns
+                    for col in result.columns:
+                        results[f'{t.strftime("%H%M")}_{col}'] = result[col]
+            return pd.DataFrame(results)
+
+        # Single time handling
         data = intraday_df if intraday_df is not None else self.intraday_data
         if data is None or data.empty:
             raise ValueError("Intraday data is required for bid-ask volume imbalance")
@@ -558,10 +644,12 @@ class IntradayMomentumLight:
             components_df.index = pd.to_datetime(components_df.index).normalize()
 
             if add_as_feature:
+                # Include period_length in feature name
+                period_str = self._format_period_length(window)
                 # Lag if needed and add each component
                 for col in components_df.columns:
                     feature_series = components_df[col] if target_time.hour < self.target_time.hour else components_df[col].shift(1)
-                    feature_name = f'{target_time.strftime("%H%M")}_{col}'
+                    feature_name = f'{target_time.strftime("%H%M")}_{period_str}_{col}' if period_str else f'{target_time.strftime("%H%M")}_{col}'
                     self._add_feature(feature_series, feature_name)
 
             return components_df
@@ -571,9 +659,11 @@ class IntradayMomentumLight:
             target_imbalance.index = pd.to_datetime(target_imbalance.index).normalize()
 
             if add_as_feature:
+                # Include period_length in feature name
+                period_str = self._format_period_length(window)
                 # Lag if needed to avoid lookahead bias
                 feature_imbalance = target_imbalance if target_time.hour < self.target_time.hour else target_imbalance.shift(1)
-                feature_name = f'{target_time.strftime("%H%M")}_ba_imbalance_norm'
+                feature_name = f'{target_time.strftime("%H%M")}_{period_str}_ba_imbalance_norm' if period_str else f'{target_time.strftime("%H%M")}_ba_imbalance_norm'
                 self._add_feature(feature_imbalance, feature_name)
 
             return target_imbalance
