@@ -133,7 +133,8 @@ class IntradayMomentumLight:
         return df[price_col].copy()
 
     def prev_hl(self, horizon=5, add_as_feature=True, normalize=False):
-        daily_ohlc = self.intraday_data.resample('1d', offset=f"-{self.target_time.hour}h").agg({"Open":"first", "High":"max", "Low":"min", "Close":"last"})
+        # Resample to daily and drop NaN rows (weekends/holidays)
+        daily_ohlc = self.intraday_data.resample('1d', offset=f"-{self.target_time.hour}h").agg({"Open":"first", "High":"max", "Low":"min", "Close":"last"}).dropna()
 
         h = daily_ohlc['High'].shift(1).rolling(horizon).max()
         l = daily_ohlc["Low"].shift(1).rolling(horizon).min()
