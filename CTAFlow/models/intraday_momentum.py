@@ -443,48 +443,55 @@ class IntradayMomentumLight:
 
     def bid_ask_volume_imbalance(
             self,
+            target_time: time,
             intraday_df: Optional[pd.DataFrame] = None,
             period_length: Optional[timedelta] = None,
             bid_vol_col: str = "BidVolume",
             ask_vol_col: str = "AskVolume",
-            add_as_feature: bool = True,
+            add_as_feature: bool = False,
             use_proxy: bool = False,
-    ) -> pd.DataFrame:
-        """Calculate cumulative bid-ask volume imbalance over a period.
+            return_components: bool = False,
+    ) -> Union[pd.Series, pd.DataFrame]:
+        """Calculate bid-ask volume imbalance at a specific target time.
 
         Parameters
         ----------
+        target_time : time
+            The target time to extract imbalance for (e.g., time(9, 30) for 9:30 AM)
         intraday_df : Optional[pd.DataFrame]
             Intraday data with DatetimeIndex. Uses self.intraday_data if None.
         period_length : Optional[timedelta]
-            Length of period to aggregate imbalance. Uses self.closing_length if None.
+            Length of rolling window to aggregate imbalance. Uses self.closing_length if None.
         bid_vol_col : str, default "BidVolume"
             Column name for bid volume data
         ask_vol_col : str, default "AskVolume"
             Column name for ask volume data
-        add_as_feature : bool, default True
-            If True, add imbalance features to training_data
+        add_as_feature : bool, default False
+            If True, add imbalance to training_data with proper lagging
         use_proxy : bool, default False
             If True and bid/ask columns not found, use price change to proxy direction:
             - Volume on upticks attributed to ask (buyers)
             - Volume on downticks attributed to bid (sellers)
+        return_components : bool, default False
+            If True, return DataFrame with imbalance, ratio, and normalized imbalance.
+            If False, return Series with just the normalized imbalance.
 
         Returns
         -------
-        pd.DataFrame
-            Daily features with columns:
-            - ba_imbalance: cumulative (bid_vol - ask_vol) over period
-            - ba_ratio: bid_vol / ask_vol ratio
-            - ba_imbalance_norm: imbalance normalized by total volume
+        pd.Series or pd.DataFrame
+            If return_components=False: Series with normalized imbalance (-1 to 1)
+            If return_components=True: DataFrame with columns:
+                - ba_imbalance: raw (bid_vol - ask_vol)
+                - ba_ratio: bid_vol / ask_vol ratio
+                - ba_imbalance_norm: normalized by total volume
 
         Notes
         -----
-        Bid-ask imbalance measures buying vs selling pressure:
+        - Calculates imbalance over rolling window ending at target_time
+        - Properly lags the feature if target_time is before self.target_time
         - Positive imbalance: more bid volume (selling pressure)
         - Negative imbalance: more ask volume (buying pressure)
-
-        If bid/ask volume columns are not available and use_proxy=True, the method
-        will classify volume by price movement direction.
+        - Similar API to target_time_returns() for consistency
         """
         data = intraday_df if intraday_df is not None else self.intraday_data
         if data is None or data.empty:
@@ -523,70 +530,53 @@ class IntradayMomentumLight:
             ask_volume = pd.Series(ask_volume, index=data.index)
             bid_volume = pd.Series(bid_volume, index=data.index)
 
-        # Vectorized approach: compute session times
-        session_open_offset = pd.Timedelta(
-            hours=self.session_open.hour,
-            minutes=self.session_open.minute,
-            seconds=self.session_open.second,
-        )
-
-        work_df = pd.DataFrame({
-            'bid_vol': bid_volume,
-            'ask_vol': ask_volume,
-        })
-        work_df['date'] = work_df.index.normalize()
-        work_df['session_start'] = work_df['date'] + session_open_offset
-        work_df['session_end'] = work_df['session_start'] + window
-
-        # Filter to target period
-        in_period = (work_df.index >= work_df['session_start']) & (work_df.index < work_df['session_end'])
-        period_data = work_df[in_period].copy()
-
-        if period_data.empty:
-            return pd.DataFrame(columns=['ba_imbalance', 'ba_ratio', 'ba_imbalance_norm'])
-
-        # Aggregate by date
-        daily_agg = period_data.groupby('date').agg({
-            'bid_vol': 'sum',
-            'ask_vol': 'sum'
-        })
+        # Calculate rolling imbalance over the window
+        if window:
+            bars = max(int(window.total_seconds() // 60 // 5), 1)
+            bid_rolling = bid_volume.rolling(bars).sum()
+            ask_rolling = ask_volume.rolling(bars).sum()
+        else:
+            bid_rolling = bid_volume
+            ask_rolling = ask_volume
 
         # Calculate imbalance metrics
-        daily_agg['ba_imbalance'] = daily_agg['bid_vol'] - daily_agg['ask_vol']
-        daily_agg['total_vol'] = daily_agg['bid_vol'] + daily_agg['ask_vol']
-        daily_agg['ba_ratio'] = np.where(
-            daily_agg['ask_vol'] > 0,
-            daily_agg['bid_vol'] / daily_agg['ask_vol'],
-            np.nan
-        )
-        daily_agg['ba_imbalance_norm'] = np.where(
-            daily_agg['total_vol'] > 0,
-            daily_agg['ba_imbalance'] / daily_agg['total_vol'],
-            0
-        )
+        imbalance = bid_rolling - ask_rolling
+        total_vol = bid_rolling + ask_rolling
+        ratio = np.where(ask_rolling > 0, bid_rolling / ask_rolling, np.nan)
+        imbalance_norm = np.where(total_vol > 0, imbalance / total_vol, 0)
 
-        # Return only feature columns
-        feature_df = daily_agg[['ba_imbalance', 'ba_ratio', 'ba_imbalance_norm']].copy()
-        feature_df.index = pd.to_datetime(feature_df.index).normalize()
+        # Extract at target time
+        mask = data.index.time == target_time
 
-        # Check if we need to lag the features
-        window_end_time = (
-            pd.Timestamp("1970-01-01")
-            + pd.Timedelta(
-                hours=self.session_open.hour,
-                minutes=self.session_open.minute,
-                seconds=self.session_open.second,
-            )
-            + window
-        ).time()
-        if window_end_time > self.target_time:
-            feature_df = feature_df.shift(1)
+        if return_components:
+            # Return all components as DataFrame
+            components_df = pd.DataFrame({
+                'ba_imbalance': imbalance[mask],
+                'ba_ratio': ratio[mask],
+                'ba_imbalance_norm': imbalance_norm[mask]
+            })
+            components_df.index = pd.to_datetime(components_df.index).normalize()
 
-        if add_as_feature and isinstance(self.training_data, pd.DataFrame):
-            for col in feature_df.columns:
-                self._add_feature(feature_df[col], col, tf='1d')
+            if add_as_feature:
+                # Lag if needed and add each component
+                for col in components_df.columns:
+                    feature_series = components_df[col] if target_time.hour < self.target_time.hour else components_df[col].shift(1)
+                    feature_name = f'{target_time.strftime("%H%M")}_{col}'
+                    self._add_feature(feature_series, feature_name)
 
-        return feature_df
+            return components_df
+        else:
+            # Return just normalized imbalance as Series (default, like target_time_returns)
+            target_imbalance = pd.Series(imbalance_norm[mask])
+            target_imbalance.index = pd.to_datetime(target_imbalance.index).normalize()
+
+            if add_as_feature:
+                # Lag if needed to avoid lookahead bias
+                feature_imbalance = target_imbalance if target_time.hour < self.target_time.hour else target_imbalance.shift(1)
+                feature_name = f'{target_time.strftime("%H%M")}_ba_imbalance_norm'
+                self._add_feature(feature_imbalance, feature_name)
+
+            return target_imbalance
 
     def market_structure_features(
             self,
