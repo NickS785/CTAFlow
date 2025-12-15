@@ -23,6 +23,33 @@ from .config import build_default_params, infer_task_from_target
 warnings.filterwarnings('ignore')
 data_load_func = fetch_data_sync
 
+
+def _detect_cuda_available():
+    """Detect if CUDA-capable GPU is available for XGBoost/LightGBM
+
+    Returns:
+        bool: True if CUDA GPU is available, False otherwise
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return True
+    except ImportError:
+        pass
+
+    try:
+        # Try XGBoost GPU detection
+        import xgboost as xgb
+        # Check if gpu_hist tree method is available
+        params = {'tree_method': 'gpu_hist', 'gpu_id': 0}
+        dtrain = xgb.DMatrix([[1, 2], [3, 4]], label=[0, 1])
+        xgb.train(params, dtrain, num_boost_round=1)
+        return True
+    except Exception:
+        pass
+
+    return False
+
 class CTAForecast:
     """Forecasting framework optimized for your COT-enhanced dataset"""
 
@@ -1711,17 +1738,21 @@ class CTALight:
 
 
 class CTAXGBoost:
-    """XGBoost model optimized for CTA positioning prediction"""
+    """XGBoost model optimized for CTA positioning prediction with GPU support"""
 
-    def __init__(self, **xgb_params):
+    def __init__(self, use_gpu: bool = False, task: str = 'regression', **xgb_params):
         """Initialize XGBoost model with CTA-optimized defaults
 
         Args:
+            use_gpu: Enable GPU acceleration (CUDA) when True
+            task: Learning task type ('regression', 'binary_classification', or 'multiclass')
             **xgb_params: XGBoost parameters to override defaults
         """
+        self.use_gpu = bool(use_gpu)
+        self.task = task.lower() if task else 'regression'
+
+        # Base parameters
         default_params = {
-            'objective': 'reg:squarederror',
-            'eval_metric': 'rmse',
             'learning_rate': 0.05,
             'max_depth': 6,
             'subsample': 0.8,
@@ -1732,11 +1763,36 @@ class CTAXGBoost:
             'random_state': 42,
             'n_jobs': -1
         }
-        self.default_grid = dict(learning_rate=[0.01, 0.1, 0.2],
-                                 max_depth=[3, 5, 7, 9],
-                                 subsample=[0.8, 0.9, 1.0],
-                                 n_estimators=[200],
-                                 max_leaves=[5, 7, 8])
+
+        # Task-specific parameters
+        if self.task == 'binary_classification' or self.task == 'binary':
+            default_params['objective'] = 'binary:logistic'
+            default_params['eval_metric'] = 'logloss'
+        elif self.task == 'multiclass':
+            default_params['objective'] = 'multi:softprob'
+            default_params['eval_metric'] = 'mlogloss'
+        else:  # regression
+            default_params['objective'] = 'reg:squarederror'
+            default_params['eval_metric'] = 'rmse'
+
+        # GPU parameters
+        if self.use_gpu:
+            default_params['tree_method'] = 'gpu_hist'
+            default_params['gpu_id'] = 0
+            default_params['predictor'] = 'gpu_predictor'
+            # Remove n_jobs for GPU (not needed/compatible)
+            default_params.pop('n_jobs', None)
+        else:
+            default_params['tree_method'] = 'hist'  # Use CPU histogram
+
+        self.default_grid = dict(
+            learning_rate=[0.01, 0.05, 0.1, 0.2],
+            max_depth=[3, 5, 7, 9],
+            subsample=[0.7, 0.8, 0.9, 1.0],
+            n_estimators=[100, 200, 300],
+            max_leaves=[0, 5, 7, 8],
+            colsample_bytree=[0.7, 0.8, 0.9, 1.0]
+        )
 
         self.params = {**default_params, **xgb_params}
         self.model = XGBRegressor(**self.params)
@@ -1802,7 +1858,7 @@ class CTAXGBoost:
         return self.model.predict(X)
 
     def cross_validate(self, X, y, cv_folds=5, scoring='neg_mean_squared_error'):
-        """Perform time series cross-validation"""
+        """Perform time series cross-validation with GPU support"""
         if isinstance(X, pd.DataFrame):
             X = X.values
         if isinstance(y, pd.Series):
@@ -1814,8 +1870,11 @@ class CTAXGBoost:
 
         tscv = TimeSeriesSplit(n_splits=cv_folds)
         model = XGBRegressor(**self.params)
+
+        # Don't use n_jobs with GPU (GPU already parallelizes)
+        n_jobs_cv = 1 if self.use_gpu else -1
         cv_scores = cross_val_score(
-            model, X_clean, y_clean, cv=tscv, scoring=scoring, n_jobs=-1
+            model, X_clean, y_clean, cv=tscv, scoring=scoring, n_jobs=n_jobs_cv
         )
 
         return {
@@ -1856,7 +1915,19 @@ class CTAXGBoost:
 
     def grid_search(self, X, y, param_grid=None, cv_folds=5,
                     scoring='neg_mean_squared_error', verbose=True):
-        """Perform grid search over hyperparameters"""
+        """Perform grid search over hyperparameters with GPU support
+
+        Args:
+            X: Features DataFrame or array
+            y: Target Series or array
+            param_grid: Dictionary of parameters to search over. If None, uses default grid.
+            cv_folds: Number of CV folds for validation
+            scoring: Scoring metric ('neg_mean_squared_error', 'neg_mean_absolute_error', 'r2')
+            verbose: Whether to print progress
+
+        Returns:
+            Dictionary with best parameters, best score, and cv_results
+        """
         if isinstance(X, pd.DataFrame):
             self.feature_names = list(X.columns)
             X = X.values
@@ -1873,7 +1944,7 @@ class CTAXGBoost:
         if param_grid is None:
             param_grid = {
                 'max_depth': [3, 6, 9],
-                'learning_rate': [0.01,0.03, 0.07, 0.1],
+                'learning_rate': [0.01, 0.03, 0.07, 0.1],
                 'subsample': [0.8, 1.0],
                 'colsample_bytree': [0.8, 1.0],
                 'n_estimators': [100, 200]
@@ -1881,12 +1952,16 @@ class CTAXGBoost:
 
         tscv = TimeSeriesSplit(n_splits=cv_folds)
         base_model = XGBRegressor(**self.params)
+
+        # Don't use n_jobs with GPU (GPU already parallelizes)
+        n_jobs_grid = 1 if self.use_gpu else -1
+
         grid = GridSearchCV(
             base_model,
             param_grid,
             cv=tscv,
             scoring=scoring,
-            n_jobs=-1,
+            n_jobs=n_jobs_grid,
             verbose=1 if verbose else 0
         )
         grid.fit(X_clean, y_clean)
@@ -1937,14 +2012,33 @@ class CTAXGBoost:
 
 
 class CTARForest:
-    """Random Forest model optimized for CTA positioning prediction"""
-    
-    def __init__(self, **rf_params):
+    """Random Forest model optimized for CTA positioning prediction
+
+    Note: Random Forest in scikit-learn does not support GPU acceleration.
+    For GPU-accelerated Random Forest, consider using cuML's RandomForestRegressor.
+    This class maximizes CPU parallelization with n_jobs=-1.
+    """
+
+    def __init__(self, use_gpu: bool = False, task: str = 'regression', **rf_params):
         """Initialize Random Forest model with CTA-optimized defaults
-        
+
         Args:
+            use_gpu: Not used for Random Forest (scikit-learn RF is CPU-only).
+                     Kept for interface consistency with other models.
+            task: Learning task type ('regression', 'binary_classification', or 'multiclass')
             **rf_params: Random Forest parameters to override defaults
         """
+        self.use_gpu = bool(use_gpu)  # Stored but not used (RF is CPU-only)
+        self.task = task.lower() if task else 'regression'
+
+        if self.use_gpu:
+            warnings.warn(
+                "GPU acceleration is not available for scikit-learn RandomForest. "
+                "Using CPU with n_jobs=-1 for parallelization. "
+                "For GPU support, consider using cuML's RandomForestRegressor.",
+                UserWarning
+            )
+
         # CTA-optimized default parameters
         default_params = {
             'n_estimators': 200,
@@ -1954,10 +2048,10 @@ class CTARForest:
             'max_features': 'sqrt',
             'bootstrap': True,
             'oob_score': True,
-            'n_jobs': -1,
+            'n_jobs': -1,  # Use all CPU cores
             'random_state': 42
         }
-        
+
         # Default parameter grid for grid search
         self.default_grid = {
             'n_estimators': [100, 200, 300],
@@ -1966,7 +2060,7 @@ class CTARForest:
             'min_samples_leaf': [1, 2, 4],
             'max_features': ['sqrt', 'log2', None]
         }
-        
+
         self.params = {**default_params, **rf_params}
         self.model = RandomForestRegressor(**self.params)
         self.is_fitted = False
