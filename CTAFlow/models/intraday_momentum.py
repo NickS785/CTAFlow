@@ -813,6 +813,178 @@ class IntradayMomentumLight:
         else:
             return pd.DataFrame(correlations)
 
+    def daily_correlation(
+            self,
+            ticker: str,
+            length: int,
+            price_col: str = "Close",
+            add_as_feature: bool = False,
+    ) -> pd.Series:
+        """Calculate rolling daily correlation between main and supplementary ticker.
+
+        Computes rolling correlation of daily returns between the main instrument
+        and a supplementary ticker over a specified window. Automatically offsets
+        by one day to prevent lookahead bias.
+
+        Args:
+            ticker: Ticker symbol from supplementary_intraday_data
+            length: Rolling window length in days
+            price_col: Column name for prices (default: "Close")
+            add_as_feature: If True, add correlation to training_data
+
+        Returns:
+            pd.Series: Daily correlation values indexed by date, shifted by 1 day
+
+        Raises:
+            ValueError: If supplementary_intraday_data was not provided
+            KeyError: If ticker not found in supplementary_intraday_data
+
+        Example:
+            >>> # Calculate 20-day rolling correlation with ES
+            >>> corr = model.daily_correlation('ES', length=20)
+        """
+        if not self.supplementary_intraday_data:
+            raise ValueError(
+                "supplementary_intraday_data must be provided to IntradayMomentumLight "
+                "to use daily_correlation()"
+            )
+
+        if ticker not in self.supplementary_intraday_data:
+            raise KeyError(
+                f"Ticker '{ticker}' not found in supplementary_intraday_data. "
+                f"Available: {list(self.supplementary_intraday_data.keys())}"
+            )
+
+        # Get main instrument daily returns
+        if not isinstance(self.intraday_data.index, pd.DatetimeIndex):
+            main_data = self.intraday_data.copy()
+            main_data.index = pd.to_datetime(main_data.index)
+        else:
+            main_data = self.intraday_data
+
+        # Resample to daily using session close time
+        main_daily = main_data[price_col].resample('1D').last().dropna()
+        main_daily_returns = main_daily.pct_change()
+
+        # Get supplementary ticker daily returns
+        supp_data = self.supplementary_intraday_data[ticker]
+        if not isinstance(supp_data.index, pd.DatetimeIndex):
+            supp_data = supp_data.copy()
+            supp_data.index = pd.to_datetime(supp_data.index)
+
+        supp_daily = supp_data[price_col].resample('1D').last().dropna()
+        supp_daily_returns = supp_daily.pct_change()
+
+        # Align the two return series
+        aligned_main, aligned_supp = main_daily_returns.align(supp_daily_returns, join='inner')
+
+        # Calculate rolling correlation
+        rolling_corr = aligned_main.rolling(window=length).corr(aligned_supp)
+
+        # Offset by 1 day to prevent lookahead bias
+        rolling_corr = rolling_corr.shift(1)
+
+        if add_as_feature:
+            feature_name = f'daily_{length}d_corr_{ticker}'
+            self._add_feature(rolling_corr, feature_name)
+
+        return rolling_corr
+
+    def target_ticker_returns(
+            self,
+            ticker: str,
+            target_time: Union[time, List[time]],
+            period_length: Optional[timedelta] = None,
+            price_col: str = "Close",
+            add_as_feature: bool = False,
+    ) -> Union[pd.Series, pd.DataFrame]:
+        """Calculate returns for a supplementary ticker at target time(s).
+
+        Similar to target_time_returns() but uses supplementary_intraday_data.
+        Automatically prevents lookahead bias by shifting returns if target_time
+        is at or after the session target time.
+
+        Args:
+            ticker: Ticker symbol from supplementary_intraday_data
+            target_time: Single time or list of times to extract returns for
+            period_length: Rolling window length for returns calculation
+            price_col: Column name for prices (default: "Close")
+            add_as_feature: If True, add to training_data with proper lagging
+
+        Returns:
+            pd.Series: If single time, returns Series indexed by date
+            pd.DataFrame: If list of times, returns DataFrame with one column per time
+
+        Raises:
+            ValueError: If supplementary_intraday_data was not provided
+            KeyError: If ticker not found in supplementary_intraday_data
+
+        Example:
+            >>> # Get ES returns at 2:30 PM over 60 min window
+            >>> es_ret = model.target_ticker_returns('ES', time(14, 30),
+            ...                                       timedelta(minutes=60))
+        """
+        if not self.supplementary_intraday_data:
+            raise ValueError(
+                "supplementary_intraday_data must be provided to IntradayMomentumLight "
+                "to use target_ticker_returns()"
+            )
+
+        if ticker not in self.supplementary_intraday_data:
+            raise KeyError(
+                f"Ticker '{ticker}' not found in supplementary_intraday_data. "
+                f"Available: {list(self.supplementary_intraday_data.keys())}"
+            )
+
+        # Handle list of times
+        if isinstance(target_time, (list, tuple)):
+            results = {}
+            for t in target_time:
+                result = self.target_ticker_returns(
+                    ticker, t, period_length, price_col, add_as_feature
+                )
+                results[f'{ticker}_{t.strftime("%H%M")}'] = result
+            return pd.DataFrame(results)
+
+        # Get supplementary ticker data
+        supp_data = self.supplementary_intraday_data[ticker]
+        if not isinstance(supp_data.index, pd.DatetimeIndex):
+            supp_data = supp_data.copy()
+            supp_data.index = pd.to_datetime(supp_data.index)
+
+        if supp_data is None or supp_data.empty:
+            raise ValueError(f"Supplementary data for ticker '{ticker}' is empty")
+
+        window = period_length or self.closing_length
+        prices = self._coerce_price(supp_data, price_col)
+        ret = prices.pct_change().dropna()
+
+        # Extract returns at target_time
+        mask = ret.index.time == target_time
+        if window:
+            bars = max(int(window.total_seconds() // 60 // 5), 1)
+            ret = ret.rolling(bars).sum()
+        target_returns = ret[mask]
+        target_returns.index = pd.to_datetime(target_returns.index).normalize()
+
+        if add_as_feature:
+            # Prevent lookahead: shift if target_time >= session target time
+            feature_ticker_return = (
+                target_returns
+                if target_time < self.target_time
+                else target_returns.shift(1)
+            )
+            # Include ticker and period_length in feature name
+            period_str = self._format_period_length(window)
+            feature_name = (
+                f'{ticker}_{target_time.strftime("%H%M")}_{period_str}_return'
+                if period_str
+                else f'{ticker}_{target_time.strftime("%H%M")}_return'
+            )
+            self._add_feature(feature_ticker_return, feature_name)
+
+        return target_returns
+
     def market_structure_features(
             self,
             daily_df: pd.DataFrame,
