@@ -652,19 +652,23 @@ class CTAForecast:
         grid_search_results = None
         validation_metrics = None
         validation_importance = None
+        eval_set = None
+        if X_val is not None and len(X_val) > 0:
+            eval_set = (X_val, y_val)
+
         if model_type in ['lightgbm', 'xgboost']:
             if use_grid_search:
                 grid_results = model.fit_with_grid_search(
                     X_train_fit, y_train_fit,
                     param_grid=param_grid,
-                    eval_set=(X_val, y_val),
+                    eval_set=eval_set,
                     cv_folds=grid_search_cv,
                     scoring=grid_search_scoring,
                     verbose=True
                 )
                 grid_search_results = grid_results['grid_search_results']
             else:
-                model.fit(X_train_fit, y_train_fit, eval_set=(X_val, y_val))
+                model.fit(X_train_fit, y_train_fit, eval_set=eval_set)
         elif model_type == 'randomforest':
             # Random Forest doesn't need separate validation set for early stopping
             if use_grid_search:
