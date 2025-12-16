@@ -2321,11 +2321,12 @@ class CTARForest:
         # Default parameter grid if none provided
         if param_grid is None:
             param_grid = {
-                'n_estimators': [150, 300],
-                'max_depth': [6, None],
-                'min_samples_split': [2, 5],
-                'min_samples_leaf': [1, 2],
-                'max_features': ['sqrt', 'log2']
+                "n_estimators": [200, 500],
+                "max_depth": [None, 6, 10, 16],
+                "min_samples_split": [2, 5, 10],
+                "min_samples_leaf": [1, 2, 5],
+                "max_features": ["sqrt", 0.5, 1.0],
+                "bootstrap": [True],
             }
         
         if verbose:

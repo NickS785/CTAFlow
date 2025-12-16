@@ -12,6 +12,15 @@ __all__ = ["filter_session_ticks", "filter_session_bars"]
 
 _TimeLike = Union[str, time]
 
+def asia():
+
+    return (time(18, 30), time(3, 0))
+
+def london():
+    return (time(2,30), time(11, 0))
+
+
+
 # Cache for parsed time objects to avoid repeated parsing
 @lru_cache(maxsize=128)
 def _parse_time(value: _TimeLike) -> time:
