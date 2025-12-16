@@ -2049,7 +2049,8 @@ class CTAXGBoost:
 
         return {
             'best_params': grid.best_params_,
-            'best_score': grid.best_score_,
+            'best_mean_score': grid.best_score_,  # GridSearchCV returns mean score
+            'best_score': grid.best_score_,  # Backwards compatibility
             'best_params_full': self.params,
             'cv_results': grid.cv_results_,
             'scoring_metric': scoring
@@ -2363,7 +2364,8 @@ class CTARForest:
         
         return {
             'best_params': grid.best_params_,
-            'best_score': grid.best_score_,
+            'best_mean_score': grid.best_score_,  # GridSearchCV returns mean score
+            'best_score': grid.best_score_,  # Backwards compatibility
             'best_params_full': self.params,
             'cv_results': grid.cv_results_,
             'scoring_metric': scoring
