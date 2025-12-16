@@ -1686,40 +1686,59 @@ class CTALight:
 
                 cv_scores.append(score)
             
-            # Calculate mean CV score
+            # Calculate CV statistics
             mean_cv_score = np.mean(cv_scores)
             std_cv_score = np.std(cv_scores)
-            
-            # Store results
+            best_fold_score = max(cv_scores)  # Best individual fold
+            worst_fold_score = min(cv_scores)  # Worst individual fold
+
+            # Store results with detailed metrics
             result = {
                 'params': current_params,
-                'mean_cv_score': mean_cv_score,
+                'mean_cv_score': mean_cv_score,  # Used for selection
                 'std_cv_score': std_cv_score,
+                'best_fold_score': best_fold_score,
+                'worst_fold_score': worst_fold_score,
                 'cv_scores': cv_scores
             }
             all_results.append(result)
-            
-            # Check if this is the best score
+
+            # Select best parameters by MEAN validation score (not best fold)
             if mean_cv_score > best_score:
                 best_score = mean_cv_score
                 best_params = current_params
-            
+
             if verbose and (i + 1) % 10 == 0:
-                print(f"Completed {i + 1}/{len(param_combinations)} combinations. Best score so far: {best_score:.4f}")
+                print(f"Completed {i + 1}/{len(param_combinations)} combinations. "
+                      f"Best MEAN score: {best_score:.6f}")
         
         if verbose:
             print(f"\nGrid search completed!")
             print(f"Best parameters: {best_params}")
-            print(f"Best {scoring}: {best_score:.4f}")
+            print(f"\nBest MEAN validation {scoring}: {best_score:.6f}")
+
+            # Show detailed statistics for best parameter set
+            best_result = [r for r in all_results if r['params'] == best_params][0]
+            print(f"  Best individual fold:  {best_result['best_fold_score']:.6f}")
+            print(f"  Worst individual fold: {best_result['worst_fold_score']:.6f}")
+            print(f"  Std across folds:      {best_result['std_cv_score']:.6f}")
+            print(f"\nNote: Best parameters selected by MEAN score across all folds,")
+            print(f"      not by best individual fold (for robust generalization).")
 
         # Update model parameters with best found
         if best_params:
             self._user_params.update(best_params)
         self.params.update(best_params)
-        
+
+        # Get detailed stats for best result
+        best_result = [r for r in all_results if r['params'] == best_params][0]
+
         return {
             'best_params': best_params,
-            'best_score': best_score,
+            'best_mean_score': best_score,  # Mean validation score (what's optimized)
+            'best_fold_score': best_result['best_fold_score'],  # Best individual fold
+            'worst_fold_score': best_result['worst_fold_score'],  # Worst individual fold
+            'std_score': best_result['std_cv_score'],  # Consistency across folds
             'best_params_full': {**self.params, **best_params},
             'all_results': all_results,
             'scoring_metric': scoring
