@@ -1787,7 +1787,10 @@ class CTALight:
             'grid_search_results': grid_results,
             'model': self,
             'best_params': grid_results['best_params'],
-            'best_score': grid_results['best_score']
+            'best_mean_score': grid_results['best_mean_score'],
+            'best_fold_score': grid_results.get('best_fold_score'),
+            'worst_fold_score': grid_results.get('worst_fold_score'),
+            'std_score': grid_results.get('std_score')
         }
     
     def plot_importance(self, max_num_features=20, importance_type='gain'):
@@ -2077,7 +2080,10 @@ class CTAXGBoost:
             'grid_search_results': grid_results,
             'model': self,
             'best_params': grid_results['best_params'],
-            'best_score': grid_results['best_score']
+            'best_mean_score': grid_results['best_mean_score'],
+            'best_fold_score': grid_results.get('best_fold_score'),
+            'worst_fold_score': grid_results.get('worst_fold_score'),
+            'std_score': grid_results.get('std_score')
         }
 
 
@@ -2403,7 +2409,10 @@ class CTARForest:
             'grid_search_results': grid_results,
             'model': self,
             'best_params': grid_results['best_params'],
-            'best_score': grid_results['best_score']
+            'best_mean_score': grid_results['best_mean_score'],
+            'best_fold_score': grid_results.get('best_fold_score'),
+            'worst_fold_score': grid_results.get('worst_fold_score'),
+            'std_score': grid_results.get('std_score')
         }
     
     def plot_importance(self, max_num_features=20):
