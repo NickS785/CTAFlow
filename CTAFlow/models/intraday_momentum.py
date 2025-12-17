@@ -16,7 +16,7 @@ from . import base_models
 from .base_models import CTALight
 
 
-class IntradayMomentumLight:
+class IntradayMomentum:
     """LightGBM wrapper focused on intraday momentum and volatility features.
 
     The model is tailored to predict session-end behaviour (default 15:00 CST)
