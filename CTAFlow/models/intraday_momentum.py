@@ -52,6 +52,9 @@ class IntradayMomentum:
         self.feature_names = []  # Track feature names for model training
         self.tz = tz
 
+        # Get valid trading dates from intraday data (excludes weekends/holidays)
+        self.valid_trading_dates = self._get_valid_trading_dates(intraday_data)
+
         if session_target == "open":
             # Calculate target_time as session_open + closing_length
             # Use timedelta arithmetic to handle any period length correctly
@@ -89,6 +92,52 @@ class IntradayMomentum:
             model_cls = self._resolve_model_class()
             self.model = model_cls(**self.model_kwargs)
         return self.model
+
+    @staticmethod
+    def _get_valid_trading_dates(intraday_data: pd.DataFrame) -> pd.DatetimeIndex:
+        """Extract valid trading dates from intraday data (excludes weekends/holidays).
+
+        Parameters
+        ----------
+        intraday_data : pd.DataFrame
+            Intraday OHLCV data with DatetimeIndex
+
+        Returns
+        -------
+        pd.DatetimeIndex
+            Normalized dates that have actual trading data
+        """
+        if not isinstance(intraday_data.index, pd.DatetimeIndex):
+            intraday_data = intraday_data.copy()
+            intraday_data.index = pd.to_datetime(intraday_data.index)
+
+        # Get unique trading dates by normalizing and dropping duplicates
+        valid_dates = pd.DatetimeIndex(intraday_data.index.normalize().unique()).sort_values()
+        return valid_dates
+
+    def _filter_to_trading_dates(self, data: Union[pd.Series, pd.DataFrame]) -> Union[pd.Series, pd.DataFrame]:
+        """Filter a series or dataframe to only include valid trading dates.
+
+        Parameters
+        ----------
+        data : pd.Series or pd.DataFrame
+            Data with DatetimeIndex to filter
+
+        Returns
+        -------
+        pd.Series or pd.DataFrame
+            Filtered data containing only valid trading dates
+        """
+        if not isinstance(data.index, pd.DatetimeIndex):
+            data = data.copy()
+            data.index = pd.to_datetime(data.index)
+
+        # Normalize the data index
+        normalized_idx = data.index.normalize()
+
+        # Keep only dates that are in valid_trading_dates
+        mask = normalized_idx.isin(self.valid_trading_dates)
+        return data[mask]
 
     @staticmethod
     def _filter_kwargs(method, kwargs: Dict) -> Dict:
@@ -143,6 +192,10 @@ class IntradayMomentum:
             import warnings
             warnings.warn(f"Feature '{feature_name}' already exists, skipping duplicate", UserWarning)
             return
+
+        # Convert boolean features to integers (0/1) for ML compatibility
+        if data.dtype == bool:
+            data = data.astype(int)
 
         if tf == 'intraday':
             self.intraday_data[feature_name] = data
@@ -356,6 +409,10 @@ class IntradayMomentum:
 
         rv = returns.pow(2).groupby(pd.Grouper(freq="1D")).sum()
         rv.index = rv.index.normalize()
+
+        # Filter to only valid trading dates (removes weekends/holidays created by Grouper)
+        rv = self._filter_to_trading_dates(rv)
+
         uses_post_target = (returns.index.time > self.target_time).any()
 
         features: Dict[str, pd.Series] = {}
@@ -425,6 +482,9 @@ class IntradayMomentum:
             ret = ret.rolling(bars).sum()
         target_returns = ret[mask]
         target_returns.index = pd.to_datetime(target_returns.index).normalize()
+
+        # Filter to only valid trading dates (removes weekends/holidays)
+        target_returns = self._filter_to_trading_dates(target_returns)
 
         if add_as_feature:
             feature_time_return = target_returns if target_time.hour < self.target_time.hour else target_returns.shift(1)
@@ -508,6 +568,9 @@ class IntradayMomentum:
         mask = volume.index.time == target_time
         target_volume = volume[mask]
         target_volume.index = pd.to_datetime(target_volume.index).normalize()
+
+        # Filter to only valid trading dates (removes weekends/holidays)
+        target_volume = self._filter_to_trading_dates(target_volume)
 
         if add_as_feature:
             # Lag if target_time is before the session target time to avoid lookahead bias
@@ -651,6 +714,9 @@ class IntradayMomentum:
             })
             components_df.index = pd.to_datetime(components_df.index).normalize()
 
+            # Filter to only valid trading dates (removes weekends/holidays)
+            components_df = self._filter_to_trading_dates(components_df)
+
             if add_as_feature:
                 # Include period_length in feature name
                 period_str = self._format_period_length(window)
@@ -665,6 +731,9 @@ class IntradayMomentum:
             # Return just normalized imbalance as Series (default, like target_time_returns)
             target_imbalance = pd.Series(imbalance_norm[mask])
             target_imbalance.index = pd.to_datetime(target_imbalance.index).normalize()
+
+            # Filter to only valid trading dates (removes weekends/holidays)
+            target_imbalance = self._filter_to_trading_dates(target_imbalance)
 
             if add_as_feature:
                 # Include period_length in feature name
@@ -803,6 +872,10 @@ class IntradayMomentum:
 
             # Create Series for this ticker
             corr_series = pd.Series(target_corr, index=pd.DatetimeIndex(dates))
+
+            # Filter to only valid trading dates (removes weekends/holidays)
+            corr_series = self._filter_to_trading_dates(corr_series)
+
             correlations[ticker] = corr_series
 
             # Add as feature if requested
@@ -972,6 +1045,9 @@ class IntradayMomentum:
             ret = ret.rolling(bars).sum()
         target_returns = ret[mask]
         target_returns.index = pd.to_datetime(target_returns.index).normalize()
+
+        # Filter to only valid trading dates (removes weekends/holidays)
+        target_returns = self._filter_to_trading_dates(target_returns)
 
         if add_as_feature:
             # Prevent lookahead: shift if target_time >= session target time
@@ -1172,7 +1248,13 @@ class IntradayMomentum:
         if include_weeks_until_expiration:
             keep_cols.append("weeks_until_expiration")
 
-        feature_df = cal_feats[keep_cols]
+        feature_df = cal_feats[keep_cols].copy()
+
+        # Convert boolean columns to integers (0/1) for ML compatibility
+        for col in feature_df.columns:
+            if feature_df[col].dtype == bool:
+                feature_df[col] = feature_df[col].astype(int)
+
         for name, series in feature_df.items():
             self._add_feature(series, name)
         return feature_df

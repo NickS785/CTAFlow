@@ -18,7 +18,7 @@ from .base_models import (
     CTAXGBoost,
     CTARForest,
 )
-from .intraday_momentum import IntradayMomentumLight
+from .intraday_momentum import IntradayMomentum
 from .volatility import RVForecast
 
 __all__ = [
@@ -30,6 +30,6 @@ __all__ = [
     'CTALight',
     'CTAXGBoost',
     'CTARForest',
-    'IntradayMomentumLight',
+    'IntradayMomentum',
     'RVForecast',
 ]
