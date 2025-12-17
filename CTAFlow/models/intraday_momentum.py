@@ -6,6 +6,12 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Type, Unio
 import numpy as np
 import pandas as pd
 
+from ..features.dt_features import build_datetime_features
+from ..features.session_features import (
+    cumulative_session_returns,
+    cumulative_session_volatility,
+)
+from ..utils.session import DEFAULT_SESSION_TZ
 from . import base_models
 from .base_models import CTALight
 
@@ -1113,6 +1119,112 @@ class IntradayMomentumLight:
                 self._add_feature(momentum_lagged, feature_name, tf='1d')
 
         return pd.DataFrame(feats)
+
+    def add_basic_datetime_features(
+        self,
+        dates: Optional[pd.DatetimeIndex] = None,
+        add_day_of_week: bool = True,
+        add_month: bool = True,
+        add_quarter: bool = True,
+    ) -> pd.DataFrame:
+        """Attach simple calendar breakdowns (DOW, month, quarter)."""
+
+        idx = dates if dates is not None else self.training_data.index
+        normalized = pd.DatetimeIndex(idx).normalize()
+        feats: Dict[str, pd.Series] = {}
+
+        if add_day_of_week:
+            feats["day_of_week"] = normalized.dayofweek
+        if add_month:
+            feats["month"] = normalized.month
+        if add_quarter:
+            feats["quarter"] = normalized.quarter
+
+        feature_df = pd.DataFrame(feats, index=normalized)
+        for name, series in feature_df.items():
+            self._add_feature(series, name)
+        return feature_df
+
+    def add_calendar_datetime_features(
+        self,
+        ticker: str,
+        include_last_trading_week: bool = True,
+        include_opex_week: bool = True,
+        include_days_since_opex: bool = True,
+        include_expiration_week: bool = True,
+        include_weeks_until_expiration: bool = True,
+        dates: Optional[pd.DatetimeIndex] = None,
+    ) -> pd.DataFrame:
+        """Add calendar-based features such as opex and expiry timing."""
+
+        idx = dates if dates is not None else self.training_data.index
+        cal_feats = build_datetime_features(idx, ticker)
+
+        keep_cols = []
+        if include_last_trading_week:
+            keep_cols.append("is_last_trading_week")
+        if include_opex_week:
+            keep_cols.append("is_opex_week")
+        if include_days_since_opex:
+            keep_cols.append("days_since_opex")
+        if include_expiration_week:
+            keep_cols.append("is_expiration_week")
+        if include_weeks_until_expiration:
+            keep_cols.append("weeks_until_expiration")
+
+        feature_df = cal_feats[keep_cols]
+        for name, series in feature_df.items():
+            self._add_feature(series, name)
+        return feature_df
+
+    def add_session_features(
+        self,
+        intraday_df: Optional[pd.DataFrame] = None,
+        price_col: str = "Close",
+        return_periods: Sequence[int] = (1, 5, 10),
+        volatility_periods: Sequence[int] = (1, 5, 10),
+        add_returns: bool = True,
+        add_volatility: bool = True,
+        session_start: Optional[time] = None,
+        session_end: Optional[time] = None,
+        tz: str = DEFAULT_SESSION_TZ,
+    ) -> pd.DataFrame:
+        """Create rolling session return and volatility features."""
+
+        data = intraday_df if intraday_df is not None else self.intraday_data
+        if data is None or data.empty:
+            raise ValueError("Intraday data is required for session features")
+
+        start = session_start or self.session_open
+        end = session_end or self.session_end
+
+        features: Dict[str, pd.Series] = {}
+        if add_returns:
+            ret_df = cumulative_session_returns(
+                intraday_df=data,
+                n_periods=return_periods,
+                price_col=price_col,
+                session_start=start,
+                session_end=end,
+                tz=tz,
+            )
+            features.update(ret_df.to_dict(orient="series"))
+
+        if add_volatility:
+            vol_df = cumulative_session_volatility(
+                intraday_df=data,
+                n_periods=volatility_periods,
+                price_col=price_col,
+                session_start=start,
+                session_end=end,
+                tz=tz,
+            )
+            features.update(vol_df.to_dict(orient="series"))
+
+        for name, series in features.items():
+            self._add_feature(series, name)
+
+        return pd.DataFrame(features)
 
     def assemble_training_frame(
             self,
