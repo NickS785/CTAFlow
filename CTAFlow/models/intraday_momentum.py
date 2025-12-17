@@ -139,6 +139,104 @@ class IntradayMomentum:
         mask = normalized_idx.isin(self.valid_trading_dates)
         return data[mask]
 
+    def _needs_shift(self, feature_time: time) -> bool:
+        """Determine if a feature at feature_time needs to be shifted to avoid lookahead bias.
+
+        Parameters
+        ----------
+        feature_time : time
+            The time of day when the feature is measured
+
+        Returns
+        -------
+        bool
+            True if feature should be shifted (lagged by 1 day)
+
+        Notes
+        -----
+        Shift is needed when feature_time is at or after target_time within the same trading session.
+        For overnight sessions (session_open > session_end), handles midnight wrap-around correctly.
+        """
+        # Check if we're in an overnight session (crosses midnight)
+        if self.session_open > self.session_end:
+            # Overnight session (e.g., 18:00 open, 16:00 close next day)
+            # Session timeline: [session_open, 23:59] -> midnight -> [00:00, session_end]
+
+            # Determine if times are in session
+            feature_in_session = (feature_time >= self.session_open) or (feature_time <= self.session_end)
+            target_in_session = (self.target_time >= self.session_open) or (self.target_time <= self.session_end)
+
+            # If feature is outside session hours, it's from previous trading day
+            if not feature_in_session:
+                return True
+
+            # Both in session - determine temporal order accounting for midnight wrap
+            feature_is_evening = feature_time >= self.session_open  # In [session_open, 23:59]
+            target_is_evening = self.target_time >= self.session_open  # In [session_open, 23:59]
+
+            if feature_is_evening and target_is_evening:
+                # Both in evening part - simple comparison
+                return feature_time >= self.target_time
+            elif not feature_is_evening and not target_is_evening:
+                # Both in morning part (next calendar day) - simple comparison
+                return feature_time >= self.target_time
+            elif feature_is_evening and not target_is_evening:
+                # Feature is in evening (e.g., 20:00), target in morning (e.g., 16:00)
+                # Feature comes BEFORE target in session timeline
+                return False
+            else:
+                # Feature is in morning (e.g., 08:00), target in evening (e.g., 20:00)
+                # Feature comes AFTER target in session timeline
+                return True
+        else:
+            # Standard session (no midnight crossing)
+            return feature_time >= self.target_time
+
+    def _make_feature_name(
+        self,
+        base_name: str,
+        feature_time: time,
+        period_str: str = "",
+        ticker: str = ""
+    ) -> str:
+        """Generate feature name with proper prefix for shifted features.
+
+        Parameters
+        ----------
+        base_name : str
+            Base descriptor (e.g., 'return', 'volume', 'ba_imbalance_norm')
+        feature_time : time
+            Time of day when feature is measured
+        period_str : str, optional
+            Period length string (e.g., '60min')
+        ticker : str, optional
+            Ticker symbol for cross-ticker features
+
+        Returns
+        -------
+        str
+            Feature name with 'pd_' prefix if shifted, otherwise standard format
+        """
+        time_str = feature_time.strftime("%H%M")
+        needs_shift = self._needs_shift(feature_time)
+
+        # Build components
+        parts = []
+        if ticker:
+            parts.append(ticker)
+        parts.append(time_str)
+        if period_str:
+            parts.append(period_str)
+        parts.append(base_name)
+
+        feature_name = '_'.join(parts)
+
+        # Add prefix if shifted
+        if needs_shift:
+            feature_name = f"pd_{feature_name}"
+
+        return feature_name
+
     @staticmethod
     def _filter_kwargs(method, kwargs: Dict) -> Dict:
         import inspect
@@ -487,10 +585,13 @@ class IntradayMomentum:
         target_returns = self._filter_to_trading_dates(target_returns)
 
         if add_as_feature:
-            feature_time_return = target_returns if target_time.hour < self.target_time.hour else target_returns.shift(1)
-            # Include period_length in feature name
+            # Shift if needed to avoid lookahead bias
+            needs_shift = self._needs_shift(target_time)
+            feature_time_return = target_returns.shift(1) if needs_shift else target_returns
+
+            # Generate feature name with 'pd_' prefix if shifted
             period_str = self._format_period_length(window)
-            feature_name = f'{target_time.strftime("%H%M")}_{period_str}_return' if period_str else f'{target_time.strftime("%H%M")}_return'
+            feature_name = self._make_feature_name('return', target_time, period_str)
             self._add_feature(feature_time_return, feature_name)
 
         return target_returns
@@ -573,11 +674,13 @@ class IntradayMomentum:
         target_volume = self._filter_to_trading_dates(target_volume)
 
         if add_as_feature:
-            # Lag if target_time is before the session target time to avoid lookahead bias
-            feature_volume = target_volume if target_time.hour < self.target_time.hour else target_volume.shift(1)
-            # Include period_length in feature name
+            # Shift if needed to avoid lookahead bias
+            needs_shift = self._needs_shift(target_time)
+            feature_volume = target_volume.shift(1) if needs_shift else target_volume
+
+            # Generate feature name with 'pd_' prefix if shifted
             period_str = self._format_period_length(window)
-            feature_name = f'{target_time.strftime("%H%M")}_{period_str}_volume_{aggregation}' if period_str else f'{target_time.strftime("%H%M")}_volume_{aggregation}'
+            feature_name = self._make_feature_name(f'volume_{aggregation}', target_time, period_str)
             self._add_feature(feature_volume, feature_name)
 
         return target_volume
@@ -699,18 +802,34 @@ class IntradayMomentum:
         # Calculate imbalance metrics
         imbalance = bid_rolling - ask_rolling
         total_vol = bid_rolling + ask_rolling
-        ratio = np.where(ask_rolling > 0, bid_rolling / ask_rolling, np.nan)
-        imbalance_norm = np.where(total_vol > 0, imbalance / total_vol, 0)
+
+        # Handle ratio calculation: NaN when ask_rolling is NaN or 0
+        ratio = bid_rolling / ask_rolling  # Will be NaN when ask_rolling is 0 or NaN
+
+        # Handle normalized imbalance:
+        # - Keep NaN when total_vol is NaN (from rolling window at start)
+        # - Set to 0 when total_vol is exactly 0 (no volume)
+        # - Calculate imbalance/total_vol when total_vol > 0
+        imbalance_norm = np.where(
+            pd.isna(total_vol),
+            np.nan,  # Preserve NaN from rolling window
+            np.where(total_vol > 0, imbalance / total_vol, 0)  # 0 when no volume
+        )
 
         # Extract at target time
         mask = data.index.time == target_time
 
         if return_components:
             # Return all components as DataFrame
+            # Create series first to preserve index
+            imbalance_series = pd.Series(imbalance, index=data.index)[mask]
+            ratio_series = pd.Series(ratio, index=data.index)[mask]
+            imbalance_norm_series = pd.Series(imbalance_norm, index=data.index)[mask]
+
             components_df = pd.DataFrame({
-                'ba_imbalance': imbalance[mask],
-                'ba_ratio': ratio[mask],
-                'ba_imbalance_norm': imbalance_norm[mask]
+                'ba_imbalance': imbalance_series,
+                'ba_ratio': ratio_series,
+                'ba_imbalance_norm': imbalance_norm_series
             })
             components_df.index = pd.to_datetime(components_df.index).normalize()
 
@@ -718,29 +837,35 @@ class IntradayMomentum:
             components_df = self._filter_to_trading_dates(components_df)
 
             if add_as_feature:
-                # Include period_length in feature name
+                # Shift if needed to avoid lookahead bias
+                needs_shift = self._needs_shift(target_time)
                 period_str = self._format_period_length(window)
-                # Lag if needed and add each component
+
+                # Add each component with proper naming
                 for col in components_df.columns:
-                    feature_series = components_df[col] if target_time.hour < self.target_time.hour else components_df[col].shift(1)
-                    feature_name = f'{target_time.strftime("%H%M")}_{period_str}_{col}' if period_str else f'{target_time.strftime("%H%M")}_{col}'
+                    feature_series = components_df[col].shift(1) if needs_shift else components_df[col]
+                    feature_name = self._make_feature_name(col, target_time, period_str)
                     self._add_feature(feature_series, feature_name)
 
             return components_df
         else:
             # Return just normalized imbalance as Series (default, like target_time_returns)
-            target_imbalance = pd.Series(imbalance_norm[mask])
+            # Create series with proper index before masking
+            imbalance_norm_series = pd.Series(imbalance_norm, index=data.index)
+            target_imbalance = imbalance_norm_series[mask]
             target_imbalance.index = pd.to_datetime(target_imbalance.index).normalize()
 
             # Filter to only valid trading dates (removes weekends/holidays)
             target_imbalance = self._filter_to_trading_dates(target_imbalance)
 
             if add_as_feature:
-                # Include period_length in feature name
+                # Shift if needed to avoid lookahead bias
+                needs_shift = self._needs_shift(target_time)
+                feature_imbalance = target_imbalance.shift(1) if needs_shift else target_imbalance
+
+                # Generate feature name with 'pd_' prefix if shifted
                 period_str = self._format_period_length(window)
-                # Lag if needed to avoid lookahead bias
-                feature_imbalance = target_imbalance if target_time.hour < self.target_time.hour else target_imbalance.shift(1)
-                feature_name = f'{target_time.strftime("%H%M")}_{period_str}_ba_imbalance_norm' if period_str else f'{target_time.strftime("%H%M")}_ba_imbalance_norm'
+                feature_name = self._make_feature_name('ba_imbalance_norm', target_time, period_str)
                 self._add_feature(feature_imbalance, feature_name)
 
             return target_imbalance
@@ -880,11 +1005,19 @@ class IntradayMomentum:
 
             # Add as feature if requested
             if add_as_feature:
+                # Shift if needed to avoid lookahead bias
+                needs_shift = self._needs_shift(target_time)
+                feature_corr = corr_series.shift(1) if needs_shift else corr_series
+
+                # Build feature name with proper prefix
                 period_str = f'{n_bars}bar'
                 if resample:
                     period_str = f'{n_bars}bar_{resample_period}'
-                feature_name = f'{target_time.strftime("%H%M")}_{period_str}_corr_{ticker}'
-                self._add_feature(corr_series, feature_name)
+
+                # Use standard naming with ticker
+                base_name = f'corr_{ticker}'
+                feature_name = self._make_feature_name(base_name, target_time, period_str)
+                self._add_feature(feature_corr, feature_name)
 
         # Return Series if single ticker, DataFrame if multiple
         if return_series:
@@ -1050,19 +1183,13 @@ class IntradayMomentum:
         target_returns = self._filter_to_trading_dates(target_returns)
 
         if add_as_feature:
-            # Prevent lookahead: shift if target_time >= session target time
-            feature_ticker_return = (
-                target_returns
-                if target_time < self.target_time
-                else target_returns.shift(1)
-            )
-            # Include ticker and period_length in feature name
+            # Shift if needed to avoid lookahead bias
+            needs_shift = self._needs_shift(target_time)
+            feature_ticker_return = target_returns.shift(1) if needs_shift else target_returns
+
+            # Generate feature name with 'pd_' prefix if shifted, include ticker
             period_str = self._format_period_length(window)
-            feature_name = (
-                f'{ticker}_{target_time.strftime("%H%M")}_{period_str}_return'
-                if period_str
-                else f'{ticker}_{target_time.strftime("%H%M")}_return'
-            )
+            feature_name = self._make_feature_name('return', target_time, period_str, ticker=ticker)
             self._add_feature(feature_ticker_return, feature_name)
 
         return target_returns
