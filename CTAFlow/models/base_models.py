@@ -25,6 +25,8 @@ warnings.filterwarnings('ignore')
 data_load_func = fetch_data_sync
 
 
+
+
 def _detect_cuda_available():
     """Detect if CUDA-capable GPU is available for XGBoost/LightGBM
 
