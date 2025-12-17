@@ -1,16 +1,35 @@
-"""Session filtering utilities for intraday data."""
+"""Session filtering utilities for intraday data.
+
+This module centralizes common session definitions, default timezones, and
+helpers for slicing intraday data into local trading windows.
+"""
 from __future__ import annotations
 
 from datetime import time
-from typing import Union
+from typing import Dict, Tuple, Union
 from functools import lru_cache
 
 import pandas as pd
 
-
-__all__ = ["filter_session_ticks", "filter_session_bars"]
+__all__ = [
+    "DEFAULT_SESSION_TZ",
+    "TRADING_SESSIONS",
+    "get_session_window",
+    "filter_session_ticks",
+    "filter_session_bars",
+]
 
 _TimeLike = Union[str, time]
+
+
+# Default to CME (Chicago) hours unless otherwise specified
+DEFAULT_SESSION_TZ = "America/Chicago"
+
+
+def us_regular():
+    """US regular trading hours (RTH) for equities and equity futures."""
+
+    return time(8, 30), time(15, 0)
 
 def asia():
 
@@ -18,6 +37,29 @@ def asia():
 
 def london():
     return (time(2,30), time(11, 0))
+
+
+# Canonical session definitions for downstream features
+TRADING_SESSIONS: Dict[str, Tuple[time, time]] = {
+    "us_rth": us_regular(),
+    "asia": asia(),
+    "london": london(),
+}
+
+
+def get_session_window(name: str) -> Tuple[time, time]:
+    """Return the (start, end) tuple for a named session.
+
+    Parameters
+    ----------
+    name : str
+        Key in :data:`TRADING_SESSIONS` (case-insensitive).
+    """
+
+    key = name.lower()
+    if key not in TRADING_SESSIONS:
+        raise KeyError(f"Unknown session '{name}'. Valid options: {sorted(TRADING_SESSIONS)}")
+    return TRADING_SESSIONS[key]
 
 
 
@@ -80,9 +122,9 @@ def _ensure_series_tz(series: pd.Series, tz: str) -> pd.Series:
 
 def filter_session_ticks(
     ticks: pd.DataFrame,
-    tz: str,
-    start: _TimeLike,
-    end: _TimeLike,
+    tz: str = DEFAULT_SESSION_TZ,
+    start: _TimeLike = us_regular()[0],
+    end: _TimeLike = us_regular()[1],
 ) -> pd.DataFrame:
     """Return ticks whose timestamps fall inside ``[start, end]`` in ``tz``.
 
@@ -122,9 +164,9 @@ def filter_session_ticks(
 
 def filter_session_bars(
     bars: pd.DataFrame,
-    tz: str,
-    start: _TimeLike,
-    end: _TimeLike,
+    tz: str = DEFAULT_SESSION_TZ,
+    start: _TimeLike = us_regular()[0],
+    end: _TimeLike = us_regular()[1],
 ) -> pd.DataFrame:
     """Filter intraday bars by the local session window."""
 
