@@ -149,11 +149,29 @@ class IntradayMomentumLight:
             self.feature_names.append(feature_name)
         else:
             if isinstance(self.training_data, pd.DataFrame):
-                # Use pandas Index.intersection instead of set operations
-                dates = self.training_data.index.normalize()
-                data_dates = pd.DatetimeIndex(data.index).normalize()
-                common = dates.intersection(data_dates)
-                self.training_data[feature_name] = data.loc[common]
+                # Normalize timezone alignment before intersecting indices
+                aligned_data = data.copy()
+                aligned_index = pd.DatetimeIndex(aligned_data.index)
+                train_index = pd.DatetimeIndex(self.training_data.index)
+
+                if train_index.tz is None:
+                    if aligned_index.tz is not None:
+                        aligned_index = aligned_index.tz_localize(None)
+                else:
+                    if aligned_index.tz is None:
+                        aligned_index = aligned_index.tz_localize(train_index.tz)
+                    else:
+                        aligned_index = aligned_index.tz_convert(train_index.tz)
+
+                train_dates = train_index.normalize()
+                aligned_index = aligned_index.normalize()
+
+                if train_dates.tz is None and aligned_index.tz is not None:
+                    aligned_index = aligned_index.tz_localize(None)
+
+                aligned_data.index = aligned_index
+                common = train_dates.intersection(aligned_index)
+                self.training_data[feature_name] = aligned_data.loc[common]
                 self.feature_names.append(feature_name)
         return
 
