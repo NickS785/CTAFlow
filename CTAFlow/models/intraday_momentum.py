@@ -314,26 +314,334 @@ class IntradayMomentum:
             raise KeyError(f"Price column '{price_col}' not found")
         return df[price_col].copy()
 
-    def prev_hl(self, horizon=5, add_as_feature=True, normalize=False):
-        # Resample to daily and drop NaN rows (weekends/holidays)
-        daily_ohlc = self.intraday_data.resample('1d', offset=f"-{self.target_time.hour}h").agg({"Open":"first", "High":"max", "Low":"min", "Close":"last"}).dropna()
+    def prev_hl(
+            self,
+            target_time: Optional[time] = None,
+            intraday_df: Optional[pd.DataFrame] = None,
+            price_col: str = "Close",
+            add_as_feature: bool = False,
+    ) -> pd.DataFrame:
+        """Calculate distance from current price to previous session high/low.
 
-        h = daily_ohlc['High'].shift(1).rolling(horizon).max()
-        l = daily_ohlc["Low"].shift(1).rolling(horizon).min()
+        Parameters
+        ----------
+        target_time : Optional[time]
+            Time of day to measure distance. Uses self.target_time if None.
+        intraday_df : Optional[pd.DataFrame]
+            Intraday OHLCV data with DatetimeIndex. Uses self.intraday_data if None.
+        price_col : str, default "Close"
+            Column name for price data
+        add_as_feature : bool, default False
+            If True, add features to training_data with proper lagging
 
-        if normalize or add_as_feature:
-            # Use daily_ohlc Close prices for perfect alignment with h and l
-            prices = daily_ohlc['Close']
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with columns 'dist_prior_high' and 'dist_prior_low'
 
-            h_norm = (h - prices)/prices
-            l_norm = (prices - l)/prices
-            if add_as_feature:
-                self._add_feature(h_norm, f"{horizon}_high")
-                self._add_feature(l_norm, feature_name=f"{horizon}_low")
+        Notes
+        -----
+        - Calculates (price - prior_high) / prior_high and (price - prior_low) / prior_low
+        - Prior session = previous trading day's session high/low
+        - Properly lags features if target_time is at or after self.target_time
+        - Filtered to valid trading dates (removes weekends/holidays)
 
-            return h_norm, l_norm
+        Examples
+        --------
+        >>> model = IntradayMomentum(intraday_data, session_open=time(8, 30), session_end=time(15, 0))
+        >>> dist_df = model.prev_hl(target_time=time(14, 0), add_as_feature=True)
+        """
+        data = intraday_df if intraday_df is not None else self.intraday_data
+        if data is None or data.empty:
+            raise ValueError("Intraday data is required for prev_hl")
+
+        t_time = target_time or self.target_time
+
+        # Get required columns
+        if 'High' not in data.columns or 'Low' not in data.columns:
+            raise KeyError("'High' and 'Low' columns required for prev_hl")
+
+        prices = self._coerce_price(data, price_col)
+
+        # Resample to daily to get session highs and lows
+        daily_ohlc = data.resample('1D').agg({
+            'High': 'max',
+            'Low': 'min',
+            price_col: 'last'
+        }).dropna()
+
+        # Filter to valid trading dates
+        daily_ohlc.index = daily_ohlc.index.normalize()
+        daily_ohlc = self._filter_to_trading_dates(daily_ohlc)
+
+        # Get prior session high/low (shifted by 1 day)
+        prior_high = daily_ohlc['High'].shift(1)
+        prior_low = daily_ohlc['Low'].shift(1)
+        prior_close = daily_ohlc[price_col].shift(1)
+
+        # Get current price at target_time
+        mask = data.index.time == t_time
+        target_prices = prices[mask]
+        target_prices.index = pd.to_datetime(target_prices.index).normalize()
+        target_prices = self._filter_to_trading_dates(target_prices)
+
+        # Calculate distances
+        dist_high = (target_prices - prior_high) / prior_high
+        dist_low = (target_prices - prior_low) / prior_low
+        dist_close = (target_prices - prior_close) / prior_close
+
+        result_df = pd.DataFrame({
+            'dist_prior_high': dist_high,
+            'dist_prior_low': dist_low,
+            'dist_prior_close': dist_close
+        })
+
+        if add_as_feature:
+            # Determine if we need to shift
+            needs_shift = self._needs_shift(t_time)
+
+            for col in result_df.columns:
+                feature_series = result_df[col].shift(1) if needs_shift else result_df[col]
+                feature_name = self._make_feature_name(col, t_time, "")
+                self._add_feature(feature_series, feature_name)
+
+        return result_df
+
+    def vwap_distance(
+            self,
+            target_time: Union[time, List[time]],
+            intraday_df: Optional[pd.DataFrame] = None,
+            period_length: Optional[timedelta] = None,
+            price_col: str = "Close",
+            volume_col: str = "Volume",
+            add_as_feature: bool = False,
+    ) -> Union[pd.Series, pd.DataFrame]:
+        """Calculate distance from VWAP at target time(s).
+
+        Computes volume-weighted average price from session open to target_time,
+        then calculates (price - vwap) / vwap as a normalized distance metric.
+
+        Parameters
+        ----------
+        target_time : time or List[time]
+            Single time or list of times to calculate VWAP distance for
+        intraday_df : Optional[pd.DataFrame]
+            Intraday OHLCV data with DatetimeIndex. Uses self.intraday_data if None.
+        period_length : Optional[timedelta]
+            Lookback window for VWAP calculation. If None, uses from session_open to target_time.
+        price_col : str, default "Close"
+            Column name for price data
+        volume_col : str, default "Volume"
+            Column name for volume data
+        add_as_feature : bool, default False
+            If True, add to training_data with proper lagging
+
+        Returns
+        -------
+        pd.Series or pd.DataFrame
+            If single time: Series with VWAP distance
+            If list of times: DataFrame with one column per time
+
+        Notes
+        -----
+        - VWAP = sum(price * volume) / sum(volume) over the lookback period
+        - Properly lags feature if target_time is at or after self.target_time
+        - Filtered to valid trading dates (removes weekends/holidays)
+
+        Examples
+        --------
+        >>> model = IntradayMomentum(intraday_data, session_open=time(8, 30))
+        >>> # Distance from VWAP at 2:00 PM
+        >>> vwap_dist = model.vwap_distance(time(14, 0), add_as_feature=True)
+        >>> # Multiple times
+        >>> vwap_dist_df = model.vwap_distance([time(10, 0), time(14, 0)])
+        """
+        # Handle list of times
+        if isinstance(target_time, (list, tuple)):
+            results = {}
+            for t in target_time:
+                result = self.vwap_distance(
+                    t, intraday_df, period_length, price_col, volume_col, add_as_feature
+                )
+                results[f'{t.strftime("%H%M")}'] = result
+            return pd.DataFrame(results)
+
+        # Single time handling
+        data = intraday_df if intraday_df is not None else self.intraday_data
+        if data is None or data.empty:
+            raise ValueError("Intraday data is required for VWAP distance")
+
+        if volume_col not in data.columns:
+            raise KeyError(f"Volume column '{volume_col}' not found in data")
+
+        prices = self._coerce_price(data, price_col)
+        volume = data[volume_col].copy()
+
+        # Calculate typical price (for more accurate VWAP)
+        if 'High' in data.columns and 'Low' in data.columns:
+            typical_price = (data['High'] + data['Low'] + prices) / 3
         else:
-            return h, l
+            typical_price = prices
+
+        # If period_length specified, use rolling VWAP
+        if period_length:
+            bars = max(int(period_length.total_seconds() // 60 // 5), 1)
+            pv = (typical_price * volume).rolling(bars).sum()
+            v = volume.rolling(bars).sum()
+            vwap = pv / v.replace(0, np.nan)
+        else:
+            # Use session-based VWAP (from session_open to target_time)
+            work_df = pd.DataFrame({
+                'price': typical_price,
+                'volume': volume,
+                'close': prices
+            })
+            work_df['date'] = work_df.index.normalize()
+
+            # Calculate session start time for each row
+            session_open_offset = pd.Timedelta(
+                hours=self.session_open.hour,
+                minutes=self.session_open.minute,
+                seconds=self.session_open.second,
+            )
+            work_df['session_start_time'] = work_df['date'] + session_open_offset
+
+            # Filter to session open -> target_time window
+            target_offset = pd.Timedelta(
+                hours=target_time.hour,
+                minutes=target_time.minute,
+                seconds=target_time.second,
+            )
+            work_df['target_time_dt'] = work_df['date'] + target_offset
+
+            # Keep only bars within session window
+            in_window = (work_df.index >= work_df['session_start_time']) & (work_df.index <= work_df['target_time_dt'])
+            window_data = work_df[in_window].copy()
+
+            # Calculate cumulative VWAP within each session
+            window_data['pv'] = window_data['price'] * window_data['volume']
+            cum_pv = window_data.groupby('date')['pv'].cumsum()
+            cum_vol = window_data.groupby('date')['volume'].cumsum()
+            window_data['vwap'] = cum_pv / cum_vol.replace(0, np.nan)
+
+            # Broadcast VWAP back to full dataframe
+            vwap = pd.Series(index=data.index, dtype=float)
+            vwap.loc[window_data.index] = window_data['vwap']
+
+        # Extract VWAP at target_time
+        mask = data.index.time == target_time
+        target_vwap = vwap[mask]
+        target_prices_at_time = prices[mask]
+
+        # Calculate distance: (price - vwap) / vwap
+        vwap_distance = (target_prices_at_time - target_vwap) / target_vwap
+        vwap_distance.index = pd.to_datetime(vwap_distance.index).normalize()
+
+        # Filter to valid trading dates
+        vwap_distance = self._filter_to_trading_dates(vwap_distance)
+
+        if add_as_feature:
+            # Shift if needed to avoid lookahead bias
+            needs_shift = self._needs_shift(target_time)
+            feature_vwap_dist = vwap_distance.shift(1) if needs_shift else vwap_distance
+
+            # Generate feature name with 'pd_' prefix if shifted
+            period_str = self._format_period_length(period_length) if period_length else "session"
+            feature_name = self._make_feature_name('dist_vwap', target_time, period_str)
+            self._add_feature(feature_vwap_dist, feature_name)
+
+        return vwap_distance
+
+    def overnight_returns(
+            self,
+            intraday_df: Optional[pd.DataFrame] = None,
+            price_col: str = "Close",
+            add_as_feature: bool = False,
+    ) -> pd.Series:
+        """Calculate overnight returns from previous session close to current session open.
+
+        Computes the return from the previous trading day's session close to the
+        current trading day's session open, representing the overnight gap.
+
+        Parameters
+        ----------
+        intraday_df : Optional[pd.DataFrame]
+            Intraday OHLCV data with DatetimeIndex. Uses self.intraday_data if None.
+        price_col : str, default "Close"
+            Column name for price data
+        add_as_feature : bool, default False
+            If True, add to training_data with proper lagging
+
+        Returns
+        -------
+        pd.Series
+            Daily overnight returns indexed by date
+
+        Notes
+        -----
+        - Overnight return = (session_open[t] - session_close[t-1]) / session_close[t-1]
+        - Properly lags feature if session_open is at or after target_time
+        - Filtered to only valid trading dates (removes weekends/holidays)
+
+        Examples
+        --------
+        >>> model = IntradayMomentum(intraday_data, session_open=time(8, 30), session_end=time(15, 0))
+        >>> overnight_ret = model.overnight_returns(add_as_feature=True)
+        """
+        data = intraday_df if intraday_df is not None else self.intraday_data
+        if data is None or data.empty:
+            raise ValueError("Intraday data is required for overnight returns")
+
+        prices = self._coerce_price(data, price_col)
+
+        # Extract session close prices (last price at or before session_end each day)
+        session_end_offset = pd.Timedelta(
+            hours=self.session_end.hour,
+            minutes=self.session_end.minute,
+            seconds=self.session_end.second,
+        )
+
+        # Extract session open prices (first price at or after session_open each day)
+        session_open_offset = pd.Timedelta(
+            hours=self.session_open.hour,
+            minutes=self.session_open.minute,
+            seconds=self.session_open.second,
+        )
+
+        # Create working dataframe
+        work_df = pd.DataFrame({'price': prices})
+        work_df['date'] = work_df.index.normalize()
+
+        # Get close prices (at session_end)
+        work_df['session_end_time'] = work_df['date'] + session_end_offset
+        close_mask = work_df.index.time == self.session_end
+        session_closes = work_df[close_mask].set_index('date')['price']
+
+        # Get open prices (at session_open)
+        work_df['session_open_time'] = work_df['date'] + session_open_offset
+        open_mask = work_df.index.time == self.session_open
+        session_opens = work_df[open_mask].set_index('date')['price']
+
+        # Calculate overnight returns: (open[t] - close[t-1]) / close[t-1]
+        prev_closes = session_closes.shift(1)
+        overnight_ret = (session_opens - prev_closes) / prev_closes
+
+        # Normalize index
+        overnight_ret.index = pd.to_datetime(overnight_ret.index).normalize()
+
+        # Filter to only valid trading dates (removes weekends/holidays)
+        overnight_ret = self._filter_to_trading_dates(overnight_ret)
+
+        if add_as_feature:
+            # Determine if we need to shift based on session_open time
+            needs_shift = self._needs_shift(self.session_open)
+            feature_ret = overnight_ret.shift(1) if needs_shift else overnight_ret
+
+            # Generate feature name with proper prefix
+            feature_name = self._make_feature_name('overnight_return', self.session_open, "")
+            self._add_feature(feature_ret, feature_name)
+
+        return overnight_ret
 
     def opening_range_volatility(
             self,
@@ -438,6 +746,260 @@ class IntradayMomentum:
                 self._add_feature(feature_df[col], col, tf='1d')
 
         return feature_df
+
+    def gk_vol(
+            self,
+            intraday_df: Optional[pd.DataFrame] = None,
+            lookbacks: Sequence[int] = (1, 5, 10, 20),
+            add_as_feature: bool = False,
+    ) -> pd.DataFrame:
+        """Calculate Garman-Klass volatility at daily level.
+
+        The Garman-Klass volatility estimator is more efficient than close-to-close
+        volatility as it uses OHLC data. It provides better estimates with fewer
+        observations.
+
+        Parameters
+        ----------
+        intraday_df : Optional[pd.DataFrame]
+            Intraday OHLCV data with DatetimeIndex
+        lookbacks : Sequence[int], default (1, 5, 10, 20)
+            Lookback periods in days for rolling GK volatility
+        add_as_feature : bool, default False
+            If True, add features to training_data with proper lagging
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with GK volatility columns for each lookback
+
+        Notes
+        -----
+        - GK estimator: 0.5 * log(H/L)^2 - (2*log(2) - 1) * log(C/O)^2
+        - All features are lagged by 1 day to avoid lookahead bias
+        - More efficient than realized volatility for intraday data
+        - Annualized assuming 252 trading days
+
+        Examples
+        --------
+        >>> model = IntradayMomentum(intraday_data)
+        >>> gk_vol_df = model.gk_vol(lookbacks=[5, 20], add_as_feature=True)
+        """
+        data = intraday_df if intraday_df is not None else self.intraday_data
+        if data is None or data.empty:
+            raise ValueError("Intraday data is required for GK volatility")
+
+        # Check for required columns
+        required_cols = ['Open', 'High', 'Low', 'Close']
+        missing_cols = [col for col in required_cols if col not in data.columns]
+        if missing_cols:
+            raise KeyError(f"Missing required columns for GK volatility: {missing_cols}")
+
+        # Resample to daily OHLC
+        daily_ohlc = data.resample('1D').agg({
+            'Open': 'first',
+            'High': 'max',
+            'Low': 'min',
+            'Close': 'last'
+        }).dropna()
+
+        daily_ohlc.index = daily_ohlc.index.normalize()
+        daily_ohlc = self._filter_to_trading_dates(daily_ohlc)
+
+        # Calculate log ratios
+        log_hl = np.log(daily_ohlc['High'] / daily_ohlc['Low'])
+        log_co = np.log(daily_ohlc['Close'] / daily_ohlc['Open'])
+
+        # GK estimator
+        gk_term = 0.5 * log_hl**2 - (2*np.log(2) - 1) * log_co**2
+
+        features: Dict[str, pd.Series] = {}
+        for lookback in lookbacks:
+            # Rolling average of GK term, then annualize
+            gk_vol = np.sqrt(gk_term.rolling(lookback).mean() * 252)
+
+            # Lag by 1 to avoid lookahead bias
+            gk_vol_lagged = gk_vol.shift(1)
+
+            feature_name = f"gk_vol_{lookback}d"
+            features[feature_name] = gk_vol_lagged
+
+            if add_as_feature and isinstance(self.training_data, pd.DataFrame):
+                self._add_feature(gk_vol_lagged, feature_name, tf='1d')
+
+        return pd.DataFrame(features)
+
+    def intraday_range(
+            self,
+            target_time: Union[time, List[time]],
+            intraday_df: Optional[pd.DataFrame] = None,
+            lookback_days: int = 20,
+            add_as_feature: bool = False,
+    ) -> Union[pd.Series, pd.DataFrame]:
+        """Calculate current intraday range relative to historical average.
+
+        Measures the current session's high-low range at target_time and normalizes
+        it by the average range over the lookback period.
+
+        Parameters
+        ----------
+        target_time : time or List[time]
+            Time(s) to measure the current range
+        intraday_df : Optional[pd.DataFrame]
+            Intraday OHLCV data with DatetimeIndex
+        lookback_days : int, default 20
+            Number of days to use for historical average range
+        add_as_feature : bool, default False
+            If True, add to training_data with proper lagging
+
+        Returns
+        -------
+        pd.Series or pd.DataFrame
+            If single time: Series with range ratio
+            If list of times: DataFrame with one column per time
+
+        Notes
+        -----
+        - Range ratio = current_range / avg_range
+        - Values > 1 indicate above-average range (higher volatility)
+        - Values < 1 indicate below-average range (lower volatility)
+        - Properly lags if target_time is at or after self.target_time
+
+        Examples
+        --------
+        >>> model = IntradayMomentum(intraday_data)
+        >>> range_ratio = model.intraday_range(time(14, 0), lookback_days=20, add_as_feature=True)
+        """
+        # Handle list of times
+        if isinstance(target_time, (list, tuple)):
+            results = {}
+            for t in target_time:
+                result = self.intraday_range(t, intraday_df, lookback_days, add_as_feature)
+                results[f'{t.strftime("%H%M")}'] = result
+            return pd.DataFrame(results)
+
+        # Single time handling
+        data = intraday_df if intraday_df is not None else self.intraday_data
+        if data is None or data.empty:
+            raise ValueError("Intraday data is required for intraday range")
+
+        if 'High' not in data.columns or 'Low' not in data.columns:
+            raise KeyError("'High' and 'Low' columns required for intraday range")
+
+        # Calculate cumulative session high/low up to target_time
+        work_df = pd.DataFrame({
+            'high': data['High'],
+            'low': data['Low']
+        })
+        work_df['date'] = work_df.index.normalize()
+
+        # Filter to bars up to target_time each day
+        work_df['time'] = work_df.index.time
+        mask = work_df['time'] <= target_time
+        filtered_data = work_df[mask].copy()
+
+        # Get session high/low up to target_time
+        session_stats = filtered_data.groupby('date').agg({
+            'high': 'max',
+            'low': 'min'
+        })
+        session_stats['range'] = session_stats['high'] - session_stats['low']
+
+        # Filter to valid trading dates
+        session_stats.index = pd.to_datetime(session_stats.index).normalize()
+        session_stats = self._filter_to_trading_dates(session_stats)
+
+        # Calculate rolling average range
+        avg_range = session_stats['range'].rolling(lookback_days).mean()
+
+        # Range ratio
+        range_ratio = session_stats['range'] / avg_range
+
+        if add_as_feature:
+            # Shift if needed to avoid lookahead bias
+            needs_shift = self._needs_shift(target_time)
+            feature_range = range_ratio.shift(1) if needs_shift else range_ratio
+
+            # Generate feature name
+            feature_name = self._make_feature_name(f'range_ratio_{lookback_days}d', target_time, "")
+            self._add_feature(feature_range, feature_name)
+
+        return range_ratio
+
+    def vol_ratios(
+            self,
+            intraday_df: Optional[pd.DataFrame] = None,
+            short_long_pairs: Sequence[Tuple[int, int]] = ((5, 20), (10, 60), (20, 120)),
+            price_col: str = "Close",
+            add_as_feature: bool = False,
+    ) -> pd.DataFrame:
+        """Calculate short-term vs long-term volatility ratios.
+
+        Compares short-term realized volatility to long-term volatility to identify
+        regime changes. High ratios indicate recent volatility expansion.
+
+        Parameters
+        ----------
+        intraday_df : Optional[pd.DataFrame]
+            Intraday OHLCV data with DatetimeIndex
+        short_long_pairs : Sequence[Tuple[int, int]], default ((5, 20), (10, 60), (20, 120))
+            Pairs of (short_window, long_window) in days for volatility comparison
+        price_col : str, default "Close"
+            Column name for price data
+        add_as_feature : bool, default False
+            If True, add features to training_data
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with volatility ratio columns for each pair
+
+        Notes
+        -----
+        - Ratio = short_term_vol / long_term_vol
+        - Values > 1 indicate volatility expansion (recent vol higher than average)
+        - Values < 1 indicate volatility contraction (recent vol lower than average)
+        - All features lagged by 1 day to avoid lookahead bias
+        - Uses close-to-close returns for simplicity
+
+        Examples
+        --------
+        >>> model = IntradayMomentum(intraday_data)
+        >>> vol_ratios_df = model.vol_ratios(short_long_pairs=[(5, 20), (10, 60)], add_as_feature=True)
+        """
+        data = intraday_df if intraday_df is not None else self.intraday_data
+        if data is None or data.empty:
+            raise ValueError("Intraday data is required for volatility ratios")
+
+        prices = self._coerce_price(data, price_col)
+
+        # Calculate returns
+        returns = prices.pct_change().dropna()
+
+        # Resample to daily
+        daily_returns = returns.groupby(pd.Grouper(freq="1D")).sum()
+        daily_returns.index = daily_returns.index.normalize()
+        daily_returns = self._filter_to_trading_dates(daily_returns)
+
+        features: Dict[str, pd.Series] = {}
+        for short_window, long_window in short_long_pairs:
+            # Calculate rolling volatility for both windows
+            short_vol = daily_returns.rolling(short_window).std()
+            long_vol = daily_returns.rolling(long_window).std()
+
+            # Ratio
+            vol_ratio = short_vol / long_vol.replace(0, np.nan)
+
+            # Lag by 1 to avoid lookahead bias
+            vol_ratio_lagged = vol_ratio.shift(1)
+
+            feature_name = f"vol_ratio_{short_window}_{long_window}d"
+            features[feature_name] = vol_ratio_lagged
+
+            if add_as_feature and isinstance(self.training_data, pd.DataFrame):
+                self._add_feature(vol_ratio_lagged, feature_name, tf='1d')
+
+        return pd.DataFrame(features)
 
     def create_clf_target(
             self,
