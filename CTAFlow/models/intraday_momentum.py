@@ -1983,6 +1983,136 @@ class IntradayMomentum:
             self._add_feature(series, name)
         return feature_df
 
+    def add_eia_release_features(
+        self,
+        ticker: str,
+        dates: Optional[pd.DatetimeIndex] = None,
+        add_as_feature: bool = True,
+    ) -> pd.DataFrame:
+        """Add EIA (Energy Information Administration) release day features.
+
+        EIA releases weekly petroleum and natural gas inventory reports which are
+        major market-moving events for energy futures.
+
+        Parameters
+        ----------
+        ticker : str
+            Ticker symbol to determine product type:
+            - Petroleum products (CL, RB, HO, BZ): First Tuesday + every Wednesday
+            - Natural Gas products (NG): First Tuesday + every Thursday
+        dates : Optional[pd.DatetimeIndex]
+            Date index to create features for. Uses self.training_data.index if None.
+        add_as_feature : bool, default True
+            If True, add features to training_data
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with EIA release features:
+            - is_eia_release_day: Binary flag (1 on release days, 0 otherwise)
+            - days_since_eia: Days since last EIA release
+            - days_until_eia: Days until next EIA release
+
+        Notes
+        -----
+        EIA Release Schedule:
+        - Petroleum Status Report (CL, RB, HO, BZ):
+          * First Tuesday of each month (if market open)
+          * Every Wednesday at 10:30 AM ET
+        - Natural Gas Storage Report (NG):
+          * First Tuesday of each month (if market open)
+          * Every Thursday at 10:30 AM ET
+
+        Release days can cause increased volatility and volume.
+
+        Examples
+        --------
+        >>> model = IntradayMomentum(intraday_data)
+        >>> # For crude oil
+        >>> eia_feats = model.add_eia_release_features('CL', add_as_feature=True)
+        >>> # For natural gas
+        >>> eia_feats = model.add_eia_release_features('NG', add_as_feature=True)
+        """
+        idx = dates if dates is not None else self.training_data.index
+        if not isinstance(idx, pd.DatetimeIndex):
+            idx = pd.to_datetime(idx)
+
+        # Normalize to dates
+        normalized = pd.DatetimeIndex(idx).normalize()
+
+        # Determine product type
+        petroleum_products = ['CL', 'RB', 'HO', 'BZ', 'WTI', 'BRENT']
+        natural_gas_products = ['NG', 'NGAS', 'NATGAS']
+
+        ticker_upper = ticker.upper()
+
+        # Initialize release day mask
+        is_eia_day = pd.Series(False, index=normalized)
+
+        # Get day of week (0=Monday, 1=Tuesday, ..., 6=Sunday)
+        day_of_week = normalized.dayofweek
+
+        # First Tuesday of each month (applies to both petroleum and NG)
+        # Check if it's a Tuesday (day 1) and day of month is 1-7
+        is_first_tuesday = (day_of_week == 1) & (normalized.day <= 7)
+        is_eia_day |= is_first_tuesday
+
+        if ticker_upper in petroleum_products:
+            # Every Wednesday (day 2)
+            is_wednesday = day_of_week == 2
+            is_eia_day |= is_wednesday
+
+        elif ticker_upper in natural_gas_products:
+            # Every Thursday (day 3)
+            is_thursday = day_of_week == 3
+            is_eia_day |= is_thursday
+
+        else:
+            # Unknown ticker - use petroleum schedule as default
+            import warnings
+            warnings.warn(
+                f"Ticker '{ticker}' not recognized for EIA releases. "
+                f"Using petroleum schedule (First Tuesday + Wednesday). "
+                f"Known tickers: {petroleum_products + natural_gas_products}",
+                UserWarning
+            )
+            is_wednesday = day_of_week == 2
+            is_eia_day |= is_wednesday
+
+        # Calculate days since last EIA release
+        eia_dates = normalized[is_eia_day]
+        days_since = pd.Series(np.nan, index=normalized)
+
+        for i, date in enumerate(normalized):
+            past_releases = eia_dates[eia_dates < date]
+            if len(past_releases) > 0:
+                days_since.iloc[i] = (date - past_releases[-1]).days
+            else:
+                days_since.iloc[i] = np.nan
+
+        # Calculate days until next EIA release
+        days_until = pd.Series(np.nan, index=normalized)
+
+        for i, date in enumerate(normalized):
+            future_releases = eia_dates[eia_dates > date]
+            if len(future_releases) > 0:
+                days_until.iloc[i] = (future_releases[0] - date).days
+            else:
+                days_until.iloc[i] = np.nan
+
+        # Create feature DataFrame
+        feature_df = pd.DataFrame({
+            'is_eia_release_day': is_eia_day.astype(int),
+            'days_since_eia': days_since,
+            'days_until_eia': days_until
+        }, index=normalized)
+
+        if add_as_feature and isinstance(self.training_data, pd.DataFrame):
+            for col in feature_df.columns:
+                self._add_feature(feature_df[col], col)
+
+        return feature_df
+
     def add_session_features(
         self,
         intraday_df: Optional[pd.DataFrame] = None,
