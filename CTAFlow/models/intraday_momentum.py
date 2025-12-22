@@ -11,6 +11,7 @@ from ..features.session_features import (
     cumulative_session_returns,
     cumulative_session_volatility,
 )
+from .feature_selection import FeatureSelector, FeatureSelectionConfig
 from ..utils.session import DEFAULT_SESSION_TZ
 from . import base_models
 from .base_models import CTALight
@@ -1809,6 +1810,40 @@ class IntradayMomentum:
             grid_kwargs = self._filter_kwargs(model.grid_search, kwargs)
             return model.grid_search(X, y, **grid_kwargs)
         raise AttributeError(f"Model {model.__class__.__name__} does not support grid search")
+
+    def fit_selected(
+            self,
+            selector: Optional[FeatureSelector] = None,
+            selector_config: Optional[FeatureSelectionConfig] = None,
+            **fit_kwargs,
+    ):
+        X = self.training_data.copy()
+        y = self.target_data.copy()
+
+        base_model = self._get_model()
+
+        # IMPORTANT: we want a plain sklearn-style estimator for importances.
+        # For your base_models wrappers, they typically expose `.model` internally.
+        est = getattr(base_model, "model", None) or base_model
+
+        if selector is None:
+            selector = FeatureSelector(selector_config or FeatureSelectionConfig())
+
+        Xs = selector.fit_transform(X, y, estimator=est)
+
+        # cache for later
+        self.selector_ = selector
+        self.selected_features_ = selector.selected_features_
+
+        # fit the actual wrapper model using reduced X
+        self.fit(Xs, y, **fit_kwargs)
+        return self
+
+    def predict_selected(self, X: pd.DataFrame, **predict_kwargs):
+        if not hasattr(self, "selector_"):
+            raise ValueError("No selector fitted. Call fit_selected() first.")
+        Xs = self.selector_.transform(X)
+        return self.predict(Xs, **predict_kwargs)
 
     def microstructure_features(
             self,

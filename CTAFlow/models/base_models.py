@@ -1440,7 +1440,7 @@ class CTALight:
             
         return self.model.predict(X, num_iteration=num_iteration)
     
-    def cross_validate(self, X, y, cv_folds=5, early_stopping_rounds=50):
+    def cross_validate(self, X, y, cv_folds=3, early_stopping_rounds=50):
         """Perform time series cross-validation
         
         Args:
@@ -1932,7 +1932,7 @@ class CTAXGBoost:
 
         return self.model.predict(X)
 
-    def cross_validate(self, X, y, cv_folds=5, scoring='neg_mean_squared_error'):
+    def cross_validate(self, X, y, cv_folds=3, scoring='neg_mean_squared_error'):
         """Perform time series cross-validation with GPU support"""
         if isinstance(X, pd.DataFrame):
             X = X.values
@@ -2203,7 +2203,7 @@ class CTARForest:
             
         return self.model.predict(X)
     
-    def cross_validate(self, X, y, cv_folds=5, scoring='neg_mean_squared_error'):
+    def cross_validate(self, X, y, cv_folds=3, scoring='neg_mean_squared_error'):
         """Perform time series cross-validation
         
         Args:
