@@ -2678,11 +2678,33 @@ class IntradayMomentum:
     def get_xy(
             self,
     ) -> Tuple[pd.DataFrame, pd.Series]:
-        """Convenience constructor for a full training feature matrix."""
-        x_data = self.training_data[self.feature_names].dropna()
+        """Convenience constructor for a full training feature matrix.
+
+        Performs the following cleaning steps:
+        1. Selects features from self.feature_names
+        2. Drops columns with >90% NaN values (keeps columns with at least 10% valid data)
+        3. Drops rows with any remaining NaN values
+        4. Aligns with target data by date intersection
+
+        Returns
+        -------
+        Tuple[pd.DataFrame, pd.Series]
+            (X, y) tuple with aligned training features and target
+        """
+        # Select feature columns
+        x_data = self.training_data[self.feature_names].copy()
+
+        # Step 1: Drop columns that are mostly NaN (>90% NaN)
+        # Keep columns with at least 10% non-NaN values
+        min_valid_count = max(1, int(len(x_data) * 0.1))
+        x_data = x_data.dropna(axis=1, thresh=min_valid_count)
+
+        # Step 2: Drop rows with any remaining NaN values
+        x_data = x_data.dropna(axis=0)
+
+        # Step 3: Align with target data
         y_data = self.target_data
         val_dates = x_data.index.intersection(y_data.index)
-
 
         return x_data.loc[val_dates], y_data.loc[val_dates]
 
