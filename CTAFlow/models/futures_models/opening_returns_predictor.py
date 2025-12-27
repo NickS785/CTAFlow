@@ -1,4 +1,4 @@
-"""Example: Predict opening period returns using IntradayMomentumLight.
+"""Example: Predict opening period returns using IntradayMomentum.
 
 This model uses:
 1. Short-term daily momentum features (1d, 5d, 10d, 20d) - properly lagged
@@ -7,8 +7,8 @@ This model uses:
 
 Target: Returns during the opening period (first 60 minutes of session)
 
-The model demonstrates proper use of IntradayMomentumLight which wraps CTALight for fitting:
-- Build features using IntradayMomentumLight methods
+The model demonstrates proper use of IntradayMomentum which wraps CTALight for fitting:
+- Build features using IntradayMomentum methods
 - Features are automatically added via _add_feature() method
 - Use built-in .fit() or .fit_with_grid_search() methods (LightGBM)
 """
@@ -27,7 +27,7 @@ import pandas as pd
 project_root = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from CTAFlow.models.intraday_momentum import IntradayMomentumLight
+from CTAFlow.models.intraday_momentum import IntradayMomentum
 from CTAFlow.data import read_exported_df
 from CTAFlow.config import INTRADAY_DATA_PATH
 
@@ -101,7 +101,7 @@ def main():
     """Run the complete opening returns prediction example."""
 
     print(f"\n{'='*70}")
-    print("OPENING RETURNS PREDICTION WITH IntradayMomentumLight")
+    print("OPENING RETURNS PREDICTION WITH IntradayMomentum")
     print(f"{'='*70}")
 
     # Load single ticker data directly from CSV
@@ -123,9 +123,9 @@ def main():
         print(f"PROCESSING {ticker}")
         print(f"{'='*70}")
 
-        # Initialize IntradayMomentumLight (uses CTALight internally for fitting)
-        print(f"\n1. Initializing IntradayMomentumLight...")
-        model = IntradayMomentumLight(
+        # Initialize IntradayMomentum (uses CTALight internally for fitting)
+        print(f"\n1. Initializing IntradayMomentum...")
+        model = IntradayMomentum(
             intraday_data=intraday_data,
             session_open=time(8, 30),
             session_end=time(15, 0),
@@ -143,7 +143,7 @@ def main():
         # Initialize training_data
         model.training_data = pd.DataFrame(index=daily_df.index)
 
-        # Build features using IntradayMomentumLight methods
+        # Build features using IntradayMomentum methods
         print(f"\n3. Building feature set...")
 
         # Daily momentum features (lagged by 1 day) - uses _add_feature internally
@@ -248,7 +248,7 @@ def main():
     print(f"\nRunning grid search example for {ticker}...")
 
     # Reinitialize model for grid search
-    model_gs = IntradayMomentumLight(
+    model_gs = IntradayMomentum(
         intraday_data=intraday_data,
         session_open=time(8, 30),
         session_end=time(15, 0),

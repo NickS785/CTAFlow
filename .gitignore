@@ -30,7 +30,6 @@ create_expiry_data_for_tenor_interpolation.py
 diagnose_outliers.py
 eia_schema.yaml
 .claude/
-examples/
 migration_guide.md
 node_modules/
 package-lock.json
