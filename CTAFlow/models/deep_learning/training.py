@@ -30,17 +30,18 @@ class TrainConfig:
     plateau_factor: float = 0.5
     plateau_patience: int = 5
 
-def convert_IM(model_prep:IntradayMomentum, lookback_period=20, batch_size=5, val_split=True, val_size=0.2):
+def convert_IM(model_prep:IntradayMomentum, lookback_period=10, batch_size=16, train_test_split=True, train_size=0.7):
 
     X, y = model_prep.get_xy()
 
-    if val_split:
+    if train_test_split:
         train_len = int(len(X) * (1.0 - val_size))
-        train_X, val_X = X[:train_len], X[train_len:]
-        train_y, val_y = y[:train_len], y[train_len:]
+        train_X, test_X = X[:train_len], X[train_len:]
+        train_y, test_y = y[:train_len], y[train_len:]
         (train_ds, train_dl) = make_window_dataset(train_X, train_y, lookback=lookback_period, batch_size=batch_size)
-        (val_ds, val_dl) = make_window_dataset(val_X, val_y, lookback=lookback_period, batch_size=batch_size)
-        return (train_ds, train_dl), (val_ds, val_dl)
+        (test_ds, test_dl) = make_window_dataset(test_X, test_y, lookback=lookback_period, batch_size=batch_size)
+        return (train_ds, train_dl), (test_ds, test_dl)
+
     else:
         ds, dl = make_window_dataset(X, y, lookback=lookback_period,batch_size=batch_size)
 

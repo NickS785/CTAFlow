@@ -32,7 +32,7 @@ class MomentumWindowDataset(Dataset):
         y_t = torch.tensor(self.y[idx + self.lookback - 1])
         return x_win, y_t
 
-def make_window_dataset(X_df, y, lookback=20, batch_size=64):
+def make_window_dataset(X_df, y, lookback=20, batch_size=32):
     ds = MomentumWindowDataset(X_df, y, lookback=lookback)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=False, drop_last=False)
     return ds, dl
