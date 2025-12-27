@@ -35,7 +35,7 @@ def convert_IM(model_prep:IntradayMomentum, lookback_period=10, batch_size=16, t
     X, y = model_prep.get_xy()
 
     if train_test_split:
-        train_len = int(len(X) * (1.0 - val_size))
+        train_len = int(len(X) * train_size)
         train_X, test_X = X[:train_len], X[train_len:]
         train_y, test_y = y[:train_len], y[train_len:]
         (train_ds, train_dl) = make_window_dataset(train_X, train_y, lookback=lookback_period, batch_size=batch_size)
