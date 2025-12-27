@@ -193,6 +193,87 @@ class IntradayMomentum:
             # Standard session (no midnight crossing)
             return feature_time >= self.target_time
 
+    def _get_target_time_mask(
+        self,
+        index: pd.DatetimeIndex,
+        target_time: time,
+        use_nearest: bool = True
+    ) -> pd.Series:
+        """Get mask for extracting data at target_time, with fallback to nearest available time.
+
+        Parameters
+        ----------
+        index : pd.DatetimeIndex
+            DatetimeIndex to create mask for
+        target_time : time
+            Target time to extract data for
+        use_nearest : bool, default True
+            If True and exact time not found for a day, use nearest available time <= target_time.
+            If False, use exact time matching only (may result in missing data).
+
+        Returns
+        -------
+        pd.Series
+            Boolean mask with same index, True for rows to extract
+
+        Notes
+        -----
+        This method makes target_time methods more robust to missing data by:
+        1. First trying exact time match
+        2. If use_nearest=True and a day has no exact match, finds the latest available
+           time <= target_time for that day
+        3. Returns a mask that selects one row per day (or none if no valid time found)
+
+        Examples
+        --------
+        >>> # If target_time=14:00 but data only has 13:55, 14:05 for a day,
+        >>> # will select 13:55 (nearest time <= 14:00)
+        """
+        if not use_nearest:
+            # Simple exact matching (original behavior)
+            return index.time == target_time
+
+        # Try exact match first
+        exact_mask = index.time == target_time
+
+        # Create helper dataframe
+        df = pd.DataFrame({
+            'date': index.normalize(),
+            'time': index.time
+        }, index=index)
+
+        # Check which days have exact matches
+        exact_dates = set(df[exact_mask]['date'].unique())
+        all_dates = set(df['date'].unique())
+        missing_dates = all_dates - exact_dates
+
+        if not missing_dates:
+            # All days have exact time match
+            return exact_mask
+
+        # For missing dates, find nearest time <= target_time
+        result_mask = pd.Series(False, index=index)
+        result_mask[exact_mask] = True
+
+        for missing_date in missing_dates:
+            # Get data for this day
+            day_mask = df['date'] == missing_date
+            day_data = df[day_mask]
+
+            # Find times <= target_time
+            valid_times_mask = day_data['time'] <= target_time
+
+            if valid_times_mask.any():
+                # Get the latest valid time
+                latest_time = day_data[valid_times_mask]['time'].max()
+                # Find the row(s) with this time on this date
+                nearest_mask = (df['date'] == missing_date) & (df['time'] == latest_time)
+                # Take only the first occurrence if multiple bars at same time
+                nearest_idx = df[nearest_mask].index[0]
+                result_mask.loc[nearest_idx] = True
+
+        return result_mask
+
     def _make_feature_name(
         self,
         base_name: str,
@@ -416,6 +497,7 @@ class IntradayMomentum:
             price_col: str = "Close",
             volume_col: str = "Volume",
             add_as_feature: bool = False,
+            use_nearest: bool = True,
     ) -> Union[pd.Series, pd.DataFrame]:
         """Calculate distance from VWAP at target time(s).
 
@@ -436,6 +518,9 @@ class IntradayMomentum:
             Column name for volume data
         add_as_feature : bool, default False
             If True, add to training_data with proper lagging
+        use_nearest : bool, default True
+            If True, use nearest available time <= target_time when exact time not found.
+            Prevents missing data from early closes or missing bars.
 
         Returns
         -------
@@ -462,7 +547,7 @@ class IntradayMomentum:
             results = {}
             for t in target_time:
                 result = self.vwap_distance(
-                    t, intraday_df, period_length, price_col, volume_col, add_as_feature
+                    t, intraday_df, period_length, price_col, volume_col, add_as_feature, use_nearest
                 )
                 results[f'{t.strftime("%H%M")}'] = result
             return pd.DataFrame(results)
@@ -530,7 +615,7 @@ class IntradayMomentum:
             vwap.loc[window_data.index] = window_data['vwap']
 
         # Extract VWAP at target_time
-        mask = data.index.time == target_time
+        mask = self._get_target_time_mask(data.index, target_time, use_nearest)
         target_vwap = vwap[mask]
         target_prices_at_time = prices[mask]
 
@@ -1002,6 +1087,253 @@ class IntradayMomentum:
 
         return pd.DataFrame(features)
 
+    def normalized_range(
+            self,
+            target_time: Union[time, List[time]],
+            intraday_df: Optional[pd.DataFrame] = None,
+            period_length: Optional[timedelta] = None,
+            lookback_days: int = 20,
+            normalize_by: str = "historical",
+            add_as_feature: bool = False,
+            use_nearest: bool = True,
+    ) -> Union[pd.Series, pd.DataFrame]:
+        """Calculate normalized range over a specific period at target time.
+
+        Calculates the high-low range over a rolling window ending at target_time,
+        normalized by either historical average range or current price level.
+
+        Parameters
+        ----------
+        target_time : time or List[time]
+            Time(s) to extract range for
+        intraday_df : Optional[pd.DataFrame]
+            Intraday OHLCV data with DatetimeIndex. Uses self.intraday_data if None.
+        period_length : Optional[timedelta]
+            Rolling window length for range calculation. Uses self.closing_length if None.
+        lookback_days : int, default 20
+            Number of days for historical average (only used if normalize_by='historical')
+        normalize_by : str, default "historical"
+            Normalization method:
+            - "historical": Divide by average range over lookback_days
+            - "price": Divide by current price (percentage range)
+        add_as_feature : bool, default False
+            If True, add to training_data with proper lagging
+        use_nearest : bool, default True
+            If True, use nearest available time <= target_time when exact time not found.
+            Prevents missing data from early closes or missing bars.
+
+        Returns
+        -------
+        pd.Series or pd.DataFrame
+            If single time: Series with normalized range
+            If list of times: DataFrame with one column per time
+
+        Notes
+        -----
+        - Calculates range = (high - low) over the rolling window
+        - normalize_by='historical': range / avg_historical_range
+        - normalize_by='price': range / price (gives percentage range)
+        - Properly lags if target_time is at or after self.target_time
+
+        Examples
+        --------
+        >>> # 60-minute normalized range at 2:00 PM
+        >>> norm_range = model.normalized_range(
+        ...     time(14, 0),
+        ...     period_length=timedelta(hours=1),
+        ...     normalize_by='historical',
+        ...     add_as_feature=True
+        ... )
+        """
+        # Handle list of times
+        if isinstance(target_time, (list, tuple)):
+            results = {}
+            for t in target_time:
+                result = self.normalized_range(
+                    t, intraday_df, period_length, lookback_days, normalize_by, add_as_feature, use_nearest
+                )
+                results[f'{t.strftime("%H%M")}'] = result
+            return pd.DataFrame(results)
+
+        # Single time handling
+        data = intraday_df if intraday_df is not None else self.intraday_data
+        if data is None or data.empty:
+            raise ValueError("Intraday data is required for normalized range")
+
+        if 'High' not in data.columns or 'Low' not in data.columns:
+            raise KeyError("'High' and 'Low' columns required for normalized range")
+
+        window = period_length or self.closing_length
+        high = data['High'].copy()
+        low = data['Low'].copy()
+
+        # Calculate rolling range over the window
+        if window:
+            bars = max(int(window.total_seconds() // 60 // 5), 1)
+            rolling_high = high.rolling(bars).max()
+            rolling_low = low.rolling(bars).min()
+        else:
+            rolling_high = high
+            rolling_low = low
+
+        range_series = rolling_high - rolling_low
+
+        # Extract at target time
+        mask = self._get_target_time_mask(data.index, target_time, use_nearest)
+        target_range = range_series[mask]
+        target_range.index = pd.to_datetime(target_range.index).normalize()
+
+        # Filter to valid trading dates
+        target_range = self._filter_to_trading_dates(target_range)
+
+        # Normalize
+        if normalize_by == "historical":
+            # Calculate historical average range
+            avg_range = target_range.rolling(lookback_days).mean()
+            normalized = target_range / avg_range.replace(0, np.nan)
+        elif normalize_by == "price":
+            # Normalize by current price level
+            if 'Close' not in data.columns:
+                raise KeyError("'Close' column required for price normalization")
+            close = data['Close'][mask]
+            close.index = pd.to_datetime(close.index).normalize()
+            close = self._filter_to_trading_dates(close)
+            normalized = target_range / close.replace(0, np.nan)
+        else:
+            raise ValueError(f"normalize_by must be 'historical' or 'price', got '{normalize_by}'")
+
+        if add_as_feature:
+            # Shift if needed to avoid lookahead bias
+            needs_shift = self._needs_shift(target_time)
+            feature_series = normalized.shift(1) if needs_shift else normalized
+
+            # Generate feature name
+            period_str = self._format_period_length(window)
+            norm_suffix = "hist" if normalize_by == "historical" else "pct"
+            feature_name = self._make_feature_name(f'norm_range_{norm_suffix}', target_time, period_str)
+            self._add_feature(feature_series, feature_name)
+
+        return normalized
+
+    def relative_volume(
+            self,
+            target_time: Union[time, List[time]],
+            intraday_df: Optional[pd.DataFrame] = None,
+            period_length: Optional[timedelta] = None,
+            volume_col: str = "Volume",
+            lookback_days: int = 20,
+            aggregation: str = "sum",
+            add_as_feature: bool = False,
+            use_nearest: bool = True,
+    ) -> Union[pd.Series, pd.DataFrame]:
+        """Calculate volume relative to historical average at target time.
+
+        Computes volume over a rolling window ending at target_time and normalizes
+        by the historical average volume for the same time window.
+
+        Parameters
+        ----------
+        target_time : time or List[time]
+            Time(s) to extract volume for
+        intraday_df : Optional[pd.DataFrame]
+            Intraday OHLCV data with DatetimeIndex. Uses self.intraday_data if None.
+        period_length : Optional[timedelta]
+            Rolling window length for volume aggregation. Uses self.closing_length if None.
+        volume_col : str, default "Volume"
+            Column name for volume data
+        lookback_days : int, default 20
+            Number of days for historical average calculation
+        aggregation : str, default "sum"
+            Aggregation method: "sum" for total volume, "mean" for average
+        add_as_feature : bool, default False
+            If True, add to training_data with proper lagging
+        use_nearest : bool, default True
+            If True, use nearest available time <= target_time when exact time not found.
+            Prevents missing data from early closes or missing bars.
+
+        Returns
+        -------
+        pd.Series or pd.DataFrame
+            If single time: Series with relative volume (current / historical avg)
+            If list of times: DataFrame with one column per time
+
+        Notes
+        -----
+        - relative_volume = current_volume / avg_historical_volume
+        - Values > 1 indicate above-average volume
+        - Values < 1 indicate below-average volume
+        - Properly lags if target_time is at or after self.target_time
+        - Useful for identifying unusual volume patterns
+
+        Examples
+        --------
+        >>> # Opening 30-min volume relative to 20-day average
+        >>> rel_vol = model.relative_volume(
+        ...     time(9, 30),
+        ...     period_length=timedelta(minutes=30),
+        ...     lookback_days=20,
+        ...     add_as_feature=True
+        ... )
+        """
+        # Handle list of times
+        if isinstance(target_time, (list, tuple)):
+            results = {}
+            for t in target_time:
+                result = self.relative_volume(
+                    t, intraday_df, period_length, volume_col, lookback_days, aggregation, add_as_feature, use_nearest
+                )
+                results[f'{t.strftime("%H%M")}'] = result
+            return pd.DataFrame(results)
+
+        # Single time handling
+        data = intraday_df if intraday_df is not None else self.intraday_data
+        if data is None or data.empty:
+            raise ValueError("Intraday data is required for relative volume")
+
+        if volume_col not in data.columns:
+            raise KeyError(f"Volume column '{volume_col}' not found in data")
+
+        window = period_length or self.closing_length
+        volume = data[volume_col].copy()
+
+        # Calculate rolling aggregation over the window
+        if window:
+            bars = max(int(window.total_seconds() // 60 // 5), 1)
+            if aggregation == "sum":
+                volume_agg = volume.rolling(bars).sum()
+            elif aggregation == "mean":
+                volume_agg = volume.rolling(bars).mean()
+            else:
+                raise ValueError(f"Aggregation must be 'sum' or 'mean', got '{aggregation}'")
+        else:
+            volume_agg = volume
+
+        # Extract at target time
+        mask = self._get_target_time_mask(volume_agg.index, target_time, use_nearest)
+        target_volume = volume_agg[mask]
+        target_volume.index = pd.to_datetime(target_volume.index).normalize()
+
+        # Filter to valid trading dates
+        target_volume = self._filter_to_trading_dates(target_volume)
+
+        # Calculate historical average
+        avg_volume = target_volume.rolling(lookback_days).mean()
+
+        # Relative volume
+        relative_vol = target_volume / avg_volume.replace(0, np.nan)
+
+        if add_as_feature:
+            # Shift if needed to avoid lookahead bias
+            needs_shift = self._needs_shift(target_time)
+            feature_series = relative_vol.shift(1) if needs_shift else relative_vol
+
+            # Generate feature name
+            period_str = self._format_period_length(window)
+            feature_name = self._make_feature_name(f'rel_vol_{lookback_days}d', target_time, period_str)
+            self._add_feature(feature_series, feature_name)
+
+        return relative_vol
+
     def create_clf_target(
             self,
             n_classes: int = 2,
@@ -1096,6 +1428,7 @@ class IntradayMomentum:
             period_length: Optional[timedelta] = None,
             price_col: str = "Close",
             add_as_feature=False,
+            use_nearest: bool = True,
     ) -> Union[pd.Series, pd.DataFrame]:
         """Return series for a specific target time window.
 
@@ -1111,6 +1444,9 @@ class IntradayMomentum:
             Price column name
         add_as_feature : bool
             If True, add to training_data with proper lagging
+        use_nearest : bool, default True
+            If True, use nearest available time <= target_time when exact time not found.
+            Prevents missing data from early closes or missing bars.
 
         Returns
         -------
@@ -1123,7 +1459,7 @@ class IntradayMomentum:
             results = {}
             for t in target_time:
                 result = self.target_time_returns(
-                    t, intraday_df, period_length, price_col, add_as_feature
+                    t, intraday_df, period_length, price_col, add_as_feature, use_nearest
                 )
                 results[f'{t.strftime("%H%M")}'] = result
             return pd.DataFrame(results)
@@ -1137,10 +1473,11 @@ class IntradayMomentum:
         prices = self._coerce_price(data, price_col)
         ret = prices.pct_change().dropna()
 
-        mask = ret.index.time == target_time
         if window:
             bars = max(int(window.total_seconds() // 60 // 5), 1)
             ret = ret.rolling(bars).sum()
+
+        mask = self._get_target_time_mask(ret.index, target_time, use_nearest)
         target_returns = ret[mask]
         target_returns.index = pd.to_datetime(target_returns.index).normalize()
 
@@ -1167,6 +1504,7 @@ class IntradayMomentum:
             volume_col: str = "Volume",
             add_as_feature: bool = False,
             aggregation: str = "sum",
+            use_nearest: bool = True,
     ) -> Union[pd.Series, pd.DataFrame]:
         """Calculate volume at a specific target time over a given period.
 
@@ -1184,6 +1522,9 @@ class IntradayMomentum:
             If True, add the volume series to training_data with proper lagging
         aggregation : str, default "sum"
             Aggregation method: "sum" for total volume, "mean" for average
+        use_nearest : bool, default True
+            If True, use nearest available time <= target_time when exact time not found.
+            Prevents missing data from early closes or missing bars.
 
         Returns
         -------
@@ -1202,7 +1543,7 @@ class IntradayMomentum:
             results = {}
             for t in target_time:
                 result = self.target_time_volume(
-                    t, intraday_df, period_length, volume_col, add_as_feature, aggregation
+                    t, intraday_df, period_length, volume_col, add_as_feature, aggregation, use_nearest
                 )
                 results[f'{t.strftime("%H%M")}'] = result
             return pd.DataFrame(results)
@@ -1229,7 +1570,7 @@ class IntradayMomentum:
                 raise ValueError(f"Aggregation must be 'sum' or 'mean', got '{aggregation}'")
 
         # Extract volume at target time
-        mask = volume.index.time == target_time
+        mask = self._get_target_time_mask(volume.index, target_time, use_nearest)
         target_volume = volume[mask]
         target_volume.index = pd.to_datetime(target_volume.index).normalize()
 
@@ -1258,6 +1599,7 @@ class IntradayMomentum:
             add_as_feature: bool = False,
             use_proxy: bool = False,
             return_components: bool = False,
+            use_nearest: bool = True,
     ) -> Union[pd.Series, pd.DataFrame]:
         """Calculate bid-ask volume imbalance at a specific target time.
 
@@ -1282,6 +1624,9 @@ class IntradayMomentum:
         return_components : bool, default False
             If True, return DataFrame with imbalance, ratio, and normalized imbalance.
             If False, return Series with just the normalized imbalance.
+        use_nearest : bool, default True
+            If True, use nearest available time <= target_time when exact time not found.
+            Prevents missing data from early closes or missing bars.
 
         Returns
         -------
@@ -1304,7 +1649,7 @@ class IntradayMomentum:
             for t in target_time:
                 result = self.bid_ask_volume_imbalance(
                     t, intraday_df, period_length, bid_vol_col, ask_vol_col,
-                    add_as_feature, use_proxy, return_components
+                    add_as_feature, use_proxy, return_components, use_nearest
                 )
                 # If return_components=False, we get a Series
                 if isinstance(result, pd.Series):
@@ -1380,7 +1725,7 @@ class IntradayMomentum:
         )
 
         # Extract at target time
-        mask = data.index.time == target_time
+        mask = self._get_target_time_mask(data.index, target_time, use_nearest)
 
         if return_components:
             # Return all components as DataFrame
@@ -1672,6 +2017,7 @@ class IntradayMomentum:
             period_length: Optional[timedelta] = None,
             price_col: str = "Close",
             add_as_feature: bool = False,
+            use_nearest: bool = True,
     ) -> Union[pd.Series, pd.DataFrame]:
         """Calculate returns for a supplementary ticker at target time(s).
 
@@ -1685,6 +2031,8 @@ class IntradayMomentum:
             period_length: Rolling window length for returns calculation
             price_col: Column name for prices (default: "Close")
             add_as_feature: If True, add to training_data with proper lagging
+            use_nearest: If True, use nearest available time <= target_time when exact time not found.
+                Prevents missing data from early closes or missing bars.
 
         Returns:
             pd.Series: If single time, returns Series indexed by date
@@ -1716,7 +2064,7 @@ class IntradayMomentum:
             results = {}
             for t in target_time:
                 result = self.target_ticker_returns(
-                    ticker, t, period_length, price_col, add_as_feature
+                    ticker, t, period_length, price_col, add_as_feature, use_nearest
                 )
                 results[f'{ticker}_{t.strftime("%H%M")}'] = result
             return pd.DataFrame(results)
@@ -1734,11 +2082,12 @@ class IntradayMomentum:
         prices = self._coerce_price(supp_data, price_col)
         ret = prices.pct_change().dropna()
 
-        # Extract returns at target_time
-        mask = ret.index.time == target_time
         if window:
             bars = max(int(window.total_seconds() // 60 // 5), 1)
             ret = ret.rolling(bars).sum()
+
+        # Extract returns at target_time
+        mask = self._get_target_time_mask(ret.index, target_time, use_nearest)
         target_returns = ret[mask]
         target_returns.index = pd.to_datetime(target_returns.index).normalize()
 
@@ -1817,6 +2166,7 @@ class IntradayMomentum:
             selector_config: Optional[FeatureSelectionConfig] = None,
             **fit_kwargs,
     ):
+
         X = self.training_data.copy()
         y = self.target_data.copy()
 
@@ -1844,6 +2194,80 @@ class IntradayMomentum:
             raise ValueError("No selector fitted. Call fit_selected() first.")
         Xs = self.selector_.transform(X)
         return self.predict(Xs, **predict_kwargs)
+
+    def prune_features(
+            self,
+            selector: Optional[FeatureSelector] = None,
+            selector_config: Optional[FeatureSelectionConfig] = None,
+    ) -> "IntradayMomentum":
+        """Prune features using feature selection and update training_data and feature_names.
+
+        This method applies feature selection to the current training_data and target_data,
+        then updates the model's internal state so that subsequent calls to fit() or
+        fit_with_grid_search() will automatically use only the selected features.
+
+        Parameters
+        ----------
+        selector : Optional[FeatureSelector]
+            Pre-configured FeatureSelector instance. If None, creates one from selector_config.
+        selector_config : Optional[FeatureSelectionConfig]
+            Configuration for feature selection. If None, uses default config.
+
+        Returns
+        -------
+        self
+            Returns self for method chaining
+
+        Examples
+        --------
+        >>> # Prune features, then train with grid search
+        >>> model = IntradayMomentum(intraday_data, ...)
+        >>> # Build features...
+        >>> model.prune_features(selector_config=FeatureSelectionConfig(max_features=50))
+        >>> # Now fit with only selected features
+        >>> model.fit_with_grid_search(X_train, y_train, param_grid={...})
+        >>>
+        >>> # Or prune with custom config
+        >>> config = FeatureSelectionConfig(
+        ...     max_features=80,
+        ...     per_group_max=3,
+        ...     corr_threshold=0.95
+        ... )
+        >>> model.prune_features(selector_config=config)
+        >>> model.fit(X_train, y_train)
+
+        Notes
+        -----
+        - This permanently modifies training_data and feature_names
+        - The selector and selected features are cached in selector_ and selected_features_
+        - To see what was selected, use the feature_report_ attribute on the selector
+        - After pruning, you can use normal fit() or fit_with_grid_search()
+        """
+        X = self.training_data.copy()
+        y = self.target_data.copy()
+
+        # Get the base model for importance calculations
+        base_model = self._get_model()
+        est = getattr(base_model, "model", None) or base_model
+
+        # Create or use provided selector
+        if selector is None:
+            selector = FeatureSelector(selector_config or FeatureSelectionConfig())
+
+        # Fit the selector and transform the data
+        selector.fit(X, y, estimator=est)
+
+        # Cache selector and selected features
+        self.selector_ = selector
+        self.selected_features_ = selector.selected_features_
+
+        # Update training_data to only include selected features
+        self.training_data = self.training_data[self.selected_features_].copy()
+
+        # Update feature_names to match
+        self.feature_names = self.selected_features_.copy()
+
+        return self
 
     def microstructure_features(
             self,
@@ -1926,19 +2350,61 @@ class IntradayMomentum:
         add_day_of_week: bool = True,
         add_month: bool = True,
         add_quarter: bool = True,
+        use_sincos: bool = False,
     ) -> pd.DataFrame:
-        """Attach simple calendar breakdowns (DOW, month, quarter)."""
+        """Attach simple calendar breakdowns (DOW, month, quarter).
+
+        Parameters
+        ----------
+        dates : Optional[pd.DatetimeIndex]
+            Date index to create features for. Uses self.training_data.index if None.
+        add_day_of_week : bool, default True
+            Add day of week features
+        add_month : bool, default True
+            Add month features
+        add_quarter : bool, default True
+            Add quarter features
+        use_sincos : bool, default False
+            If True, encode cyclical features using sin/cos instead of raw integers.
+            This better represents the cyclical nature (e.g., Dec->Jan, Sun->Mon).
+            Creates two features per cycle: {name}_sin and {name}_cos
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with datetime features
+        """
 
         idx = dates if dates is not None else self.training_data.index
         normalized = pd.DatetimeIndex(idx).normalize()
         feats: Dict[str, pd.Series] = {}
 
         if add_day_of_week:
-            feats["day_of_week"] = normalized.dayofweek
+            dow = normalized.dayofweek
+            if use_sincos:
+                # Day of week: 0-6, period = 7
+                feats["day_of_week_sin"] = np.sin(2 * np.pi * dow / 7)
+                feats["day_of_week_cos"] = np.cos(2 * np.pi * dow / 7)
+            else:
+                feats["day_of_week"] = dow
+
         if add_month:
-            feats["month"] = normalized.month
+            month = normalized.month
+            if use_sincos:
+                # Month: 1-12, period = 12
+                feats["month_sin"] = np.sin(2 * np.pi * month / 12)
+                feats["month_cos"] = np.cos(2 * np.pi * month / 12)
+            else:
+                feats["month"] = month
+
         if add_quarter:
-            feats["quarter"] = normalized.quarter
+            quarter = normalized.quarter
+            if use_sincos:
+                # Quarter: 1-4, period = 4
+                feats["quarter_sin"] = np.sin(2 * np.pi * quarter / 4)
+                feats["quarter_cos"] = np.cos(2 * np.pi * quarter / 4)
+            else:
+                feats["quarter"] = quarter
 
         feature_df = pd.DataFrame(feats, index=normalized)
         for name, series in feature_df.items():
@@ -1954,8 +2420,39 @@ class IntradayMomentum:
         include_expiration_week: bool = True,
         include_weeks_until_expiration: bool = True,
         dates: Optional[pd.DatetimeIndex] = None,
+        use_sincos: bool = False,
+        expiration_cycle_weeks: int = 13,
     ) -> pd.DataFrame:
-        """Add calendar-based features such as opex and expiry timing."""
+        """Add calendar-based features such as opex and expiry timing.
+
+        Parameters
+        ----------
+        ticker : str
+            Ticker symbol to determine contract cycle
+        include_last_trading_week : bool, default True
+            Add is_last_trading_week feature
+        include_opex_week : bool, default True
+            Add is_opex_week feature
+        include_days_since_opex : bool, default True
+            Add days_since_opex feature
+        include_expiration_week : bool, default True
+            Add is_expiration_week feature
+        include_weeks_until_expiration : bool, default True
+            Add weeks_until_expiration feature
+        dates : Optional[pd.DatetimeIndex]
+            Date index to create features for. Uses self.training_data.index if None.
+        use_sincos : bool, default False
+            If True, encode cyclical features using sin/cos instead of raw values.
+            Applies to: days_since_opex (30-day cycle), weeks_until_expiration (contract cycle)
+        expiration_cycle_weeks : int, default 13
+            Period for weeks_until_expiration cycle when using sin/cos encoding.
+            Use 13 for quarterly contracts, 4 for monthly contracts.
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with calendar features
+        """
 
         idx = dates if dates is not None else self.training_data.index
         cal_feats = build_datetime_features(idx, ticker)
@@ -1978,6 +2475,22 @@ class IntradayMomentum:
         for col in feature_df.columns:
             if feature_df[col].dtype == bool:
                 feature_df[col] = feature_df[col].astype(int)
+
+        # Apply sin/cos encoding to cyclical features if requested
+        if use_sincos:
+            if "days_since_opex" in feature_df.columns:
+                # Monthly OPEX cycle (approximately 30 days, but use 21 trading days)
+                days = feature_df["days_since_opex"].fillna(0)
+                feature_df["days_since_opex_sin"] = np.sin(2 * np.pi * days / 21)
+                feature_df["days_since_opex_cos"] = np.cos(2 * np.pi * days / 21)
+                feature_df = feature_df.drop(columns=["days_since_opex"])
+
+            if "weeks_until_expiration" in feature_df.columns:
+                # Contract expiration cycle (default 13 weeks for quarterly)
+                weeks = feature_df["weeks_until_expiration"]
+                feature_df["weeks_until_expiration_sin"] = np.sin(2 * np.pi * weeks / expiration_cycle_weeks)
+                feature_df["weeks_until_expiration_cos"] = np.cos(2 * np.pi * weeks / expiration_cycle_weeks)
+                feature_df = feature_df.drop(columns=["weeks_until_expiration"])
 
         for name, series in feature_df.items():
             self._add_feature(series, name)
@@ -2162,14 +2675,16 @@ class IntradayMomentum:
 
         return pd.DataFrame(features)
 
-    def assemble_training_frame(
+    def get_xy(
             self,
-            target_times : Sequence[str]= None,
-            intraday_df: Optional[pd.DataFrame] = None,
-            price_col: str = "Close",
-    ) -> pd.DataFrame:
+    ) -> Tuple[pd.DataFrame, pd.Series]:
         """Convenience constructor for a full training feature matrix."""
+        x_data = self.training_data[self.feature_names].dropna()
+        y_data = self.target_data
+        val_dates = x_data.index.intersection(y_data.index)
 
-        return combined.dropna()
+
+        return x_data.loc[val_dates], y_data.loc[val_dates]
+
 
 

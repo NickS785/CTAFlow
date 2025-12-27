@@ -24,6 +24,7 @@ from .classifications_reference import (
     get_ticker_classification_info,
     get_all_classifications
 )
+from .model_datasets import MomentumWindowDataset, make_window_dataset
 from .raw_formatting.synthetic import CrossProductEngine, IntradaySpreadEngine , CrossSpreadLeg, IntradayLeg
 from .raw_formatting.intraday_manager import read_exported_df, read_synthetic_csv
 
@@ -53,7 +54,8 @@ __all__ = [
     "ContractSpecs",
     "Contract",
     "ContractInfo",
-
+    "MomentumWindowDataset",
+    "make_window_dataset",
     # Data retrieval functions
     'fetch_market_cot_data',
     'fetch_data_sync',
