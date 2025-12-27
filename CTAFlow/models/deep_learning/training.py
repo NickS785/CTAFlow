@@ -30,21 +30,68 @@ class TrainConfig:
     plateau_factor: float = 0.5
     plateau_patience: int = 5
 
-def convert_IM(model_prep:IntradayMomentum, lookback_period=10, batch_size=16, train_test_split=True, train_size=0.7):
+def convert_IM(model_prep:IntradayMomentum, lookback_period=10, batch_size=16, train_test_split=True, train_size=0.7, val_split=False, val_size=0.15):
+    """
+    Convert IntradayMomentum model to windowed datasets for deep learning.
 
+    Parameters:
+    -----------
+    model_prep : IntradayMomentum
+        Prepared model with features
+    lookback_period : int
+        Number of time steps to look back
+    batch_size : int
+        Batch size for DataLoader
+    train_test_split : bool
+        Whether to split into train/test or train/val/test
+    train_size : float
+        Proportion of data for training (used if val_split=False)
+    val_split : bool
+        Whether to create separate validation set
+    val_size : float
+        Proportion of data for validation (from train+val combined)
+
+    Returns:
+    --------
+    If val_split=True: (train_ds, train_dl), (val_ds, val_dl)
+    If train_test_split=True and val_split=False: (train_ds, train_dl), (test_ds, test_dl)
+    Otherwise: ds, dl
+    """
     X, y = model_prep.get_xy()
 
-    if train_test_split:
+    if val_split:
+        # Split into train and validation (no test set in this mode)
+        train_len = int(len(X) * (1 - val_size))
+        train_X, val_X = X[:train_len], X[train_len:]
+        train_y, val_y = y[:train_len], y[train_len:]
+
+        # Create train dataset and get normalization stats
+        train_ds = MomentumWindowDataset(train_X, train_y, lookback=lookback_period, normalize=True)
+        train_dl = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+
+        # Use train stats for validation dataset
+        norm_stats = train_ds.get_normalization_stats()
+        val_ds = MomentumWindowDataset(val_X, val_y, lookback=lookback_period, normalize=True, fit_stats=norm_stats)
+        val_dl = torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+
+        return (train_ds, train_dl), (val_ds, val_dl)
+    elif train_test_split:
         train_len = int(len(X) * train_size)
         train_X, test_X = X[:train_len], X[train_len:]
         train_y, test_y = y[:train_len], y[train_len:]
-        (train_ds, train_dl) = make_window_dataset(train_X, train_y, lookback=lookback_period, batch_size=batch_size)
-        (test_ds, test_dl) = make_window_dataset(test_X, test_y, lookback=lookback_period, batch_size=batch_size)
+
+        # Create train dataset and get normalization stats
+        train_ds = MomentumWindowDataset(train_X, train_y, lookback=lookback_period, normalize=True)
+        train_dl = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+
+        # Use train stats for test dataset
+        norm_stats = train_ds.get_normalization_stats()
+        test_ds = MomentumWindowDataset(test_X, test_y, lookback=lookback_period, normalize=True, fit_stats=norm_stats)
+        test_dl = torch.utils.data.DataLoader(test_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+
         return (train_ds, train_dl), (test_ds, test_dl)
-
     else:
-        ds, dl = make_window_dataset(X, y, lookback=lookback_period,batch_size=batch_size)
-
+        ds, dl = make_window_dataset(X, y, lookback=lookback_period, batch_size=batch_size)
         return ds, dl
 
 def default_regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
@@ -67,7 +114,9 @@ def evaluate(
     device: str,
     metrics_fn: Optional[Callable[[np.ndarray, np.ndarray], Dict[str, float]]] = default_regression_metrics,
     use_amp: bool = False,
+    debug: bool = False,
 ) -> Dict[str, float]:
+    was_training = model.training
     model.eval()
     total_loss = 0.0
     n = 0
@@ -75,6 +124,7 @@ def evaluate(
     preds: List[np.ndarray] = []
     trues: List[np.ndarray] = []
 
+    batch_count = 0
     for xb, yb in loader:
         xb = xb.to(device, non_blocking=True)  # xb: (B, C, L)
         yb = yb.to(device, non_blocking=True).float()
@@ -90,12 +140,25 @@ def evaluate(
         preds.append(out.detach().cpu().numpy())
         trues.append(yb.detach().cpu().numpy())
 
+        if debug and batch_count == 0:
+            print(f"[DEBUG] First batch: out min={out.min().item():.6f}, max={out.max().item():.6f}, mean={out.mean().item():.6f}")
+            print(f"[DEBUG] Model params sum: {sum(p.sum().item() for p in model.parameters()):.6f}")
+        batch_count += 1
+
+    if debug:
+        print(f"[DEBUG] Total batches processed: {batch_count}")
+
     y_pred = np.concatenate(preds, axis=0)
     y_true = np.concatenate(trues, axis=0)
 
     results = {"loss": float(total_loss / max(n, 1))}
     if metrics_fn is not None:
         results.update(metrics_fn(y_true, y_pred))
+
+    # Restore training state
+    if was_training:
+        model.train()
+
     return results
 
 
@@ -165,8 +228,10 @@ def fit(
 
         # Validation
         if val_loader is not None:
+            # Enable debug for first 3 epochs to diagnose frozen metrics
+            debug_mode = epoch <= 3
             val_metrics = evaluate(
-                model, val_loader, loss_fn=loss_fn, device=device, metrics_fn=metrics_fn, use_amp=cfg.use_amp
+                model, val_loader, loss_fn=loss_fn, device=device, metrics_fn=metrics_fn, use_amp=cfg.use_amp, debug=debug_mode
             )
             history["val"].append(val_metrics)
 
