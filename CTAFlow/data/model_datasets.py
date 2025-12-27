@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import numpy as np
 
@@ -33,6 +33,6 @@ class MomentumWindowDataset(Dataset):
         return x_win, y_t
 
 def make_window_dataset(X_df, y, lookback=20, batch_size=64):
-    ds = DailyWindowDataset(X_df, y, lookback=lookback)
+    ds = MomentumWindowDataset(X_df, y, lookback=lookback)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=False, drop_last=False)
     return ds, dl
