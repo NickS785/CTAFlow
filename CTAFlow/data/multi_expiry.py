@@ -293,7 +293,7 @@ class SpreadEngine:
         logger.info(f"Indexed {len(self.lazy_pool)} contract slices.")
 
     def get_sequential_prices(self, start_date: str, end_date: str, freq: str = '1h',
-                             max_months: int = None) -> Generator[pd.DataFrame, None, None]:
+                             max_months: int = None, return_expiries: bool = False) -> Generator:
         """
         Yields continuous contract prices between expiration dates.
         Much faster than day-by-day processing - processes entire periods between rolls.
@@ -311,11 +311,15 @@ class SpreadEngine:
             Resampling frequency (default '1h')
         max_months : int, optional
             Maximum number of months to include (default: all available)
+        return_expiries : bool, default False
+            If True, yield (df_period, expiries_dict) tuples instead of just df_period.
+            expiries_dict maps column names (M1, M2, ...) to expiry timestamps.
 
         Yields:
         -------
-        pd.DataFrame
-            DataFrame with columns M1, M2, M3, ..., MN (contract prices)
+        pd.DataFrame or Tuple[pd.DataFrame, Dict[str, pd.Timestamp]]
+            If return_expiries=False: DataFrame with columns M1, M2, M3, ..., MN (contract prices)
+            If return_expiries=True: Tuple of (DataFrame, expiries_dict)
             One DataFrame per expiry period
         """
         start = pd.Timestamp(start_date)
@@ -399,7 +403,17 @@ class SpreadEngine:
                 logger.info(f"  DataFrame: {df_before.shape} -> {df_period.shape} (after dropna thresh=3)")
                 if not df_period.empty:
                     logger.info(f"  Yielding {df_period.shape[0]} rows")
-                    yield df_period
+
+                    if return_expiries:
+                        # Build expiry mapping for this period
+                        expiries_dict = {}
+                        for idx, contract in enumerate(active_contracts):
+                            col_name = f"M{idx + 1}"
+                            if col_name in df_period.columns:
+                                expiries_dict[col_name] = contract.expiry_date
+                        yield df_period, expiries_dict
+                    else:
+                        yield df_period
                 else:
                     logger.warning(f"  DataFrame empty after dropna, not yielding")
             else:

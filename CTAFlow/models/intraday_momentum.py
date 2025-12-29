@@ -394,6 +394,66 @@ class IntradayMomentum:
                 self.feature_names.append(feature_name)
         return
 
+    def _extract_at_time_daily(self, series: pd.Series, target_time: time, window_minutes: int = 5) -> pd.Series:
+        """Extract values at target_time each day using a time window.
+
+        More robust than exact time matching - finds bars within window_minutes of target_time.
+        Groups by date and takes the closest bar to target_time per day.
+
+        Parameters
+        ----------
+        series : pd.Series
+            Intraday series with DatetimeIndex
+        target_time : time
+            Target time to extract each day
+        window_minutes : int, default 5
+            Time window in minutes (looks ± window_minutes around target_time)
+
+        Returns
+        -------
+        pd.Series
+            Daily series with normalized date index
+        """
+        if not isinstance(series.index, pd.DatetimeIndex):
+            raise ValueError("Series must have DatetimeIndex")
+
+        # Create target timestamp for comparison
+        target_dt = pd.Timestamp('1970-01-01') + pd.Timedelta(
+            hours=target_time.hour,
+            minutes=target_time.minute,
+            seconds=target_time.second
+        )
+
+        # Define time window
+        lower = (target_dt - pd.Timedelta(minutes=window_minutes)).time()
+        upper = (target_dt + pd.Timedelta(minutes=window_minutes)).time()
+
+        # Filter to bars within time window
+        mask = (series.index.time >= lower) & (series.index.time <= upper)
+        series_in_window = series[mask]
+
+        if series_in_window.empty:
+            import warnings
+            warnings.warn(
+                f"No data found within {window_minutes} minutes of {target_time}. "
+                "Returning empty series - this will cause NaNs.",
+                UserWarning
+            )
+            return pd.Series(dtype=float)
+
+        # Group by date and take first bar per day (closest to target_time)
+        df = pd.DataFrame({'value': series_in_window})
+        df['date'] = df.index.normalize()
+        df['time_diff'] = abs(
+            df.index.hour * 60 + df.index.minute -
+            (target_time.hour * 60 + target_time.minute)
+        )
+
+        # For each date, take bar closest to target_time
+        result = df.sort_values('time_diff').groupby('date')['value'].first()
+
+        return result
+
     @staticmethod
     def _coerce_price(df: pd.DataFrame, price_col: str) -> pd.Series:
         if price_col not in df.columns:
@@ -2140,6 +2200,7 @@ class IntradayMomentum:
                      normalized_basis: bool = True,
                      basis_mos: Tuple[int, int] = (1, 3),
                      const_maturity: bool = False,
+                     expiry_data: Optional[pd.Series] = None,
                      add_as_feature: bool = True) -> pd.DataFrame:
         """Extract curve shape features at specific intraday time(s).
 
@@ -2161,7 +2222,11 @@ class IntradayMomentum:
         basis_mos : Tuple[int, int], default (1, 3)
             (front, back) contract months for basis calculation
         const_maturity : bool, default False
-            Use constant maturity interpolation (NOT YET IMPLEMENTED)
+            Use constant maturity tenor interpolation. If True, requires expiry_data.
+        expiry_data : pd.Series, optional
+            Mapping of contract names (M1, M2, ...) to expiry dates.
+            Required if const_maturity=True. Can be obtained from SpreadEngine
+            with return_expiries=True.
         add_as_feature : bool, default True
             If True, add features to training_data with proper lagging
 
@@ -2198,12 +2263,33 @@ class IntradayMomentum:
 
         # Single time handling
         if const_maturity:
+            # Use constant maturity interpolation
+            if expiry_data is None:
+                raise ValueError(
+                    "expiry_data is required when const_maturity=True. "
+                    "Obtain from SpreadEngine with return_expiries=True"
+                )
+
             tenor_grid = create_tenor_grid(min_tau=1/12, max_tau=1.0)
             ti = TenorInterpolator(tenor_grid=tenor_grid, min_contracts=4)
-            # TODO: Implement constant maturity interpolation
-            logger.warning("Constant maturity not yet implemented, using contract-based features")
 
-        cf = CurveFeatures(continuous_df=fwd_curve_df)
+            # Extract data at target_time for interpolation
+            mask = fwd_curve_df.index.time == target_time
+            prices_at_time = fwd_curve_df[mask]
+
+            if not prices_at_time.empty:
+                # Interpolate to constant maturity
+                const_mat_panel = ti.interpolate(prices_at_time, expiry_data)
+
+                # Use constant maturity panel for curve features
+                cf = CurveFeatures(continuous_df=const_mat_panel)
+                logger.info(f"Using constant maturity interpolation with {len(tenor_grid)} tenors")
+            else:
+                raise ValueError(f"No data found at target_time {target_time}")
+        else:
+            # Use raw contract-based features
+            cf = CurveFeatures(continuous_df=fwd_curve_df)
+
         features_dict = {}
 
         # Extract curve slope at target_time
@@ -2211,13 +2297,14 @@ class IntradayMomentum:
             # Calculate full slope series
             slope_series = cf.curve_slope(front=slope_mos[0], back=slope_mos[1])
 
-            # Extract at target_time each day
-            mask = fwd_curve_df.index.time == target_time
-            slope_at_time = slope_series[mask]
-            slope_at_time.index = pd.to_datetime(slope_at_time.index).normalize()
+            # Extract at target_time using time window (more robust than exact match)
+            slope_at_time = self._extract_at_time_daily(slope_series, target_time, window_minutes=5)
 
-            # Filter to valid trading dates
-            slope_at_time = self._filter_to_trading_dates(slope_at_time)
+            # Reindex to training_data dates with forward fill to avoid NaNs
+            slope_at_time = slope_at_time.reindex(
+                self.training_data.index.normalize(),
+                method='ffill'
+            )
 
             # Lag if needed to avoid lookahead bias
             needs_shift = self._needs_shift(target_time)
@@ -2243,13 +2330,14 @@ class IntradayMomentum:
             if front_col in fwd_curve_df.columns and back_col in fwd_curve_df.columns:
                 basis_series = (fwd_curve_df[back_col] - fwd_curve_df[front_col]) / fwd_curve_df[front_col]
 
-                # Extract at target_time each day
-                mask = fwd_curve_df.index.time == target_time
-                basis_at_time = basis_series[mask]
-                basis_at_time.index = pd.to_datetime(basis_at_time.index).normalize()
+                # Extract at target_time using time window (more robust than exact match)
+                basis_at_time = self._extract_at_time_daily(basis_series, target_time, window_minutes=5)
 
-                # Filter to valid trading dates
-                basis_at_time = self._filter_to_trading_dates(basis_at_time)
+                # Reindex to training_data dates with forward fill to avoid NaNs
+                basis_at_time = basis_at_time.reindex(
+                    self.training_data.index.normalize(),
+                    method='ffill'
+                )
 
                 # Lag if needed to avoid lookahead bias
                 needs_shift = self._needs_shift(target_time)
@@ -2344,13 +2432,14 @@ class IntradayMomentum:
             # Calculate full slope series
             slope_series = cf.curve_slope(front=slope_mos[0], back=slope_mos[1])
 
-            # Extract at target_time each day
-            mask = fwd_curve_df.index.time == target_time
-            slope_at_time = slope_series[mask]
-            slope_at_time.index = pd.to_datetime(slope_at_time.index).normalize()
+            # Extract at target_time using time window
+            slope_at_time = self._extract_at_time_daily(slope_series, target_time, window_minutes=5)
 
-            # Filter to valid trading dates
-            slope_at_time = self._filter_to_trading_dates(slope_at_time)
+            # Reindex to training_data dates with forward fill
+            slope_at_time = slope_at_time.reindex(
+                self.training_data.index.normalize(),
+                method='ffill'
+            )
 
             # Calculate change using the updated curve_slope method
             slope_change_series = cf.curve_slope(series=slope_at_time, period_length=lookback_days)
@@ -2379,13 +2468,14 @@ class IntradayMomentum:
             if front_col in fwd_curve_df.columns and back_col in fwd_curve_df.columns:
                 basis_series = (fwd_curve_df[back_col] - fwd_curve_df[front_col]) / fwd_curve_df[front_col]
 
-                # Extract at target_time each day
-                mask = fwd_curve_df.index.time == target_time
-                basis_at_time = basis_series[mask]
-                basis_at_time.index = pd.to_datetime(basis_at_time.index).normalize()
+                # Extract at target_time using time window
+                basis_at_time = self._extract_at_time_daily(basis_series, target_time, window_minutes=5)
 
-                # Filter to valid trading dates
-                basis_at_time = self._filter_to_trading_dates(basis_at_time)
+                # Reindex to training_data dates with forward fill
+                basis_at_time = basis_at_time.reindex(
+                    self.training_data.index.normalize(),
+                    method='ffill'
+                )
 
                 # Calculate change using relative_basis method
                 basis_change_series = cf.relative_basis(series_1=basis_at_time, period_length=lookback_days)
@@ -2497,17 +2587,19 @@ class IntradayMomentum:
             # Calculate full slope series
             slope_series = cf.curve_slope(front=slope_mos[0], back=slope_mos[1])
 
-            # Extract at time_1 each day
-            mask_1 = fwd_curve_df.index.time == time_1
-            slope_at_time_1 = slope_series[mask_1]
-            slope_at_time_1.index = pd.to_datetime(slope_at_time_1.index).normalize()
-            slope_at_time_1 = self._filter_to_trading_dates(slope_at_time_1)
+            # Extract at time_1 and time_2 using time window
+            slope_at_time_1 = self._extract_at_time_daily(slope_series, time_1, window_minutes=5)
+            slope_at_time_2 = self._extract_at_time_daily(slope_series, time_2, window_minutes=5)
 
-            # Extract at time_2 each day
-            mask_2 = fwd_curve_df.index.time == time_2
-            slope_at_time_2 = slope_series[mask_2]
-            slope_at_time_2.index = pd.to_datetime(slope_at_time_2.index).normalize()
-            slope_at_time_2 = self._filter_to_trading_dates(slope_at_time_2)
+            # Reindex both to training_data dates with forward fill
+            slope_at_time_1 = slope_at_time_1.reindex(
+                self.training_data.index.normalize(),
+                method='ffill'
+            )
+            slope_at_time_2 = slope_at_time_2.reindex(
+                self.training_data.index.normalize(),
+                method='ffill'
+            )
 
             # Calculate intraday change
             slope_change_series = cf.relative_basis(series_1=slope_at_time_2, series_2=slope_at_time_1)
@@ -2538,17 +2630,19 @@ class IntradayMomentum:
             if front_col in fwd_curve_df.columns and back_col in fwd_curve_df.columns:
                 basis_series = (fwd_curve_df[back_col] - fwd_curve_df[front_col]) / fwd_curve_df[front_col]
 
-                # Extract at time_1 each day
-                mask_1 = fwd_curve_df.index.time == time_1
-                basis_at_time_1 = basis_series[mask_1]
-                basis_at_time_1.index = pd.to_datetime(basis_at_time_1.index).normalize()
-                basis_at_time_1 = self._filter_to_trading_dates(basis_at_time_1)
+                # Extract at time_1 and time_2 using time window
+                basis_at_time_1 = self._extract_at_time_daily(basis_series, time_1, window_minutes=5)
+                basis_at_time_2 = self._extract_at_time_daily(basis_series, time_2, window_minutes=5)
 
-                # Extract at time_2 each day
-                mask_2 = fwd_curve_df.index.time == time_2
-                basis_at_time_2 = basis_series[mask_2]
-                basis_at_time_2.index = pd.to_datetime(basis_at_time_2.index).normalize()
-                basis_at_time_2 = self._filter_to_trading_dates(basis_at_time_2)
+                # Reindex both to training_data dates with forward fill
+                basis_at_time_1 = basis_at_time_1.reindex(
+                    self.training_data.index.normalize(),
+                    method='ffill'
+                )
+                basis_at_time_2 = basis_at_time_2.reindex(
+                    self.training_data.index.normalize(),
+                    method='ffill'
+                )
 
                 # Calculate intraday change
                 basis_change_series = cf.relative_basis(series_1=basis_at_time_2, series_2=basis_at_time_1)
