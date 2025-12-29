@@ -43,7 +43,7 @@ try:
 
     # Feature processing classes
     from .features.feature_engineering import IntradayFeatures
-    from .features.curve_analysis import CurveShapeAnalyzer, CurveEvolutionAnalyzer
+    from CTAFlow.features.curve.advanced_features import CurveShapeAnalyzer, CurveEvolutionAnalyzer
     from .features.signals_processing import COTAnalyzer, TechnicalAnalysis
 
     # Data container classes
