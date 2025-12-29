@@ -1518,12 +1518,54 @@ class IntradayMomentum:
         # Filter to valid trading dates
         target_volume = self._filter_to_trading_dates(target_volume)
 
-        # Calculate historical average with min_periods to reduce NaNs at start
-        min_periods = max(1, lookback_days // 4)  # Require at least 25% of data
-        avg_volume = target_volume.rolling(lookback_days, min_periods=min_periods).mean()
+        # CRITICAL FIX: Reindex to continuous date range to include ALL calendar days
+        # This ensures rolling windows are calendar-day based, not trading-day based
+        if not target_volume.empty:
+            # Create complete date range (including weekends/holidays)
+            full_date_range = pd.date_range(
+                start=target_volume.index.min(),
+                end=target_volume.index.max(),
+                freq='D'
+            )
 
-        # Relative volume
-        relative_vol = target_volume / avg_volume.replace(0, np.nan)
+            # Reindex to full range, NaN for non-trading days
+            target_volume_full = target_volume.reindex(full_date_range)
+
+            # Calculate historical average on CALENDAR days (not trading days)
+            # This makes lookback_days=20 actually mean 20 calendar days
+            min_periods = max(1, lookback_days // 4)  # Require at least 25% of data
+            avg_volume_full = target_volume_full.rolling(
+                window=lookback_days,
+                min_periods=min_periods
+            ).mean()
+
+            # Remove non-trading days from both series
+            avg_volume = avg_volume_full.loc[target_volume.index]
+        else:
+            # Empty data case
+            avg_volume = pd.Series(dtype=float, index=target_volume.index)
+
+        # Handle zero/NaN volumes gracefully
+        # Replace zeros in avg_volume with NaN to avoid division by zero
+        avg_volume_safe = avg_volume.replace(0, np.nan)
+
+        # Also handle NaN in target_volume (missing bars)
+        # Fill missing target volumes with 0 (no volume = neutral signal)
+        target_volume_safe = target_volume.fillna(0)
+
+        # Calculate relative volume with safe division
+        with np.errstate(divide='ignore', invalid='ignore'):
+            relative_vol = target_volume_safe / avg_volume_safe
+
+        # Replace inf values with NaN
+        relative_vol = relative_vol.replace([np.inf, -np.inf], np.nan)
+
+        # Optional: For days where avg_volume is NaN (insufficient history),
+        # we could use a global average as fallback (uncomment if needed)
+        # if relative_vol.isna().any():
+        #     global_avg = target_volume.mean()
+        #     if global_avg > 0:
+        #         relative_vol = relative_vol.fillna(target_volume / global_avg)
 
         if add_as_feature:
             # Shift if needed to avoid lookahead bias
@@ -2473,20 +2515,48 @@ class IntradayMomentum:
             # Calculate full slope series
             slope_series = cf.curve_slope(front=slope_mos[0], back=slope_mos[1])
 
-            # Extract at target_time using adaptive window (handles different bar frequencies)
-            slope_at_time = self._extract_at_time_daily(slope_series, target_time)
+            # Detect curve data frequency to adjust extraction parameters
+            curve_freq_minutes = self._detect_bar_frequency_minutes(fwd_curve_df)
 
-            # Reindex to training_data dates with limited forward fill
-            # Limit to 5 days to handle weekends/holidays without stale data propagation
-            slope_at_time = slope_at_time.reindex(
-                self.training_data.index.normalize(),
-                method='ffill',
-                limit=5
+            # Extract at target_time using adaptive window
+            # Curve data is often less frequent, so use larger window
+            max_window = max(120, int(curve_freq_minutes * 3))  # At least 2 hours or 3x frequency
+            slope_at_time = self._extract_at_time_daily(
+                slope_series,
+                target_time,
+                adaptive_window=True,
+                max_window_minutes=max_window
             )
 
-            # Lag if needed to avoid lookahead bias
-            needs_shift = self._needs_shift(target_time)
-            slope_feature = slope_at_time.shift(1) if needs_shift else slope_at_time
+            if slope_at_time.empty:
+                import warnings
+                warnings.warn(
+                    f"No curve slope data found at {target_time}. "
+                    f"Curve data frequency: {curve_freq_minutes:.1f} min. "
+                    "Slope feature will be all NaN.",
+                    UserWarning
+                )
+                slope_feature = pd.Series(dtype=float, index=self.training_data.index.normalize())
+            else:
+                # Determine appropriate forward fill limit based on curve data frequency
+                # If curve updates daily, allow 7 days fill; if hourly, allow 2 days
+                if curve_freq_minutes >= 1440:  # Daily or less frequent
+                    fill_limit = 7
+                elif curve_freq_minutes >= 60:  # Hourly
+                    fill_limit = 3
+                else:  # Intraday
+                    fill_limit = 2
+
+                # Reindex to training_data dates with frequency-aware forward fill
+                slope_at_time = slope_at_time.reindex(
+                    self.training_data.index.normalize(),
+                    method='ffill',
+                    limit=fill_limit
+                )
+
+                # Lag if needed to avoid lookahead bias
+                needs_shift = self._needs_shift(target_time)
+                slope_feature = slope_at_time.shift(1) if needs_shift else slope_at_time
 
             # Generate feature name
             feature_name = self._make_feature_name(
@@ -2508,20 +2578,47 @@ class IntradayMomentum:
             if front_col in fwd_curve_df.columns and back_col in fwd_curve_df.columns:
                 basis_series = (fwd_curve_df[back_col] - fwd_curve_df[front_col]) / fwd_curve_df[front_col]
 
-                # Extract at target_time using adaptive window (handles different bar frequencies)
-                basis_at_time = self._extract_at_time_daily(basis_series, target_time)
+                # Detect curve data frequency to adjust extraction parameters
+                curve_freq_minutes = self._detect_bar_frequency_minutes(fwd_curve_df)
 
-                # Reindex to training_data dates with limited forward fill
-                # Limit to 5 days to handle weekends/holidays without stale data propagation
-                basis_at_time = basis_at_time.reindex(
-                    self.training_data.index.normalize(),
-                    method='ffill',
-                    limit=5
+                # Extract at target_time using adaptive window
+                # Curve data is often less frequent, so use larger window
+                max_window = max(120, int(curve_freq_minutes * 3))  # At least 2 hours or 3x frequency
+                basis_at_time = self._extract_at_time_daily(
+                    basis_series,
+                    target_time,
+                    adaptive_window=True,
+                    max_window_minutes=max_window
                 )
 
-                # Lag if needed to avoid lookahead bias
-                needs_shift = self._needs_shift(target_time)
-                basis_feature = basis_at_time.shift(1) if needs_shift else basis_at_time
+                if basis_at_time.empty:
+                    import warnings
+                    warnings.warn(
+                        f"No curve basis data found at {target_time}. "
+                        f"Curve data frequency: {curve_freq_minutes:.1f} min. "
+                        "Basis feature will be all NaN.",
+                        UserWarning
+                    )
+                    basis_feature = pd.Series(dtype=float, index=self.training_data.index.normalize())
+                else:
+                    # Determine appropriate forward fill limit based on curve data frequency
+                    if curve_freq_minutes >= 1440:  # Daily or less frequent
+                        fill_limit = 7
+                    elif curve_freq_minutes >= 60:  # Hourly
+                        fill_limit = 3
+                    else:  # Intraday
+                        fill_limit = 2
+
+                    # Reindex to training_data dates with frequency-aware forward fill
+                    basis_at_time = basis_at_time.reindex(
+                        self.training_data.index.normalize(),
+                        method='ffill',
+                        limit=fill_limit
+                    )
+
+                    # Lag if needed to avoid lookahead bias
+                    needs_shift = self._needs_shift(target_time)
+                    basis_feature = basis_at_time.shift(1) if needs_shift else basis_at_time
 
                 # Generate feature name
                 feature_name = self._make_feature_name(
@@ -2607,27 +2704,54 @@ class IntradayMomentum:
         cf = CurveFeatures(continuous_df=fwd_curve_df)
         features_dict = {}
 
+        # Detect curve data frequency once for both slope and basis
+        curve_freq_minutes = self._detect_bar_frequency_minutes(fwd_curve_df)
+
+        # Determine forward fill limit based on curve frequency
+        if curve_freq_minutes >= 1440:  # Daily or less frequent
+            fill_limit = 7
+        elif curve_freq_minutes >= 60:  # Hourly
+            fill_limit = 3
+        else:  # Intraday
+            fill_limit = 2
+
+        max_window = max(120, int(curve_freq_minutes * 3))
+
         # Calculate slope change over lookback_days
         if slope_change:
             # Calculate full slope series
             slope_series = cf.curve_slope(front=slope_mos[0], back=slope_mos[1])
 
             # Extract at target_time using adaptive window
-            slope_at_time = self._extract_at_time_daily(slope_series, target_time)
-
-            # Reindex to training_data dates with limited forward fill
-            slope_at_time = slope_at_time.reindex(
-                self.training_data.index.normalize(),
-                method='ffill',
-                limit=5
+            slope_at_time = self._extract_at_time_daily(
+                slope_series,
+                target_time,
+                adaptive_window=True,
+                max_window_minutes=max_window
             )
 
-            # Calculate change: current slope minus slope lookback_days ago
-            slope_change_series = slope_at_time - slope_at_time.shift(lookback_days)
+            if slope_at_time.empty:
+                import warnings
+                warnings.warn(
+                    f"No curve slope data for daily changes at {target_time}. "
+                    f"Curve data frequency: {curve_freq_minutes:.1f} min.",
+                    UserWarning
+                )
+                slope_change_feature = pd.Series(dtype=float, index=self.training_data.index.normalize())
+            else:
+                # Reindex to training_data dates with frequency-aware forward fill
+                slope_at_time = slope_at_time.reindex(
+                    self.training_data.index.normalize(),
+                    method='ffill',
+                    limit=fill_limit
+                )
 
-            # Lag if needed to avoid lookahead bias
-            needs_shift = self._needs_shift(target_time)
-            slope_change_feature = slope_change_series.shift(1) if needs_shift else slope_change_series
+                # Calculate change: current slope minus slope lookback_days ago
+                slope_change_series = slope_at_time - slope_at_time.shift(lookback_days)
+
+                # Lag if needed to avoid lookahead bias
+                needs_shift = self._needs_shift(target_time)
+                slope_change_feature = slope_change_series.shift(1) if needs_shift else slope_change_series
 
             # Generate feature name
             feature_name = self._make_feature_name(
@@ -2650,21 +2774,35 @@ class IntradayMomentum:
                 basis_series = (fwd_curve_df[back_col] - fwd_curve_df[front_col]) / fwd_curve_df[front_col]
 
                 # Extract at target_time using adaptive window
-                basis_at_time = self._extract_at_time_daily(basis_series, target_time)
-
-                # Reindex to training_data dates with limited forward fill
-                basis_at_time = basis_at_time.reindex(
-                    self.training_data.index.normalize(),
-                    method='ffill',
-                    limit=5
+                basis_at_time = self._extract_at_time_daily(
+                    basis_series,
+                    target_time,
+                    adaptive_window=True,
+                    max_window_minutes=max_window
                 )
 
-                # Calculate change: current basis minus basis lookback_days ago
-                basis_change_series = basis_at_time - basis_at_time.shift(lookback_days)
+                if basis_at_time.empty:
+                    import warnings
+                    warnings.warn(
+                        f"No curve basis data for daily changes at {target_time}. "
+                        f"Curve data frequency: {curve_freq_minutes:.1f} min.",
+                        UserWarning
+                    )
+                    basis_change_feature = pd.Series(dtype=float, index=self.training_data.index.normalize())
+                else:
+                    # Reindex to training_data dates with frequency-aware forward fill
+                    basis_at_time = basis_at_time.reindex(
+                        self.training_data.index.normalize(),
+                        method='ffill',
+                        limit=fill_limit
+                    )
 
-                # Lag if needed to avoid lookahead bias
-                needs_shift = self._needs_shift(target_time)
-                basis_change_feature = basis_change_series.shift(1) if needs_shift else basis_change_series
+                    # Calculate change: current basis minus basis lookback_days ago
+                    basis_change_series = basis_at_time - basis_at_time.shift(lookback_days)
+
+                    # Lag if needed to avoid lookahead bias
+                    needs_shift = self._needs_shift(target_time)
+                    basis_change_feature = basis_change_series.shift(1) if needs_shift else basis_change_series
 
                 # Generate feature name
                 feature_name = self._make_feature_name(
@@ -2764,35 +2902,68 @@ class IntradayMomentum:
         cf = CurveFeatures(continuous_df=fwd_curve_df)
         features_dict = {}
 
+        # Detect curve data frequency for adaptive extraction
+        curve_freq_minutes = self._detect_bar_frequency_minutes(fwd_curve_df)
+
+        # Determine forward fill limit based on curve frequency
+        if curve_freq_minutes >= 1440:  # Daily or less frequent
+            fill_limit = 7
+        elif curve_freq_minutes >= 60:  # Hourly
+            fill_limit = 3
+        else:  # Intraday
+            fill_limit = 2
+
+        max_window = max(120, int(curve_freq_minutes * 3))
+
         # Calculate slope change between time_1 and time_2
         if slope_change:
             # Calculate full slope series
             slope_series = cf.curve_slope(front=slope_mos[0], back=slope_mos[1])
 
             # Extract at time_1 and time_2 using adaptive window
-            slope_at_time_1 = self._extract_at_time_daily(slope_series, time_1)
-            slope_at_time_2 = self._extract_at_time_daily(slope_series, time_2)
-
-            # Reindex both to training_data dates with limited forward fill
-            slope_at_time_1 = slope_at_time_1.reindex(
-                self.training_data.index.normalize(),
-                method='ffill',
-                limit=5
+            slope_at_time_1 = self._extract_at_time_daily(
+                slope_series,
+                time_1,
+                adaptive_window=True,
+                max_window_minutes=max_window
             )
-            slope_at_time_2 = slope_at_time_2.reindex(
-                self.training_data.index.normalize(),
-                method='ffill',
-                limit=5
+            slope_at_time_2 = self._extract_at_time_daily(
+                slope_series,
+                time_2,
+                adaptive_window=True,
+                max_window_minutes=max_window
             )
 
-            # Calculate intraday change: slope at time_2 minus slope at time_1 (same day)
-            # Align indices and compute difference
-            common_dates = slope_at_time_1.index.intersection(slope_at_time_2.index)
-            slope_change_series = slope_at_time_2.loc[common_dates] - slope_at_time_1.loc[common_dates]
+            # Check if either extraction failed
+            if slope_at_time_1.empty or slope_at_time_2.empty:
+                import warnings
+                warnings.warn(
+                    f"Insufficient curve slope data for intraday changes at {time_1} to {time_2}. "
+                    f"Curve data frequency: {curve_freq_minutes:.1f} min.",
+                    UserWarning
+                )
+                slope_change_feature = pd.Series(dtype=float, index=self.training_data.index.normalize())
+            else:
+                # Reindex both to training_data dates with frequency-aware forward fill
+                slope_at_time_1 = slope_at_time_1.reindex(
+                    self.training_data.index.normalize(),
+                    method='ffill',
+                    limit=fill_limit
+                )
+                slope_at_time_2 = slope_at_time_2.reindex(
+                    self.training_data.index.normalize(),
+                    method='ffill',
+                    limit=fill_limit
+                )
 
-            # Lag if needed to avoid lookahead bias (based on the later time)
-            needs_shift = self._needs_shift(time_2)
-            slope_change_feature = slope_change_series.shift(1) if needs_shift else slope_change_series
+                # Calculate intraday change: slope at time_2 minus slope at time_1 (same day)
+                # Align indices and compute difference
+                common_dates = slope_at_time_1.index.intersection(slope_at_time_2.index)
+                slope_change_series = slope_at_time_2.loc[common_dates] - slope_at_time_1.loc[common_dates]
+
+                # Lag if needed to avoid lookahead bias (based on the later time)
+                needs_shift = self._needs_shift(time_2)
+                slope_change_feature = slope_change_series.shift(1) if needs_shift else slope_change_series
 
             # Generate feature name
             time_1_str = time_1.strftime("%H%M")
@@ -2817,24 +2988,44 @@ class IntradayMomentum:
                 basis_series = (fwd_curve_df[back_col] - fwd_curve_df[front_col]) / fwd_curve_df[front_col]
 
                 # Extract at time_1 and time_2 using adaptive window
-                basis_at_time_1 = self._extract_at_time_daily(basis_series, time_1)
-                basis_at_time_2 = self._extract_at_time_daily(basis_series, time_2)
-
-                # Reindex both to training_data dates with limited forward fill
-                basis_at_time_1 = basis_at_time_1.reindex(
-                    self.training_data.index.normalize(),
-                    method='ffill',
-                    limit=5
+                basis_at_time_1 = self._extract_at_time_daily(
+                    basis_series,
+                    time_1,
+                    adaptive_window=True,
+                    max_window_minutes=max_window
                 )
-                basis_at_time_2 = basis_at_time_2.reindex(
-                    self.training_data.index.normalize(),
-                    method='ffill',
-                    limit=5
+                basis_at_time_2 = self._extract_at_time_daily(
+                    basis_series,
+                    time_2,
+                    adaptive_window=True,
+                    max_window_minutes=max_window
                 )
 
-                # Calculate intraday change: basis at time_2 minus basis at time_1 (same day)
-                common_dates = basis_at_time_1.index.intersection(basis_at_time_2.index)
-                basis_change_series = basis_at_time_2.loc[common_dates] - basis_at_time_1.loc[common_dates]
+                # Check if either extraction failed
+                if basis_at_time_1.empty or basis_at_time_2.empty:
+                    import warnings
+                    warnings.warn(
+                        f"Insufficient curve basis data for intraday changes at {time_1} to {time_2}. "
+                        f"Curve data frequency: {curve_freq_minutes:.1f} min.",
+                        UserWarning
+                    )
+                    basis_change_feature = pd.Series(dtype=float, index=self.training_data.index.normalize())
+                else:
+                    # Reindex both to training_data dates with frequency-aware forward fill
+                    basis_at_time_1 = basis_at_time_1.reindex(
+                        self.training_data.index.normalize(),
+                        method='ffill',
+                        limit=fill_limit
+                    )
+                    basis_at_time_2 = basis_at_time_2.reindex(
+                        self.training_data.index.normalize(),
+                        method='ffill',
+                        limit=fill_limit
+                    )
+
+                    # Calculate intraday change: basis at time_2 minus basis at time_1 (same day)
+                    common_dates = basis_at_time_1.index.intersection(basis_at_time_2.index)
+                    basis_change_series = basis_at_time_2.loc[common_dates] - basis_at_time_1.loc[common_dates]
 
                 # Lag if needed to avoid lookahead bias (based on the later time)
                 needs_shift = self._needs_shift(time_2)
@@ -3021,6 +3212,7 @@ class IntradayMomentum:
             daily_df: pd.DataFrame,
             lookbacks: Sequence[int] = (1, 5, 10, 20),
             price_col: str = "Close",
+            handle_missing: str = "drop",
     ) -> pd.DataFrame:
         """Add lagged daily momentum/returns features.
 
@@ -3036,6 +3228,11 @@ class IntradayMomentum:
             Lookback periods in days for momentum calculation
         price_col : str, default "Close"
             Column containing the price series
+        handle_missing : str, default "drop"
+            How to handle missing/invalid values:
+            - "drop": Drop rows with NaN/inf (safe, reduces data)
+            - "fill": Forward fill NaNs, replace inf with NaN then forward fill
+            - "zero": Replace NaN/inf with 0 (use with caution)
 
         Returns
         -------
@@ -3048,6 +3245,11 @@ class IntradayMomentum:
         include the target date's (present day) return. For example, momentum_5d
         on day T represents the cumulative return from day T-6 to day T-1.
 
+        The method handles edge cases:
+        - Zero or negative prices (log is undefined) -> NaN
+        - Missing data at start due to shift operations
+        - Index alignment with training_data
+
         Examples
         --------
         >>> model = IntradayMomentumLight(intraday_data, ...)
@@ -3055,19 +3257,59 @@ class IntradayMomentum:
         >>> # momentum_5d contains returns from T-6 to T-1 (5 days, lagged by 1)
         """
         prices = self._coerce_price(daily_df, price_col)
+
+        # Ensure index is normalized DatetimeIndex
+        if not isinstance(prices.index, pd.DatetimeIndex):
+            prices.index = pd.to_datetime(prices.index)
+        prices.index = prices.index.normalize()
+
+        # Validate prices (log requires positive values)
+        if (prices <= 0).any():
+            import warnings
+            n_invalid = (prices <= 0).sum()
+            warnings.warn(
+                f"Found {n_invalid} non-positive prices in daily_df. "
+                "Log returns will be NaN for these periods.",
+                UserWarning
+            )
+
         feats: Dict[str, pd.Series] = {}
 
         for lb in lookbacks:
             # Calculate total log return over lookback period
-            momentum = np.log(prices / prices.shift(lb))
+            # Use np.where to handle edge cases gracefully
+            price_ratio = prices / prices.shift(lb)
+
+            # Calculate log return, handling invalid values
+            with np.errstate(invalid='ignore', divide='ignore'):
+                momentum = np.log(price_ratio)
+
+            # Replace inf with NaN (from division by zero or log of zero)
+            momentum = momentum.replace([np.inf, -np.inf], np.nan)
+
             # Lag by 1 to avoid using current day's return
             momentum_lagged = momentum.shift(1)
+
+            # Handle missing values based on strategy
+            if handle_missing == "fill":
+                # Forward fill NaNs (use with caution - may propagate stale data)
+                momentum_lagged = momentum_lagged.fillna(method='ffill')
+            elif handle_missing == "zero":
+                # Replace NaNs with 0 (neutral return)
+                momentum_lagged = momentum_lagged.fillna(0)
+            # "drop" strategy: leave NaNs as-is, will be handled by _add_feature
+
             feature_name = f"momentum_{lb}d"
             feats[feature_name] = momentum_lagged
 
             # Add to training data if it exists
             if isinstance(self.training_data, pd.DataFrame):
-                self._add_feature(momentum_lagged, feature_name, tf='1d')
+                # Align with training_data index before adding
+                aligned_feature = momentum_lagged.reindex(
+                    self.training_data.index.normalize(),
+                    method=None  # No forward/backward fill during reindex
+                )
+                self._add_feature(aligned_feature, feature_name, tf='1d')
 
         return pd.DataFrame(feats)
 

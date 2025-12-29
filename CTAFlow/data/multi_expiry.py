@@ -292,6 +292,11 @@ class SpreadEngine:
         self.lazy_pool.sort(key=lambda x: x.expiry_date)
         logger.info(f"Indexed {len(self.lazy_pool)} contract slices.")
 
+    def _get_ffill_limit(self, freq: str) -> int:
+        """Calculate ffill limit (4 hours) based on frequency."""
+        freq_map = {'1min': 240, '5min': 48, '15min': 16, '30min': 8, '1h': 4, '1H': 4}
+        return freq_map.get(freq, 16)
+
     def get_sequential_prices(self, start_date: str, end_date: str, freq: str = '1h',
                              max_months: int = None, return_expiries: bool = False) -> Generator:
         """
@@ -384,11 +389,14 @@ class SpreadEngine:
                     full_df = loaded_contracts[contract]
 
                     # Slice for entire period
-                    slice_df = full_df[(full_df.index >= period_start) & (full_df.index < period_end)]
+                    # Add 4-hour overlap to prevent gaps at period boundaries
+                    overlap = pd.Timedelta(hours=4)
+                    slice_df = full_df[(full_df.index >= period_start - overlap) & (full_df.index < period_end)]
 
                     if not slice_df.empty and 'close' in slice_df.columns:
-                        # Resample for entire period at once
-                        resampled = slice_df['close'].resample(freq).last().ffill()
+                        # Resample with limited forward fill (4 hours max)
+                        ffill_limit = self._get_ffill_limit(freq)
+                        resampled = slice_df['close'].resample(freq).last().ffill(limit=ffill_limit)
                         period_data[f"M{idx + 1}"] = resampled
             except Exception as e:
                 logger.error(f"  Error slicing/resampling for period {i+1}: {e}")
