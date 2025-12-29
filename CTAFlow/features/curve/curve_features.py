@@ -10,6 +10,7 @@ CRACK_SPREAD_LOCATION = Path("F:\\Data\\intraday\\synthetic\\crack_spread.csv")
 DATA_DIR = Path("F:\\monthly_contracts\\")
 
 
+
 class CurveFeatures:
     """
     Features derived from futures curve structure for energy commodities.
@@ -23,7 +24,7 @@ class CurveFeatures:
     Usage:
     ------
     from CTAFlow.data.spread_loader import SpreadEngine
-    from CTAFlow.features.market_specific.energy import CurveFeatures
+    from CTAFlow.features.curve.energy import CurveFeatures
 
     # Generate continuous contracts and spreads
     engine = SpreadEngine(contract_pool)
