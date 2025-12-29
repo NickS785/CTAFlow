@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 from datetime import time, timedelta
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Type, Union
 
@@ -15,8 +16,11 @@ from .feature_selection import FeatureSelector, FeatureSelectionConfig
 from ..utils.session import DEFAULT_SESSION_TZ
 from . import base_models
 from .base_models import CTALight
+from ..features.curve.curve_features import CurveFeatures
+from ..utils.tenor_interpolation import TenorInterpolator, create_tenor_grid
 
 
+# noinspection PyDefaultArgument
 class IntradayMomentum:
     """LightGBM wrapper focused on intraday momentum and volatility features.
 
@@ -177,10 +181,10 @@ class IntradayMomentum:
 
             if feature_is_evening and target_is_evening:
                 # Both in evening part - simple comparison
-                return feature_time >= self.target_time
+                return feature_time > self.target_time
             elif not feature_is_evening and not target_is_evening:
                 # Both in morning part (next calendar day) - simple comparison
-                return feature_time >= self.target_time
+                return feature_time > self.target_time
             elif feature_is_evening and not target_is_evening:
                 # Feature is in evening (e.g., 20:00), target in morning (e.g., 16:00)
                 # Feature comes BEFORE target in session timeline
@@ -194,10 +198,10 @@ class IntradayMomentum:
             return feature_time >= self.target_time
 
     def _get_target_time_mask(
-        self,
-        index: pd.DatetimeIndex,
-        target_time: time,
-        use_nearest: bool = True
+            self,
+            index: pd.DatetimeIndex,
+            target_time: time,
+            use_nearest: bool = True
     ) -> pd.Series:
         """Get mask for extracting data at target_time, with fallback to nearest available time.
 
@@ -275,11 +279,11 @@ class IntradayMomentum:
         return result_mask
 
     def _make_feature_name(
-        self,
-        base_name: str,
-        feature_time: time,
-        period_str: str = "",
-        ticker: str = ""
+            self,
+            base_name: str,
+            feature_time: time,
+            period_str: str = "",
+            ticker: str = ""
     ) -> str:
         """Generate feature name with proper prefix for shifted features.
 
@@ -331,10 +335,10 @@ class IntradayMomentum:
         if preds.ndim > 1:
             if preds.shape[1] == 1:
                 return preds.ravel()
-            if hasattr(self.model, "task") and getattr(self.model, "task", None) in {"binary_classification", "multiclass"}:
+            if hasattr(self.model, "task") and getattr(self.model, "task", None) in {"binary_classification",
+                                                                                     "multiclass"}:
                 return np.argmax(preds, axis=1)
         return preds
-
 
     @staticmethod
     def _format_period_length(period_length: Optional[timedelta]) -> str:
@@ -816,13 +820,13 @@ class IntradayMomentum:
         feature_df.index = pd.to_datetime(feature_df.index).normalize()
 
         window_end_time = (
-            pd.Timestamp("1970-01-01")
-            + pd.Timedelta(
-                hours=self.session_open.hour,
-                minutes=self.session_open.minute,
-                seconds=self.session_open.second,
-            )
-            + window
+                pd.Timestamp("1970-01-01")
+                + pd.Timedelta(
+            hours=self.session_open.hour,
+            minutes=self.session_open.minute,
+            seconds=self.session_open.second,
+        )
+                + window
         ).time()
         if window_end_time > self.target_time:
             feature_df = feature_df.shift(1)
@@ -897,7 +901,7 @@ class IntradayMomentum:
         log_co = np.log(daily_ohlc['Close'] / daily_ohlc['Open'])
 
         # GK estimator
-        gk_term = 0.5 * log_hl**2 - (2*np.log(2) - 1) * log_co**2
+        gk_term = 0.5 * log_hl ** 2 - (2 * np.log(2) - 1) * log_co ** 2
 
         features: Dict[str, pd.Series] = {}
         for lookback in lookbacks:
@@ -1419,7 +1423,6 @@ class IntradayMomentum:
                 self._add_feature(feature_series, feature_name, tf='1d')
 
         return pd.DataFrame(features)
-
 
     def target_time_returns(
             self,
@@ -2129,6 +2132,447 @@ class IntradayMomentum:
 
         return pd.DataFrame(feats)
 
+    def curve_levels(self,
+                     fwd_curve_df: pd.DataFrame,
+                     target_time: Union[time, List[time]],
+                     slope: bool = True,
+                     slope_mos: Tuple[int, int] = (1, 4),
+                     normalized_basis: bool = True,
+                     basis_mos: Tuple[int, int] = (1, 3),
+                     const_maturity: bool = False,
+                     add_as_feature: bool = True) -> pd.DataFrame:
+        """Extract curve shape features at specific intraday time(s).
+
+        Measures the forward curve structure (slope, basis) at target_time each day.
+        Features are properly lagged to avoid lookahead bias.
+
+        Parameters
+        ----------
+        fwd_curve_df : pd.DataFrame
+            Continuous contract prices (M1, M2, M3, ...) with intraday DatetimeIndex
+        target_time : time or List[time]
+            Intraday time(s) to extract curve features
+        slope : bool, default True
+            Calculate curve slope between slope_mos contracts
+        slope_mos : Tuple[int, int], default (1, 4)
+            (front, back) contract months for slope calculation
+        normalized_basis : bool, default True
+            Calculate normalized spread (basis) between basis_mos contracts
+        basis_mos : Tuple[int, int], default (1, 3)
+            (front, back) contract months for basis calculation
+        const_maturity : bool, default False
+            Use constant maturity interpolation (NOT YET IMPLEMENTED)
+        add_as_feature : bool, default True
+            If True, add features to training_data with proper lagging
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with curve level features for each target_time
+
+        Notes
+        -----
+        - Features are lagged if target_time is at or after self.target_time
+        - Slope measures average price change per month: (M_back - M_front) / (back - front)
+        - Normalized basis: (M_back - M_front) / M_front (percentage spread)
+
+        Examples
+        --------
+        >>> # Curve slope at 10am and 2pm
+        >>> curve_feats = model.curve_levels(
+        ...     fwd_curve_df=continuous_contracts,
+        ...     target_time=[time(10, 0), time(14, 0)],
+        ...     slope=True,
+        ...     normalized_basis=True
+        ... )
+        """
+        # Handle list of times
+        if isinstance(target_time, (list, tuple)):
+            all_features = []
+            for t in target_time:
+                feats = self.curve_levels(
+                    fwd_curve_df, t, slope, slope_mos, normalized_basis, basis_mos, const_maturity, add_as_feature
+                )
+                all_features.append(feats)
+            return pd.concat(all_features, axis=1)
+
+        # Single time handling
+        if const_maturity:
+            tenor_grid = create_tenor_grid(min_tau=1/12, max_tau=1.0)
+            ti = TenorInterpolator(tenor_grid=tenor_grid, min_contracts=4)
+            # TODO: Implement constant maturity interpolation
+            logger.warning("Constant maturity not yet implemented, using contract-based features")
+
+        cf = CurveFeatures(continuous_df=fwd_curve_df)
+        features_dict = {}
+
+        # Extract curve slope at target_time
+        if slope:
+            # Calculate full slope series
+            slope_series = cf.curve_slope(front=slope_mos[0], back=slope_mos[1])
+
+            # Extract at target_time each day
+            mask = fwd_curve_df.index.time == target_time
+            slope_at_time = slope_series[mask]
+            slope_at_time.index = pd.to_datetime(slope_at_time.index).normalize()
+
+            # Filter to valid trading dates
+            slope_at_time = self._filter_to_trading_dates(slope_at_time)
+
+            # Lag if needed to avoid lookahead bias
+            needs_shift = self._needs_shift(target_time)
+            slope_feature = slope_at_time.shift(1) if needs_shift else slope_at_time
+
+            # Generate feature name
+            feature_name = self._make_feature_name(
+                f'curve_slope_M{slope_mos[0]}_M{slope_mos[1]}',
+                target_time,
+                ""
+            )
+            features_dict[feature_name] = slope_feature
+
+            if add_as_feature:
+                self._add_feature(slope_feature, feature_name)
+
+        # Extract normalized basis at target_time
+        if normalized_basis:
+            # Calculate normalized spread: (M_back - M_front) / M_front
+            front_col = f"M{basis_mos[0]}"
+            back_col = f"M{basis_mos[1]}"
+
+            if front_col in fwd_curve_df.columns and back_col in fwd_curve_df.columns:
+                basis_series = (fwd_curve_df[back_col] - fwd_curve_df[front_col]) / fwd_curve_df[front_col]
+
+                # Extract at target_time each day
+                mask = fwd_curve_df.index.time == target_time
+                basis_at_time = basis_series[mask]
+                basis_at_time.index = pd.to_datetime(basis_at_time.index).normalize()
+
+                # Filter to valid trading dates
+                basis_at_time = self._filter_to_trading_dates(basis_at_time)
+
+                # Lag if needed to avoid lookahead bias
+                needs_shift = self._needs_shift(target_time)
+                basis_feature = basis_at_time.shift(1) if needs_shift else basis_at_time
+
+                # Generate feature name
+                feature_name = self._make_feature_name(
+                    f'norm_basis_M{basis_mos[0]}_M{basis_mos[1]}',
+                    target_time,
+                    ""
+                )
+                features_dict[feature_name] = basis_feature
+
+                if add_as_feature:
+                    self._add_feature(basis_feature, feature_name)
+
+        return pd.DataFrame(features_dict)
+
+    def daily_curve_changes(self,
+                           fwd_curve_df: pd.DataFrame,
+                           target_time: Union[time, List[time]],
+                           lookback_days: int,
+                           slope_change: bool = True,
+                           slope_mos: Tuple[int, int] = (1, 4),
+                           relative_basis_change: bool = True,
+                           basis_mos: Tuple[int, int] = (1, 3),
+                           add_as_feature: bool = True) -> pd.DataFrame:
+        """Calculate daily changes in curve shape (day-over-day).
+
+        Measures how the forward curve structure at target_time has changed over
+        the past lookback_days trading days. Features are properly lagged to avoid lookahead bias.
+
+        Parameters
+        ----------
+        fwd_curve_df : pd.DataFrame
+            Continuous contract prices (M1, M2, M3, ...) with intraday DatetimeIndex
+        target_time : time or List[time]
+            Intraday time(s) to extract curve for comparison
+        lookback_days : int
+            Lookback period in days. E.g., 5 = change from 5 days ago to today
+        slope_change : bool, default True
+            Calculate change in curve slope over lookback_days
+        slope_mos : Tuple[int, int], default (1, 4)
+            (front, back) contract months for slope calculation
+        relative_basis_change : bool, default True
+            Calculate change in normalized basis over lookback_days
+        basis_mos : Tuple[int, int], default (1, 3)
+            (front, back) contract months for basis calculation
+        add_as_feature : bool, default True
+            If True, add features to training_data with proper lagging
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with daily curve change features
+
+        Notes
+        -----
+        - Features are lagged if target_time is at or after self.target_time
+        - Slope change: slope[t] - slope[t - lookback_days]
+        - Basis change: basis[t] - basis[t - lookback_days]
+        - Positive values indicate steepening/widening, negative values indicate flattening/narrowing
+
+        Examples
+        --------
+        >>> # 5-day curve slope change at 2pm (comparing 2pm today vs 2pm 5 days ago)
+        >>> daily_change_feats = model.daily_curve_changes(
+        ...     fwd_curve_df=continuous_contracts,
+        ...     target_time=time(14, 0),
+        ...     lookback_days=5,
+        ...     slope_change=True,
+        ...     relative_basis_change=True
+        ... )
+        """
+        # Handle list of times
+        if isinstance(target_time, (list, tuple)):
+            all_features = []
+            for t in target_time:
+                feats = self.daily_curve_changes(
+                    fwd_curve_df, t, lookback_days, slope_change, slope_mos,
+                    relative_basis_change, basis_mos, add_as_feature
+                )
+                all_features.append(feats)
+            return pd.concat(all_features, axis=1)
+
+        # Single time handling
+        cf = CurveFeatures(continuous_df=fwd_curve_df)
+        features_dict = {}
+
+        # Calculate slope change over lookback_days
+        if slope_change:
+            # Calculate full slope series
+            slope_series = cf.curve_slope(front=slope_mos[0], back=slope_mos[1])
+
+            # Extract at target_time each day
+            mask = fwd_curve_df.index.time == target_time
+            slope_at_time = slope_series[mask]
+            slope_at_time.index = pd.to_datetime(slope_at_time.index).normalize()
+
+            # Filter to valid trading dates
+            slope_at_time = self._filter_to_trading_dates(slope_at_time)
+
+            # Calculate change using the updated curve_slope method
+            slope_change_series = cf.curve_slope(series=slope_at_time, period_length=lookback_days)
+
+            # Lag if needed to avoid lookahead bias
+            needs_shift = self._needs_shift(target_time)
+            slope_change_feature = slope_change_series.shift(1) if needs_shift else slope_change_series
+
+            # Generate feature name
+            feature_name = self._make_feature_name(
+                f'daily_curve_slope_change_{lookback_days}d_M{slope_mos[0]}_M{slope_mos[1]}',
+                target_time,
+                ""
+            )
+            features_dict[feature_name] = slope_change_feature
+
+            if add_as_feature:
+                self._add_feature(slope_change_feature, feature_name)
+
+        # Calculate basis change over lookback_days
+        if relative_basis_change:
+            # Calculate normalized spread: (M_back - M_front) / M_front
+            front_col = f"M{basis_mos[0]}"
+            back_col = f"M{basis_mos[1]}"
+
+            if front_col in fwd_curve_df.columns and back_col in fwd_curve_df.columns:
+                basis_series = (fwd_curve_df[back_col] - fwd_curve_df[front_col]) / fwd_curve_df[front_col]
+
+                # Extract at target_time each day
+                mask = fwd_curve_df.index.time == target_time
+                basis_at_time = basis_series[mask]
+                basis_at_time.index = pd.to_datetime(basis_at_time.index).normalize()
+
+                # Filter to valid trading dates
+                basis_at_time = self._filter_to_trading_dates(basis_at_time)
+
+                # Calculate change using relative_basis method
+                basis_change_series = cf.relative_basis(series_1=basis_at_time, period_length=lookback_days)
+
+                # Lag if needed to avoid lookahead bias
+                needs_shift = self._needs_shift(target_time)
+                basis_change_feature = basis_change_series.shift(1) if needs_shift else basis_change_series
+
+                # Generate feature name
+                feature_name = self._make_feature_name(
+                    f'daily_norm_basis_change_{lookback_days}d_M{basis_mos[0]}_M{basis_mos[1]}',
+                    target_time,
+                    ""
+                )
+                features_dict[feature_name] = basis_change_feature
+
+                if add_as_feature:
+                    self._add_feature(basis_change_feature, feature_name)
+
+        return pd.DataFrame(features_dict)
+
+    def intraday_curve_changes(self,
+                              fwd_curve_df: pd.DataFrame,
+                              time_1: time,
+                              time_2: Optional[time] = None,
+                              period_length: Optional[timedelta] = None,
+                              slope_change: bool = True,
+                              slope_mos: Tuple[int, int] = (1, 4),
+                              relative_basis_change: bool = True,
+                              basis_mos: Tuple[int, int] = (1, 3),
+                              add_as_feature: bool = True) -> pd.DataFrame:
+        """Calculate intraday changes in curve shape (within-day).
+
+        Measures how the forward curve structure changed within the trading day,
+        either between two specific times or over a period from time_1.
+
+        Parameters
+        ----------
+        fwd_curve_df : pd.DataFrame
+            Continuous contract prices (M1, M2, M3, ...) with intraday DatetimeIndex
+        time_1 : time
+            First time point or starting time for comparison
+        time_2 : time, optional
+            Second time point for comparison. If None, must provide period_length.
+        period_length : timedelta, optional
+            Period from time_1 to calculate change. E.g., timedelta(hours=4) = 4 hours after time_1.
+            If None, must provide time_2.
+        slope_change : bool, default True
+            Calculate change in curve slope between times
+        slope_mos : Tuple[int, int], default (1, 4)
+            (front, back) contract months for slope calculation
+        relative_basis_change : bool, default True
+            Calculate change in normalized basis between times
+        basis_mos : Tuple[int, int], default (1, 3)
+            (front, back) contract months for basis calculation
+        add_as_feature : bool, default True
+            If True, add features to training_data with proper lagging
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with intraday curve change features
+
+        Notes
+        -----
+        - Features are lagged if the later time is at or after self.target_time
+        - Slope change: slope[time_2] - slope[time_1] (or slope[time_1 + period_length] - slope[time_1])
+        - Basis change: basis[time_2] - basis[time_1]
+        - Positive values indicate steepening/widening, negative values indicate flattening/narrowing
+
+        Examples
+        --------
+        >>> # Curve change from 10am to 2pm (same day)
+        >>> intraday_change_feats = model.intraday_curve_changes(
+        ...     fwd_curve_df=continuous_contracts,
+        ...     time_1=time(10, 0),
+        ...     time_2=time(14, 0),
+        ...     slope_change=True,
+        ...     relative_basis_change=True
+        ... )
+        >>>
+        >>> # Curve change over 4 hours from 10am
+        >>> intraday_change_feats = model.intraday_curve_changes(
+        ...     fwd_curve_df=continuous_contracts,
+        ...     time_1=time(10, 0),
+        ...     period_length=timedelta(hours=4),
+        ...     slope_change=True
+        ... )
+        """
+        if time_2 is None and period_length is None:
+            raise ValueError("Must provide either time_2 or period_length")
+
+        # Determine the second time
+        if time_2 is None:
+            # Calculate time_2 from time_1 + period_length
+            dt_base = pd.Timestamp('1970-01-01') + pd.Timedelta(
+                hours=time_1.hour,
+                minutes=time_1.minute,
+                seconds=time_1.second
+            )
+            dt_end = dt_base + period_length
+            time_2 = dt_end.time()
+
+        cf = CurveFeatures(continuous_df=fwd_curve_df)
+        features_dict = {}
+
+        # Calculate slope change between time_1 and time_2
+        if slope_change:
+            # Calculate full slope series
+            slope_series = cf.curve_slope(front=slope_mos[0], back=slope_mos[1])
+
+            # Extract at time_1 each day
+            mask_1 = fwd_curve_df.index.time == time_1
+            slope_at_time_1 = slope_series[mask_1]
+            slope_at_time_1.index = pd.to_datetime(slope_at_time_1.index).normalize()
+            slope_at_time_1 = self._filter_to_trading_dates(slope_at_time_1)
+
+            # Extract at time_2 each day
+            mask_2 = fwd_curve_df.index.time == time_2
+            slope_at_time_2 = slope_series[mask_2]
+            slope_at_time_2.index = pd.to_datetime(slope_at_time_2.index).normalize()
+            slope_at_time_2 = self._filter_to_trading_dates(slope_at_time_2)
+
+            # Calculate intraday change
+            slope_change_series = cf.relative_basis(series_1=slope_at_time_2, series_2=slope_at_time_1)
+
+            # Lag if needed to avoid lookahead bias (based on the later time)
+            needs_shift = self._needs_shift(time_2)
+            slope_change_feature = slope_change_series.shift(1) if needs_shift else slope_change_series
+
+            # Generate feature name
+            time_1_str = time_1.strftime("%H%M")
+            time_2_str = time_2.strftime("%H%M")
+            feature_name = self._make_feature_name(
+                f'intraday_curve_slope_change_{time_1_str}_to_{time_2_str}_M{slope_mos[0]}_M{slope_mos[1]}',
+                time_2,  # Use later time for shift logic
+                ""
+            )
+            features_dict[feature_name] = slope_change_feature
+
+            if add_as_feature:
+                self._add_feature(slope_change_feature, feature_name)
+
+        # Calculate basis change between time_1 and time_2
+        if relative_basis_change:
+            # Calculate normalized spread: (M_back - M_front) / M_front
+            front_col = f"M{basis_mos[0]}"
+            back_col = f"M{basis_mos[1]}"
+
+            if front_col in fwd_curve_df.columns and back_col in fwd_curve_df.columns:
+                basis_series = (fwd_curve_df[back_col] - fwd_curve_df[front_col]) / fwd_curve_df[front_col]
+
+                # Extract at time_1 each day
+                mask_1 = fwd_curve_df.index.time == time_1
+                basis_at_time_1 = basis_series[mask_1]
+                basis_at_time_1.index = pd.to_datetime(basis_at_time_1.index).normalize()
+                basis_at_time_1 = self._filter_to_trading_dates(basis_at_time_1)
+
+                # Extract at time_2 each day
+                mask_2 = fwd_curve_df.index.time == time_2
+                basis_at_time_2 = basis_series[mask_2]
+                basis_at_time_2.index = pd.to_datetime(basis_at_time_2.index).normalize()
+                basis_at_time_2 = self._filter_to_trading_dates(basis_at_time_2)
+
+                # Calculate intraday change
+                basis_change_series = cf.relative_basis(series_1=basis_at_time_2, series_2=basis_at_time_1)
+
+                # Lag if needed to avoid lookahead bias (based on the later time)
+                needs_shift = self._needs_shift(time_2)
+                basis_change_feature = basis_change_series.shift(1) if needs_shift else basis_change_series
+
+                # Generate feature name
+                time_1_str = time_1.strftime("%H%M")
+                time_2_str = time_2.strftime("%H%M")
+                feature_name = self._make_feature_name(
+                    f'intraday_norm_basis_change_{time_1_str}_to_{time_2_str}_M{basis_mos[0]}_M{basis_mos[1]}',
+                    time_2,  # Use later time for shift logic
+                    ""
+                )
+                features_dict[feature_name] = basis_change_feature
+
+                if add_as_feature:
+                    self._add_feature(basis_change_feature, feature_name)
+
+        return pd.DataFrame(features_dict)
+
+
     def fit(self, X, y, **kwargs):
         """Fit the configured base model with compatible parameters."""
         model = self._get_model()
@@ -2345,12 +2789,12 @@ class IntradayMomentum:
         return pd.DataFrame(feats)
 
     def add_basic_datetime_features(
-        self,
-        dates: Optional[pd.DatetimeIndex] = None,
-        add_day_of_week: bool = True,
-        add_month: bool = True,
-        add_quarter: bool = True,
-        use_sincos: bool = False,
+            self,
+            dates: Optional[pd.DatetimeIndex] = None,
+            add_day_of_week: bool = True,
+            add_month: bool = True,
+            add_quarter: bool = True,
+            use_sincos: bool = False,
     ) -> pd.DataFrame:
         """Attach simple calendar breakdowns (DOW, month, quarter).
 
@@ -2412,16 +2856,16 @@ class IntradayMomentum:
         return feature_df
 
     def add_calendar_datetime_features(
-        self,
-        ticker: str,
-        include_last_trading_week: bool = True,
-        include_opex_week: bool = True,
-        include_days_since_opex: bool = True,
-        include_expiration_week: bool = True,
-        include_weeks_until_expiration: bool = True,
-        dates: Optional[pd.DatetimeIndex] = None,
-        use_sincos: bool = False,
-        expiration_cycle_weeks: int = 13,
+            self,
+            ticker: str,
+            include_last_trading_week: bool = True,
+            include_opex_week: bool = True,
+            include_days_since_opex: bool = True,
+            include_expiration_week: bool = True,
+            include_weeks_until_expiration: bool = True,
+            dates: Optional[pd.DatetimeIndex] = None,
+            use_sincos: bool = False,
+            expiration_cycle_weeks: int = 13,
     ) -> pd.DataFrame:
         """Add calendar-based features such as opex and expiry timing.
 
@@ -2497,10 +2941,10 @@ class IntradayMomentum:
         return feature_df
 
     def add_eia_release_features(
-        self,
-        ticker: str,
-        dates: Optional[pd.DatetimeIndex] = None,
-        add_as_feature: bool = True,
+            self,
+            ticker: str,
+            dates: Optional[pd.DatetimeIndex] = None,
+            add_as_feature: bool = True,
     ) -> pd.DataFrame:
         """Add EIA (Energy Information Administration) release day features.
 
@@ -2627,16 +3071,16 @@ class IntradayMomentum:
         return feature_df
 
     def add_session_features(
-        self,
-        intraday_df: Optional[pd.DataFrame] = None,
-        price_col: str = "Close",
-        return_periods: Sequence[int] = (1, 5, 10),
-        volatility_periods: Sequence[int] = (1, 5, 10),
-        add_returns: bool = True,
-        add_volatility: bool = True,
-        session_start: Optional[time] = None,
-        session_end: Optional[time] = None,
-        tz: str = DEFAULT_SESSION_TZ,
+            self,
+            intraday_df: Optional[pd.DataFrame] = None,
+            price_col: str = "Close",
+            return_periods: Sequence[int] = (1, 5, 10),
+            volatility_periods: Sequence[int] = (1, 5, 10),
+            add_returns: bool = True,
+            add_volatility: bool = True,
+            session_start: Optional[time] = None,
+            session_end: Optional[time] = None,
+            tz: str = DEFAULT_SESSION_TZ,
     ) -> pd.DataFrame:
         """Create rolling session return and volatility features."""
 
@@ -2707,6 +3151,3 @@ class IntradayMomentum:
         val_dates = x_data.index.intersection(y_data.index)
 
         return x_data.loc[val_dates], y_data.loc[val_dates]
-
-
-
