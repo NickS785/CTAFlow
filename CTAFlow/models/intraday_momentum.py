@@ -394,7 +394,15 @@ class IntradayMomentum:
                 self.feature_names.append(feature_name)
         return
 
-    def _extract_at_time_daily(self, series: pd.Series, target_time: time, window_minutes: int = 5) -> pd.Series:
+    def _extract_at_time_daily(
+            self,
+            series: pd.Series,
+            target_time: time,
+            window_minutes: int = 5,
+            adaptive_window: bool = True,
+            max_window_minutes: int = 120,
+            fallback_to_nearest: bool = True,
+    ) -> pd.Series:
         """Extract values at target_time each day using a time window.
 
         More robust than exact time matching - finds bars within window_minutes of target_time.
@@ -407,15 +415,37 @@ class IntradayMomentum:
         target_time : time
             Target time to extract each day
         window_minutes : int, default 5
-            Time window in minutes (looks ± window_minutes around target_time)
+            Initial time window in minutes (looks ± window_minutes around target_time)
+        adaptive_window : bool, default True
+            If True and no bars found within initial window, automatically expands
+            the window up to max_window_minutes to find the nearest bar.
+        max_window_minutes : int, default 120
+            Maximum window size for adaptive expansion (2 hours default)
+        fallback_to_nearest : bool, default True
+            If True and no bars found even with expanded window, falls back to
+            the nearest bar <= target_time for each day (prevents complete data loss)
 
         Returns
         -------
         pd.Series
             Daily series with normalized date index
+
+        Notes
+        -----
+        The adaptive window handles data with different bar frequencies (5-min, 15-min,
+        hourly, etc.) without manual configuration. The fallback ensures that even if
+        the exact window has no data, we use the most recent available observation.
         """
         if not isinstance(series.index, pd.DatetimeIndex):
             raise ValueError("Series must have DatetimeIndex")
+
+        # Detect data frequency for smarter window sizing
+        if adaptive_window and len(series) > 1:
+            time_diffs = series.index.to_series().diff().dropna()
+            if not time_diffs.empty:
+                median_freq_minutes = time_diffs.median().total_seconds() / 60
+                # Ensure window is at least 1.5x the data frequency
+                window_minutes = max(window_minutes, int(median_freq_minutes * 1.5))
 
         # Create target timestamp for comparison
         target_dt = pd.Timestamp('1970-01-01') + pd.Timedelta(
@@ -424,24 +454,59 @@ class IntradayMomentum:
             seconds=target_time.second
         )
 
-        # Define time window
-        lower = (target_dt - pd.Timedelta(minutes=window_minutes)).time()
-        upper = (target_dt + pd.Timedelta(minutes=window_minutes)).time()
+        # Try initial window
+        current_window = window_minutes
+        series_in_window = pd.Series(dtype=float)
 
-        # Filter to bars within time window
-        mask = (series.index.time >= lower) & (series.index.time <= upper)
-        series_in_window = series[mask]
+        while current_window <= max_window_minutes:
+            lower = (target_dt - pd.Timedelta(minutes=current_window)).time()
+            upper = (target_dt + pd.Timedelta(minutes=current_window)).time()
+
+            # Handle midnight wrap-around for overnight sessions
+            if lower > upper:
+                mask = (series.index.time >= lower) | (series.index.time <= upper)
+            else:
+                mask = (series.index.time >= lower) & (series.index.time <= upper)
+
+            series_in_window = series[mask]
+
+            if not series_in_window.empty or not adaptive_window:
+                break
+
+            # Expand window and try again
+            current_window = min(current_window * 2, max_window_minutes + 1)
+
+        # If still empty and fallback enabled, use nearest bar <= target_time per day
+        if series_in_window.empty and fallback_to_nearest:
+            df = pd.DataFrame({'value': series})
+            df['date'] = df.index.normalize()
+            df['time'] = df.index.time
+
+            results = []
+            for date, group in df.groupby('date'):
+                # Find bars <= target_time
+                valid = group[group['time'] <= target_time]
+                if not valid.empty:
+                    # Take the latest bar <= target_time
+                    results.append(valid.iloc[-1]['value'])
+                else:
+                    # No bars <= target_time, take earliest bar of the day as last resort
+                    results.append(group.iloc[0]['value'])
+
+            if results:
+                dates = df.groupby('date').first().index
+                return pd.Series(results, index=dates)
 
         if series_in_window.empty:
             import warnings
             warnings.warn(
-                f"No data found within {window_minutes} minutes of {target_time}. "
+                f"No data found within {max_window_minutes} minutes of {target_time}. "
                 "Returning empty series - this will cause NaNs.",
                 UserWarning
             )
             return pd.Series(dtype=float)
 
-        # Group by date and take first bar per day (closest to target_time)
+        # Group by date and take bar closest to target_time
         df = pd.DataFrame({'value': series_in_window})
         df['date'] = df.index.normalize()
         df['time_diff'] = abs(
@@ -459,6 +524,60 @@ class IntradayMomentum:
         if price_col not in df.columns:
             raise KeyError(f"Price column '{price_col}' not found")
         return df[price_col].copy()
+
+    def _detect_bar_frequency_minutes(self, data: Optional[pd.DataFrame] = None) -> float:
+        """Detect the median bar frequency in minutes from data.
+
+        Parameters
+        ----------
+        data : Optional[pd.DataFrame]
+            Data with DatetimeIndex. Uses self.intraday_data if None.
+
+        Returns
+        -------
+        float
+            Median bar frequency in minutes. Returns 5.0 as default if cannot detect.
+        """
+        df = data if data is not None else self.intraday_data
+        if df is None or df.empty or len(df) < 2:
+            return 5.0  # Default assumption
+
+        if not isinstance(df.index, pd.DatetimeIndex):
+            return 5.0
+
+        time_diffs = df.index.to_series().diff().dropna()
+        if time_diffs.empty:
+            return 5.0
+
+        median_minutes = time_diffs.median().total_seconds() / 60
+        return max(1.0, median_minutes)  # At least 1 minute
+
+    def _period_to_bars(
+            self,
+            period: timedelta,
+            data: Optional[pd.DataFrame] = None,
+            min_bars: int = 1,
+    ) -> int:
+        """Convert a timedelta period to number of bars based on detected data frequency.
+
+        Parameters
+        ----------
+        period : timedelta
+            Time period to convert
+        data : Optional[pd.DataFrame]
+            Data to detect frequency from. Uses self.intraday_data if None.
+        min_bars : int, default 1
+            Minimum number of bars to return
+
+        Returns
+        -------
+        int
+            Number of bars corresponding to the period
+        """
+        freq_minutes = self._detect_bar_frequency_minutes(data)
+        period_minutes = period.total_seconds() / 60
+        bars = int(period_minutes / freq_minutes)
+        return max(min_bars, bars)
 
     def prev_hl(
             self,
@@ -635,9 +754,10 @@ class IntradayMomentum:
 
         # If period_length specified, use rolling VWAP
         if period_length:
-            bars = max(int(period_length.total_seconds() // 60 // 5), 1)
-            pv = (typical_price * volume).rolling(bars).sum()
-            v = volume.rolling(bars).sum()
+            # Use detected bar frequency instead of hardcoded 5-minute assumption
+            bars = self._period_to_bars(period_length, data)
+            pv = (typical_price * volume).rolling(bars, min_periods=1).sum()
+            v = volume.rolling(bars, min_periods=1).sum()
             vwap = pv / v.replace(0, np.nan)
         else:
             # Use session-based VWAP (from session_open to target_time)
@@ -1233,9 +1353,10 @@ class IntradayMomentum:
 
         # Calculate rolling range over the window
         if window:
-            bars = max(int(window.total_seconds() // 60 // 5), 1)
-            rolling_high = high.rolling(bars).max()
-            rolling_low = low.rolling(bars).min()
+            # Use detected bar frequency instead of hardcoded 5-minute assumption
+            bars = self._period_to_bars(window, data)
+            rolling_high = high.rolling(bars, min_periods=1).max()
+            rolling_low = low.rolling(bars, min_periods=1).min()
         else:
             rolling_high = high
             rolling_low = low
@@ -1245,7 +1366,18 @@ class IntradayMomentum:
         # Extract at target time
         mask = self._get_target_time_mask(data.index, target_time, use_nearest)
         target_range = range_series[mask]
-        target_range.index = pd.to_datetime(target_range.index).normalize()
+
+        # Handle case where mask returns no data
+        if target_range.empty:
+            import warnings
+            warnings.warn(
+                f"No data found at target_time {target_time}. Using fallback extraction.",
+                UserWarning
+            )
+            # Use the improved _extract_at_time_daily which has adaptive window
+            target_range = self._extract_at_time_daily(range_series, target_time)
+        else:
+            target_range.index = pd.to_datetime(target_range.index).normalize()
 
         # Filter to valid trading dates
         target_range = self._filter_to_trading_dates(target_range)
@@ -1362,11 +1494,12 @@ class IntradayMomentum:
 
         # Calculate rolling aggregation over the window
         if window:
-            bars = max(int(window.total_seconds() // 60 // 5), 1)
+            # Use detected bar frequency instead of hardcoded 5-minute assumption
+            bars = self._period_to_bars(window, data)
             if aggregation == "sum":
-                volume_agg = volume.rolling(bars).sum()
+                volume_agg = volume.rolling(bars, min_periods=1).sum()
             elif aggregation == "mean":
-                volume_agg = volume.rolling(bars).mean()
+                volume_agg = volume.rolling(bars, min_periods=1).mean()
             else:
                 raise ValueError(f"Aggregation must be 'sum' or 'mean', got '{aggregation}'")
         else:
@@ -1375,13 +1508,19 @@ class IntradayMomentum:
         # Extract at target time
         mask = self._get_target_time_mask(volume_agg.index, target_time, use_nearest)
         target_volume = volume_agg[mask]
-        target_volume.index = pd.to_datetime(target_volume.index).normalize()
+
+        # Handle case where mask returns no data
+        if target_volume.empty:
+            target_volume = self._extract_at_time_daily(volume_agg, target_time)
+        else:
+            target_volume.index = pd.to_datetime(target_volume.index).normalize()
 
         # Filter to valid trading dates
         target_volume = self._filter_to_trading_dates(target_volume)
 
-        # Calculate historical average
-        avg_volume = target_volume.rolling(lookback_days).mean()
+        # Calculate historical average with min_periods to reduce NaNs at start
+        min_periods = max(1, lookback_days // 4)  # Require at least 25% of data
+        avg_volume = target_volume.rolling(lookback_days, min_periods=min_periods).mean()
 
         # Relative volume
         relative_vol = target_volume / avg_volume.replace(0, np.nan)
@@ -1537,12 +1676,18 @@ class IntradayMomentum:
         ret = prices.pct_change().dropna()
 
         if window:
-            bars = max(int(window.total_seconds() // 60 // 5), 1)
-            ret = ret.rolling(bars).sum()
+            # Use detected bar frequency instead of hardcoded 5-minute assumption
+            bars = self._period_to_bars(window, data)
+            ret = ret.rolling(bars, min_periods=1).sum()
 
         mask = self._get_target_time_mask(ret.index, target_time, use_nearest)
         target_returns = ret[mask]
-        target_returns.index = pd.to_datetime(target_returns.index).normalize()
+
+        # Handle case where mask returns no data
+        if target_returns.empty:
+            target_returns = self._extract_at_time_daily(ret, target_time)
+        else:
+            target_returns.index = pd.to_datetime(target_returns.index).normalize()
 
         # Filter to only valid trading dates (removes weekends/holidays)
         target_returns = self._filter_to_trading_dates(target_returns)
@@ -1624,18 +1769,24 @@ class IntradayMomentum:
 
         # Calculate rolling aggregation over the specified window
         if window:
-            bars = max(int(window.total_seconds() // 60 // 5), 1)
+            # Use detected bar frequency instead of hardcoded 5-minute assumption
+            bars = self._period_to_bars(window, data)
             if aggregation == "sum":
-                volume = volume.rolling(bars).sum()
+                volume = volume.rolling(bars, min_periods=1).sum()
             elif aggregation == "mean":
-                volume = volume.rolling(bars).mean()
+                volume = volume.rolling(bars, min_periods=1).mean()
             else:
                 raise ValueError(f"Aggregation must be 'sum' or 'mean', got '{aggregation}'")
 
         # Extract volume at target time
         mask = self._get_target_time_mask(volume.index, target_time, use_nearest)
         target_volume = volume[mask]
-        target_volume.index = pd.to_datetime(target_volume.index).normalize()
+
+        # Handle case where mask returns no data
+        if target_volume.empty:
+            target_volume = self._extract_at_time_daily(volume, target_time)
+        else:
+            target_volume.index = pd.to_datetime(target_volume.index).normalize()
 
         # Filter to only valid trading dates (removes weekends/holidays)
         target_volume = self._filter_to_trading_dates(target_volume)
@@ -1763,9 +1914,10 @@ class IntradayMomentum:
 
         # Calculate rolling imbalance over the window
         if window:
-            bars = max(int(window.total_seconds() // 60 // 5), 1)
-            bid_rolling = bid_volume.rolling(bars).sum()
-            ask_rolling = ask_volume.rolling(bars).sum()
+            # Use detected bar frequency instead of hardcoded 5-minute assumption
+            bars = self._period_to_bars(window, data)
+            bid_rolling = bid_volume.rolling(bars, min_periods=1).sum()
+            ask_rolling = ask_volume.rolling(bars, min_periods=1).sum()
         else:
             bid_rolling = bid_volume
             ask_rolling = ask_volume
@@ -2146,13 +2298,19 @@ class IntradayMomentum:
         ret = prices.pct_change().dropna()
 
         if window:
-            bars = max(int(window.total_seconds() // 60 // 5), 1)
-            ret = ret.rolling(bars).sum()
+            # Use detected bar frequency instead of hardcoded 5-minute assumption
+            bars = self._period_to_bars(window, supp_data)
+            ret = ret.rolling(bars, min_periods=1).sum()
 
         # Extract returns at target_time
         mask = self._get_target_time_mask(ret.index, target_time, use_nearest)
         target_returns = ret[mask]
-        target_returns.index = pd.to_datetime(target_returns.index).normalize()
+
+        # Handle case where mask returns no data
+        if target_returns.empty:
+            target_returns = self._extract_at_time_daily(ret, target_time)
+        else:
+            target_returns.index = pd.to_datetime(target_returns.index).normalize()
 
         # Filter to only valid trading dates (removes weekends/holidays)
         target_returns = self._filter_to_trading_dates(target_returns)
@@ -2273,9 +2431,28 @@ class IntradayMomentum:
             tenor_grid = create_tenor_grid(min_tau=1/12, max_tau=1.0)
             ti = TenorInterpolator(tenor_grid=tenor_grid, min_contracts=4)
 
-            # Extract data at target_time for interpolation
-            mask = fwd_curve_df.index.time == target_time
+            # Extract data at target_time using adaptive windowing
+            # Use _get_target_time_mask with fallback instead of exact matching
+            mask = self._get_target_time_mask(fwd_curve_df.index, target_time, use_nearest=True)
             prices_at_time = fwd_curve_df[mask]
+
+            if prices_at_time.empty:
+                # Try extracting with adaptive window as fallback
+                import warnings
+                warnings.warn(
+                    f"No exact match at target_time {target_time}. "
+                    "Using adaptive window extraction for curve data.",
+                    UserWarning
+                )
+                # Extract first column to check if data exists
+                test_series = fwd_curve_df.iloc[:, 0]
+                test_extract = self._extract_at_time_daily(test_series, target_time)
+                if test_extract.empty:
+                    raise ValueError(f"No data found at or near target_time {target_time}")
+                # Re-extract all columns using the identified indices
+                prices_at_time = fwd_curve_df.loc[
+                    fwd_curve_df.index.normalize().isin(test_extract.index)
+                ]
 
             if not prices_at_time.empty:
                 # Interpolate to constant maturity
@@ -2283,7 +2460,6 @@ class IntradayMomentum:
 
                 # Use constant maturity panel for curve features
                 cf = CurveFeatures(continuous_df=const_mat_panel)
-                logger.info(f"Using constant maturity interpolation with {len(tenor_grid)} tenors")
             else:
                 raise ValueError(f"No data found at target_time {target_time}")
         else:
@@ -2297,13 +2473,15 @@ class IntradayMomentum:
             # Calculate full slope series
             slope_series = cf.curve_slope(front=slope_mos[0], back=slope_mos[1])
 
-            # Extract at target_time using time window (more robust than exact match)
-            slope_at_time = self._extract_at_time_daily(slope_series, target_time, window_minutes=5)
+            # Extract at target_time using adaptive window (handles different bar frequencies)
+            slope_at_time = self._extract_at_time_daily(slope_series, target_time)
 
-            # Reindex to training_data dates with forward fill to avoid NaNs
+            # Reindex to training_data dates with limited forward fill
+            # Limit to 5 days to handle weekends/holidays without stale data propagation
             slope_at_time = slope_at_time.reindex(
                 self.training_data.index.normalize(),
-                method='ffill'
+                method='ffill',
+                limit=5
             )
 
             # Lag if needed to avoid lookahead bias
@@ -2330,13 +2508,15 @@ class IntradayMomentum:
             if front_col in fwd_curve_df.columns and back_col in fwd_curve_df.columns:
                 basis_series = (fwd_curve_df[back_col] - fwd_curve_df[front_col]) / fwd_curve_df[front_col]
 
-                # Extract at target_time using time window (more robust than exact match)
-                basis_at_time = self._extract_at_time_daily(basis_series, target_time, window_minutes=5)
+                # Extract at target_time using adaptive window (handles different bar frequencies)
+                basis_at_time = self._extract_at_time_daily(basis_series, target_time)
 
-                # Reindex to training_data dates with forward fill to avoid NaNs
+                # Reindex to training_data dates with limited forward fill
+                # Limit to 5 days to handle weekends/holidays without stale data propagation
                 basis_at_time = basis_at_time.reindex(
                     self.training_data.index.normalize(),
-                    method='ffill'
+                    method='ffill',
+                    limit=5
                 )
 
                 # Lag if needed to avoid lookahead bias
@@ -2432,17 +2612,18 @@ class IntradayMomentum:
             # Calculate full slope series
             slope_series = cf.curve_slope(front=slope_mos[0], back=slope_mos[1])
 
-            # Extract at target_time using time window
-            slope_at_time = self._extract_at_time_daily(slope_series, target_time, window_minutes=5)
+            # Extract at target_time using adaptive window
+            slope_at_time = self._extract_at_time_daily(slope_series, target_time)
 
-            # Reindex to training_data dates with forward fill
+            # Reindex to training_data dates with limited forward fill
             slope_at_time = slope_at_time.reindex(
                 self.training_data.index.normalize(),
-                method='ffill'
+                method='ffill',
+                limit=5
             )
 
-            # Calculate change using the updated curve_slope method
-            slope_change_series = cf.curve_slope(series=slope_at_time, period_length=lookback_days)
+            # Calculate change: current slope minus slope lookback_days ago
+            slope_change_series = slope_at_time - slope_at_time.shift(lookback_days)
 
             # Lag if needed to avoid lookahead bias
             needs_shift = self._needs_shift(target_time)
@@ -2468,17 +2649,18 @@ class IntradayMomentum:
             if front_col in fwd_curve_df.columns and back_col in fwd_curve_df.columns:
                 basis_series = (fwd_curve_df[back_col] - fwd_curve_df[front_col]) / fwd_curve_df[front_col]
 
-                # Extract at target_time using time window
-                basis_at_time = self._extract_at_time_daily(basis_series, target_time, window_minutes=5)
+                # Extract at target_time using adaptive window
+                basis_at_time = self._extract_at_time_daily(basis_series, target_time)
 
-                # Reindex to training_data dates with forward fill
+                # Reindex to training_data dates with limited forward fill
                 basis_at_time = basis_at_time.reindex(
                     self.training_data.index.normalize(),
-                    method='ffill'
+                    method='ffill',
+                    limit=5
                 )
 
-                # Calculate change using relative_basis method
-                basis_change_series = cf.relative_basis(series_1=basis_at_time, period_length=lookback_days)
+                # Calculate change: current basis minus basis lookback_days ago
+                basis_change_series = basis_at_time - basis_at_time.shift(lookback_days)
 
                 # Lag if needed to avoid lookahead bias
                 needs_shift = self._needs_shift(target_time)
@@ -2587,22 +2769,26 @@ class IntradayMomentum:
             # Calculate full slope series
             slope_series = cf.curve_slope(front=slope_mos[0], back=slope_mos[1])
 
-            # Extract at time_1 and time_2 using time window
-            slope_at_time_1 = self._extract_at_time_daily(slope_series, time_1, window_minutes=5)
-            slope_at_time_2 = self._extract_at_time_daily(slope_series, time_2, window_minutes=5)
+            # Extract at time_1 and time_2 using adaptive window
+            slope_at_time_1 = self._extract_at_time_daily(slope_series, time_1)
+            slope_at_time_2 = self._extract_at_time_daily(slope_series, time_2)
 
-            # Reindex both to training_data dates with forward fill
+            # Reindex both to training_data dates with limited forward fill
             slope_at_time_1 = slope_at_time_1.reindex(
                 self.training_data.index.normalize(),
-                method='ffill'
+                method='ffill',
+                limit=5
             )
             slope_at_time_2 = slope_at_time_2.reindex(
                 self.training_data.index.normalize(),
-                method='ffill'
+                method='ffill',
+                limit=5
             )
 
-            # Calculate intraday change
-            slope_change_series = cf.relative_basis(series_1=slope_at_time_2, series_2=slope_at_time_1)
+            # Calculate intraday change: slope at time_2 minus slope at time_1 (same day)
+            # Align indices and compute difference
+            common_dates = slope_at_time_1.index.intersection(slope_at_time_2.index)
+            slope_change_series = slope_at_time_2.loc[common_dates] - slope_at_time_1.loc[common_dates]
 
             # Lag if needed to avoid lookahead bias (based on the later time)
             needs_shift = self._needs_shift(time_2)
@@ -2630,22 +2816,25 @@ class IntradayMomentum:
             if front_col in fwd_curve_df.columns and back_col in fwd_curve_df.columns:
                 basis_series = (fwd_curve_df[back_col] - fwd_curve_df[front_col]) / fwd_curve_df[front_col]
 
-                # Extract at time_1 and time_2 using time window
-                basis_at_time_1 = self._extract_at_time_daily(basis_series, time_1, window_minutes=5)
-                basis_at_time_2 = self._extract_at_time_daily(basis_series, time_2, window_minutes=5)
+                # Extract at time_1 and time_2 using adaptive window
+                basis_at_time_1 = self._extract_at_time_daily(basis_series, time_1)
+                basis_at_time_2 = self._extract_at_time_daily(basis_series, time_2)
 
-                # Reindex both to training_data dates with forward fill
+                # Reindex both to training_data dates with limited forward fill
                 basis_at_time_1 = basis_at_time_1.reindex(
                     self.training_data.index.normalize(),
-                    method='ffill'
+                    method='ffill',
+                    limit=5
                 )
                 basis_at_time_2 = basis_at_time_2.reindex(
                     self.training_data.index.normalize(),
-                    method='ffill'
+                    method='ffill',
+                    limit=5
                 )
 
-                # Calculate intraday change
-                basis_change_series = cf.relative_basis(series_1=basis_at_time_2, series_2=basis_at_time_1)
+                # Calculate intraday change: basis at time_2 minus basis at time_1 (same day)
+                common_dates = basis_at_time_1.index.intersection(basis_at_time_2.index)
+                basis_change_series = basis_at_time_2.loc[common_dates] - basis_at_time_1.loc[common_dates]
 
                 # Lag if needed to avoid lookahead bias (based on the later time)
                 needs_shift = self._needs_shift(time_2)
