@@ -58,9 +58,10 @@ class TCNRegressor(nn.Module):
         out = self.head(last).squeeze(-1)  # (B,)
         return out
 
-def train_simple_tcn(ds: MomentumWindowDataset, in_channels: int, epochs: int = 30):
+def train_simple_tcn(ds: MomentumWindowDataset, in_channels: int, epochs: int = 30, model : nn.Module = None):
     loader = DataLoader(ds, batch_size=64, shuffle=False)
-    model = TCNRegressor(in_channels=in_channels)
+    if model is None:
+        model = TCNRegressor(in_channels=in_channels)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
