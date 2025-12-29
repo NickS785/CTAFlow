@@ -12,13 +12,13 @@ from scipy import stats
 from scipy.stats import skew, kurtosis
 import plotly.io as pio
 from numpy.linalg import svd
-from CTAFlow.data.raw_formatting.spread_manager import FuturesCurve, SpreadData, SpreadFeature
-from CTAFlow.utils.seasonal import deseasonalize_monthly
+from ...data.raw_formatting.spread_manager import FuturesCurve, SpreadData, SpreadFeature
+from ...utils.seasonal import deseasonalize_monthly
 pio.renderers.default = "browser"
 # Import data client and utilities if available
 try:
-    from CTAFlow.data.data_client import DataClient
-    from CTAFlow.data.raw_formatting.spread_manager import MONTH_CODE_MAP, _is_empty
+    from ..data.data_client import DataClient
+    from ..data.raw_formatting.spread_manager import MONTH_CODE_MAP, _is_empty
 except ImportError:
     # Fallback definitions for standalone use
     MONTH_CODE_MAP = {
@@ -40,11 +40,10 @@ except ImportError:
 from numba import jit, prange
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import plotly.express as px
 
 # Import tenor interpolation utilities
 try:
-    from CTAFlow.utils.tenor_interpolation import TenorInterpolator, create_tenor_grid
+    from ...utils.tenor_interpolation import TenorInterpolator, create_tenor_grid
 except ImportError:
     TenorInterpolator = None
     create_tenor_grid = None
