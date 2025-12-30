@@ -251,7 +251,8 @@ class CurveFeatures:
                    front: int = 1,
                    back: int = 6,
                    series: Optional[pd.Series] = None,
-                   period_length: Optional[int] = None) -> pd.Series:
+                   period_length: Optional[int] = None,
+                   anchor_to_front: bool = False) -> pd.Series:
         """
         Calculate overall curve slope or slope changes.
 
@@ -271,6 +272,9 @@ class CurveFeatures:
         period_length : int, optional
             If provided with series, calculates change in slope over this period.
             E.g., period_length=5 shows how slope changed over 5 days.
+        anchor_to_front : bool, default False
+            If True and back contract is missing, will return NaN without raising error.
+            This allows graceful handling when using constant M1 as anchor.
 
         Returns:
         --------
@@ -283,6 +287,9 @@ class CurveFeatures:
 
         # Calculate slope change over 5 days
         slope_change = curve_features.curve_slope(series=current_slope, period_length=5)
+
+        # M1-anchored slope (returns NaN if M4 missing instead of raising error)
+        slope = curve_features.curve_slope(front=1, back=4, anchor_to_front=True)
         """
         # Mode 1: Calculate slope change from series
         if series is not None and period_length is not None:
@@ -295,10 +302,69 @@ class CurveFeatures:
         front_col = f"M{front}"
         back_col = f"M{back}"
 
-        if front_col not in self.continuous_df.columns or back_col not in self.continuous_df.columns:
-            raise ValueError(f"Required contracts not found: {front_col}, {back_col}")
+        # Check if columns exist
+        front_exists = front_col in self.continuous_df.columns
+        back_exists = back_col in self.continuous_df.columns
+
+        if not front_exists or not back_exists:
+            if anchor_to_front:
+                # Return NaN series with same index if anchoring mode
+                logger.warning(f"Contract(s) not found: {front_col if not front_exists else ''} {back_col if not back_exists else ''}. Returning NaN series.")
+                return pd.Series(index=self.continuous_df.index, dtype=float)
+            else:
+                raise ValueError(f"Required contracts not found: {front_col}, {back_col}")
 
         return (self.continuous_df[back_col] - self.continuous_df[front_col]) / (back - front)
+
+    def m1_anchored_slopes(self, max_months: int = 6) -> pd.DataFrame:
+        """
+        Calculate multiple slope features anchored to M1 (front month).
+
+        When using a constant front month reference, this calculates:
+        - M1-M2 slope: (M2 - M1) / M1
+        - M1-M3 slope: (M3 - M1) / M1
+        - M1-M4 slope: (M4 - M1) / M1
+        etc.
+
+        This provides graceful degradation: if M4 is missing, you still get M1-M2 and M1-M3.
+
+        Parameters:
+        -----------
+        max_months : int, default 6
+            Maximum number of back months to calculate slopes for (M2 through M{max_months})
+
+        Returns:
+        --------
+        pd.DataFrame with columns: slope_M1_M2, slope_M1_M3, slope_M1_M4, etc.
+            Each slope is normalized by M1 price (percentage basis)
+
+        Example:
+        --------
+        >>> slopes = curve_features.m1_anchored_slopes(max_months=4)
+        >>> # Returns: slope_M1_M2, slope_M1_M3, slope_M1_M4
+        >>> # If M4 is missing on some days, slope_M1_M4 will be NaN but others still available
+        """
+        if self.continuous_df is None:
+            raise ValueError("No continuous contract data available")
+
+        if "M1" not in self.continuous_df.columns:
+            raise ValueError("M1 (front month) not found in data")
+
+        slopes = pd.DataFrame(index=self.continuous_df.index)
+        m1 = self.continuous_df["M1"]
+
+        for back_month in range(2, max_months + 1):
+            col_name = f"M{back_month}"
+            if col_name in self.continuous_df.columns:
+                # Calculate slope: (M_back - M1) / M1
+                slope = (self.continuous_df[col_name] - m1) / m1
+                slopes[f"slope_M1_M{back_month}"] = slope
+            else:
+                # Contract doesn't exist - add NaN column
+                slopes[f"slope_M1_M{back_month}"] = np.nan
+                logger.debug(f"Contract {col_name} not found, slope_M1_M{back_month} will be NaN")
+
+        return slopes
 
     def all_features(self, lookbacks: List[int] = [5, 10, 20]) -> pd.DataFrame:
         """

@@ -45,7 +45,7 @@ class FeatureSelectionConfig:
     per_group_max: Optional[int] = None
     group_mode: Literal["base_name", "base_name_time", "none"] = "base_name"
 
-class FeatureXplanation:
+class FeatureXplainer:
     """
     Handles SHAP-based explanations for Deep Learning models (TCN/GRU).
     Identifies feature importance by analyzing model gradients or perturbations.

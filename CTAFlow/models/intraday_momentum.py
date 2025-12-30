@@ -2640,7 +2640,8 @@ class IntradayMomentum:
                            slope_change: bool = True,
                            slope_mos: Tuple[int, int] = (1, 4),
                            relative_basis_change: bool = True,
-                           basis_mos: Tuple[int, int] = (1, 3),
+                           spread_pair_1: Tuple[int, int] = (1, 2),
+                           spread_pair_2: Tuple[int, int] = (2, 3),
                            add_as_feature: bool = True) -> pd.DataFrame:
         """Calculate daily changes in curve shape (day-over-day).
 
@@ -2660,9 +2661,12 @@ class IntradayMomentum:
         slope_mos : Tuple[int, int], default (1, 4)
             (front, back) contract months for slope calculation
         relative_basis_change : bool, default True
-            Calculate change in normalized basis over lookback_days
-        basis_mos : Tuple[int, int], default (1, 3)
-            (front, back) contract months for basis calculation
+            Calculate change in relative basis over lookback_days.
+            Relative basis = (Spread1 / dt1) - (Spread2 / dt2)
+        spread_pair_1 : Tuple[int, int], default (1, 2)
+            First spread pair (front, back). E.g., (1, 2) means M2 - M1
+        spread_pair_2 : Tuple[int, int], default (2, 3)
+            Second spread pair (front, back). E.g., (2, 3) means M3 - M2
         add_as_feature : bool, default True
             If True, add features to training_data with proper lagging
 
@@ -2675,18 +2679,20 @@ class IntradayMomentum:
         -----
         - Features are lagged if target_time is at or after self.target_time
         - Slope change: slope[t] - slope[t - lookback_days]
-        - Basis change: basis[t] - basis[t - lookback_days]
+        - Relative basis change: rel_basis[t] - rel_basis[t - lookback_days]
+          where rel_basis = (Spread1/dt1) - (Spread2/dt2)
         - Positive values indicate steepening/widening, negative values indicate flattening/narrowing
 
         Examples
         --------
-        >>> # 5-day curve slope change at 2pm (comparing 2pm today vs 2pm 5 days ago)
+        >>> # 5-day relative basis change at 2pm
         >>> daily_change_feats = model.daily_curve_changes(
         ...     fwd_curve_df=continuous_contracts,
         ...     target_time=time(14, 0),
         ...     lookback_days=5,
-        ...     slope_change=True,
-        ...     relative_basis_change=True
+        ...     relative_basis_change=True,
+        ...     spread_pair_1=(1, 2),  # M2 - M1
+        ...     spread_pair_2=(2, 3),  # M3 - M2
         ... )
         """
         # Handle list of times
@@ -2695,7 +2701,7 @@ class IntradayMomentum:
             for t in target_time:
                 feats = self.daily_curve_changes(
                     fwd_curve_df, t, lookback_days, slope_change, slope_mos,
-                    relative_basis_change, basis_mos, add_as_feature
+                    relative_basis_change, spread_pair_1, spread_pair_2, add_as_feature
                 )
                 all_features.append(feats)
             return pd.concat(all_features, axis=1)
@@ -2764,56 +2770,70 @@ class IntradayMomentum:
             if add_as_feature:
                 self._add_feature(slope_change_feature, feature_name)
 
-        # Calculate basis change over lookback_days
+        # Calculate relative basis change over lookback_days
+        # Relative basis = (Spread1 / dt1) - (Spread2 / dt2)
+        # where Spread = M_back - M_front, dt = months between contracts
         if relative_basis_change:
-            # Calculate normalized spread: (M_back - M_front) / M_front
-            front_col = f"M{basis_mos[0]}"
-            back_col = f"M{basis_mos[1]}"
+            # Spread 1: e.g., M2 - M1
+            s1_front_col = f"M{spread_pair_1[0]}"
+            s1_back_col = f"M{spread_pair_1[1]}"
+            dt1 = abs(spread_pair_1[1] - spread_pair_1[0])
 
-            if front_col in fwd_curve_df.columns and back_col in fwd_curve_df.columns:
-                basis_series = (fwd_curve_df[back_col] - fwd_curve_df[front_col]) / fwd_curve_df[front_col]
+            # Spread 2: e.g., M3 - M2
+            s2_front_col = f"M{spread_pair_2[0]}"
+            s2_back_col = f"M{spread_pair_2[1]}"
+            dt2 = abs(spread_pair_2[1] - spread_pair_2[0])
+
+            required_cols = [s1_front_col, s1_back_col, s2_front_col, s2_back_col]
+            if all(col in fwd_curve_df.columns for col in required_cols):
+                # Calculate spreads
+                spread_1 = fwd_curve_df[s1_back_col] - fwd_curve_df[s1_front_col]
+                spread_2 = fwd_curve_df[s2_back_col] - fwd_curve_df[s2_front_col]
+
+                # Annualized relative basis
+                rel_basis_series = (spread_1 / dt1) - (spread_2 / dt2)
 
                 # Extract at target_time using adaptive window
-                basis_at_time = self._extract_at_time_daily(
-                    basis_series,
+                rel_basis_at_time = self._extract_at_time_daily(
+                    rel_basis_series,
                     target_time,
                     adaptive_window=True,
                     max_window_minutes=max_window
                 )
 
-                if basis_at_time.empty:
+                if rel_basis_at_time.empty:
                     import warnings
                     warnings.warn(
-                        f"No curve basis data for daily changes at {target_time}. "
+                        f"No relative basis data for daily changes at {target_time}. "
                         f"Curve data frequency: {curve_freq_minutes:.1f} min.",
                         UserWarning
                     )
-                    basis_change_feature = pd.Series(dtype=float, index=self.training_data.index.normalize())
+                    rel_basis_change_feature = pd.Series(dtype=float, index=self.training_data.index.normalize())
                 else:
                     # Reindex to training_data dates with frequency-aware forward fill
-                    basis_at_time = basis_at_time.reindex(
+                    rel_basis_at_time = rel_basis_at_time.reindex(
                         self.training_data.index.normalize(),
                         method='ffill',
                         limit=fill_limit
                     )
 
-                    # Calculate change: current basis minus basis lookback_days ago
-                    basis_change_series = basis_at_time - basis_at_time.shift(lookback_days)
+                    # Calculate change: current rel_basis minus rel_basis lookback_days ago
+                    rel_basis_change_series = rel_basis_at_time - rel_basis_at_time.shift(lookback_days)
 
                     # Lag if needed to avoid lookahead bias
                     needs_shift = self._needs_shift(target_time)
-                    basis_change_feature = basis_change_series.shift(1) if needs_shift else basis_change_series
+                    rel_basis_change_feature = rel_basis_change_series.shift(1) if needs_shift else rel_basis_change_series
 
-                # Generate feature name
+                # Generate feature name: daily_rel_basis_change_5d_M1M2_vs_M2M3
                 feature_name = self._make_feature_name(
-                    f'daily_norm_basis_change_{lookback_days}d_M{basis_mos[0]}_M{basis_mos[1]}',
+                    f'daily_rel_basis_change_{lookback_days}d_M{spread_pair_1[0]}M{spread_pair_1[1]}_vs_M{spread_pair_2[0]}M{spread_pair_2[1]}',
                     target_time,
                     ""
                 )
-                features_dict[feature_name] = basis_change_feature
+                features_dict[feature_name] = rel_basis_change_feature
 
                 if add_as_feature:
-                    self._add_feature(basis_change_feature, feature_name)
+                    self._add_feature(rel_basis_change_feature, feature_name)
 
         return pd.DataFrame(features_dict)
 
@@ -2825,7 +2845,8 @@ class IntradayMomentum:
                               slope_change: bool = True,
                               slope_mos: Tuple[int, int] = (1, 4),
                               relative_basis_change: bool = True,
-                              basis_mos: Tuple[int, int] = (1, 3),
+                              spread_pair_1: Tuple[int, int] = (1, 2),
+                              spread_pair_2: Tuple[int, int] = (2, 3),
                               add_as_feature: bool = True) -> pd.DataFrame:
         """Calculate intraday changes in curve shape (within-day).
 
@@ -2848,9 +2869,12 @@ class IntradayMomentum:
         slope_mos : Tuple[int, int], default (1, 4)
             (front, back) contract months for slope calculation
         relative_basis_change : bool, default True
-            Calculate change in normalized basis between times
-        basis_mos : Tuple[int, int], default (1, 3)
-            (front, back) contract months for basis calculation
+            Calculate change in relative basis between times.
+            Relative basis = (Spread1 / dt1) - (Spread2 / dt2)
+        spread_pair_1 : Tuple[int, int], default (1, 2)
+            First spread pair (front, back). E.g., (1, 2) means M2 - M1
+        spread_pair_2 : Tuple[int, int], default (2, 3)
+            Second spread pair (front, back). E.g., (2, 3) means M3 - M2
         add_as_feature : bool, default True
             If True, add features to training_data with proper lagging
 
@@ -2863,7 +2887,8 @@ class IntradayMomentum:
         -----
         - Features are lagged if the later time is at or after self.target_time
         - Slope change: slope[time_2] - slope[time_1] (or slope[time_1 + period_length] - slope[time_1])
-        - Basis change: basis[time_2] - basis[time_1]
+        - Relative basis change: rel_basis[time_2] - rel_basis[time_1]
+          where rel_basis = (Spread1/dt1) - (Spread2/dt2)
         - Positive values indicate steepening/widening, negative values indicate flattening/narrowing
 
         Examples
@@ -2874,7 +2899,9 @@ class IntradayMomentum:
         ...     time_1=time(10, 0),
         ...     time_2=time(14, 0),
         ...     slope_change=True,
-        ...     relative_basis_change=True
+        ...     relative_basis_change=True,
+        ...     spread_pair_1=(1, 2),  # M2 - M1
+        ...     spread_pair_2=(2, 3),  # M3 - M2
         ... )
         >>>
         >>> # Curve change over 4 hours from 10am
@@ -2978,71 +3005,85 @@ class IntradayMomentum:
             if add_as_feature:
                 self._add_feature(slope_change_feature, feature_name)
 
-        # Calculate basis change between time_1 and time_2
+        # Calculate relative basis change between time_1 and time_2
+        # Relative basis = (Spread1 / dt1) - (Spread2 / dt2)
+        # where Spread = M_back - M_front, dt = months between contracts
         if relative_basis_change:
-            # Calculate normalized spread: (M_back - M_front) / M_front
-            front_col = f"M{basis_mos[0]}"
-            back_col = f"M{basis_mos[1]}"
+            # Spread 1: e.g., M2 - M1
+            s1_front_col = f"M{spread_pair_1[0]}"
+            s1_back_col = f"M{spread_pair_1[1]}"
+            dt1 = abs(spread_pair_1[1] - spread_pair_1[0])
 
-            if front_col in fwd_curve_df.columns and back_col in fwd_curve_df.columns:
-                basis_series = (fwd_curve_df[back_col] - fwd_curve_df[front_col]) / fwd_curve_df[front_col]
+            # Spread 2: e.g., M3 - M2
+            s2_front_col = f"M{spread_pair_2[0]}"
+            s2_back_col = f"M{spread_pair_2[1]}"
+            dt2 = abs(spread_pair_2[1] - spread_pair_2[0])
+
+            required_cols = [s1_front_col, s1_back_col, s2_front_col, s2_back_col]
+            if all(col in fwd_curve_df.columns for col in required_cols):
+                # Calculate spreads
+                spread_1 = fwd_curve_df[s1_back_col] - fwd_curve_df[s1_front_col]
+                spread_2 = fwd_curve_df[s2_back_col] - fwd_curve_df[s2_front_col]
+
+                # Annualized relative basis
+                rel_basis_series = (spread_1 / dt1) - (spread_2 / dt2)
 
                 # Extract at time_1 and time_2 using adaptive window
-                basis_at_time_1 = self._extract_at_time_daily(
-                    basis_series,
+                rel_basis_at_time_1 = self._extract_at_time_daily(
+                    rel_basis_series,
                     time_1,
                     adaptive_window=True,
                     max_window_minutes=max_window
                 )
-                basis_at_time_2 = self._extract_at_time_daily(
-                    basis_series,
+                rel_basis_at_time_2 = self._extract_at_time_daily(
+                    rel_basis_series,
                     time_2,
                     adaptive_window=True,
                     max_window_minutes=max_window
                 )
 
                 # Check if either extraction failed
-                if basis_at_time_1.empty or basis_at_time_2.empty:
+                if rel_basis_at_time_1.empty or rel_basis_at_time_2.empty:
                     import warnings
                     warnings.warn(
-                        f"Insufficient curve basis data for intraday changes at {time_1} to {time_2}. "
+                        f"Insufficient relative basis data for intraday changes at {time_1} to {time_2}. "
                         f"Curve data frequency: {curve_freq_minutes:.1f} min.",
                         UserWarning
                     )
-                    basis_change_feature = pd.Series(dtype=float, index=self.training_data.index.normalize())
+                    rel_basis_change_feature = pd.Series(dtype=float, index=self.training_data.index.normalize())
                 else:
                     # Reindex both to training_data dates with frequency-aware forward fill
-                    basis_at_time_1 = basis_at_time_1.reindex(
+                    rel_basis_at_time_1 = rel_basis_at_time_1.reindex(
                         self.training_data.index.normalize(),
                         method='ffill',
                         limit=fill_limit
                     )
-                    basis_at_time_2 = basis_at_time_2.reindex(
+                    rel_basis_at_time_2 = rel_basis_at_time_2.reindex(
                         self.training_data.index.normalize(),
                         method='ffill',
                         limit=fill_limit
                     )
 
-                    # Calculate intraday change: basis at time_2 minus basis at time_1 (same day)
-                    common_dates = basis_at_time_1.index.intersection(basis_at_time_2.index)
-                    basis_change_series = basis_at_time_2.loc[common_dates] - basis_at_time_1.loc[common_dates]
+                    # Calculate intraday change: rel_basis at time_2 minus rel_basis at time_1 (same day)
+                    common_dates = rel_basis_at_time_1.index.intersection(rel_basis_at_time_2.index)
+                    rel_basis_change_series = rel_basis_at_time_2.loc[common_dates] - rel_basis_at_time_1.loc[common_dates]
 
-                # Lag if needed to avoid lookahead bias (based on the later time)
-                needs_shift = self._needs_shift(time_2)
-                basis_change_feature = basis_change_series.shift(1) if needs_shift else basis_change_series
+                    # Lag if needed to avoid lookahead bias (based on the later time)
+                    needs_shift = self._needs_shift(time_2)
+                    rel_basis_change_feature = rel_basis_change_series.shift(1) if needs_shift else rel_basis_change_series
 
-                # Generate feature name
+                # Generate feature name: intraday_rel_basis_change_1000_to_1400_M1M2_vs_M2M3
                 time_1_str = time_1.strftime("%H%M")
                 time_2_str = time_2.strftime("%H%M")
                 feature_name = self._make_feature_name(
-                    f'intraday_norm_basis_change_{time_1_str}_to_{time_2_str}_M{basis_mos[0]}_M{basis_mos[1]}',
+                    f'intraday_rel_basis_change_{time_1_str}_to_{time_2_str}_M{spread_pair_1[0]}M{spread_pair_1[1]}_vs_M{spread_pair_2[0]}M{spread_pair_2[1]}',
                     time_2,  # Use later time for shift logic
                     ""
                 )
-                features_dict[feature_name] = basis_change_feature
+                features_dict[feature_name] = rel_basis_change_feature
 
                 if add_as_feature:
-                    self._add_feature(basis_change_feature, feature_name)
+                    self._add_feature(rel_basis_change_feature, feature_name)
 
         return pd.DataFrame(features_dict)
 
