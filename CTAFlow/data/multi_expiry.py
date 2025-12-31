@@ -522,8 +522,31 @@ class SpreadEngine:
         return Path(scid_directory) / filename
 
     def _load_scid_contract(self, scid_path: Path, start_date: pd.Timestamp,
-                           end_date: pd.Timestamp, resample_rule: Optional[str] = None) -> Optional[pd.Series]:
-        """Load a single contract's SCID file and return Close prices."""
+                           end_date: pd.Timestamp, resample_rule: Optional[str] = None,
+                           target_tz: str = 'America/Chicago') -> Optional[pd.Series]:
+        """Load a single contract's SCID file and return Close prices.
+
+        Parameters:
+        -----------
+        scid_path : Path
+            Path to SCID file
+        start_date : pd.Timestamp
+            Start date for filtering
+        end_date : pd.Timestamp
+            End date for filtering
+        resample_rule : str, optional
+            Resample rule (e.g., '5min', '15min')
+        target_tz : str, default 'America/Chicago'
+            Target timezone to convert UTC data to. Common options:
+            - 'America/Chicago' (CST/CDT for CME, CBOT, NYMEX)
+            - 'America/New_York' (EST/EDT for ICE)
+            - None to keep UTC
+
+        Returns:
+        --------
+        pd.Series or None
+            Close prices with timezone-converted index
+        """
         if not HAS_SIERRAPY:
             return None
 
@@ -543,12 +566,16 @@ class SpreadEngine:
             if df.empty:
                 return None
 
-            # Filter to date range
-            df = df[(df.index >= start_date) & (df.index <= end_date)]
-
-            # Handle timezone
-            if df.index.tz is not None:
+            # Convert timezone from UTC to target timezone
+            if df.index.tz is not None and target_tz is not None:
+                # Convert UTC to target timezone, then make naive
+                df.index = df.index.tz_convert(target_tz).tz_localize(None)
+            elif df.index.tz is not None:
+                # Just strip timezone if target_tz is None
                 df.index = df.index.tz_localize(None)
+
+            # Filter to date range (after timezone conversion)
+            df = df[(df.index >= start_date) & (df.index <= end_date)]
 
             return df['Close'] if 'Close' in df.columns else None
 
@@ -563,6 +590,8 @@ class SpreadEngine:
         exchange: str = "NYMEX",
         service: str = "sierra",
         resample_rule: Optional[str] = None,
+        target_tz: str = 'America/Chicago',
+        contract_map: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
         """
         Patch NaN gaps in DataFrame using SCID files from Sierra Chart.
@@ -584,6 +613,14 @@ class SpreadEngine:
             Service name for ScidReader file conventions
         resample_rule : str, optional
             Resample rule (e.g., '5min', '15min'). If None, uses original frequency.
+        target_tz : str, default 'America/Chicago'
+            Target timezone to convert SCID UTC data to. Should match your DataFrame timezone.
+            Common options: 'America/Chicago' (CME, CBOT, NYMEX), 'America/New_York' (ICE)
+        contract_map : pd.DataFrame, optional
+            Contract map DataFrame with columns ['M1', 'M2', 'M3', ...] containing
+            contract codes (e.g., 'H2020', 'J2020') for each timestamp.
+            If provided, uses this to determine which SCID file to use for each period.
+            If None, falls back to lazy_pool-based contract selection (less accurate).
 
         Returns:
         --------
@@ -594,10 +631,13 @@ class SpreadEngine:
         --------
         >>> engine = SpreadEngine("F:\\monthly_contracts\\CL\\", "CL")
         >>> df = pd.concat([chunk for chunk in engine.get_sequential_prices(...)])
+        >>> contract_map = engine.build_contract_map(df.index.min(), df.index.max())
         >>> df_patched = engine.patch_gaps_from_scid(
         ...     df,
         ...     scid_directory="F:\\SierraChart\\Data",
-        ...     exchange="NYMEX"
+        ...     exchange="NYMEX",
+        ...     target_tz='America/Chicago',
+        ...     contract_map=contract_map  # Use contract map for accurate mapping
         ... )
         """
         if not HAS_SIERRAPY:
@@ -623,59 +663,170 @@ class SpreadEngine:
 
         logger.info(f"Found {len(m_columns)} contract columns to patch: {m_columns}")
 
-        # For each period, determine which contracts map to M1, M2, M3...
-        # We use the lazy_pool contracts sorted by expiry
-        # Group by approximate periods (weekly) to determine contract mapping
-        weekly_dates = pd.date_range(start_date, end_date, freq='W')
-
         # Cache for loaded SCID data
         scid_cache: Dict[str, pd.Series] = {}
 
-        for period_start in weekly_dates:
-            period_end = period_start + pd.Timedelta(days=7)
-            period_mid = period_start + pd.Timedelta(days=3)
+        if contract_map is not None:
+            # USE CONTRACT MAP for accurate contract-to-M mapping
+            logger.info("Using contract map for accurate SCID file selection")
 
-            # Find active contracts for this period
-            active_contracts = []
-            for c in self.lazy_pool:
-                buffer = pd.Timedelta(days=c.roll_buffer_days) if hasattr(c, 'roll_buffer_days') else pd.Timedelta(days=0)
-                if c.expiry_date > (period_mid + buffer):
-                    active_contracts.append(c)
+            # Handle duplicate timestamps in DataFrame index
+            if patched_df.index.duplicated().any():
+                logger.warning(f"Found {patched_df.index.duplicated().sum()} duplicate timestamps in DataFrame, keeping last")
+                patched_df = patched_df[~patched_df.index.duplicated(keep='last')]
 
-            if not active_contracts:
-                continue
+            # Align contract map to DataFrame index (forward fill from daily to intraday)
+            # Use large limit to cover full days of intraday data (288 bars for 5-min data)
+            contract_map_aligned = contract_map.reindex(patched_df.index, method='ffill')
 
-            # Map M1, M2, M3... to contracts
-            for m_idx, col in enumerate(m_columns):
-                if m_idx >= len(active_contracts):
-                    break
-
-                contract = active_contracts[m_idx]
-                contract_key = f"{contract.month_code}{contract.delivery_year}"
-
-                # Load SCID if not cached
-                if contract_key not in scid_cache:
-                    scid_path = self._build_scid_filepath(scid_directory, contract, exchange)
-                    scid_data = self._load_scid_contract(scid_path, start_date, end_date, resample_rule)
-                    scid_cache[contract_key] = scid_data
-
-                scid_data = scid_cache[contract_key]
-                if scid_data is None:
+            # For each M column, find gaps and patch using contract map
+            for col in m_columns:
+                if col not in contract_map_aligned.columns:
+                    logger.warning(f"{col} not in contract map, skipping")
                     continue
 
-                # Get rows in this period that have gaps
-                period_mask = (patched_df.index >= period_start) & (patched_df.index < period_end)
-                gap_mask = period_mask & patched_df[col].isna()
-
+                # Find gaps in this M column
+                gap_mask = patched_df[col].isna()
                 if not gap_mask.any():
                     continue
 
-                # Reindex SCID data to match gap timestamps
+                # Get contract codes for gap timestamps
                 gap_timestamps = patched_df.index[gap_mask]
-                scid_reindexed = scid_data.reindex(gap_timestamps, method='nearest', tolerance='5min')
+                gap_contracts = contract_map_aligned.loc[gap_timestamps, col]
 
-                # Fill gaps
-                patched_df.loc[gap_mask, col] = scid_reindexed.values
+                # Group by contract code to minimize SCID loads
+                for raw_contract_code in gap_contracts.dropna().unique():
+                    # Normalize contract code for cache key and filename
+                    contract_code = str(raw_contract_code).strip().upper()
+                    ticker_upper = self.ticker.upper()
+
+                    # Load SCID if not cached
+                    if contract_code not in scid_cache:
+                        # Parse contract code - handle multiple formats
+                        # Format 1: 'CLJ20' (ticker + month + 2-digit year)
+                        if contract_code.startswith(ticker_upper):
+                            filename = f"{contract_code}-{exchange}.scid"
+
+                        # Format 2: 'J2020' (month + 4-digit year) - legacy
+                        elif len(contract_code) >= 5 and contract_code[1:].isdigit():
+                            month_code = contract_code[0]
+                            year = int(contract_code[1:])
+                            year_2digit = str(year)[-2:]
+                            filename = f"{ticker_upper}{month_code}{year_2digit}-{exchange}.scid"
+
+                        # Format 3: 'J20' (month + 2-digit year) - need to add ticker
+                        elif len(contract_code) <= 3:
+                            filename = f"{ticker_upper}{contract_code}-{exchange}.scid"
+
+                        else:
+                            logger.warning(f"Unrecognized contract code format: '{contract_code}' (ticker={self.ticker})")
+                            scid_cache[contract_code] = None
+                            continue
+
+                        scid_path = Path(scid_directory) / filename
+
+                        if scid_path.exists():
+                            scid_data = self._load_scid_contract(scid_path, start_date, end_date, resample_rule, target_tz)
+
+                            if scid_data is not None:
+                                # Remove duplicate timestamps if present
+                                if scid_data.index.duplicated().any():
+                                    logger.debug(f"Removing {scid_data.index.duplicated().sum()} duplicates from SCID data")
+                                    scid_data = scid_data[~scid_data.index.duplicated(keep='last')]
+
+                                # Ensure monotonic index for reindexing
+                                if not scid_data.index.is_monotonic_increasing:
+                                    logger.debug(f"Sorting SCID data index")
+                                    scid_data = scid_data.sort_index()
+
+                            scid_cache[contract_code] = scid_data
+                        else:
+                            logger.debug(f"SCID file not found: {scid_path}")
+                            scid_cache[contract_code] = None
+
+                    scid_data = scid_cache.get(contract_code)
+                    if scid_data is None:
+                        continue
+
+                    # Find gaps for this specific contract (use raw code to match contract_map_aligned)
+                    contract_gap_mask = gap_mask & (contract_map_aligned[col] == raw_contract_code)
+                    if not contract_gap_mask.any():
+                        continue
+
+                    # Get gap timestamps
+                    contract_gap_timestamps = patched_df.index[contract_gap_mask]
+
+                    # Reindex SCID data to match gap timestamps using merge_asof for robustness
+                    # Create a Series of gap timestamps to fill
+                    gap_df = pd.DataFrame({'ts': contract_gap_timestamps})
+                    scid_df = pd.DataFrame({'ts': scid_data.index, 'value': scid_data.values})
+
+                    # Use merge_asof to find nearest SCID value for each gap timestamp
+                    merged = pd.merge_asof(
+                        gap_df.sort_values('ts'),
+                        scid_df.sort_values('ts'),
+                        on='ts',
+                        direction='nearest',
+                        tolerance=pd.Timedelta('5min')
+                    )
+
+                    # Fill gaps using the matched values
+                    if merged['value'].notna().any():
+                        # Create a mapping from timestamp to value
+                        fill_values = merged.set_index('ts')['value']
+                        patched_df.loc[fill_values.index, col] = fill_values.values
+
+        else:
+            # FALLBACK: Use lazy_pool-based contract selection (less accurate)
+            logger.warning("No contract map provided, using lazy_pool fallback (may be inaccurate)")
+
+            weekly_dates = pd.date_range(start_date, end_date, freq='W')
+
+            for period_start in weekly_dates:
+                period_end = period_start + pd.Timedelta(days=7)
+                period_mid = period_start + pd.Timedelta(days=3)
+
+                # Find active contracts for this period
+                active_contracts = []
+                for c in self.lazy_pool:
+                    buffer = pd.Timedelta(days=c.roll_buffer_days) if hasattr(c, 'roll_buffer_days') else pd.Timedelta(days=0)
+                    if c.expiry_date > (period_mid + buffer):
+                        active_contracts.append(c)
+
+                if not active_contracts:
+                    continue
+
+                # Map M1, M2, M3... to contracts
+                for m_idx, col in enumerate(m_columns):
+                    if m_idx >= len(active_contracts):
+                        break
+
+                    contract = active_contracts[m_idx]
+                    contract_key = f"{contract.month_code}{contract.delivery_year}"
+
+                    # Load SCID if not cached
+                    if contract_key not in scid_cache:
+                        scid_path = self._build_scid_filepath(scid_directory, contract, exchange)
+                        scid_data = self._load_scid_contract(scid_path, start_date, end_date, resample_rule, target_tz)
+                        scid_cache[contract_key] = scid_data
+
+                    scid_data = scid_cache[contract_key]
+                    if scid_data is None:
+                        continue
+
+                    # Get rows in this period that have gaps
+                    period_mask = (patched_df.index >= period_start) & (patched_df.index < period_end)
+                    gap_mask = period_mask & patched_df[col].isna()
+
+                    if not gap_mask.any():
+                        continue
+
+                    # Reindex SCID data to match gap timestamps
+                    gap_timestamps = patched_df.index[gap_mask]
+                    scid_reindexed = scid_data.reindex(gap_timestamps, method='nearest', tolerance='5min')
+
+                    # Fill gaps
+                    patched_df.loc[gap_mask, col] = scid_reindexed.values
 
         # Log per-column improvement
         for col in m_columns:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime
 from datetime import time, timedelta
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Type, Union
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Type, Union
 
 import numpy as np
 import pandas as pd
@@ -2397,14 +2397,17 @@ class IntradayMomentum:
                      target_time: Union[time, List[time]],
                      slope: bool = True,
                      slope_mos: Tuple[int, int] = (1, 4),
-                     normalized_basis: bool = True,
+                     normalized_basis: bool = False,
                      basis_mos: Tuple[int, int] = (1, 3),
+                     relative_basis: bool = True,
+                     spread_pair_1: Tuple[int, int] = (1, 2),
+                     spread_pair_2: Tuple[int, int] = (2, 3),
                      const_maturity: bool = False,
                      expiry_data: Optional[pd.Series] = None,
                      add_as_feature: bool = True) -> pd.DataFrame:
         """Extract curve shape features at specific intraday time(s).
 
-        Measures the forward curve structure (slope, basis) at target_time each day.
+        Measures the forward curve structure (slope, basis, relative basis) at target_time each day.
         Features are properly lagged to avoid lookahead bias.
 
         Parameters
@@ -2417,10 +2420,20 @@ class IntradayMomentum:
             Calculate curve slope between slope_mos contracts
         slope_mos : Tuple[int, int], default (1, 4)
             (front, back) contract months for slope calculation
-        normalized_basis : bool, default True
-            Calculate normalized spread (basis) between basis_mos contracts
+        normalized_basis : bool, default False
+            Calculate normalized spread (basis) between contracts.
+            If relative_basis=False, uses spread_pair_1 for calculation.
+            Formula: (M_back - M_front) / M_front
         basis_mos : Tuple[int, int], default (1, 3)
-            (front, back) contract months for basis calculation
+            DEPRECATED: Use spread_pair_1 instead. Kept for backward compatibility.
+        relative_basis : bool, default True
+            Calculate relative basis (annualized spread difference).
+            Formula: (Spread1/dt1) - (Spread2/dt2) where dt = months between contracts
+        spread_pair_1 : Tuple[int, int], default (1, 2)
+            First spread pair (front, back) for relative basis. Also used for normalized_basis
+            when relative_basis=False. E.g., (1, 2) means M2 - M1.
+        spread_pair_2 : Tuple[int, int], default (2, 3)
+            Second spread pair (front, back) for relative basis. E.g., (2, 3) means M3 - M2.
         const_maturity : bool, default False
             Use constant maturity tenor interpolation. If True, requires expiry_data.
         expiry_data : pd.Series, optional
@@ -2440,15 +2453,18 @@ class IntradayMomentum:
         - Features are lagged if target_time is at or after self.target_time
         - Slope measures average price change per month: (M_back - M_front) / (back - front)
         - Normalized basis: (M_back - M_front) / M_front (percentage spread)
+        - Relative basis: (Spread1/dt1) - (Spread2/dt2) where Spread = M_back - M_front
 
         Examples
         --------
-        >>> # Curve slope at 10am and 2pm
+        >>> # Curve slope and relative basis at 10am and 2pm
         >>> curve_feats = model.curve_levels(
         ...     fwd_curve_df=continuous_contracts,
         ...     target_time=[time(10, 0), time(14, 0)],
         ...     slope=True,
-        ...     normalized_basis=True
+        ...     relative_basis=True,
+        ...     spread_pair_1=(1, 2),
+        ...     spread_pair_2=(2, 3)
         ... )
         """
         # Handle list of times
@@ -2456,7 +2472,9 @@ class IntradayMomentum:
             all_features = []
             for t in target_time:
                 feats = self.curve_levels(
-                    fwd_curve_df, t, slope, slope_mos, normalized_basis, basis_mos, const_maturity, add_as_feature
+                    fwd_curve_df, t, slope, slope_mos, normalized_basis, basis_mos,
+                    relative_basis, spread_pair_1, spread_pair_2,
+                    const_maturity, expiry_data, add_as_feature
                 )
                 all_features.append(feats)
             return pd.concat(all_features, axis=1)
@@ -2570,20 +2588,21 @@ class IntradayMomentum:
                 self._add_feature(slope_feature, feature_name)
 
         # Extract normalized basis at target_time
-        if normalized_basis:
-            # Calculate normalized spread: (M_back - M_front) / M_front
-            front_col = f"M{basis_mos[0]}"
-            back_col = f"M{basis_mos[1]}"
+        # When relative_basis=False and normalized_basis=True, use spread_pair_1 for normal basis
+        if normalized_basis and not relative_basis:
+            # Use spread_pair_1 for normalized basis calculation
+            front_col = f"M{spread_pair_1[0]}"
+            back_col = f"M{spread_pair_1[1]}"
 
             if front_col in fwd_curve_df.columns and back_col in fwd_curve_df.columns:
+                # Calculate normalized spread: (M_back - M_front) / M_front
                 basis_series = (fwd_curve_df[back_col] - fwd_curve_df[front_col]) / fwd_curve_df[front_col]
 
                 # Detect curve data frequency to adjust extraction parameters
                 curve_freq_minutes = self._detect_bar_frequency_minutes(fwd_curve_df)
 
                 # Extract at target_time using adaptive window
-                # Curve data is often less frequent, so use larger window
-                max_window = max(120, int(curve_freq_minutes * 3))  # At least 2 hours or 3x frequency
+                max_window = max(120, int(curve_freq_minutes * 3))
                 basis_at_time = self._extract_at_time_daily(
                     basis_series,
                     target_time,
@@ -2622,7 +2641,7 @@ class IntradayMomentum:
 
                 # Generate feature name
                 feature_name = self._make_feature_name(
-                    f'norm_basis_M{basis_mos[0]}_M{basis_mos[1]}',
+                    f'norm_basis_M{spread_pair_1[0]}_M{spread_pair_1[1]}',
                     target_time,
                     ""
                 )
@@ -2630,6 +2649,88 @@ class IntradayMomentum:
 
                 if add_as_feature:
                     self._add_feature(basis_feature, feature_name)
+
+        # Extract relative basis at target_time
+        # Relative basis = (Spread1/dt1) - (Spread2/dt2)
+        if relative_basis:
+            # Get column names for both spread pairs
+            s1_front_col = f"M{spread_pair_1[0]}"
+            s1_back_col = f"M{spread_pair_1[1]}"
+            s2_front_col = f"M{spread_pair_2[0]}"
+            s2_back_col = f"M{spread_pair_2[1]}"
+
+            # Calculate time differences (months between contracts)
+            dt1 = abs(spread_pair_1[1] - spread_pair_1[0])
+            dt2 = abs(spread_pair_2[1] - spread_pair_2[0])
+
+            required_cols = [s1_front_col, s1_back_col, s2_front_col, s2_back_col]
+            if all(col in fwd_curve_df.columns for col in required_cols):
+                # Calculate spreads
+                spread_1 = fwd_curve_df[s1_back_col] - fwd_curve_df[s1_front_col]
+                spread_2 = fwd_curve_df[s2_back_col] - fwd_curve_df[s2_front_col]
+
+                # Annualized relative basis
+                rel_basis_series = (spread_1 / dt1) - (spread_2 / dt2)
+
+                # Detect curve data frequency to adjust extraction parameters
+                curve_freq_minutes = self._detect_bar_frequency_minutes(fwd_curve_df)
+
+                # Extract at target_time using adaptive window
+                max_window = max(120, int(curve_freq_minutes * 3))
+                rel_basis_at_time = self._extract_at_time_daily(
+                    rel_basis_series,
+                    target_time,
+                    adaptive_window=True,
+                    max_window_minutes=max_window
+                )
+
+                if rel_basis_at_time.empty:
+                    import warnings
+                    warnings.warn(
+                        f"No relative basis data found at {target_time}. "
+                        f"Curve data frequency: {curve_freq_minutes:.1f} min. "
+                        "Relative basis feature will be all NaN.",
+                        UserWarning
+                    )
+                    rel_basis_feature = pd.Series(dtype=float, index=self.training_data.index.normalize())
+                else:
+                    # Determine appropriate forward fill limit based on curve data frequency
+                    if curve_freq_minutes >= 1440:  # Daily or less frequent
+                        fill_limit = 7
+                    elif curve_freq_minutes >= 60:  # Hourly
+                        fill_limit = 3
+                    else:  # Intraday
+                        fill_limit = 2
+
+                    # Reindex to training_data dates with frequency-aware forward fill
+                    rel_basis_at_time = rel_basis_at_time.reindex(
+                        self.training_data.index.normalize(),
+                        method='ffill',
+                        limit=fill_limit
+                    )
+
+                    # Lag if needed to avoid lookahead bias
+                    needs_shift = self._needs_shift(target_time)
+                    rel_basis_feature = rel_basis_at_time.shift(1) if needs_shift else rel_basis_at_time
+
+                # Generate feature name: rel_basis_M1M2_vs_M2M3
+                feature_name = self._make_feature_name(
+                    f'rel_basis_M{spread_pair_1[0]}M{spread_pair_1[1]}_vs_M{spread_pair_2[0]}M{spread_pair_2[1]}',
+                    target_time,
+                    ""
+                )
+                features_dict[feature_name] = rel_basis_feature
+
+                if add_as_feature:
+                    self._add_feature(rel_basis_feature, feature_name)
+            else:
+                missing = [c for c in required_cols if c not in fwd_curve_df.columns]
+                import warnings
+                warnings.warn(
+                    f"Missing columns for relative basis: {missing}. "
+                    "Skipping relative basis calculation.",
+                    UserWarning
+                )
 
         return pd.DataFrame(features_dict)
 
