@@ -3188,6 +3188,146 @@ class IntradayMomentum:
 
         return pd.DataFrame(features_dict)
 
+    def liquidity_impact(
+            self,
+            target_time: Union[time, List[time]],
+            intraday_df: Optional[pd.DataFrame] = None,
+            period_length: Optional[timedelta] = None,
+            price_col: str = "Close",
+            bid_vol_col: str = "BidVolume",
+            ask_vol_col: str = "AskVolume",
+            use_proxy: bool = False,
+            add_as_feature: bool = False,
+            use_nearest: bool = True,
+    ) -> Union[pd.DataFrame, pd.DataFrame]:
+        """Calculate average liquidity impact metrics over a time interval.
+
+        Measures the average price impact of orders crossing the spread (aggressive flow)
+        and the average magnitude of that flow over a rolling window.
+
+        Parameters
+        ----------
+        target_time : time or List[time]
+            Time(s) to extract metrics for.
+        intraday_df : Optional[pd.DataFrame]
+            Intraday data. Uses self.intraday_data if None.
+        period_length : Optional[timedelta]
+            Length of the rolling window for averaging. Uses self.closing_length if None.
+        price_col : str, default "Close"
+            Price column name.
+        bid_vol_col : str, default "BidVolume"
+            Bid volume column name.
+        ask_vol_col : str, default "AskVolume"
+            Ask volume column name.
+        use_proxy : bool, default False
+            If True, estimate aggressive volume using price direction if bid/ask cols missing.
+        add_as_feature : bool, default False
+            If True, add features to training_data with proper lagging.
+        use_nearest : bool, default True
+            Use nearest bar if exact target_time is missing.
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with columns:
+            - impact_coeff: Average |PriceChange| / |NetVolume| (Price impact per unit of volume)
+            - impact_vol: Average |NetVolume| (Volume crossing the spread)
+        """
+        # Handle list of times
+        if isinstance(target_time, (list, tuple)):
+            all_features = []
+            for t in target_time:
+                feats = self.liquidity_impact(
+                    t, intraday_df, period_length, price_col, bid_vol_col,
+                    ask_vol_col, use_proxy, add_as_feature, use_nearest
+                )
+                # Rename columns to include time for uniqueness
+                time_str = t.strftime("%H%M")
+                feats.columns = [f"{c}_{time_str}" for c in feats.columns]
+                all_features.append(feats)
+            return pd.concat(all_features, axis=1)
+
+        # Single time handling
+        data = intraday_df if intraday_df is not None else self.intraday_data
+        if data is None or data.empty:
+            raise ValueError("Intraday data is required for liquidity impact")
+
+        window = period_length or self.closing_length
+        prices = self._coerce_price(data, price_col)
+
+        # Calculate Price Changes
+        price_diff = prices.diff().fillna(0)
+
+        # Calculate Net Aggressor Volume (Signed Volume)
+        has_bid_ask = bid_vol_col in data.columns and ask_vol_col in data.columns
+
+        if has_bid_ask:
+            bid_vol = data[bid_vol_col].fillna(0)
+            ask_vol = data[ask_vol_col].fillna(0)
+            # Net Aggressor Volume: Ask (Buy) - Bid (Sell)
+            signed_vol = ask_vol - bid_vol
+        elif use_proxy:
+            # Proxy: Volume * Sign of Price Change
+            vol = data.get("Volume", pd.Series(0, index=data.index))
+            signed_vol = vol * np.sign(price_diff)
+        else:
+            raise KeyError(
+                f"Bid/Ask columns '{bid_vol_col}/{ask_vol_col}' not found. "
+                "Set use_proxy=True to estimate."
+            )
+
+        # 1. Calculate Per-Bar Impact Coefficient (Amihud-like but for aggressive flow)
+        # Ratio = |PriceChange| / |NetVolume|
+        # Use abs() because we care about the magnitude of impact per unit of volume,
+        # regardless of direction. Avoid division by zero.
+        abs_vol = signed_vol.abs()
+        impact_ratio = price_diff.abs() / abs_vol.replace(0, np.nan)
+
+        # 2. Calculate rolling averages
+        if window:
+            bars = self._period_to_bars(window, data)
+            # Average Impact Coefficient
+            avg_impact = impact_ratio.rolling(bars, min_periods=1).mean()
+            # Average Aggressive Volume (Impact Volume)
+            avg_impact_vol = abs_vol.rolling(bars, min_periods=1).mean()
+        else:
+            avg_impact = impact_ratio
+            avg_impact_vol = abs_vol
+
+        # Extract at target time
+        mask = self._get_target_time_mask(data.index, target_time, use_nearest)
+
+        # Create result DataFrame
+        result = pd.DataFrame({
+            'impact_coeff': avg_impact[mask],
+            'impact_vol': avg_impact_vol[mask]
+        })
+
+        # Handle empty extraction fallback
+        if result.empty:
+            avg_impact_extract = self._extract_at_time_daily(avg_impact, target_time)
+            avg_vol_extract = self._extract_at_time_daily(avg_impact_vol, target_time)
+
+            result = pd.DataFrame({
+                'impact_coeff': avg_impact_extract,
+                'impact_vol': avg_vol_extract
+            })
+        else:
+            result.index = pd.to_datetime(result.index).normalize()
+
+        result = self._filter_to_trading_dates(result)
+
+        if add_as_feature:
+            needs_shift = self._needs_shift(target_time)
+            period_str = self._format_period_length(window)
+
+            for col in result.columns:
+                feature_series = result[col].shift(1) if needs_shift else result[col]
+                feature_name = self._make_feature_name(col, target_time, period_str)
+                self._add_feature(feature_series, feature_name)
+
+        return result
+
 
     def fit(self, X, y, **kwargs):
         """Fit the configured base model with compatible parameters."""
