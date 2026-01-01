@@ -3617,7 +3617,7 @@ class IntradayMomentum:
         resample_rule = f"{freq_minutes}min"
 
         if use_session_times:
-            data = data.between_time(self.session_open, self.session_end, include_end=True)
+            data = data.between_time(self.session_open, self.session_end, inclusive='both')
 
         prices = self._coerce_price(data, "Close")
         resampled_prices = prices.resample(resample_rule).last()
