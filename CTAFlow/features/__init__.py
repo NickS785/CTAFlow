@@ -18,6 +18,15 @@ from .feature_engineering import IntradayFeatures
 from .curve.advanced_features import SpreadData, FuturesCurve, CurveShapeAnalyzer, CurveEvolutionAnalyzer
 from .seasonal_anamoly import intraday_autocorr_between_times, intraday_lag_autocorr, last_year_predicts_this_year, abnormal_months, prewindow_feature, prewindow_predicts_month
 from .signals_processing import COTAnalyzer, TechnicalAnalysis
+from .volatility import (
+    DiurnalAdjuster,
+    RollingDiurnalAdjuster,
+    fft_spectrum,
+    compute_realized_volatility,
+    deseasonalize_volatility,
+    deseasonalize_volume,
+    estimate_diurnal_pattern,
+)
 from .regime_classification import (
     BaseRegimeClassifier,
     CrowdingRegimeClassifier,
@@ -39,6 +48,14 @@ __all__ = [
     # Signal processing classes
     'COTAnalyzer',
     'TechnicalAnalysis',
+    # Volatility deseasonalization
+    'DiurnalAdjuster',
+    'RollingDiurnalAdjuster',
+    'fft_spectrum',
+    'compute_realized_volatility',
+    'deseasonalize_volatility',
+    'deseasonalize_volume',
+    'estimate_diurnal_pattern',
     # Regime classification helpers
     'BaseRegimeClassifier',
     'TrendRegimeClassifier',

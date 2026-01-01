@@ -105,6 +105,140 @@ def default_regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[s
     return {"mse": mse, "mae": mae, "corr": corr, "dir_acc": dir_acc}
 
 
+def default_classification_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    """Compute classification metrics.
+
+    Parameters
+    ----------
+    y_true : np.ndarray
+        True class labels (integers)
+    y_pred : np.ndarray
+        Predicted class labels (integers) or logits/probabilities
+
+    Returns
+    -------
+    Dict[str, float]
+        Dictionary with accuracy and per-class metrics
+    """
+    # Handle case where y_pred might be logits (2D array)
+    if y_pred.ndim == 2:
+        y_pred = np.argmax(y_pred, axis=1)
+
+    accuracy = float(np.mean(y_true == y_pred))
+
+    # Per-class accuracy
+    classes = np.unique(y_true)
+    per_class = {}
+    for c in classes:
+        mask = y_true == c
+        if mask.sum() > 0:
+            per_class[f"acc_class_{c}"] = float(np.mean(y_pred[mask] == c))
+
+    return {"accuracy": accuracy, **per_class}
+
+
+def compute_class_weights(
+    labels: np.ndarray,
+    method: str = "balanced",
+    smoothing: float = 0.0,
+) -> torch.Tensor:
+    """Compute class weights for imbalanced datasets.
+
+    Parameters
+    ----------
+    labels : np.ndarray
+        Array of integer class labels
+    method : str, default "balanced"
+        Weighting method:
+        - "balanced": Inverse frequency weighting (sklearn-style)
+        - "effective": Effective number of samples (for long-tail distributions)
+        - "sqrt": Square root of inverse frequency (softer than balanced)
+    smoothing : float, default 0.0
+        Label smoothing factor (0 to 1). Higher values make weights more uniform.
+
+    Returns
+    -------
+    torch.Tensor
+        Class weights tensor of shape (num_classes,)
+
+    Example
+    -------
+    >>> labels = np.array([0, 0, 0, 1, 1, 2])  # Imbalanced
+    >>> weights = compute_class_weights(labels)
+    >>> loss_fn = nn.CrossEntropyLoss(weight=weights)
+    """
+    labels = np.asarray(labels).astype(int)
+    classes = np.unique(labels)
+    num_classes = len(classes)
+    n_samples = len(labels)
+
+    # Count samples per class
+    counts = np.bincount(labels, minlength=num_classes).astype(float)
+    counts = np.maximum(counts, 1)  # Avoid division by zero
+
+    if method == "balanced":
+        # sklearn-style balanced weights: n_samples / (n_classes * n_samples_per_class)
+        weights = n_samples / (num_classes * counts)
+    elif method == "effective":
+        # Effective number of samples (for long-tail)
+        # From "Class-Balanced Loss Based on Effective Number of Samples"
+        beta = 0.9999
+        effective_num = 1.0 - np.power(beta, counts)
+        weights = (1.0 - beta) / effective_num
+    elif method == "sqrt":
+        # Square root of inverse frequency (softer weighting)
+        weights = np.sqrt(n_samples / (num_classes * counts))
+    else:
+        raise ValueError(f"Unknown method: {method}. Use 'balanced', 'effective', or 'sqrt'")
+
+    # Normalize so mean weight = 1
+    weights = weights / weights.mean()
+
+    # Apply smoothing (interpolate towards uniform)
+    if smoothing > 0:
+        uniform = np.ones(num_classes)
+        weights = (1 - smoothing) * weights + smoothing * uniform
+
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+def create_classification_targets(
+    returns: np.ndarray,
+    thresholds: Tuple[float, ...] = (-0.001, 0.001),
+) -> np.ndarray:
+    """Convert continuous returns to classification targets.
+
+    Parameters
+    ----------
+    returns : np.ndarray
+        Continuous return values
+    thresholds : tuple of float
+        Boundaries for classification. E.g., (-0.001, 0.001) creates 3 classes:
+        - Class 0: returns < -0.001 (down)
+        - Class 1: -0.001 <= returns <= 0.001 (flat)
+        - Class 2: returns > 0.001 (up)
+
+    Returns
+    -------
+    np.ndarray
+        Integer class labels
+
+    Example
+    -------
+    >>> returns = np.array([-0.02, 0.0, 0.015, -0.005])
+    >>> labels = create_classification_targets(returns, thresholds=(-0.01, 0.01))
+    >>> # labels = [0, 1, 2, 0]  # down, flat, up, down
+    """
+    returns = np.asarray(returns)
+    thresholds = sorted(thresholds)
+
+    labels = np.zeros(len(returns), dtype=np.int64)
+    for i, threshold in enumerate(thresholds):
+        labels[returns > threshold] = i + 1
+
+    return labels
+
+
 
 @torch.no_grad()
 def evaluate(

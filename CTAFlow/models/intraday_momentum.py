@@ -17,6 +17,7 @@ from ..utils.session import DEFAULT_SESSION_TZ
 from . import base_models
 from .base_models import CTALight
 from ..features.curve.curve_features import CurveFeatures
+from ..features.diurnal_seasonality import deseasonalize_volatility, deseasonalize_volume
 from ..utils.tenor_interpolation import TenorInterpolator, create_tenor_grid
 
 
@@ -56,6 +57,7 @@ class IntradayMomentum:
         self.supplementary_intraday_data = supplementary_intraday_data or {}
         self.feature_names = []  # Track feature names for model training
         self.tz = tz
+        self.diurnal_factor = None
 
         # Get valid trading dates from intraday data (excludes weekends/holidays)
         self.valid_trading_dates = self._get_valid_trading_dates(intraday_data)
@@ -3594,6 +3596,14 @@ class IntradayMomentum:
                 self._add_feature(aligned_feature, feature_name, tf='1d')
 
         return pd.DataFrame(feats)
+
+    def deseasonalized_vol(self, target_time:Union[datetime.time],period_length:timedelta, rolling_days=252, return_volume=True, return_volatility=True,use_session_times=True):
+
+
+
+        return
+
+
 
     def add_basic_datetime_features(
             self,
