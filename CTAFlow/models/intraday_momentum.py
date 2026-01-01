@@ -3604,23 +3604,37 @@ class IntradayMomentum:
             rolling_days: int = 252,
             return_volume: bool = True,
             return_volatility: bool = True,
+            return_scaled_returns: bool = False,
             use_session_times: bool = True,
             add_as_feature: bool = False,
     ):
-        # Handle list of times
-        if isinstance(target_time, (list, tuple)):
-            all_results = []
-            for t in target_time:
-                result = self.deseasonalized_vol(
-                    t, period_length, rolling_days, return_volume,
-                    return_volatility, use_session_times, add_as_feature
-                )
-                if isinstance(result, pd.Series):
-                    result = result.to_frame(name=t.strftime("%H%M"))
-                else:
-                    result.columns = [f"{c}_{t.strftime('%H%M')}" for c in result.columns]
-                all_results.append(result)
-            return pd.concat(all_results, axis=1) if all_results else pd.DataFrame()
+        """Extract deseasonalized volatility and/or volume at target time(s).
+
+        Computes deseasonalization once, then extracts at multiple times efficiently.
+
+        Parameters
+        ----------
+        target_time : time or list of time
+            Target time(s) to extract features at
+        period_length : timedelta
+            Resampling frequency (e.g., timedelta(minutes=5))
+        rolling_days : int, default 252
+            Rolling window for deseasonalization (avoids look-ahead bias)
+        return_volume : bool, default True
+            Return deseasonalized volume
+        return_volatility : bool, default True
+            Return deseasonalized volatility
+        return_scaled_returns : bool, default False
+            Return returns scaled by seasonal volatility factor (r / s_t).
+            Useful for standardizing returns by time-of-day volatility.
+        use_session_times : bool, default True
+            Filter to session hours
+        add_as_feature : bool, default False
+            Add extracted series as features to the model
+        """
+        # Normalize target_time to list for uniform processing
+        times_list = list(target_time) if isinstance(target_time, (list, tuple)) else [target_time]
+        single_time = len(times_list) == 1
 
         data = self.intraday_data.copy()
 
@@ -3646,76 +3660,120 @@ class IntradayMomentum:
         else:
             volume = None
 
-        # Build intraday index for deseasonalization
+        # Build intraday index for deseasonalization (once)
         resampled_idx = resampled_prices.index
         intraday_idx = pd.Series(resampled_idx).groupby(resampled_idx.normalize()).cumcount()
         intraday_idx.index = resampled_idx
 
-        results = {}
         period_str = self._format_period_length(period_length)
+        all_results = {}
 
-        if return_volatility:
+        # Compute deseasonalized volatility ONCE, extract at multiple times
+        # Also get seasonal factor if we need scaled returns
+        seasonal_factor = None
+        if return_volatility or return_scaled_returns:
             vol_idx = intraday_idx.loc[volatility.index]
-            deseasonalized_vol = deseasonalize_volatility(
+            deseas_result = deseasonalize_volatility(
                 volatility,
                 intraday_idx=vol_idx,
                 rolling_days=rolling_days,
-            )["adjusted"]
+            )
+            deseasonalized_vol_full = deseas_result["adjusted"]
 
-            mask = self._get_target_time_mask(deseasonalized_vol.index, target_time)
-            target_vol_series = deseasonalized_vol[mask]
-            if target_vol_series.empty:
-                target_vol_series = self._extract_at_time_daily(deseasonalized_vol, target_time)
-            else:
-                target_vol_series.index = pd.to_datetime(target_vol_series.index).normalize()
+            # Get seasonal factor for scaling returns (convert from log-space to linear)
+            if return_scaled_returns:
+                seasonal_factor = np.exp(deseas_result["seasonal"])
 
-            target_vol_series = self._filter_to_trading_dates(target_vol_series)
+            if return_volatility:
+                for t in times_list:
+                    time_key = t.strftime("%H%M")
+                    mask = self._get_target_time_mask(deseasonalized_vol_full.index, t)
+                    target_series = deseasonalized_vol_full[mask]
 
-            if add_as_feature:
-                needs_shift = self._needs_shift(target_time)
-                feature_series = target_vol_series.shift(1) if needs_shift else target_vol_series
-                feature_name = self._make_feature_name(
-                    "deseasonalized_volatility",
-                    target_time,
-                    period_str,
-                )
-                self._add_feature(feature_series, feature_name)
+                    if target_series.empty:
+                        target_series = self._extract_at_time_daily(deseasonalized_vol_full, t)
+                    else:
+                        target_series.index = pd.to_datetime(target_series.index).normalize()
 
-            results["volatility"] = target_vol_series
+                    target_series = self._filter_to_trading_dates(target_series)
 
+                    if add_as_feature:
+                        needs_shift = self._needs_shift(t)
+                        feature_series = target_series.shift(1) if needs_shift else target_series
+                        feature_name = self._make_feature_name(
+                            "deseasonalized_volatility", t, period_str,
+                        )
+                        self._add_feature(feature_series, feature_name)
+
+                    col_name = "volatility" if single_time else f"volatility_{time_key}"
+                    all_results[col_name] = target_series
+
+        # Compute scaled returns: r_t / s_t (returns divided by seasonal volatility)
+        if return_scaled_returns and seasonal_factor is not None:
+            # Align returns with seasonal factor
+            common_idx = returns.index.intersection(seasonal_factor.index)
+            scaled_returns_full = returns.loc[common_idx] / seasonal_factor.loc[common_idx]
+
+            for t in times_list:
+                time_key = t.strftime("%H%M")
+                mask = self._get_target_time_mask(scaled_returns_full.index, t)
+                target_series = scaled_returns_full[mask]
+
+                if target_series.empty:
+                    target_series = self._extract_at_time_daily(scaled_returns_full, t)
+                else:
+                    target_series.index = pd.to_datetime(target_series.index).normalize()
+
+                target_series = self._filter_to_trading_dates(target_series)
+
+                if add_as_feature:
+                    needs_shift = self._needs_shift(t)
+                    feature_series = target_series.shift(1) if needs_shift else target_series
+                    feature_name = self._make_feature_name(
+                        "scaled_returns", t, period_str,
+                    )
+                    self._add_feature(feature_series, feature_name)
+
+                col_name = "scaled_returns" if single_time else f"scaled_returns_{time_key}"
+                all_results[col_name] = target_series
+
+        # Compute deseasonalized volume ONCE, extract at multiple times
         if return_volume and volume is not None:
             vol_idx = intraday_idx.loc[volume.index]
-            deseasonalized_volume = deseasonalize_volume(
+            deseasonalized_vol_full = deseasonalize_volume(
                 volume,
                 intraday_idx=vol_idx,
                 rolling_days=rolling_days,
             )["adjusted"]
 
-            mask = self._get_target_time_mask(deseasonalized_volume.index, target_time)
-            target_vol_series = deseasonalized_volume[mask]
-            if target_vol_series.empty:
-                target_vol_series = self._extract_at_time_daily(deseasonalized_volume, target_time)
-            else:
-                target_vol_series.index = pd.to_datetime(target_vol_series.index).normalize()
+            for t in times_list:
+                time_key = t.strftime("%H%M")
+                mask = self._get_target_time_mask(deseasonalized_vol_full.index, t)
+                target_series = deseasonalized_vol_full[mask]
 
-            target_vol_series = self._filter_to_trading_dates(target_vol_series)
+                if target_series.empty:
+                    target_series = self._extract_at_time_daily(deseasonalized_vol_full, t)
+                else:
+                    target_series.index = pd.to_datetime(target_series.index).normalize()
 
-            if add_as_feature:
-                needs_shift = self._needs_shift(target_time)
-                feature_series = target_vol_series.shift(1) if needs_shift else target_vol_series
-                feature_name = self._make_feature_name(
-                    "deseasonalized_volume",
-                    target_time,
-                    period_str,
-                )
-                self._add_feature(feature_series, feature_name)
+                target_series = self._filter_to_trading_dates(target_series)
 
-            results["volume"] = target_vol_series
+                if add_as_feature:
+                    needs_shift = self._needs_shift(t)
+                    feature_series = target_series.shift(1) if needs_shift else target_series
+                    feature_name = self._make_feature_name(
+                        "deseasonalized_volume", t, period_str,
+                    )
+                    self._add_feature(feature_series, feature_name)
 
-        if len(results) == 1:
-            return next(iter(results.values()))
+                col_name = "volume" if single_time else f"volume_{time_key}"
+                all_results[col_name] = target_series
 
-        return pd.DataFrame(results)
+        # Return format based on inputs
+        if len(all_results) == 1:
+            return next(iter(all_results.values()))
+
+        return pd.DataFrame(all_results)
 
 
 
