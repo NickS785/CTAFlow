@@ -24,6 +24,8 @@ RESULTS_HDF_PATH = Path(
     os.getenv("CTAFLOW_RESULTS_HDF", Path("F:\\", "Data", "screener_results.h5"))
 )
 
+OHLC_DICT = {'Open': 'first', 'High':'max', 'Low':'min', 'Close':'last', "AskVolume":"sum", "BidVolume":"sum", "Volume":"sum"}
+
 # File system paths
 DATA_DIR = Path("F:\\Data ")
 RAW_MARKET_DATA_PATH = Path("F:\\", 'charts')  # CSV market data files
