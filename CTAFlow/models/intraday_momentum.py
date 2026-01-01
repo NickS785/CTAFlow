@@ -3597,11 +3597,111 @@ class IntradayMomentum:
 
         return pd.DataFrame(feats)
 
-    def deseasonalized_vol(self, target_time:Union[datetime.time],period_length:timedelta, rolling_days=252, return_volume=True, return_volatility=True,use_session_times=True):
+    def deseasonalized_vol(
+            self,
+            target_time: Union[datetime.time],
+            period_length: timedelta,
+            rolling_days: int = 252,
+            return_volume: bool = True,
+            return_volatility: bool = True,
+            use_session_times: bool = True,
+            add_as_feature: bool = False,
+    ):
 
+        data = self.intraday_data.copy()
 
+        if not isinstance(data.index, pd.DatetimeIndex):
+            data.index = pd.to_datetime(data.index)
 
-        return
+        freq_minutes = int(period_length.total_seconds() / 60)
+        resample_rule = f"{freq_minutes}min"
+
+        if use_session_times:
+            data = data.between_time(self.session_open, self.session_end, include_end=True)
+
+        prices = self._coerce_price(data, "Close")
+        resampled_prices = prices.resample(resample_rule).last()
+        returns = resampled_prices.pct_change().dropna()
+
+        volatility = returns.abs()
+
+        if return_volume:
+            if "Volume" not in data.columns:
+                raise KeyError("Volume column not found in intraday data")
+            volume = data["Volume"].resample(resample_rule).sum()
+        else:
+            volume = None
+
+        # Build intraday index for deseasonalization
+        resampled_idx = resampled_prices.index
+        intraday_idx = pd.Series(resampled_idx).groupby(resampled_idx.normalize()).cumcount()
+        intraday_idx.index = resampled_idx
+
+        results = {}
+        period_str = self._format_period_length(period_length)
+
+        if return_volatility:
+            vol_idx = intraday_idx.loc[volatility.index]
+            deseasonalized_vol = deseasonalize_volatility(
+                volatility,
+                intraday_idx=vol_idx,
+                rolling_days=rolling_days,
+            )["adjusted"]
+
+            mask = self._get_target_time_mask(deseasonalized_vol.index, target_time)
+            target_vol_series = deseasonalized_vol[mask]
+            if target_vol_series.empty:
+                target_vol_series = self._extract_at_time_daily(deseasonalized_vol, target_time)
+            else:
+                target_vol_series.index = pd.to_datetime(target_vol_series.index).normalize()
+
+            target_vol_series = self._filter_to_trading_dates(target_vol_series)
+
+            if add_as_feature:
+                needs_shift = self._needs_shift(target_time)
+                feature_series = target_vol_series.shift(1) if needs_shift else target_vol_series
+                feature_name = self._make_feature_name(
+                    "deseasonalized_volatility",
+                    target_time,
+                    period_str,
+                )
+                self._add_feature(feature_series, feature_name)
+
+            results["volatility"] = target_vol_series
+
+        if return_volume and volume is not None:
+            vol_idx = intraday_idx.loc[volume.index]
+            deseasonalized_volume = deseasonalize_volume(
+                volume,
+                intraday_idx=vol_idx,
+                rolling_days=rolling_days,
+            )["adjusted"]
+
+            mask = self._get_target_time_mask(deseasonalized_volume.index, target_time)
+            target_vol_series = deseasonalized_volume[mask]
+            if target_vol_series.empty:
+                target_vol_series = self._extract_at_time_daily(deseasonalized_volume, target_time)
+            else:
+                target_vol_series.index = pd.to_datetime(target_vol_series.index).normalize()
+
+            target_vol_series = self._filter_to_trading_dates(target_vol_series)
+
+            if add_as_feature:
+                needs_shift = self._needs_shift(target_time)
+                feature_series = target_vol_series.shift(1) if needs_shift else target_vol_series
+                feature_name = self._make_feature_name(
+                    "deseasonalized_volume",
+                    target_time,
+                    period_str,
+                )
+                self._add_feature(feature_series, feature_name)
+
+            results["volume"] = target_vol_series
+
+        if len(results) == 1:
+            return next(iter(results.values()))
+
+        return pd.DataFrame(results)
 
 
 
