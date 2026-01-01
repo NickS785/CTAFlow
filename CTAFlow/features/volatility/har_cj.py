@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
-from CTAFlow.features.diurnal_seasonality import deseasonalize_volatility
+from ..diurnal_seasonality import deseasonalize_volatility
 from typing import List, Optional
 
 
