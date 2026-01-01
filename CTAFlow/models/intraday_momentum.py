@@ -3599,7 +3599,7 @@ class IntradayMomentum:
 
     def deseasonalized_vol(
             self,
-            target_time: Union[datetime.time],
+            target_time: Union[datetime.time, List[datetime.time]],
             period_length: timedelta,
             rolling_days: int = 252,
             return_volume: bool = True,
@@ -3607,6 +3607,20 @@ class IntradayMomentum:
             use_session_times: bool = True,
             add_as_feature: bool = False,
     ):
+        # Handle list of times
+        if isinstance(target_time, (list, tuple)):
+            all_results = []
+            for t in target_time:
+                result = self.deseasonalized_vol(
+                    t, period_length, rolling_days, return_volume,
+                    return_volatility, use_session_times, add_as_feature
+                )
+                if isinstance(result, pd.Series):
+                    result = result.to_frame(name=t.strftime("%H%M"))
+                else:
+                    result.columns = [f"{c}_{t.strftime('%H%M')}" for c in result.columns]
+                all_results.append(result)
+            return pd.concat(all_results, axis=1) if all_results else pd.DataFrame()
 
         data = self.intraday_data.copy()
 
