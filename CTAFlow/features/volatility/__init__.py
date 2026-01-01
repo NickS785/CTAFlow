@@ -1,4 +1,4 @@
-from CTAFlow.features.diurnal_seasonality import (
+from .features.diurnal_seasonality import (
     DiurnalAdjuster,
     RollingDiurnalAdjuster,
     fft_spectrum,
