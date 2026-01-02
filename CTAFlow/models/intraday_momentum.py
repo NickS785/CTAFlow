@@ -3378,6 +3378,11 @@ class IntradayMomentum:
         X = self.training_data.copy()
         y = self.target_data.copy()
 
+        # Drop rows with NaN in target (required for sklearn mutual_info_regression)
+        valid_mask = y.notna()
+        X = X.loc[valid_mask]
+        y = y.loc[valid_mask]
+
         base_model = self._get_model()
 
         # IMPORTANT: we want a plain sklearn-style estimator for importances.
@@ -3453,6 +3458,11 @@ class IntradayMomentum:
         """
         X = self.training_data.copy()
         y = self.target_data.copy()
+
+        # Drop rows with NaN in target (required for sklearn mutual_info_regression)
+        valid_mask = y.notna()
+        X = X.loc[valid_mask]
+        y = y.loc[valid_mask]
 
         # Get the base model for importance calculations
         base_model = self._get_model()
