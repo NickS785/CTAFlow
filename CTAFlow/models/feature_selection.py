@@ -108,6 +108,12 @@ class FeatureSelector:
         X = self._ensure_df(X)
         y = self._ensure_y(y, X.index)
 
+        # Handle edge case: no features to select from
+        if X.shape[1] == 0:
+            self.selected_features_ = []
+            self.feature_report_ = pd.DataFrame()
+            return self
+
         # A) Hard filters + Impute
         X1, report = self._hard_filter_and_impute(X)
 
@@ -135,6 +141,10 @@ class FeatureSelector:
         Computes Mutual Information between features and target to capture
         non-linear dependencies.
         """
+        # Handle edge case: no features left after filtering
+        if X.shape[1] == 0:
+            return pd.DataFrame({"mi_score": []}, index=X.columns)
+
         mi = mutual_info_regression(
             X, y,
             n_neighbors=self.config.mi_neighbors,
@@ -297,6 +307,10 @@ class FeatureSelector:
         return X[kept_cols].copy(), report
 
     def _stability_importance(self, X: pd.DataFrame, y: pd.Series, estimator) -> pd.DataFrame:
+        # Handle edge case: no features left after filtering
+        if X.shape[1] == 0:
+            return pd.DataFrame({"stability_score": []}, index=X.columns)
+
         cfg = self.config
         tscv = TimeSeriesSplit(n_splits=min(cfg.n_splits, max(2, len(X) // 50)))
 
