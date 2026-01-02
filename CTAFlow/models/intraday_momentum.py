@@ -2114,7 +2114,10 @@ class IntradayMomentum:
         # Calculate main returns
         main_prices = main_data[price_col]
         if resample:
-            main_prices = main_prices.resample(resample_period).last().dropna()
+            # Use closed='right', label='right' to avoid lookahead bias
+            main_prices = main_prices.resample(
+                resample_period, closed='right', label='right'
+            ).last().dropna()
         main_returns = main_prices.pct_change()
 
         # Dictionary to store correlation series for each ticker
@@ -2130,7 +2133,10 @@ class IntradayMomentum:
             # Calculate supplementary returns
             supp_prices = supp_data[price_col]
             if resample:
-                supp_prices = supp_prices.resample(resample_period).last().dropna()
+                # Use closed='right', label='right' to avoid lookahead bias
+                supp_prices = supp_prices.resample(
+                    resample_period, closed='right', label='right'
+                ).last().dropna()
             supp_returns = supp_prices.pct_change()
 
             # Align the two return series
@@ -3648,7 +3654,13 @@ class IntradayMomentum:
             data = data.between_time(self.session_open, self.session_end, inclusive='both')
 
         prices = self._coerce_price(data, "Close")
-        resampled_prices = prices.resample(resample_rule).last()
+
+        # Use closed='right', label='right' to avoid lookahead bias:
+        # - Bar labeled 10:00 contains data from 09:01 to 10:00 (not 10:00 to 10:59)
+        # - The return at 10:00 = (close_10:00 - close_09:00) / close_09:00
+        resampled_prices = prices.resample(
+            resample_rule, closed='right', label='right'
+        ).last()
         returns = resampled_prices.pct_change().dropna()
 
         volatility = returns.abs()
@@ -3656,7 +3668,9 @@ class IntradayMomentum:
         if return_volume:
             if "Volume" not in data.columns:
                 raise KeyError("Volume column not found in intraday data")
-            volume = data["Volume"].resample(resample_rule).sum()
+            volume = data["Volume"].resample(
+                resample_rule, closed='right', label='right'
+            ).sum()
         else:
             volume = None
 
