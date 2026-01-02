@@ -1087,9 +1087,174 @@ class CTAForecast:
         return self.models[model_key]
 
 
-class CTALinear:
+class CTABase:
+    """Base class for all CTA model classes with common attributes and methods
+
+    This class provides:
+    - Common attribute initialization (use_gpu, task, params, is_fitted, feature_names, feature_importance)
+    - Common data preparation and cleaning methods
+    - Shared evaluation and feature importance methods
+    - Abstract methods that subclasses must implement
+    """
+
+    def __init__(self):
+        """Initialize common attributes for all CTA models
+
+        Note: Subclasses should call super().__init__() after setting their specific attributes
+        """
+        self.use_gpu = False
+        self.task = 'regression'
+        self.params = {}
+        self.model = None
+        self.is_fitted = False
+        self.feature_names = None
+        self.feature_importance = None
+
+    def _prepare_data(self, X, y=None):
+        """Convert pandas DataFrames/Series to numpy arrays and extract feature names
+
+        Args:
+            X: Features DataFrame or array
+            y: Optional target Series or array
+
+        Returns:
+            Tuple of (X_array, y_array or None, feature_names)
+        """
+        # Handle X
+        if isinstance(X, pd.DataFrame):
+            feature_names = list(X.columns)
+            X_array = X.values
+        else:
+            X_array = np.asarray(X)
+            feature_names = [f'feature_{i}' for i in range(X_array.shape[1])]
+
+        # Handle y if provided
+        y_array = None
+        if y is not None:
+            if isinstance(y, pd.Series):
+                y_array = y.values
+            else:
+                y_array = np.asarray(y)
+
+        return X_array, y_array, feature_names
+
+    def _clean_data(self, X, y):
+        """Remove rows with NaN values from features and target
+
+        Args:
+            X: Features array
+            y: Target array
+
+        Returns:
+            Tuple of (X_clean, y_clean) with NaN rows removed
+
+        Raises:
+            ValueError: If no valid samples remain after cleaning
+        """
+        # Create mask for valid rows (no NaN in X or y)
+        mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
+        X_clean = X[mask]
+        y_clean = y[mask]
+
+        if len(X_clean) == 0:
+            raise ValueError("No valid samples after removing NaN values")
+
+        return X_clean, y_clean
+
+    def fit(self, X, y, eval_set=None, **kwargs):
+        """Fit the model - must be implemented by subclasses
+
+        Args:
+            X: Features DataFrame or array
+            y: Target Series or array
+            eval_set: Optional validation set as tuple (X_val, y_val)
+            **kwargs: Additional model-specific parameters
+
+        Returns:
+            self
+        """
+        raise NotImplementedError("Subclasses must implement fit()")
+
+    def predict(self, X):
+        """Make predictions - must be implemented by subclasses
+
+        Args:
+            X: Features DataFrame or array
+
+        Returns:
+            Predictions array
+        """
+        raise NotImplementedError("Subclasses must implement predict()")
+
+    def cross_validate(self, X, y, cv_folds=3, scoring='neg_mean_squared_error'):
+        """Perform cross-validation - must be implemented by subclasses
+
+        Args:
+            X: Features DataFrame or array
+            y: Target Series or array
+            cv_folds: Number of CV folds
+            scoring: Scoring method
+
+        Returns:
+            Dictionary with CV results
+        """
+        raise NotImplementedError("Subclasses must implement cross_validate()")
+
+    def evaluate(self, X_test, y_test):
+        """Evaluate model performance on test set
+
+        This implementation is shared across all model types.
+
+        Args:
+            X_test: Test features
+            y_test: Test targets
+
+        Returns:
+            Dictionary with performance metrics (mse, rmse, mae, r2, directional_accuracy)
+        """
+        predictions = self.predict(X_test)
+
+        # Convert to numpy arrays for consistent handling
+        if isinstance(y_test, pd.Series):
+            y_test = y_test.values
+
+        # Remove NaN values for evaluation
+        mask = ~(np.isnan(predictions) | np.isnan(y_test))
+        pred_clean = predictions[mask]
+        y_clean = y_test[mask]
+
+        if len(pred_clean) == 0:
+            raise ValueError("No valid predictions for evaluation")
+
+        return {
+            'mse': mean_squared_error(y_clean, pred_clean),
+            'rmse': np.sqrt(mean_squared_error(y_clean, pred_clean)),
+            'mae': mean_absolute_error(y_clean, pred_clean),
+            'r2': r2_score(y_clean, pred_clean),
+            'directional_accuracy': np.mean(np.sign(pred_clean) == np.sign(y_clean)) if len(y_clean) > 0 else 0.0
+        }
+
+    def get_feature_importance(self, top_n=35):
+        """Get feature importance
+
+        Args:
+            top_n: Number of top features to return
+
+        Returns:
+            Series with top feature importances
+
+        Raises:
+            ValueError: If model hasn't been fitted yet
+        """
+        if self.feature_importance is None:
+            raise ValueError("Model must be fitted first")
+
+        return self.feature_importance.head(top_n)
+
+
+class CTALinear(CTABase):
     """Linear regression models optimized for CTA positioning prediction"""
-    
+
     def __init__(self, model_type='ridge', alpha=1.0, l1_ratio=0.5, normalize=True):
         """
         Args:
@@ -1098,11 +1263,13 @@ class CTALinear:
             l1_ratio: L1 ratio for ElasticNet (0=Ridge, 1=Lasso)
             normalize: Whether to standardize features
         """
+        super().__init__()
+
         self.model_type = model_type
         self.alpha = alpha
         self.l1_ratio = l1_ratio
         self.normalize = normalize
-        
+
         # Initialize model based on type
         if model_type == 'linear':
             self.model = LinearRegression()
@@ -1114,52 +1281,38 @@ class CTALinear:
             self.model = ElasticNet(alpha=alpha, l1_ratio=l1_ratio, max_iter=2000)
         else:
             raise ValueError(f"model_type must be one of ['linear', 'ridge', 'lasso', 'elastic_net'], got {model_type}")
-        
+
         self.scaler = StandardScaler() if normalize else None
-        self.is_fitted = False
-        self.feature_names = None
-        self.feature_importance = None
-        
+        # Note: is_fitted, feature_names, feature_importance are initialized in parent
+
     def fit(self, X, y):
         """Fit the linear model
-        
+
         Args:
             X: Features DataFrame or array
             y: Target Series or array
         """
-        # Convert to numpy arrays and handle missing values
-        if isinstance(X, pd.DataFrame):
-            self.feature_names = list(X.columns)
-            X = X.values
-        else:
-            self.feature_names = [f'feature_{i}' for i in range(X.shape[1])]
-            
-        if isinstance(y, pd.Series):
-            y = y.values
-            
-        # Remove rows with NaN values
-        mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
-        X_clean = X[mask]
-        y_clean = y[mask]
-        
-        if len(X_clean) == 0:
-            raise ValueError("No valid samples after removing NaN values")
-        
+        # Use base class method to prepare data
+        X_array, y_array, self.feature_names = self._prepare_data(X, y)
+
+        # Use base class method to clean data
+        X_clean, y_clean = self._clean_data(X_array, y_array)
+
         # Normalize features if requested
         if self.scaler:
             X_clean = self.scaler.fit_transform(X_clean)
-        
+
         # Fit the model
         self.model.fit(X_clean, y_clean)
         self.is_fitted = True
-        
+
         # Store feature importance (coefficients)
         if hasattr(self.model, 'coef_'):
             self.feature_importance = pd.Series(
-                self.model.coef_, 
+                self.model.coef_,
                 index=self.feature_names
             ).abs().sort_values(ascending=False)
-        
+
         return self
     
     def predict(self, X):
@@ -1222,55 +1375,9 @@ class CTALinear:
             'all_scores': cv_scores,
             'scoring_method': scoring
         }
-    
-    def evaluate(self, X_test, y_test):
-        """Evaluate model performance on test set
-        
-        Args:
-            X_test: Test features
-            y_test: Test targets
-            
-        Returns:
-            Dictionary with performance metrics
-        """
-        predictions = self.predict(X_test)
-        
-        # Convert to numpy arrays for consistent handling
-        if isinstance(y_test, pd.Series):
-            y_test = y_test.values
-            
-        # Remove NaN values for evaluation
-        mask = ~(np.isnan(predictions) | np.isnan(y_test))
-        pred_clean = predictions[mask]
-        y_clean = y_test[mask]
-        
-        if len(pred_clean) == 0:
-            raise ValueError("No valid predictions for evaluation")
-        
-        return {
-            'mse': mean_squared_error(y_clean, pred_clean),
-            'rmse': np.sqrt(mean_squared_error(y_clean, pred_clean)),
-            'mae': mean_absolute_error(y_clean, pred_clean),
-            'r2': r2_score(y_clean, pred_clean),
-            'directional_accuracy': np.mean(np.sign(pred_clean) == np.sign(y_clean)) if len(y_clean) > 0 else 0.0
-        }
-    
-    def get_feature_importance(self, top_n=35):
-        """Get feature importance (coefficient magnitudes)
-        
-        Args:
-            top_n: Number of top features to return
-            
-        Returns:
-            Series with top feature importances
-        """
-        if self.feature_importance is None:
-            raise ValueError("Model must be fitted first")
-            
-        return self.feature_importance.head(top_n)
 
 
-class CTALight:
+class CTALight(CTABase):
     """LightGBM model optimized for CTA positioning prediction"""
 
     def __init__(
@@ -1290,6 +1397,8 @@ class CTALight:
             config_path: Optional JSON file containing base LightGBM parameters.
             **lgb_params: LightGBM parameters to override defaults.
         """
+        super().__init__()
+
         task_normalized = (task or 'regression').lower()
         self.use_gpu = bool(use_gpu)
         self.config_path = config_path
@@ -1307,10 +1416,7 @@ class CTALight:
         self.params: Dict[str, Any] = {**default_params, **lgb_params}
         self.task = resolved_task
 
-        self.model = None
-        self.is_fitted = False
-        self.feature_names = None
-        self.feature_importance = None
+        # Note: model, is_fitted, feature_names, feature_importance initialized in parent
         self.train_history = None
 
     def _maybe_update_task_from_y(self, y: Union[pd.Series, np.ndarray, list, tuple]) -> np.ndarray:
@@ -1337,7 +1443,7 @@ class CTALight:
         
     def fit(self, X, y, eval_set=None, early_stopping_rounds=50, num_boost_round=1000):
         """Fit the LightGBM model
-        
+
         Args:
             X: Features DataFrame or array
             y: Target Series or array
@@ -1345,22 +1451,14 @@ class CTALight:
             early_stopping_rounds: Early stopping patience
             num_boost_round: Maximum number of boosting rounds
         """
-        # Convert to numpy arrays and handle missing values
-        if isinstance(X, pd.DataFrame):
-            self.feature_names = list(X.columns)
-            X = X.values
-        else:
-            self.feature_names = [f'feature_{i}' for i in range(X.shape[1])]
+        # Use base class method to prepare data
+        X_array, y_array, self.feature_names = self._prepare_data(X, y)
 
-        y = self._maybe_update_task_from_y(y)
+        # Update task from y if needed
+        y_array = self._maybe_update_task_from_y(y_array)
 
-        # Remove rows with NaN values
-        mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
-        X_clean = X[mask]
-        y_clean = y[mask]
-
-        if len(X_clean) == 0:
-            raise ValueError("No valid samples after removing NaN values")
+        # Use base class method to clean data
+        X_clean, y_clean = self._clean_data(X_array, y_array)
         
         # Create LightGBM dataset
         train_data = lgb.Dataset(X_clean, label=y_clean, feature_name=self.feature_names)
@@ -1519,39 +1617,7 @@ class CTALight:
             'all_scores': cv_scores,
             'feature_importance': avg_importance
         }
-    
-    def evaluate(self, X_test, y_test):
-        """Evaluate model performance on test set
-        
-        Args:
-            X_test: Test features
-            y_test: Test targets
-            
-        Returns:
-            Dictionary with performance metrics
-        """
-        predictions = self.predict(X_test)
-        
-        # Convert to numpy arrays for consistent handling
-        if isinstance(y_test, pd.Series):
-            y_test = y_test.values
-            
-        # Remove NaN values for evaluation
-        mask = ~(np.isnan(predictions) | np.isnan(y_test))
-        pred_clean = predictions[mask]
-        y_clean = y_test[mask]
-        
-        if len(pred_clean) == 0:
-            raise ValueError("No valid predictions for evaluation")
-        
-        return {
-            'mse': mean_squared_error(y_clean, pred_clean),
-            'rmse': np.sqrt(mean_squared_error(y_clean, pred_clean)),
-            'mae': mean_absolute_error(y_clean, pred_clean),
-            'r2': r2_score(y_clean, pred_clean),
-            'directional_accuracy': np.mean(np.sign(pred_clean) == np.sign(y_clean)) if len(y_clean) > 0 else 0.0
-        }
-    
+
     def get_feature_importance(self, importance_type='gain', top_n=20):
         """Get feature importance
         
@@ -1813,7 +1879,7 @@ class CTALight:
             return self.get_feature_importance(importance_type, max_num_features)
 
 
-class CTAXGBoost:
+class CTAXGBoost(CTABase):
     """XGBoost model optimized for CTA positioning prediction with GPU support"""
 
     def __init__(self, use_gpu: bool = False, task: str = 'regression', **xgb_params):
@@ -1824,6 +1890,8 @@ class CTAXGBoost:
             task: Learning task type ('regression', 'binary_classification', or 'multiclass')
             **xgb_params: XGBoost parameters to override defaults
         """
+        super().__init__()
+
         self.use_gpu = bool(use_gpu)
         self.task = task.lower() if task else 'regression'
 
@@ -1871,27 +1939,15 @@ class CTAXGBoost:
 
         self.params = {**default_params, **xgb_params}
         self.model = XGBRegressor(**self.params)
-        self.is_fitted = False
-        self.feature_names = None
-        self.feature_importance = None
+        # Note: is_fitted, feature_names, feature_importance initialized in parent
 
     def fit(self, X, y, eval_set=None,):
         """Fit the XGBoost model"""
-        if isinstance(X, pd.DataFrame):
-            self.feature_names = list(X.columns)
-            X = X.values
-        else:
-            self.feature_names = [f'feature_{i}' for i in range(X.shape[1])]
+        # Use base class method to prepare data
+        X_array, y_array, self.feature_names = self._prepare_data(X, y)
 
-        if isinstance(y, pd.Series):
-            y = y.values
-
-        mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
-        X_clean = X[mask]
-        y_clean = y[mask]
-
-        if len(X_clean) == 0:
-            raise ValueError("No valid samples after removing NaN values")
+        # Use base class method to clean data
+        X_clean, y_clean = self._clean_data(X_array, y_array)
 
         eval_sets = None
         if eval_set is not None:
@@ -1958,35 +2014,6 @@ class CTAXGBoost:
             'all_scores': cv_scores,
             'scoring_method': scoring
         }
-
-    def evaluate(self, X_test, y_test):
-        """Evaluate model performance on test set"""
-        predictions = self.predict(X_test)
-
-        if isinstance(y_test, pd.Series):
-            y_test = y_test.values
-
-        mask = ~(np.isnan(predictions) | np.isnan(y_test))
-        pred_clean = predictions[mask]
-        y_clean = y_test[mask]
-
-        if len(pred_clean) == 0:
-            raise ValueError("No valid predictions for evaluation")
-
-        return {
-            'mse': mean_squared_error(y_clean, pred_clean),
-            'rmse': np.sqrt(mean_squared_error(y_clean, pred_clean)),
-            'mae': mean_absolute_error(y_clean, pred_clean),
-            'r2': r2_score(y_clean, pred_clean),
-            'directional_accuracy': np.mean(np.sign(pred_clean) == np.sign(y_clean)) if len(y_clean) > 0 else 0.0
-        }
-
-    def get_feature_importance(self, top_n=35):
-        """Get feature importance"""
-        if self.feature_importance is None:
-            raise ValueError("Model must be fitted first")
-
-        return self.feature_importance.head(top_n)
 
     def grid_search(self, X, y, param_grid=None, cv_folds=5,
                     scoring='neg_mean_squared_error', verbose=True):
@@ -2090,7 +2117,7 @@ class CTAXGBoost:
         }
 
 
-class CTARForest:
+class CTARForest(CTABase):
     """Random Forest model optimized for CTA positioning prediction
 
     Note: Random Forest in scikit-learn does not support GPU acceleration.
@@ -2107,6 +2134,8 @@ class CTARForest:
             task: Learning task type ('regression', 'binary_classification', or 'multiclass')
             **rf_params: Random Forest parameters to override defaults
         """
+        super().__init__()
+
         self.use_gpu = bool(use_gpu)  # Stored but not used (RF is CPU-only)
         self.task = task.lower() if task else 'regression'
 
@@ -2142,35 +2171,21 @@ class CTARForest:
 
         self.params = {**default_params, **rf_params}
         self.model = RandomForestRegressor(**self.params)
-        self.is_fitted = False
-        self.feature_names = None
-        self.feature_importance = None
-        
+        # Note: is_fitted, feature_names, feature_importance initialized in parent
+
     def fit(self, X, y, eval_set=None):
         """Fit the Random Forest model
-        
+
         Args:
             X: Features DataFrame or array
-            y: Target Series or array  
+            y: Target Series or array
             eval_set: Not used for Random Forest but kept for interface consistency
         """
-        # Convert to numpy arrays and handle missing values
-        if isinstance(X, pd.DataFrame):
-            self.feature_names = list(X.columns)
-            X = X.values
-        else:
-            self.feature_names = [f'feature_{i}' for i in range(X.shape[1])]
-            
-        if isinstance(y, pd.Series):
-            y = y.values
-            
-        # Remove rows with NaN values
-        mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
-        X_clean = X[mask]
-        y_clean = y[mask]
-        
-        if len(X_clean) == 0:
-            raise ValueError("No valid samples after removing NaN values")
+        # Use base class method to prepare data
+        X_array, y_array, self.feature_names = self._prepare_data(X, y)
+
+        # Use base class method to clean data
+        X_clean, y_clean = self._clean_data(X_array, y_array)
         
         # Create and fit the model
         self.model = RandomForestRegressor(**self.params)
@@ -2275,21 +2290,7 @@ class CTARForest:
             'directional_accuracy': np.mean(np.sign(pred_clean) == np.sign(y_clean)) if len(y_clean) > 0 else 0.0,
             'oob_score': self.model.oob_score_ if hasattr(self.model, 'oob_score_') else None
         }
-    
-    def get_feature_importance(self, top_n=35):
-        """Get feature importance
-        
-        Args:
-            top_n: Number of top features to return
-            
-        Returns:
-            Series with top feature importances
-        """
-        if self.feature_importance is None:
-            raise ValueError("Model must be fitted first")
-            
-        return self.feature_importance.head(top_n)
-    
+
     def grid_search(self, X, y, param_grid=None, cv_folds=5, 
                    scoring='neg_mean_squared_error', verbose=True):
         """Perform grid search for hyperparameter optimization
