@@ -3648,8 +3648,27 @@ class IntradayMomentum:
         add_as_feature : bool, default False
             Add extracted series as features to the model
         """
+        # Helper to convert various formats to time object
+        def _to_time(t):
+            if isinstance(t, time):
+                return t
+            elif isinstance(t, int):
+                return time(t, 0)
+            elif isinstance(t, tuple) and len(t) in (2, 3) and all(isinstance(x, int) for x in t):
+                # Tuple (hour, minute[, second]) -> time object
+                return time(*t)
+            else:
+                raise TypeError(f"target_time must be time, int, or (hour, min) tuple, got {type(t)}: {t}")
+
         # Normalize target_time to list for uniform processing
-        times_list = list(target_time) if isinstance(target_time, (list, tuple)) else [target_time]
+        # Special case: if tuple of 2-3 ints, treat as single time (hour, minute)
+        if isinstance(target_time, tuple) and len(target_time) in (2, 3) and all(isinstance(x, int) for x in target_time):
+            times_list = [_to_time(target_time)]
+        elif isinstance(target_time, (list, tuple)):
+            times_list = [_to_time(t) for t in target_time]
+        else:
+            times_list = [_to_time(target_time)]
+
         single_time = len(times_list) == 1
 
         data = self.intraday_data.copy()
