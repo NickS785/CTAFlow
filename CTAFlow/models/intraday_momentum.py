@@ -59,6 +59,9 @@ class IntradayMomentum:
         self.tz = tz
         self.diurnal_factor = None
 
+        # Cache for deseasonalized calculations to avoid redundant computation
+        self._deseas_cache = {}
+
         # Get valid trading dates from intraday data (excludes weekends/holidays)
         self.valid_trading_dates = self._get_valid_trading_dates(intraday_data)
 
@@ -3376,6 +3379,8 @@ class IntradayMomentum:
             drop_na_features: Optional[str] = None,
             force_keep_dates: Optional[list] = None,
             fillna_features: Optional[dict] = None,
+            X:Optional[np.array]=None,
+            y:Optional[np.array]=None,
             **fit_kwargs,
     ):
         """Fit model with feature selection
@@ -3395,6 +3400,7 @@ class IntradayMomentum:
         Returns:
             self
         """
+
         X = self.training_data.copy()
         y = self.target_data.copy()
 
@@ -3439,9 +3445,9 @@ class IntradayMomentum:
 
         base_model = self._get_model()
 
-        # IMPORTANT: we want a plain sklearn-style estimator for importances.
-        # For your base_models wrappers, they typically expose `.model` internally.
-        est = getattr(base_model, "model", None) or base_model
+        # Use the base_model wrapper directly - FeatureSelector now handles CTA models
+        # (CTALight, CTAXGBoost, etc.) as well as sklearn estimators
+        est = base_model
 
         if selector is None:
             selector = FeatureSelector(selector_config or FeatureSelectionConfig())
@@ -3573,7 +3579,8 @@ class IntradayMomentum:
 
         # Get the base model for importance calculations
         base_model = self._get_model()
-        est = getattr(base_model, "model", None) or base_model
+        # Use the base_model wrapper directly - FeatureSelector now handles CTA models
+        est = base_model
 
         # Create or use provided selector
         if selector is None:
@@ -3730,10 +3737,12 @@ class IntradayMomentum:
             return_scaled_returns: bool = False,
             use_session_times: bool = True,
             add_as_feature: bool = False,
+            use_cache: bool = True,
     ):
         """Extract deseasonalized volatility and/or volume at target time(s).
 
         Computes deseasonalization once, then extracts at multiple times efficiently.
+        Caches deseasonalized results to reuse across multiple calls with same parameters.
 
         Parameters
         ----------
@@ -3754,6 +3763,8 @@ class IntradayMomentum:
             Filter to session hours
         add_as_feature : bool, default False
             Add extracted series as features to the model
+        use_cache : bool, default True
+            Use cached deseasonalized data if available. Set to False to force recalculation.
         """
         # Helper to convert various formats to time object
         def _to_time(t):

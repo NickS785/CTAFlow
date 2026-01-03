@@ -25,7 +25,7 @@ class FeatureSelectionConfig:
     corr_threshold: float = 0.98
 
     # CV / stability
-    n_splits: int = 5
+    n_splits: int = 3
     importance: Literal["permutation", "model"] = "permutation"
     n_perm_repeats: int = 5
     random_state: int = 42
@@ -340,14 +340,36 @@ class FeatureSelector:
                 )
                 imp = pd.Series(perm.importances_mean, index=X.columns)
             else:
-                # model-based (LightGBM/XGB etc.) if it exists
-                if hasattr(est, "feature_importances_"):
+                # model-based importance extraction
+                # Try CTA models first (CTALight, CTAXGBoost, etc.)
+                if hasattr(est, "feature_importance"):
+                    # CTA models store importance as a Series
+                    if isinstance(est.feature_importance, pd.Series):
+                        # Reindex to match X.columns in case of missing features
+                        imp = est.feature_importance.reindex(X.columns, fill_value=0.0)
+                    else:
+                        # If it's an array, create a Series
+                        imp = pd.Series(est.feature_importance, index=X.columns)
+                # Try sklearn-style feature_importances_ (note the 's')
+                elif hasattr(est, "feature_importances_"):
                     imp = pd.Series(est.feature_importances_, index=X.columns)
+                # Try internal .model attribute (for wrappers that expose it)
+                elif hasattr(est, "model") and hasattr(est.model, "feature_importance"):
+                    # LightGBM Booster has feature_importance method
+                    try:
+                        importance_vals = est.model.feature_importance(importance_type='gain')
+                        imp = pd.Series(importance_vals, index=X.columns)
+                    except Exception:
+                        # Fallback to coef
+                        coef = getattr(est, "coef_", None)
+                        if coef is None:
+                            raise AttributeError("Estimator has no feature_importances_, feature_importance, or coef_.")
+                        imp = pd.Series(np.abs(np.ravel(coef)), index=X.columns)
                 else:
-                    # fallback: abs coef
+                    # Fallback: abs coef for linear models
                     coef = getattr(est, "coef_", None)
                     if coef is None:
-                        raise AttributeError("Estimator has no feature_importances_ or coef_.")
+                        raise AttributeError("Estimator has no feature_importances_, feature_importance, or coef_.")
                     imp = pd.Series(np.abs(np.ravel(coef)), index=X.columns)
 
             imp.name = f"fold_{fold}"
@@ -372,12 +394,52 @@ class FeatureSelector:
 
     @staticmethod
     def _clone_estimator(estimator):
-        # Works for sklearn estimators; for wrappers, we just reuse the same class if possible.
+        """Clone an estimator, handling both sklearn and CTA model wrappers.
+
+        For CTALight and other CTA models, we create a fresh instance with the same parameters.
+        For sklearn estimators, we use sklearn.base.clone.
+        """
+        # Check if it's a CTA model wrapper (has 'params' and 'task' attributes)
+        if hasattr(estimator, 'params') and hasattr(estimator, 'task'):
+            # It's a CTA model (CTALight, CTAXGBoost, etc.)
+            estimator_class = type(estimator)
+
+            # Get the original parameters used to create the instance
+            if hasattr(estimator, '_user_params'):
+                # CTALight stores user params separately
+                clone_params = estimator._user_params.copy()
+            else:
+                # Fallback: use current params
+                clone_params = estimator.params.copy()
+
+            # Add task parameter
+            if hasattr(estimator, 'requested_task'):
+                clone_params['task'] = estimator.requested_task
+            else:
+                clone_params['task'] = estimator.task
+
+            # Add use_gpu if present
+            if hasattr(estimator, 'use_gpu'):
+                clone_params['use_gpu'] = estimator.use_gpu
+
+            # Add config_path if present
+            if hasattr(estimator, 'config_path'):
+                clone_params['config_path'] = estimator.config_path
+
+            # Create new instance with same parameters
+            try:
+                return estimator_class(**clone_params)
+            except Exception as e:
+                # If instantiation fails, try deepcopy as fallback
+                import copy
+                return copy.deepcopy(estimator)
+
+        # Try sklearn clone for standard estimators
         try:
             from sklearn.base import clone
             return clone(estimator)
         except Exception:
-            # last resort
+            # Last resort: deepcopy
             import copy
             return copy.deepcopy(estimator)
 
