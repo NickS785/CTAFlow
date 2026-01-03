@@ -3372,16 +3372,65 @@ class IntradayMomentum:
             self,
             selector: Optional[FeatureSelector] = None,
             selector_config: Optional[FeatureSelectionConfig] = None,
+            drop_na_target: bool = True,
+            drop_na_features: Optional[str] = None,
+            force_keep_dates: Optional[list] = None,
+            fillna_features: Optional[dict] = None,
             **fit_kwargs,
     ):
+        """Fit model with feature selection
 
+        Args:
+            selector: Optional FeatureSelector instance to use
+            selector_config: Optional FeatureSelectionConfig to create selector
+            drop_na_target: If True, drop rows where target is NaN (default: True)
+            drop_na_features: How to handle NaN in features:
+                - 'any': drop rows with any NaN in features
+                - 'all': drop rows only if all features are NaN
+                - None: don't drop rows based on feature NaNs (default)
+            force_keep_dates: Optional list of dates/indices to keep even if they have NaNs
+            fillna_features: Optional dict of {feature: value} to fill NaNs before selection
+            **fit_kwargs: Additional arguments passed to fit()
+
+        Returns:
+            self
+        """
         X = self.training_data.copy()
         y = self.target_data.copy()
 
-        # Drop rows with NaN in target (required for sklearn mutual_info_regression)
-        valid_mask = y.notna()
-        X = X.loc[valid_mask]
-        y = y.loc[valid_mask]
+        # Track which rows to keep
+        keep_mask = pd.Series(True, index=X.index)
+
+        # 1. Handle NaN in target
+        if drop_na_target:
+            target_valid = y.notna()
+            keep_mask &= target_valid
+
+        # 2. Handle NaN in features
+        if drop_na_features == 'any':
+            # Drop rows with any NaN in features
+            features_valid = X.notna().all(axis=1)
+            keep_mask &= features_valid
+        elif drop_na_features == 'all':
+            # Drop rows only if all features are NaN
+            features_valid = X.notna().any(axis=1)
+            keep_mask &= features_valid
+        # If None, don't drop based on features
+
+        # 3. Force keep specific dates/indices
+        if force_keep_dates is not None:
+            force_keep_mask = X.index.isin(force_keep_dates)
+            keep_mask |= force_keep_mask
+
+        # Apply the combined mask
+        X = X.loc[keep_mask]
+        y = y.loc[keep_mask]
+
+        # 4. Fill NaN in features if requested (before selection)
+        if fillna_features is not None:
+            for feature, value in fillna_features.items():
+                if feature in X.columns:
+                    X[feature] = X[feature].fillna(value)
 
         base_model = self._get_model()
 
@@ -3412,6 +3461,10 @@ class IntradayMomentum:
             self,
             selector: Optional[FeatureSelector] = None,
             selector_config: Optional[FeatureSelectionConfig] = None,
+            drop_na_target: bool = True,
+            drop_na_features: Optional[str] = None,
+            force_keep_dates: Optional[list] = None,
+            fillna_features: Optional[dict] = None,
     ) -> "IntradayMomentum":
         """Prune features using feature selection and update training_data and feature_names.
 
@@ -3425,6 +3478,17 @@ class IntradayMomentum:
             Pre-configured FeatureSelector instance. If None, creates one from selector_config.
         selector_config : Optional[FeatureSelectionConfig]
             Configuration for feature selection. If None, uses default config.
+        drop_na_target : bool, default True
+            If True, drop rows where target is NaN
+        drop_na_features : Optional[str], default None
+            How to handle NaN in features:
+            - 'any': drop rows with any NaN in features
+            - 'all': drop rows only if all features are NaN
+            - None: don't drop rows based on feature NaNs
+        force_keep_dates : Optional[list], default None
+            List of dates/indices to keep even if they have NaNs
+        fillna_features : Optional[dict], default None
+            Dict of {feature: value} to fill NaNs before selection
 
         Returns
         -------
@@ -3440,13 +3504,17 @@ class IntradayMomentum:
         >>> # Now fit with only selected features
         >>> model.fit_with_grid_search(X_train, y_train, param_grid={...})
         >>>
-        >>> # Or prune with custom config
+        >>> # Or prune with custom config and NaN handling
         >>> config = FeatureSelectionConfig(
         ...     max_features=80,
         ...     per_group_max=3,
         ...     corr_threshold=0.95
         ... )
-        >>> model.prune_features(selector_config=config)
+        >>> model.prune_features(
+        ...     selector_config=config,
+        ...     drop_na_features='all',  # Only drop if all features are NaN
+        ...     fillna_features={'feature1': 0, 'feature2': -999}
+        ... )
         >>> model.fit(X_train, y_train)
 
         Notes
@@ -3459,10 +3527,39 @@ class IntradayMomentum:
         X = self.training_data.copy()
         y = self.target_data.copy()
 
-        # Drop rows with NaN in target (required for sklearn mutual_info_regression)
-        valid_mask = y.notna()
-        X = X.loc[valid_mask]
-        y = y.loc[valid_mask]
+        # Track which rows to keep
+        keep_mask = pd.Series(True, index=X.index)
+
+        # 1. Handle NaN in target
+        if drop_na_target:
+            target_valid = y.notna()
+            keep_mask &= target_valid
+
+        # 2. Handle NaN in features
+        if drop_na_features == 'any':
+            # Drop rows with any NaN in features
+            features_valid = X.notna().all(axis=1)
+            keep_mask &= features_valid
+        elif drop_na_features == 'all':
+            # Drop rows only if all features are NaN
+            features_valid = X.notna().any(axis=1)
+            keep_mask &= features_valid
+        # If None, don't drop based on features
+
+        # 3. Force keep specific dates/indices
+        if force_keep_dates is not None:
+            force_keep_mask = X.index.isin(force_keep_dates)
+            keep_mask |= force_keep_mask
+
+        # Apply the combined mask
+        X = X.loc[keep_mask]
+        y = y.loc[keep_mask]
+
+        # 4. Fill NaN in features if requested (before selection)
+        if fillna_features is not None:
+            for feature, value in fillna_features.items():
+                if feature in X.columns:
+                    X[feature] = X[feature].fillna(value)
 
         # Get the base model for importance calculations
         base_model = self._get_model()
