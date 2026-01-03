@@ -3398,6 +3398,11 @@ class IntradayMomentum:
         X = self.training_data.copy()
         y = self.target_data.copy()
 
+        # Ensure X and y are aligned by index (use inner join)
+        common_index = X.index.intersection(y.index)
+        X = X.loc[common_index]
+        y = y.loc[common_index]
+
         # Track which rows to keep
         keep_mask = pd.Series(True, index=X.index)
 
@@ -3526,6 +3531,11 @@ class IntradayMomentum:
         """
         X = self.training_data.copy()
         y = self.target_data.copy()
+
+        # Ensure X and y are aligned by index (use inner join)
+        common_index = X.index.intersection(y.index)
+        X = X.loc[common_index]
+        y = y.loc[common_index]
 
         # Track which rows to keep
         keep_mask = pd.Series(True, index=X.index)
