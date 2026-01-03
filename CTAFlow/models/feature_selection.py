@@ -155,7 +155,7 @@ class FeatureSelector:
         )
         return pd.DataFrame({"mi_score": mi}, index=X.columns)
 
-    def _select_with_budget(self, report: pd.DataFrame) -> List[str]:
+    def _select_with_budget(self, report: pd.DataFrame) -> Tuple[List[str], pd.DataFrame]:
         cfg = self.config
         r = report.copy()
 
@@ -396,7 +396,7 @@ class FeatureSelector:
             return base_name
         return "__all__"
 
-    def _select_with_budget(self, report: pd.DataFrame) -> List[str]:
+    def _select_with_budget(self, report: pd.DataFrame) -> Tuple[List[str], pd.DataFrame]:
         cfg = self.config
         r = report.copy()
 
@@ -430,4 +430,4 @@ class FeatureSelector:
 
         r.loc[selected, "selected"] = True
         self.feature_report_ = r
-        return selected
+        return selected, r
