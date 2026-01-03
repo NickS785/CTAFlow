@@ -130,9 +130,12 @@ class FeatureSelector:
         report = report.join(imp_df, how="left")
 
         # E) Budget + Group caps
-        selected = self._select_with_budget(report)
+        selected, report = self._select_with_budget(report)
 
         self.selected_features_ = selected
+        # Ensure stability_score exists before sorting
+        if "stability_score" not in report.columns:
+            report["stability_score"] = 0.0
         self.feature_report_ = report.sort_values(["selected", "stability_score"], ascending=[False, False])
         return self
 
@@ -197,9 +200,13 @@ class FeatureSelector:
 
         r.loc[selected, "selected"] = True
         # Update the report with the calculated score
-        r["stability_score"] = cand["stability_score"].reindex(r.index)
+        if len(cand) > 0:
+            r["stability_score"] = cand["stability_score"].reindex(r.index)
+        else:
+            # If no candidates, ensure stability_score column exists
+            r["stability_score"] = 0.0
         self.feature_report_ = r
-        return selected
+        return selected, r
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         if not self.selected_features_:
