@@ -646,6 +646,9 @@ def deseasonalize_volume(
     bins_per_day: Optional[int] = None,
     order: int = 4,
     rolling_days: Optional[int] = None,
+    bid_ask_volume: bool = False,
+    bid_volume: Optional[pd.Series] = None,
+    ask_volume: Optional[pd.Series] = None,
 ) -> pd.DataFrame:
     """Convenience function to deseasonalize volume.
 
@@ -655,7 +658,7 @@ def deseasonalize_volume(
     Parameters
     ----------
     volume : pd.Series
-        Volume series with DatetimeIndex
+        Volume series with DatetimeIndex (used when bid_ask_volume=False)
     intraday_idx : pd.Series, optional
         Intraday time index
     bins_per_day : int, optional
@@ -664,20 +667,85 @@ def deseasonalize_volume(
         FFF order
     rolling_days : int, optional
         Rolling window size (None = fit on all data)
+    bid_ask_volume : bool, default False
+        If True, deseasonalize bid and ask volumes separately plus their difference.
+        Requires bid_volume and ask_volume parameters.
+    bid_volume : pd.Series, optional
+        Bid volume series (required when bid_ask_volume=True)
+    ask_volume : pd.Series, optional
+        Ask volume series (required when bid_ask_volume=True)
 
     Returns
     -------
     pd.DataFrame
-        DataFrame with 'original', 'seasonal', 'adjusted' columns
+        If bid_ask_volume=False:
+            DataFrame with 'original', 'seasonal', 'adjusted' columns
+        If bid_ask_volume=True:
+            DataFrame with columns for bid, ask, and imbalance:
+            - 'bid_original', 'bid_seasonal', 'bid_adjusted'
+            - 'ask_original', 'ask_seasonal', 'ask_adjusted'
+            - 'imbalance_original', 'imbalance_seasonal', 'imbalance_adjusted'
     """
-    return deseasonalize_volatility(
-        volume,
-        intraday_idx=intraday_idx,
-        bins_per_day=bins_per_day,
-        order=order,
-        use_log=True,  # Volume is strictly positive
-        rolling_days=rolling_days,
-    )
+    if bid_ask_volume:
+        if bid_volume is None or ask_volume is None:
+            raise ValueError("bid_volume and ask_volume must be provided when bid_ask_volume=True")
+
+        # Deseasonalize bid volume
+        bid_result = deseasonalize_volatility(
+            bid_volume,
+            intraday_idx=intraday_idx,
+            bins_per_day=bins_per_day,
+            order=order,
+            use_log=True,
+            rolling_days=rolling_days,
+        )
+
+        # Deseasonalize ask volume
+        ask_result = deseasonalize_volatility(
+            ask_volume,
+            intraday_idx=intraday_idx,
+            bins_per_day=bins_per_day,
+            order=order,
+            use_log=True,
+            rolling_days=rolling_days,
+        )
+
+        # Calculate volume imbalance (absolute difference)
+        imbalance = (bid_volume - ask_volume).abs()
+
+        # Deseasonalize imbalance
+        imbalance_result = deseasonalize_volatility(
+            imbalance,
+            intraday_idx=intraday_idx,
+            bins_per_day=bins_per_day,
+            order=order,
+            use_log=True,
+            rolling_days=rolling_days,
+        )
+
+        # Combine results
+        combined = pd.DataFrame(index=bid_volume.index)
+        combined['bid_original'] = bid_result['original']
+        combined['bid_seasonal'] = bid_result['seasonal']
+        combined['bid_adjusted'] = bid_result['adjusted']
+        combined['ask_original'] = ask_result['original']
+        combined['ask_seasonal'] = ask_result['seasonal']
+        combined['ask_adjusted'] = ask_result['adjusted']
+        combined['imbalance_original'] = imbalance_result['original']
+        combined['imbalance_seasonal'] = imbalance_result['seasonal']
+        combined['imbalance_adjusted'] = imbalance_result['adjusted']
+
+        return combined
+
+    else:
+        return deseasonalize_volatility(
+            volume,
+            intraday_idx=intraday_idx,
+            bins_per_day=bins_per_day,
+            order=order,
+            use_log=True,  # Volume is strictly positive
+            rolling_days=rolling_days,
+        )
 
 
 def estimate_diurnal_pattern(

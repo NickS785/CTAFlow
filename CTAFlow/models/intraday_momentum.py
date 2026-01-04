@@ -41,6 +41,8 @@ class IntradayMomentum:
             session_target="close",
             supplementary_intraday_data: Optional[Mapping[str, pd.DataFrame]] = None,
             base_model: Union[str, Type[object], object] = CTALight,
+            vol_scale_ewm_halflife=21,
+            vol_scale_ewm_span=63,
             **kwargs,
     ) -> None:
         self.base_model = base_model
@@ -61,6 +63,9 @@ class IntradayMomentum:
 
         # Cache for deseasonalized calculations to avoid redundant computation
         self._deseas_cache = {}
+
+        # Volatility scale for normalizing returns (calculated by _get_volatility_scale)
+        self.volatility_scale = self._get_volatility_scale(halflife=vol_scale_ewm_halflife, lookback_days=vol_scale_ewm_span)
 
         # Get valid trading dates from intraday data (excludes weekends/holidays)
         self.valid_trading_dates = self._get_valid_trading_dates(intraday_data)
@@ -363,6 +368,347 @@ class IntradayMomentum:
             return ""
         total_minutes = int(period_length.total_seconds() / 60)
         return f"{total_minutes}min"
+
+    def _get_volatility_scale(
+            self,
+            lookback_days: int = 63,
+            halflife: Optional[int] = 21,
+            min_periods: int = 20,
+            epsilon: float = 1e-8,
+            use_intraday: bool = False,
+    ) -> pd.Series:
+        """Calculate volatility scale for normalizing returns.
+
+        Uses the formula: scale = exp(EWMA(log(σ_d))) + ε
+        where σ_d is daily realized volatility.
+
+        This scale can be used to normalize returns: z_t = r_t / scale_t
+
+        Parameters
+        ----------
+        lookback_days : int, default 252
+            Number of days to use for volatility calculation
+        halflife : int, optional, default 60
+            Halflife for EWMA in days. If None, uses simple moving average
+        min_periods : int, default 20
+            Minimum periods required for EWMA calculation
+        epsilon : float, default 1e-8
+            Small constant added to scale to avoid division by zero
+        use_intraday : bool, default False
+            If True, calculate volatility from intraday returns.
+            If False, use daily close-to-close returns (faster, standard approach)
+
+        Returns
+        -------
+        pd.Series
+            Volatility scale indexed by date, to be stored in self.volatility_scale
+
+        Notes
+        -----
+        - Scale is calculated using only past data to avoid lookahead bias
+        - Returns are scaled as: scaled_return = return / volatility_scale
+        - Higher volatility periods get downweighted (returns divided by higher scale)
+        - Lower volatility periods get upweighted (returns divided by lower scale)
+
+        Example
+        -------
+        >>> model = IntradayMomentum(...)
+        >>> model._get_volatility_scale(lookback_days=252, halflife=60)
+        >>> # Now use self.volatility_scale to normalize returns
+        """
+        if use_intraday:
+            # Calculate realized volatility from intraday returns
+            prices = self._coerce_price(self.intraday_data, "Close")
+            returns = prices.pct_change().dropna()
+
+            # Group by date and calculate daily realized volatility (std of intraday returns)
+            daily_vol = returns.groupby(returns.index.normalize()).std()
+        else:
+            # Calculate daily close-to-close volatility (standard approach)
+            # Get daily closes
+            prices = self._coerce_price(self.intraday_data, "Close")
+            daily_prices = prices.resample('D').last().dropna()
+            daily_returns = daily_prices.pct_change().dropna()
+
+            # Calculate rolling volatility
+            daily_vol = daily_returns.abs()  # Use absolute returns as proxy for volatility
+
+        # Apply the formula: scale = exp(EWMA(log(σ_d))) + ε
+        # Take log of volatility (add small constant to handle zeros)
+        log_vol = np.log(daily_vol + epsilon)
+
+        # Apply EWMA or SMA to log volatility
+        if halflife is not None:
+            # EWMA with specified halflife
+            ewma_log_vol = log_vol.ewm(halflife=halflife, min_periods=min_periods).mean()
+        else:
+            # Simple moving average
+            ewma_log_vol = log_vol.rolling(lookback_days, min_periods=min_periods).mean()
+
+        # Exponentiate back and add epsilon
+        volatility_scale = np.exp(ewma_log_vol) + epsilon
+
+        # Filter to trading dates and align with target_data index
+        volatility_scale = self._filter_to_trading_dates(volatility_scale)
+        volatility_scale = volatility_scale.reindex(self.target_data.index)
+
+        # Forward fill any missing values (in case of gaps)
+        volatility_scale = volatility_scale.fillna(method='ffill')
+
+        # Store in instance variable
+        self.volatility_scale = volatility_scale
+
+        return volatility_scale
+
+    def _broadcast_volatility_scale_to_intraday(
+            self,
+            intraday_index: pd.DatetimeIndex,
+            smooth_method: str = 'none',
+            smooth_window: Optional[int] = None,
+    ) -> pd.Series:
+        """Broadcast daily volatility scale to intraday frequency with optional smoothing.
+
+        Parameters
+        ----------
+        intraday_index : pd.DatetimeIndex
+            Intraday timestamps to broadcast the scale to
+        smooth_method : str, default 'none'
+            Smoothing method to apply:
+            - 'none': Use same daily value for all bars in a day (step function)
+            - 'interpolate': Linear interpolation between days
+            - 'rolling': Rolling average of intraday realized volatility
+            - 'ewma': EWMA of intraday realized volatility
+        smooth_window : int, optional
+            Window size for 'rolling' or halflife for 'ewma' (in number of bars)
+
+        Returns
+        -------
+        pd.Series
+            Volatility scale at intraday frequency, aligned with intraday_index
+
+        Notes
+        -----
+        - 'none': Fastest, same value throughout the day (creates steps at day boundaries)
+        - 'interpolate': Smooth transition between days
+        - 'rolling'/'ewma': Adapts to intraday volatility changes (slower, more responsive)
+
+        Example
+        -------
+        >>> model._get_volatility_scale()  # Calculate daily scale first
+        >>> intraday_scale = model._broadcast_volatility_scale_to_intraday(
+        ...     model.intraday_data.index,
+        ...     smooth_method='interpolate'
+        ... )
+        """
+        if self.volatility_scale is None:
+            raise ValueError(
+                "volatility_scale is not calculated. Call _get_volatility_scale() first."
+            )
+
+        if not isinstance(intraday_index, pd.DatetimeIndex):
+            intraday_index = pd.to_datetime(intraday_index)
+
+        if smooth_method == 'none':
+            # Simple broadcast: map each intraday bar to its date's volatility scale
+            dates = intraday_index.normalize()
+            intraday_scale = self.volatility_scale.reindex(dates)
+            intraday_scale.index = intraday_index
+            return intraday_scale
+
+        elif smooth_method == 'interpolate':
+            # Linear interpolation between daily values
+            # Create a series at daily frequency, then interpolate to intraday
+            daily_scale = self.volatility_scale.copy()
+
+            # Reindex to include all intraday timestamps
+            combined_index = daily_scale.index.union(intraday_index)
+            combined_scale = daily_scale.reindex(combined_index)
+
+            # Interpolate missing values
+            combined_scale = combined_scale.interpolate(method='time')
+
+            # Select only intraday timestamps
+            intraday_scale = combined_scale.reindex(intraday_index)
+            return intraday_scale
+
+        elif smooth_method in ['rolling', 'ewma']:
+            # Calculate intraday realized volatility and smooth it
+            prices = self._coerce_price(self.intraday_data, "Close")
+            intraday_returns = prices.pct_change().abs()
+
+            if smooth_method == 'rolling':
+                if smooth_window is None:
+                    smooth_window = 12  # Default: 1 hour for 5-min bars
+                intraday_vol = intraday_returns.rolling(
+                    smooth_window, min_periods=max(1, smooth_window // 4)
+                ).mean()
+            else:  # ewma
+                if smooth_window is None:
+                    smooth_window = 12  # Default halflife: 1 hour for 5-min bars
+                intraday_vol = intraday_returns.ewm(
+                    halflife=smooth_window, min_periods=max(1, smooth_window // 4)
+                ).mean()
+
+            # Apply log-exp transform to match daily scale methodology
+            log_vol = np.log(intraday_vol + 1e-8)
+            smoothed_log_vol = log_vol.ewm(halflife=smooth_window or 12).mean()
+            intraday_scale = np.exp(smoothed_log_vol) + 1e-8
+
+            # Align with intraday_index
+            intraday_scale = intraday_scale.reindex(intraday_index)
+            return intraday_scale
+
+        else:
+            raise ValueError(
+                f"Unknown smooth_method: {smooth_method}. "
+                f"Choose from: 'none', 'interpolate', 'rolling', 'ewma'"
+            )
+
+    def vol_scaled_deseasonalized_returns(
+            self,
+            period_length: timedelta = timedelta(minutes=5),
+            rolling_days: int = 252,
+            deseasonalize: bool = True,
+            vol_scale: bool = True,
+            smooth_method: str = 'interpolate',
+            smooth_window: Optional[int] = None,
+            return_components: bool = False,
+    ) -> Union[pd.Series, pd.DataFrame]:
+        """Calculate returns that are both volatility-scaled and deseasonalized.
+
+        This method combines two normalization techniques:
+        1. Volatility scaling: Normalize by recent volatility level
+        2. Deseasonalization: Remove time-of-day patterns
+
+        The result is returns that are normalized for both volatility regime and
+        intraday seasonal patterns.
+
+        Parameters
+        ----------
+        period_length : timedelta, default 5 minutes
+            Bar frequency for return calculation
+        rolling_days : int, default 252
+            Lookback for deseasonalization
+        deseasonalize : bool, default True
+            If True, remove seasonal time-of-day patterns
+        vol_scale : bool, default True
+            If True, scale by volatility
+        smooth_method : str, default 'interpolate'
+            Method for broadcasting daily vol scale to intraday:
+            'none', 'interpolate', 'rolling', 'ewma'
+        smooth_window : int, optional
+            Window for smoothing (if using 'rolling' or 'ewma')
+        return_components : bool, default False
+            If True, return DataFrame with raw returns, scaled, and deseasonalized
+
+        Returns
+        -------
+        pd.Series or pd.DataFrame
+            If return_components=False: Series of normalized returns
+            If return_components=True: DataFrame with columns:
+                - 'raw_returns': Original returns
+                - 'vol_scaled': Returns scaled by volatility
+                - 'deseasonalized': Deseasonalized returns
+                - 'both': Both vol-scaled and deseasonalized
+
+        Notes
+        -----
+        Order of operations:
+        1. Calculate raw returns at period_length frequency
+        2. Apply volatility scaling (if vol_scale=True)
+        3. Apply deseasonalization (if deseasonalize=True)
+
+        Example
+        -------
+        >>> model = IntradayMomentum(...)
+        >>> model._get_volatility_scale(halflife=60)
+        >>>
+        >>> # Get fully normalized returns
+        >>> normalized = model.vol_scaled_deseasonalized_returns(
+        ...     period_length=timedelta(minutes=5),
+        ...     smooth_method='interpolate'
+        ... )
+        >>>
+        >>> # Or see all components
+        >>> components = model.vol_scaled_deseasonalized_returns(
+        ...     return_components=True
+        ... )
+        """
+        # Calculate raw returns
+        freq_minutes = int(period_length.total_seconds() / 60)
+        resample_rule = f"{freq_minutes}min"
+
+        prices = self._coerce_price(self.intraday_data, "Close")
+        resampled_prices = prices.resample(
+            resample_rule, closed='right', label='right'
+        ).last()
+        returns = resampled_prices.pct_change().dropna()
+
+        result = pd.DataFrame({'raw_returns': returns})
+
+        # Apply volatility scaling if requested
+        if vol_scale:
+            if self.volatility_scale is None:
+                raise ValueError(
+                    "volatility_scale not calculated. Call _get_volatility_scale() first."
+                )
+
+            # Broadcast daily scale to intraday
+            intraday_scale = self._broadcast_volatility_scale_to_intraday(
+                returns.index,
+                smooth_method=smooth_method,
+                smooth_window=smooth_window,
+            )
+
+            vol_scaled = returns / intraday_scale
+            result['vol_scaled'] = vol_scaled
+        else:
+            vol_scaled = returns
+            result['vol_scaled'] = vol_scaled
+
+        # Apply deseasonalization if requested
+        if deseasonalize:
+            from CTAFlow.features.volume_seasonality import deseasonalize_volume
+
+            # Build intraday index for deseasonalization
+            intraday_idx = pd.Series(returns.index).groupby(
+                returns.index.normalize()
+            ).cumcount()
+            intraday_idx.index = returns.index
+
+            # Deseasonalize the volatility (absolute returns)
+            volatility = returns.abs()
+            deseas_result = deseasonalize_volume(
+                volatility,
+                intraday_idx=intraday_idx,
+                rolling_days=rolling_days,
+            )
+            deseasonalized = deseas_result["adjusted"]
+
+            # Restore sign (deseasonalization works on magnitudes)
+            deseasonalized = deseasonalized * np.sign(returns)
+            result['deseasonalized'] = deseasonalized
+
+            # Apply both vol scaling and deseasonalization
+            if vol_scale:
+                both = vol_scaled.abs()
+                deseas_both = deseasonalize_volume(
+                    both,
+                    intraday_idx=intraday_idx,
+                    rolling_days=rolling_days,
+                )["adjusted"]
+                deseas_both = deseas_both * np.sign(vol_scaled)
+                result['both'] = deseas_both
+            else:
+                result['both'] = deseasonalized
+        else:
+            result['deseasonalized'] = vol_scaled
+            result['both'] = vol_scaled
+
+        if return_components:
+            return result
+        else:
+            return result['both']
 
     def _add_feature(self, data: pd.Series, feature_name: str, tf='1d'):
         """Add a feature to the training dataset and track it.
@@ -2745,6 +3091,22 @@ class IntradayMomentum:
 
         return pd.DataFrame(features_dict)
 
+    def _get_volatility_scale(self,intraday_df=None, n_days=21, price_col="Close"):
+        if intraday_df is None:
+            px = self.intraday_data[price_col]
+        close_offset = self.session_end.hour - 24
+        daily_px = px.resample('1d', offset=f'-{close_offset}h').last()
+        pd.DataFrame.interpolate()
+        daily_px.interpolate(method='linear')
+        vol_scale = np.exp(daily_px.pct_change().ewm(span=n_days).std())
+
+
+
+
+
+
+        return
+
     def daily_curve_changes(self,
                            fwd_curve_df: pd.DataFrame,
                            target_time: Union[time, List[time]],
@@ -3401,9 +3763,9 @@ class IntradayMomentum:
             self
         """
 
-        if not X:
+        if X is None:
             X = self.training_data.copy()
-        if not y:
+        if y is None:
             y = self.target_data.copy()
 
         # Ensure X and y are aligned by index (use inner join)
@@ -3459,9 +3821,11 @@ class IntradayMomentum:
         # cache for later
         self.selector_ = selector
         self.selected_features_ = selector.selected_features_
+        self.feature_names = selector.selected_features_
 
         # fit the actual wrapper model using reduced X
         self.fit(Xs, y, **fit_kwargs)
+
         return self
 
     def predict_selected(self, X: pd.DataFrame, **predict_kwargs):
@@ -3740,6 +4104,7 @@ class IntradayMomentum:
             use_session_times: bool = True,
             add_as_feature: bool = False,
             use_cache: bool = True,
+            bid_ask_volume: bool = False,
     ):
         """Extract deseasonalized volatility and/or volume at target time(s).
 
@@ -3767,6 +4132,10 @@ class IntradayMomentum:
             Add extracted series as features to the model
         use_cache : bool, default True
             Use cached deseasonalized data if available. Set to False to force recalculation.
+        bid_ask_volume : bool, default False
+            If True, deseasonalize bid and ask volumes separately plus their imbalance.
+            Requires 'BidVolume' and 'AskVolume' columns in intraday_data.
+            Returns additional columns: 'bid_volume', 'ask_volume', 'volume_imbalance'.
         """
         # Helper to convert various formats to time object
         def _to_time(t):
@@ -3799,6 +4168,7 @@ class IntradayMomentum:
             use_session_times,
             return_volume,
             return_volatility or return_scaled_returns,  # Both need volatility deseasonalization
+            bid_ask_volume,
         )
 
         # Check if we can reuse cached deseasonalized data
@@ -3810,6 +4180,9 @@ class IntradayMomentum:
             intraday_idx = cached.get('intraday_idx')
             returns = cached.get('returns')
             scaled_returns_full = cached.get('scaled_returns_full')
+            deseasonalized_bid_volume = cached.get('deseasonalized_bid_volume')
+            deseasonalized_ask_volume = cached.get('deseasonalized_ask_volume')
+            deseasonalized_imbalance = cached.get('deseasonalized_imbalance')
         else:
             # Compute deseasonalized data from scratch
             data = self.intraday_data.copy()
@@ -3879,6 +4252,40 @@ class IntradayMomentum:
                     rolling_days=rolling_days,
                 )["adjusted"]
 
+            # Compute deseasonalized bid/ask volumes and imbalance
+            deseasonalized_bid_volume = None
+            deseasonalized_ask_volume = None
+            deseasonalized_imbalance = None
+            if bid_ask_volume:
+                if "BidVolume" not in data.columns or "AskVolume" not in data.columns:
+                    raise KeyError("BidVolume and AskVolume columns required when bid_ask_volume=True")
+
+                # Resample bid and ask volumes
+                bid_vol = data["BidVolume"].resample(
+                    resample_rule, closed='right', label='right'
+                ).sum()
+                ask_vol = data["AskVolume"].resample(
+                    resample_rule, closed='right', label='right'
+                ).sum()
+
+                # Get intraday indices for the resampled volumes
+                bid_idx = intraday_idx.loc[bid_vol.index]
+                ask_idx = intraday_idx.loc[ask_vol.index]
+
+                # Deseasonalize bid, ask, and imbalance
+                bid_ask_result = deseasonalize_volume(
+                    volume=None,
+                    bid_ask_volume=True,
+                    bid_volume=bid_vol,
+                    ask_volume=ask_vol,
+                    intraday_idx=bid_idx,
+                    rolling_days=rolling_days,
+                )
+
+                deseasonalized_bid_volume = bid_ask_result["bid_adjusted"]
+                deseasonalized_ask_volume = bid_ask_result["ask_adjusted"]
+                deseasonalized_imbalance = bid_ask_result["imbalance_adjusted"]
+
             # Cache the results for future calls
             if use_cache:
                 self._deseas_cache[cache_key] = {
@@ -3888,6 +4295,9 @@ class IntradayMomentum:
                     'intraday_idx': intraday_idx,
                     'returns': returns,
                     'scaled_returns_full': scaled_returns_full,
+                    'deseasonalized_bid_volume': deseasonalized_bid_volume,
+                    'deseasonalized_ask_volume': deseasonalized_ask_volume,
+                    'deseasonalized_imbalance': deseasonalized_imbalance,
                 }
 
         period_str = self._format_period_length(period_length)
@@ -3968,6 +4378,77 @@ class IntradayMomentum:
 
                 col_name = "volume" if single_time else f"volume_{time_key}"
                 all_results[col_name] = target_series
+
+        # Extract deseasonalized bid/ask volumes and imbalance from cached data
+        if bid_ask_volume and deseasonalized_bid_volume is not None:
+            for t in times_list:
+                time_key = t.strftime("%H%M")
+
+                # Extract bid volume
+                mask = self._get_target_time_mask(deseasonalized_bid_volume.index, t)
+                bid_series = deseasonalized_bid_volume[mask]
+
+                if bid_series.empty:
+                    bid_series = self._extract_at_time_daily(deseasonalized_bid_volume, t)
+                else:
+                    bid_series.index = pd.to_datetime(bid_series.index).normalize()
+
+                bid_series = self._filter_to_trading_dates(bid_series)
+
+                if add_as_feature:
+                    needs_shift = self._needs_shift(t)
+                    feature_series = bid_series.shift(1) if needs_shift else bid_series
+                    feature_name = self._make_feature_name(
+                        "deseasonalized_bid_volume", t, period_str,
+                    )
+                    self._add_feature(feature_series, feature_name)
+
+                col_name = "bid_volume" if single_time else f"bid_volume_{time_key}"
+                all_results[col_name] = bid_series
+
+                # Extract ask volume
+                mask = self._get_target_time_mask(deseasonalized_ask_volume.index, t)
+                ask_series = deseasonalized_ask_volume[mask]
+
+                if ask_series.empty:
+                    ask_series = self._extract_at_time_daily(deseasonalized_ask_volume, t)
+                else:
+                    ask_series.index = pd.to_datetime(ask_series.index).normalize()
+
+                ask_series = self._filter_to_trading_dates(ask_series)
+
+                if add_as_feature:
+                    needs_shift = self._needs_shift(t)
+                    feature_series = ask_series.shift(1) if needs_shift else ask_series
+                    feature_name = self._make_feature_name(
+                        "deseasonalized_ask_volume", t, period_str,
+                    )
+                    self._add_feature(feature_series, feature_name)
+
+                col_name = "ask_volume" if single_time else f"ask_volume_{time_key}"
+                all_results[col_name] = ask_series
+
+                # Extract volume imbalance
+                mask = self._get_target_time_mask(deseasonalized_imbalance.index, t)
+                imbalance_series = deseasonalized_imbalance[mask]
+
+                if imbalance_series.empty:
+                    imbalance_series = self._extract_at_time_daily(deseasonalized_imbalance, t)
+                else:
+                    imbalance_series.index = pd.to_datetime(imbalance_series.index).normalize()
+
+                imbalance_series = self._filter_to_trading_dates(imbalance_series)
+
+                if add_as_feature:
+                    needs_shift = self._needs_shift(t)
+                    feature_series = imbalance_series.shift(1) if needs_shift else imbalance_series
+                    feature_name = self._make_feature_name(
+                        "deseasonalized_volume_imbalance", t, period_str,
+                    )
+                    self._add_feature(feature_series, feature_name)
+
+                col_name = "volume_imbalance" if single_time else f"volume_imbalance_{time_key}"
+                all_results[col_name] = imbalance_series
 
         # Return format based on inputs
         if len(all_results) == 1:
@@ -4316,7 +4797,11 @@ class IntradayMomentum:
 
     def get_xy(
             self,
-    ) -> Tuple[pd.DataFrame, pd.Series]:
+            start_date=None,
+            end_date=None,
+            val_split: bool = False,
+            val_split_size: float = 0.2,
+    ):
         """Convenience constructor for a full training feature matrix.
 
         Performs the following cleaning steps:
@@ -4324,11 +4809,25 @@ class IntradayMomentum:
         2. Drops columns with >90% NaN values (keeps columns with at least 10% valid data)
         3. Drops rows with any remaining NaN values
         4. Aligns with target data by date intersection
+        5. Optionally filters by date range
+        6. Optionally splits into train/validation sets
+
+        Parameters
+        ----------
+        start_date : str, pd.Timestamp, or datetime, optional
+            Filter data from this date onwards (inclusive)
+        end_date : str, pd.Timestamp, or datetime, optional
+            Filter data up to this date (inclusive)
+        val_split : bool, default False
+            If True, split data into train and validation sets
+        val_split_size : float, default 0.2
+            Proportion of data to use for validation (only used if val_split=True)
 
         Returns
         -------
-        Tuple[pd.DataFrame, pd.Series]
-            (X, y) tuple with aligned training features and target
+        Tuple[pd.DataFrame, pd.Series] or Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]
+            If val_split=False: (X, y) tuple with aligned features and target
+            If val_split=True: (X_train, X_val, y_train, y_val) tuple
         """
         # Select feature columns
         x_data = self.training_data[self.feature_names].copy()
@@ -4344,5 +4843,30 @@ class IntradayMomentum:
         # Step 3: Align with target data
         y_data = self.target_data
         val_dates = x_data.index.intersection(y_data.index)
+        x_data = x_data.loc[val_dates]
+        y_data = y_data.loc[val_dates]
 
-        return x_data.loc[val_dates], y_data.loc[val_dates]
+        # Step 4: Filter by date range if provided
+        if start_date is not None:
+            start_date = pd.to_datetime(start_date)
+            x_data = x_data[x_data.index >= start_date]
+            y_data = y_data[y_data.index >= start_date]
+
+        if end_date is not None:
+            end_date = pd.to_datetime(end_date)
+            x_data = x_data[x_data.index <= end_date]
+            y_data = y_data[y_data.index <= end_date]
+
+        # Step 5: Optionally split into train/validation sets
+        if val_split:
+            # Time-series split: use earlier data for training, later for validation
+            split_idx = int(len(x_data) * (1 - val_split_size))
+
+            X_train = x_data.iloc[:split_idx]
+            X_val = x_data.iloc[split_idx:]
+            y_train = y_data.iloc[:split_idx]
+            y_val = y_data.iloc[split_idx:]
+
+            return X_train, X_val, y_train, y_val
+        else:
+            return x_data, y_data
