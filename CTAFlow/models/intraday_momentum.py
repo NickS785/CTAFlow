@@ -3401,8 +3401,10 @@ class IntradayMomentum:
             self
         """
 
-        X = self.training_data.copy()
-        y = self.target_data.copy()
+        if not X:
+            X = self.training_data.copy()
+        if not y:
+            y = self.target_data.copy()
 
         # Ensure X and y are aligned by index (use inner join)
         common_index = X.index.intersection(y.index)

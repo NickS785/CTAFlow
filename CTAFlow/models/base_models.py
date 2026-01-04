@@ -1186,6 +1186,53 @@ class CTABase:
         """
         raise NotImplementedError("Subclasses must implement predict()")
 
+    def score(self, X, y):
+        """Calculate score for the model (sklearn-compatible scoring method).
+
+        Returns R² score for regression tasks and accuracy for classification tasks.
+        This method is required for sklearn's permutation_importance and other utilities.
+
+        Args:
+            X: Features DataFrame or array
+            y: Target Series or array
+
+        Returns:
+            float: R² score for regression, accuracy for classification
+        """
+        if not self.is_fitted:
+            raise ValueError("Model must be fitted before scoring. Call fit() first.")
+
+        from sklearn.metrics import r2_score, accuracy_score
+
+        # Get predictions
+        y_pred = self.predict(X)
+
+        # Handle y format
+        if isinstance(y, pd.Series):
+            y_true = y.values
+        else:
+            y_true = np.asarray(y)
+
+        # Return appropriate score based on task
+        if self.task == 'regression':
+            # For regression: R² score (higher is better, max 1.0)
+            return r2_score(y_true, y_pred)
+        elif self.task in ['binary_classification', 'multiclass']:
+            # For classification: accuracy (higher is better, max 1.0)
+            # For binary classification with probabilities, convert to class predictions
+            if y_pred.ndim > 1 and y_pred.shape[1] > 1:
+                # Multiclass probabilities - take argmax
+                y_pred = np.argmax(y_pred, axis=1)
+            elif y_pred.ndim > 1 and y_pred.shape[1] == 1:
+                # Binary probabilities in 2D array - flatten and threshold
+                y_pred = (y_pred.ravel() > 0.5).astype(int)
+            elif (y_pred >= 0).all() and (y_pred <= 1).all() and len(np.unique(y_true)) == 2:
+                # Binary probabilities in 1D array - threshold at 0.5
+                y_pred = (y_pred > 0.5).astype(int)
+            return accuracy_score(y_true, y_pred)
+        else:
+            raise ValueError(f"Unknown task type: {self.task}")
+
     def cross_validate(self, X, y, cv_folds=3, scoring='neg_mean_squared_error'):
         """Perform cross-validation - must be implemented by subclasses
 
