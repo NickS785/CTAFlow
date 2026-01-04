@@ -3789,91 +3789,135 @@ class IntradayMomentum:
 
         single_time = len(times_list) == 1
 
-        data = self.intraday_data.copy()
-
-        if not isinstance(data.index, pd.DatetimeIndex):
-            data.index = pd.to_datetime(data.index)
-
+        # Create cache key based on parameters that affect deseasonalization
         freq_minutes = int(period_length.total_seconds() / 60)
-        resample_rule = f"{freq_minutes}min"
+        cache_key = (
+            freq_minutes,
+            rolling_days,
+            use_session_times,
+            return_volume,
+            return_volatility or return_scaled_returns,  # Both need volatility deseasonalization
+        )
 
-        if use_session_times:
-            data = data.between_time(self.session_open, self.session_end, inclusive='both')
-
-        prices = self._coerce_price(data, "Close")
-
-        # Use closed='right', label='right' to avoid lookahead bias:
-        # - Bar labeled 10:00 contains data from 09:01 to 10:00 (not 10:00 to 10:59)
-        # - The return at 10:00 = (close_10:00 - close_09:00) / close_09:00
-        resampled_prices = prices.resample(
-            resample_rule, closed='right', label='right'
-        ).last()
-        returns = resampled_prices.pct_change().dropna()
-
-        volatility = returns.abs()
-
-        if return_volume:
-            if "Volume" not in data.columns:
-                raise KeyError("Volume column not found in intraday data")
-            volume = data["Volume"].resample(
-                resample_rule, closed='right', label='right'
-            ).sum()
+        # Check if we can reuse cached deseasonalized data
+        if use_cache and cache_key in self._deseas_cache:
+            cached = self._deseas_cache[cache_key]
+            deseasonalized_vol_full = cached.get('deseasonalized_vol_full')
+            seasonal_factor = cached.get('seasonal_factor')
+            deseasonalized_vol_full_volume = cached.get('deseasonalized_vol_full_volume')
+            intraday_idx = cached.get('intraday_idx')
+            returns = cached.get('returns')
+            scaled_returns_full = cached.get('scaled_returns_full')
         else:
-            volume = None
+            # Compute deseasonalized data from scratch
+            data = self.intraday_data.copy()
 
-        # Build intraday index for deseasonalization (once)
-        resampled_idx = resampled_prices.index
-        intraday_idx = pd.Series(resampled_idx).groupby(resampled_idx.normalize()).cumcount()
-        intraday_idx.index = resampled_idx
+            if not isinstance(data.index, pd.DatetimeIndex):
+                data.index = pd.to_datetime(data.index)
+
+            resample_rule = f"{freq_minutes}min"
+
+            if use_session_times:
+                data = data.between_time(self.session_open, self.session_end, inclusive='both')
+
+            prices = self._coerce_price(data, "Close")
+
+            # Use closed='right', label='right' to avoid lookahead bias:
+            # - Bar labeled 10:00 contains data from 09:01 to 10:00 (not 10:00 to 10:59)
+            # - The return at 10:00 = (close_10:00 - close_09:00) / close_09:00
+            resampled_prices = prices.resample(
+                resample_rule, closed='right', label='right'
+            ).last()
+            returns = resampled_prices.pct_change().dropna()
+
+            volatility = returns.abs()
+
+            if return_volume:
+                if "Volume" not in data.columns:
+                    raise KeyError("Volume column not found in intraday data")
+                volume = data["Volume"].resample(
+                    resample_rule, closed='right', label='right'
+                ).sum()
+            else:
+                volume = None
+
+            # Build intraday index for deseasonalization (once)
+            resampled_idx = resampled_prices.index
+            intraday_idx = pd.Series(resampled_idx).groupby(resampled_idx.normalize()).cumcount()
+            intraday_idx.index = resampled_idx
+
+            # Compute deseasonalized volatility ONCE
+            # Also get seasonal factor if we need scaled returns
+            seasonal_factor = None
+            deseasonalized_vol_full = None
+            scaled_returns_full = None
+            if return_volatility or return_scaled_returns:
+                vol_idx = intraday_idx.loc[volatility.index]
+                deseas_result = deseasonalize_volatility(
+                    volatility,
+                    intraday_idx=vol_idx,
+                    rolling_days=rolling_days,
+                )
+                deseasonalized_vol_full = deseas_result["adjusted"]
+
+                # Get seasonal factor for scaling returns (convert from log-space to linear)
+                if return_scaled_returns:
+                    seasonal_factor = np.exp(deseas_result["seasonal"])
+                    # Pre-compute scaled returns for caching
+                    common_idx = returns.index.intersection(seasonal_factor.index)
+                    scaled_returns_full = returns.loc[common_idx] / seasonal_factor.loc[common_idx]
+
+            # Compute deseasonalized volume ONCE
+            deseasonalized_vol_full_volume = None
+            if return_volume and volume is not None:
+                vol_idx = intraday_idx.loc[volume.index]
+                deseasonalized_vol_full_volume = deseasonalize_volume(
+                    volume,
+                    intraday_idx=vol_idx,
+                    rolling_days=rolling_days,
+                )["adjusted"]
+
+            # Cache the results for future calls
+            if use_cache:
+                self._deseas_cache[cache_key] = {
+                    'deseasonalized_vol_full': deseasonalized_vol_full,
+                    'seasonal_factor': seasonal_factor,
+                    'deseasonalized_vol_full_volume': deseasonalized_vol_full_volume,
+                    'intraday_idx': intraday_idx,
+                    'returns': returns,
+                    'scaled_returns_full': scaled_returns_full,
+                }
 
         period_str = self._format_period_length(period_length)
         all_results = {}
 
-        # Compute deseasonalized volatility ONCE, extract at multiple times
-        # Also get seasonal factor if we need scaled returns
-        seasonal_factor = None
-        if return_volatility or return_scaled_returns:
-            vol_idx = intraday_idx.loc[volatility.index]
-            deseas_result = deseasonalize_volatility(
-                volatility,
-                intraday_idx=vol_idx,
-                rolling_days=rolling_days,
-            )
-            deseasonalized_vol_full = deseas_result["adjusted"]
+        # Extract at target times from cached/computed deseasonalized data
+        if return_volatility and deseasonalized_vol_full is not None:
+            for t in times_list:
+                time_key = t.strftime("%H%M")
+                mask = self._get_target_time_mask(deseasonalized_vol_full.index, t)
+                target_series = deseasonalized_vol_full[mask]
 
-            # Get seasonal factor for scaling returns (convert from log-space to linear)
-            if return_scaled_returns:
-                seasonal_factor = np.exp(deseas_result["seasonal"])
+                if target_series.empty:
+                    target_series = self._extract_at_time_daily(deseasonalized_vol_full, t)
+                else:
+                    target_series.index = pd.to_datetime(target_series.index).normalize()
 
-            if return_volatility:
-                for t in times_list:
-                    time_key = t.strftime("%H%M")
-                    mask = self._get_target_time_mask(deseasonalized_vol_full.index, t)
-                    target_series = deseasonalized_vol_full[mask]
+                target_series = self._filter_to_trading_dates(target_series)
 
-                    if target_series.empty:
-                        target_series = self._extract_at_time_daily(deseasonalized_vol_full, t)
-                    else:
-                        target_series.index = pd.to_datetime(target_series.index).normalize()
+                if add_as_feature:
+                    needs_shift = self._needs_shift(t)
+                    feature_series = target_series.shift(1) if needs_shift else target_series
+                    feature_name = self._make_feature_name(
+                        "deseasonalized_volatility", t, period_str,
+                    )
+                    self._add_feature(feature_series, feature_name)
 
-                    target_series = self._filter_to_trading_dates(target_series)
+                col_name = "volatility" if single_time else f"volatility_{time_key}"
+                all_results[col_name] = target_series
 
-                    if add_as_feature:
-                        needs_shift = self._needs_shift(t)
-                        feature_series = target_series.shift(1) if needs_shift else target_series
-                        feature_name = self._make_feature_name(
-                            "deseasonalized_volatility", t, period_str,
-                        )
-                        self._add_feature(feature_series, feature_name)
-
-                    col_name = "volatility" if single_time else f"volatility_{time_key}"
-                    all_results[col_name] = target_series
-
-        # Compute scaled returns: r_t / s_t (returns divided by seasonal volatility)
-        if return_scaled_returns and seasonal_factor is not None:
-            # Align returns with seasonal factor
-            common_idx = returns.index.intersection(seasonal_factor.index)
-            scaled_returns_full = returns.loc[common_idx] / seasonal_factor.loc[common_idx]
+        # Extract scaled returns from cached data
+        if return_scaled_returns and scaled_returns_full is not None:
 
             for t in times_list:
                 time_key = t.strftime("%H%M")
@@ -3898,22 +3942,15 @@ class IntradayMomentum:
                 col_name = "scaled_returns" if single_time else f"scaled_returns_{time_key}"
                 all_results[col_name] = target_series
 
-        # Compute deseasonalized volume ONCE, extract at multiple times
-        if return_volume and volume is not None:
-            vol_idx = intraday_idx.loc[volume.index]
-            deseasonalized_vol_full = deseasonalize_volume(
-                volume,
-                intraday_idx=vol_idx,
-                rolling_days=rolling_days,
-            )["adjusted"]
-
+        # Extract deseasonalized volume from cached data
+        if return_volume and deseasonalized_vol_full_volume is not None:
             for t in times_list:
                 time_key = t.strftime("%H%M")
-                mask = self._get_target_time_mask(deseasonalized_vol_full.index, t)
-                target_series = deseasonalized_vol_full[mask]
+                mask = self._get_target_time_mask(deseasonalized_vol_full_volume.index, t)
+                target_series = deseasonalized_vol_full_volume[mask]
 
                 if target_series.empty:
-                    target_series = self._extract_at_time_daily(deseasonalized_vol_full, t)
+                    target_series = self._extract_at_time_daily(deseasonalized_vol_full_volume, t)
                 else:
                     target_series.index = pd.to_datetime(target_series.index).normalize()
 
@@ -3936,7 +3973,13 @@ class IntradayMomentum:
 
         return pd.DataFrame(all_results)
 
+    def clear_deseas_cache(self):
+        """Clear the deseasonalized data cache.
 
+        Call this method if you've updated the intraday_data and want to force
+        recalculation of deseasonalized volatility/volume.
+        """
+        self._deseas_cache = {}
 
     def add_basic_datetime_features(
             self,
