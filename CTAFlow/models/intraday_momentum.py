@@ -28,6 +28,13 @@ class IntradayMomentum:
     The model is tailored to predict session-end behaviour (default 15:00 CST)
     and exposes convenience helpers for constructing intraday-aware training
     matrices.
+
+    Parameters
+    ----------
+    scale_target_by_volatility : bool, default False
+        If True, scale target_data by volatility_scale (EWMA of realized volatility).
+        This produces volatility-adjusted returns as the target, useful for normalizing
+        returns by their expected volatility.
     """
 
     def __init__(
@@ -43,6 +50,7 @@ class IntradayMomentum:
             base_model: Union[str, Type[object], object] = CTALight,
             vol_scale_ewm_halflife=21,
             vol_scale_ewm_span=63,
+            scale_target_by_volatility: bool = False,
             **kwargs,
     ) -> None:
         self.base_model = base_model
@@ -88,6 +96,16 @@ class IntradayMomentum:
             intraday_data,
             period_length=closing_length,
         )
+
+        # Apply volatility scaling to target if requested
+        if scale_target_by_volatility:
+            # Align volatility scale with target data
+            common_idx = self.target_data.index.intersection(self.volatility_scale.index)
+            if len(common_idx) > 0:
+                self.target_data = self.target_data.loc[common_idx] / self.volatility_scale.loc[common_idx]
+            else:
+                raise ValueError("No common dates between target_data and volatility_scale")
+
         self.training_data = pd.DataFrame(index=self.target_data.index)
 
         return
@@ -3091,21 +3109,7 @@ class IntradayMomentum:
 
         return pd.DataFrame(features_dict)
 
-    def _get_volatility_scale(self,intraday_df=None, n_days=21, price_col="Close"):
-        if intraday_df is None:
-            px = self.intraday_data[price_col]
-        close_offset = self.session_end.hour - 24
-        daily_px = px.resample('1d', offset=f'-{close_offset}h').last()
-        pd.DataFrame.interpolate()
-        daily_px.interpolate(method='linear')
-        vol_scale = np.exp(daily_px.pct_change().ewm(span=n_days).std())
 
-
-
-
-
-
-        return
 
     def daily_curve_changes(self,
                            fwd_curve_df: pd.DataFrame,

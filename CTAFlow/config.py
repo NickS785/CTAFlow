@@ -27,7 +27,8 @@ RESULTS_HDF_PATH = Path(
 OHLC_DICT = {'Open': 'first', 'High':'max', 'Low':'min', 'Close':'last', "AskVolume":"sum", "BidVolume":"sum", "Volume":"sum"}
 
 # File system paths
-DATA_DIR = Path("F:\\Data ")
+DATA_DIR = Path("F:\\Data")
+CSV_DIR = Path("F:\\Data", "intraday", "CSV")
 RAW_MARKET_DATA_PATH = Path("F:\\", 'charts')  # CSV market data files
 DLY_DATA_PATH = Path("F:\\", 'SierraChart', 'Data')  # DLY futures data files
 MODEL_DATA_PATH = Path("F:\\", "ML", "models")
