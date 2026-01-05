@@ -76,9 +76,6 @@ class IntradayMomentum:
         # Must be set before calling _get_volatility_scale() which uses _filter_to_trading_dates()
         self.valid_trading_dates = self._get_valid_trading_dates(intraday_data)
 
-        # Volatility scale for normalizing returns (calculated by _get_volatility_scale)
-        self.volatility_scale = self._get_volatility_scale(halflife=vol_scale_ewm_halflife, lookback_days=vol_scale_ewm_span)
-
         if session_target == "open":
             # Calculate target_time as session_open + closing_length
             # Use timedelta arithmetic to handle any period length correctly
@@ -97,6 +94,10 @@ class IntradayMomentum:
             intraday_data,
             period_length=closing_length,
         )
+
+        # Volatility scale for normalizing returns (calculated by _get_volatility_scale)
+        # Must be set after target_data since _get_volatility_scale() needs to reindex to target_data
+        self.volatility_scale = self._get_volatility_scale(halflife=vol_scale_ewm_halflife, lookback_days=vol_scale_ewm_span)
 
         # Apply volatility scaling to target if requested
         if scale_target:
