@@ -9,9 +9,16 @@ import pandas as pd
 from scipy.signal import hilbert
 
 try:
+    from tqdm import tqdm
+except ImportError:
+    # Fallback if tqdm not available
+    tqdm = None
+
+try:
     # pip install EMD-signal
     from PyEMD import CEEMDAN
 except Exception:  # pragma: no cover
+    print("Failed to import PyEMD module")
     CEEMDAN = None  # type: ignore
 
 
@@ -62,7 +69,7 @@ class CEEMDANCycleAnalysisConfig:
     demean: bool = True
 
     # --- CEEMDAN params ---
-    trials: int = 40
+    trials: int = 20  # Reduced from 40 for better performance (40 is very slow)
     noise_width: float = 0.15
     random_state: Optional[int] = 7
     max_imfs: Optional[int] = None
@@ -97,8 +104,12 @@ class CEEMDANCycleAnalysisConfig:
     # --- aggregation ---
     prevalence_agg: AggMethod = "median"
 
+    # --- performance ---
+    verbose: bool = True  # Show progress bar during analysis
+    anchor_stride: int = 1  # Process every Nth anchor (1 = all, 5 = every 5th day)
+
     # --- RV + segmentation ---
-    rv: RVConfig = RVConfig()
+    rv: RVConfig = None
     split_mode: Optional[SplitMode] = None  # None -> no segmentation
     # For vol_quantile, split is done on daily sigma computed from intraday returns.
 
@@ -119,6 +130,8 @@ class CEEMDANCycleAnalyzer:
         self.cfg = cfg or CEEMDANCycleAnalysisConfig()
         if CEEMDAN is None:
             raise ImportError("PyEMD not installed. Install with: pip install EMD-signal")
+        if self.cfg.rv is None:
+            self.cfg.rv = RVConfig()
 
         self._ce = CEEMDAN(trials=self.cfg.trials, noise_width=self.cfg.noise_width)
         if self.cfg.random_state is not None:
@@ -304,7 +317,10 @@ class CEEMDANCycleAnalyzer:
     # ---------------------------
     def _build_anchors(self, idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
         cfg = self.cfg
-        days = pd.DatetimeIndex(idx.normalize().unique()).tz_localize(idx.tz)
+        days = pd.DatetimeIndex(idx.normalize().unique())
+        # Only localize if idx has timezone and days doesn't (avoid double-localization)
+        if idx.tz is not None and days.tz is None:
+            days = days.tz_localize(idx.tz)
         anchors = []
 
         if cfg.anchor_time is None:
@@ -333,7 +349,16 @@ class CEEMDANCycleAnalyzer:
         cfg = self.cfg
         rows = []
 
-        for a in anchors:
+        # Apply anchor stride to reduce computation
+        if cfg.anchor_stride > 1:
+            anchors = anchors[::cfg.anchor_stride]
+
+        # Setup progress bar if verbose and tqdm available
+        iterator = anchors
+        if cfg.verbose and tqdm is not None:
+            iterator = tqdm(anchors, desc="CEEMDAN windows", unit="window")
+
+        for a in iterator:
             start = a - pd.Timedelta(days=cfg.window_days)
             w = r.loc[start:a].values
             if w.shape[0] < cfg.min_points:
@@ -385,7 +410,11 @@ class CEEMDANCycleAnalyzer:
             x_pad = x
             pad_offset = 0
 
-        imfs = self._ce.ceemdan(x_pad, max_imf=cfg.max_imfs) if cfg.max_imfs is not None else self._ce.ceemdan(x_pad)
+        # Call CEEMDAN with max_imf parameter
+        if cfg.max_imfs is not None:
+            imfs = self._ce.ceemdan(x_pad, max_imf=cfg.max_imfs)
+        else:
+            imfs = self._ce.ceemdan(x_pad)
         imfs = np.asarray(imfs)
         if imfs.size == 0:
             return imfs

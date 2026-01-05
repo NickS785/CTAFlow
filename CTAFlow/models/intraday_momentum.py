@@ -31,7 +31,7 @@ class IntradayMomentum:
 
     Parameters
     ----------
-    scale_target_by_volatility : bool, default False
+    scale_target : bool, default False
         If True, scale target_data by volatility_scale (EWMA of realized volatility).
         This produces volatility-adjusted returns as the target, useful for normalizing
         returns by their expected volatility.
@@ -50,7 +50,7 @@ class IntradayMomentum:
             base_model: Union[str, Type[object], object] = CTALight,
             vol_scale_ewm_halflife=21,
             vol_scale_ewm_span=63,
-            scale_target_by_volatility: bool = False,
+            scale_target: bool = False,
             **kwargs,
     ) -> None:
         self.base_model = base_model
@@ -72,11 +72,12 @@ class IntradayMomentum:
         # Cache for deseasonalized calculations to avoid redundant computation
         self._deseas_cache = {}
 
+        # Get valid trading dates from intraday data (excludes weekends/holidays)
+        # Must be set before calling _get_volatility_scale() which uses _filter_to_trading_dates()
+        self.valid_trading_dates = self._get_valid_trading_dates(intraday_data)
+
         # Volatility scale for normalizing returns (calculated by _get_volatility_scale)
         self.volatility_scale = self._get_volatility_scale(halflife=vol_scale_ewm_halflife, lookback_days=vol_scale_ewm_span)
-
-        # Get valid trading dates from intraday data (excludes weekends/holidays)
-        self.valid_trading_dates = self._get_valid_trading_dates(intraday_data)
 
         if session_target == "open":
             # Calculate target_time as session_open + closing_length
@@ -98,7 +99,7 @@ class IntradayMomentum:
         )
 
         # Apply volatility scaling to target if requested
-        if scale_target_by_volatility:
+        if scale_target:
             # Align volatility scale with target data
             common_idx = self.target_data.index.intersection(self.volatility_scale.index)
             if len(common_idx) > 0:
