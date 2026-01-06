@@ -49,3 +49,27 @@ tests/test_sequential_curves.py
 tests/test_ticker_classification.py
 tests/test_weekly_resampling.py
 update_files.py
+
+# Debug and temporary files
+debug_*.py
+*_debug_output.txt
+futures_debug_output.txt
+temp_notebook.ipynb
+
+# Example files at root
+align_ticker_data_example.py
+
+# Examples directory
+examples/*.py
+examples/*.csv
+examples/*.ipynb
+examples/.ipynb_checkpoints/
+examples/examples/
+examples/results/
+
+# Documentation/notes (non-essential)
+CALENDAR_PATTERN_USAGE.md
+CONSTANT_M1_IMPLEMENTATION.md
+
+# Backtest outputs
+calendar_patterns_backtest.csv

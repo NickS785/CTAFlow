@@ -17,7 +17,7 @@ from ..utils.session import DEFAULT_SESSION_TZ
 from . import base_models
 from .base_models import CTALight
 from ..features.curve.curve_features import CurveFeatures
-from ..features.diurnal_seasonality import deseasonalize_volatility, deseasonalize_volume
+from ..features import deseasonalize_volatility, deseasonalize_volume
 from ..utils.tenor_interpolation import TenorInterpolator, create_tenor_grid
 
 
@@ -31,6 +31,7 @@ class IntradayMomentum:
 
     Parameters
     ----------
+
     scale_target : bool, default False
         If True, scale target_data by volatility_scale (EWMA of realized volatility).
         This produces volatility-adjusted returns as the target, useful for normalizing

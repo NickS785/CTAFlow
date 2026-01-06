@@ -1,6 +1,15 @@
 import pandas as pd
 import numpy as np
 from ..base_extractor import ScidBaseExtractor
+from dataclasses import dataclass
+
+@dataclass
+class VPINConfig:
+    data_dir: str
+    ticker: str
+    tz : str = ("America/Chicago")
+    window_size: int = 60
+    bucket_volume: int = 150
 
 
 class VPINExtractor(ScidBaseExtractor):
@@ -129,3 +138,17 @@ class VPINExtractor(ScidBaseExtractor):
 
         # 2. Calculate VPIN
         return self.calculate_vpin(df_raw, bucket_volume=bucket_volume, window=window)
+
+    def __getitem__(self, item: slice, window : int = None):
+        """
+        Slice syntax: extractor['2023-01-01':'2023-01-02':100, 20]
+        """
+        if not isinstance(item, slice):
+            raise TypeError("Expected slice object")
+
+        start_str = self._to_time_string(item.start)
+        end_str = self._to_time_str
+        bucket_volume = float(item.step) if isinstance(item.step, (int, float)) else self.bucket_volume
+        window = self.window if window is None else window
+
+        return self.get_vpin(start_str, end_str, bucket_volume=bucket_volume, window=window)
