@@ -446,6 +446,132 @@ class RollingDiurnalAdjuster:
             return result, seasonal
         return result
 
+    def batch_fit_transform(
+        self,
+        y_dict: Dict[str, pd.Series],
+        intraday_idx: pd.Series,
+        dates: Union[pd.Series, pd.DatetimeIndex],
+        return_seasonal: bool = False,
+    ) -> Dict[str, Union[pd.Series, Tuple[pd.Series, pd.Series]]]:
+        """Apply rolling FFF adjustment to multiple series with single fit per day.
+
+        Significantly faster than calling fit_transform multiple times when
+        deseasonalizing related series (e.g., bid/ask/imbalance volumes).
+
+        Parameters
+        ----------
+        y_dict : Dict[str, pd.Series]
+            Dictionary of series to deseasonalize (e.g., {'bid': bid_vol, 'ask': ask_vol})
+        intraday_idx : pd.Series
+            Intraday time index (0 to bins_per_day-1)
+        dates : pd.Series or pd.DatetimeIndex
+            Date component (normalized dates)
+        return_seasonal : bool, default False
+            If True, also return the seasonal components
+
+        Returns
+        -------
+        Dict[str, Union[pd.Series, Tuple[pd.Series, pd.Series]]]
+            Dictionary with same keys, containing deseasonalized series
+            (and seasonal if return_seasonal=True)
+        """
+        # Use first series as reference for index
+        ref_key = next(iter(y_dict))
+        ref_series = y_dict[ref_key]
+
+        # Convert all to numpy
+        y_arrays = {k: v.values.astype(np.float64) for k, v in y_dict.items()}
+        idx_vals = intraday_idx.values.astype(np.int32)
+
+        # Convert dates to integer day codes for fast comparison
+        if isinstance(dates, pd.DatetimeIndex):
+            date_vals = dates.normalize()
+        elif isinstance(dates, pd.Series):
+            date_vals = pd.DatetimeIndex(dates.values).normalize()
+        else:
+            date_vals = pd.DatetimeIndex(dates).normalize()
+
+        # Get unique dates and create mapping
+        unique_dates = np.sort(date_vals.unique())
+        n_days = len(unique_dates)
+
+        # Pre-compute day boundaries
+        date_codes = pd.Categorical(date_vals, categories=unique_dates).codes
+        day_boundaries = []
+        for day_idx in range(n_days):
+            mask = date_codes == day_idx
+            indices = np.where(mask)[0]
+            if len(indices) > 0:
+                day_boundaries.append((indices[0], indices[-1] + 1))
+            else:
+                day_boundaries.append((0, 0))
+
+        # Pre-allocate result arrays for all series
+        n_samples = len(ref_series)
+        result_arrays = {k: np.full(n_samples, np.nan, dtype=np.float64) for k in y_dict}
+        seasonal_arrays = {k: np.full(n_samples, np.nan, dtype=np.float64) for k in y_dict} if return_seasonal else None
+
+        # Reuse single adjuster instance
+        adjuster = DiurnalAdjuster(
+            bins_per_day=self.bins_per_day,
+            order=self.order,
+            use_log=self.use_log,
+        )
+
+        for i in range(self.min_days, n_days):
+            start_day = max(0, i - self.lookback_days)
+
+            # Gather training data from lookback window
+            train_slices = []
+            for j in range(start_day, i):
+                s, e = day_boundaries[j]
+                if e > s:
+                    train_slices.append((s, e))
+
+            if not train_slices:
+                continue
+
+            # Use reference series to fit (all series share same seasonal pattern)
+            train_y = np.concatenate([y_arrays[ref_key][s:e] for s, e in train_slices])
+            train_idx = np.concatenate([idx_vals[s:e] for s, e in train_slices])
+
+            curr_start, curr_end = day_boundaries[i]
+            if curr_end <= curr_start:
+                continue
+
+            try:
+                # Fit ONCE on reference series
+                adjuster.fit(train_y, train_idx)
+
+                # Transform ALL series using the same fitted model
+                curr_idx = idx_vals[curr_start:curr_end]
+
+                for key, y_arr in y_arrays.items():
+                    curr_y = y_arr[curr_start:curr_end]
+
+                    if return_seasonal:
+                        y_adj, seas = adjuster.transform(curr_y, curr_idx, return_seasonal=True)
+                        seasonal_arrays[key][curr_start:curr_end] = seas
+                    else:
+                        y_adj = adjuster.transform(curr_y, curr_idx)
+
+                    result_arrays[key][curr_start:curr_end] = y_adj
+
+            except Exception:
+                continue
+
+        # Convert back to Series
+        results = {}
+        for key in y_dict:
+            result_series = pd.Series(result_arrays[key], index=ref_series.index)
+            if return_seasonal:
+                seasonal_series = pd.Series(seasonal_arrays[key], index=ref_series.index)
+                results[key] = (result_series, seasonal_series)
+            else:
+                results[key] = result_series
+
+        return results
+
 
 def fft_spectrum(
     signal: np.ndarray,
@@ -690,50 +816,88 @@ def deseasonalize_volume(
         if bid_volume is None or ask_volume is None:
             raise ValueError("bid_volume and ask_volume must be provided when bid_ask_volume=True")
 
-        # Deseasonalize bid volume
-        bid_result = deseasonalize_volatility(
-            bid_volume,
-            intraday_idx=intraday_idx,
-            bins_per_day=bins_per_day,
-            order=order,
-            use_log=True,
-            rolling_days=rolling_days,
-        )
-
-        # Deseasonalize ask volume
-        ask_result = deseasonalize_volatility(
-            ask_volume,
-            intraday_idx=intraday_idx,
-            bins_per_day=bins_per_day,
-            order=order,
-            use_log=True,
-            rolling_days=rolling_days,
-        )
-
         # Calculate volume imbalance (absolute difference)
         imbalance = (bid_volume - ask_volume).abs()
 
-        # Deseasonalize imbalance
-        imbalance_result = deseasonalize_volatility(
-            imbalance,
-            intraday_idx=intraday_idx,
-            bins_per_day=bins_per_day,
-            order=order,
-            use_log=True,
-            rolling_days=rolling_days,
-        )
+        # Estimate bins_per_day if not provided
+        if bins_per_day is None:
+            dates = bid_volume.index.normalize()
+            counts = dates.value_counts()
+            bins_per_day = int(counts.median())
 
-        # Combine results
-        combined = pd.DataFrame(index=bid_volume.index)
-        combined['bid_original'] = bid_result['original']
-        combined['bid_seasonal'] = bid_result['seasonal']
-        combined['bid_adjusted'] = bid_result['adjusted']
-        combined['ask_original'] = ask_result['original']
-        combined['ask_seasonal'] = ask_result['seasonal']
-        combined['ask_adjusted'] = ask_result['adjusted']
-        combined['imbalance_original'] = imbalance_result['original']
-        combined['imbalance_seasonal'] = imbalance_result['seasonal']
-        combined['imbalance_adjusted'] = imbalance_result['adjusted']
+        # Compute intraday_idx if not provided
+        if intraday_idx is None:
+            df_temp = pd.DataFrame({'vol': bid_volume})
+            df_temp['date'] = df_temp.index.normalize()
+            df_temp['intraday_idx'] = df_temp.groupby('date').cumcount()
+            intraday_idx = df_temp['intraday_idx']
+
+        # Ensure intraday_idx is a Series with the same index
+        if not isinstance(intraday_idx, pd.Series):
+            intraday_idx = pd.Series(intraday_idx, index=bid_volume.index)
+        elif not intraday_idx.index.equals(bid_volume.index):
+            intraday_idx = pd.Series(intraday_idx.values, index=bid_volume.index)
+
+        if rolling_days is not None:
+            # Use batch method for 3x speedup with rolling window
+            dates = pd.Series(bid_volume.index.normalize(), index=bid_volume.index)
+            adjuster = RollingDiurnalAdjuster(
+                bins_per_day=bins_per_day,
+                lookback_days=rolling_days,
+                order=order,
+                use_log=True,
+            )
+
+            # Batch transform all three series with single fit per day
+            batch_results = adjuster.batch_fit_transform(
+                y_dict={'bid': bid_volume, 'ask': ask_volume, 'imbalance': imbalance},
+                intraday_idx=intraday_idx,
+                dates=dates,
+                return_seasonal=True,
+            )
+
+            # Unpack results
+            bid_adjusted, bid_seasonal = batch_results['bid']
+            ask_adjusted, ask_seasonal = batch_results['ask']
+            imbalance_adjusted, imbalance_seasonal = batch_results['imbalance']
+
+            combined = pd.DataFrame(index=bid_volume.index)
+            combined['bid_original'] = bid_volume
+            combined['bid_seasonal'] = bid_seasonal
+            combined['bid_adjusted'] = bid_adjusted
+            combined['ask_original'] = ask_volume
+            combined['ask_seasonal'] = ask_seasonal
+            combined['ask_adjusted'] = ask_adjusted
+            combined['imbalance_original'] = imbalance
+            combined['imbalance_seasonal'] = imbalance_seasonal
+            combined['imbalance_adjusted'] = imbalance_adjusted
+
+        else:
+            # Non-rolling: use existing method (fit on all data)
+            adjuster = DiurnalAdjuster(
+                bins_per_day=bins_per_day,
+                order=order,
+                use_log=True,
+            )
+
+            # Fit on bid volume (representative of volume pattern)
+            adjuster.fit(bid_volume.values, intraday_idx.values)
+
+            # Transform all series with same fitted model
+            bid_adj, bid_seas = adjuster.transform(bid_volume.values, intraday_idx.values, return_seasonal=True)
+            ask_adj, ask_seas = adjuster.transform(ask_volume.values, intraday_idx.values, return_seasonal=True)
+            imb_adj, imb_seas = adjuster.transform(imbalance.values, intraday_idx.values, return_seasonal=True)
+
+            combined = pd.DataFrame(index=bid_volume.index)
+            combined['bid_original'] = bid_volume
+            combined['bid_seasonal'] = bid_seas
+            combined['bid_adjusted'] = bid_adj
+            combined['ask_original'] = ask_volume
+            combined['ask_seasonal'] = ask_seas
+            combined['ask_adjusted'] = ask_adj
+            combined['imbalance_original'] = imbalance
+            combined['imbalance_seasonal'] = imb_seas
+            combined['imbalance_adjusted'] = imb_adj
 
         return combined
 
