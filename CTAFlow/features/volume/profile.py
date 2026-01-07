@@ -4,16 +4,25 @@ from datetime import datetime, date, time
 from pathlib import Path
 from typing import Optional, List, Tuple, Union, Dict
 import logging
-
+from dataclasses import dataclass
 # Import from your provided files
 from sierrapy.parser.scid_parse import FastScidReader, ScidTickerFileManager, ScidContractInfo
 from ...data.contract_expiry_rules import calculate_expiry, get_roll_buffer_days
 from ..base_extractor import ScidBaseExtractor
 logger = logging.getLogger(__name__)
 
+@dataclass
+class MarketProfileConfig:
+    data_dir: str
+    ticker: str
+    tz : str = "America/Chicago"
+    tick_size = 0.01
+
+
+
 
 class MarketProfileExtractor(ScidBaseExtractor):
-    def __init__(self, data_dir: str, ticker: Optional[str] = None, tz: str = "America/Chicago"):
+    def __init__(self, data_dir: str, ticker: Optional[str] = None, tz: str = "America/Chicago", tick_size=None):
         """
         Initialize MarketProfileExtractor.
 
@@ -23,6 +32,7 @@ class MarketProfileExtractor(ScidBaseExtractor):
             tz: Timezone for time interpretation (default: America/Chicago)
         """
         super().__init__(data_dir, ticker, tz)
+        self.tick_size = tick_size if tick_size else None
         return
 
     def calculate_volume_profile(self, df: pd.DataFrame, tick_size: Optional[float] = None) -> pd.DataFrame:
@@ -30,6 +40,11 @@ class MarketProfileExtractor(ScidBaseExtractor):
             return pd.DataFrame()
 
         data = df.copy()
+
+        # Convert volume columns to float64 to prevent uint32 overflow on subtraction
+        for col in ['TotalVolume', 'BidVolume', 'AskVolume']:
+            if col in data.columns:
+                data[col] = data[col].astype(np.float64)
 
         # Binning logic
         if tick_size is not None and tick_size > 0:
@@ -48,7 +63,8 @@ class MarketProfileExtractor(ScidBaseExtractor):
         profile.sort_index(ascending=True, inplace=True)
 
         if 'BidVolume' in profile.columns and 'AskVolume' in profile.columns:
-            profile['Delta'] = profile['AskVolume'] - profile['BidVolume']
+            # Ensure float64 after aggregation to prevent overflow
+            profile['Delta'] = profile['AskVolume'].astype(np.float64) - profile['BidVolume'].astype(np.float64)
 
         return profile
 

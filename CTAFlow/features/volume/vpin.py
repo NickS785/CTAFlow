@@ -59,10 +59,10 @@ class VPINExtractor(ScidBaseExtractor):
         if 'BidVolume' not in df.columns or 'AskVolume' not in df.columns:
             raise ValueError("Data must contain 'BidVolume' and 'AskVolume'")
 
-        # Clean
+        # Clean - explicitly convert to float64 to avoid uint32 overflow on subtraction
         df = df.copy()
-        df['buy_vol'] = pd.to_numeric(df['AskVolume'], errors='coerce').fillna(0.0).clip(lower=0.0)
-        df['sell_vol'] = pd.to_numeric(df['BidVolume'], errors='coerce').fillna(0.0).clip(lower=0.0)
+        df['buy_vol'] = pd.to_numeric(df['AskVolume'], errors='coerce').astype(np.float64).fillna(0.0).clip(lower=0.0)
+        df['sell_vol'] = pd.to_numeric(df['BidVolume'], errors='coerce').astype(np.float64).fillna(0.0).clip(lower=0.0)
 
         # Reset index to treat Timestamp as a column for grouping
         df = df.reset_index().rename(columns={df.index.name: 'ts'})
@@ -70,7 +70,7 @@ class VPINExtractor(ScidBaseExtractor):
             df.rename(columns={'index': 'ts'}, inplace=True)
 
         # 1. Cumulative Volume Bucketing
-        vol = (df['buy_vol'] + df['sell_vol']).to_numpy()
+        vol = (df['buy_vol'] + df['sell_vol']).to_numpy(dtype=np.float64)
         if vol.sum() == 0: return pd.DataFrame()
 
         cum = np.cumsum(vol)
@@ -94,7 +94,9 @@ class VPINExtractor(ScidBaseExtractor):
         if min_bucket_vol > 0:
             gb = gb[gb['vol'] >= min_bucket_vol].reset_index(drop=True)
 
-        # 3. VPIN Calculation
+        # 3. VPIN Calculation - ensure float64 to prevent uint32 overflow
+        gb['buy'] = gb['buy'].astype(np.float64)
+        gb['sell'] = gb['sell'].astype(np.float64)
         gb['imbalance'] = (gb['buy'] - gb['sell']).abs()
         gb['imb_frac'] = gb['imbalance'] / gb['vol'].replace(0, np.nan)
 
@@ -147,7 +149,7 @@ class VPINExtractor(ScidBaseExtractor):
             raise TypeError("Expected slice object")
 
         start_str = self._to_time_string(item.start)
-        end_str = self._to_time_str
+        end_str = self._to_time_string(item.stop)
         bucket_volume = float(item.step) if isinstance(item.step, (int, float)) else self.bucket_volume
         window = self.window if window is None else window
 

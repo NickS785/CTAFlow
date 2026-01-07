@@ -4808,16 +4808,21 @@ class IntradayMomentum:
             end_date=None,
             val_split: bool = False,
             val_split_size: float = 0.2,
+            dropna: bool = True,
+            verbose: bool = False,
+            remove_outliers: bool = False,
+            outlier_threshold: float = 0.01,
     ):
         """Convenience constructor for a full training feature matrix.
 
         Performs the following cleaning steps:
         1. Selects features from self.feature_names
         2. Drops columns with >90% NaN values (keeps columns with at least 10% valid data)
-        3. Drops rows with any remaining NaN values
-        4. Aligns with target data by date intersection
-        5. Optionally filters by date range
-        6. Optionally splits into train/validation sets
+        3. Drops rows with any remaining NaN values (if dropna=True)
+        4. Removes outliers from target data (if remove_outliers=True)
+        5. Aligns with target data by date intersection
+        6. Optionally filters by date range
+        7. Optionally splits into train/validation sets
 
         Parameters
         ----------
@@ -4829,6 +4834,18 @@ class IntradayMomentum:
             If True, split data into train and validation sets
         val_split_size : float, default 0.2
             Proportion of data to use for validation (only used if val_split=True)
+        dropna : bool, default True
+            If True, drop rows with NaN values. Set to False to keep all rows
+            (useful for debugging or when you want to handle NaN yourself).
+        verbose : bool, default False
+            If True, print diagnostic info showing where rows are dropped
+        remove_outliers : bool, default False
+            If True, remove extreme return outliers from target data before alignment.
+            Removes returns below the `outlier_threshold` percentile and above
+            the `1 - outlier_threshold` percentile.
+        outlier_threshold : float, default 0.01
+            Percentile threshold for outlier removal (0.01 = remove top/bottom 1%).
+            Only used if remove_outliers=True.
 
         Returns
         -------
@@ -4838,33 +4855,104 @@ class IntradayMomentum:
         """
         # Select feature columns
         x_data = self.training_data[self.feature_names].copy()
+        initial_rows = len(x_data)
+        initial_cols = len(x_data.columns)
+
+        if verbose:
+            print(f"Initial: {initial_rows} rows, {initial_cols} features")
 
         # Step 1: Drop columns that are mostly NaN (>90% NaN)
         # Keep columns with at least 10% non-NaN values
         min_valid_count = max(1, int(len(x_data) * 0.1))
         x_data = x_data.dropna(axis=1, thresh=min_valid_count)
 
-        # Step 2: Drop rows with any remaining NaN values
-        x_data = x_data.dropna(axis=0)
+        if verbose:
+            dropped_cols = initial_cols - len(x_data.columns)
+            if dropped_cols > 0:
+                print(f"After dropping sparse columns: {len(x_data.columns)} features ({dropped_cols} dropped)")
 
-        # Step 3: Align with target data
-        y_data = self.target_data
+        # Step 2: Drop rows with any remaining NaN values
+        if dropna:
+            rows_before = len(x_data)
+
+            if verbose:
+                # Identify which columns have NaN in remaining rows
+                nan_per_col = x_data.isna().sum()
+                cols_with_nan = nan_per_col[nan_per_col > 0].sort_values(ascending=False)
+                if len(cols_with_nan) > 0:
+                    print(f"Columns with NaN values (causing row drops):")
+                    for col, count in cols_with_nan.head(10).items():
+                        print(f"  {col}: {count} NaN ({100*count/rows_before:.1f}%)")
+                    if len(cols_with_nan) > 10:
+                        print(f"  ... and {len(cols_with_nan) - 10} more columns")
+
+            x_data = x_data.dropna(axis=0)
+
+            if verbose:
+                dropped_rows = rows_before - len(x_data)
+                if dropped_rows > 0:
+                    print(f"After dropna: {len(x_data)} rows ({dropped_rows} dropped, {100*dropped_rows/rows_before:.1f}%)")
+
+        # Step 3: Remove outliers from target data
+        y_data = self.target_data.copy()
+
+        if remove_outliers:
+            y_before = len(y_data)
+            lower_pct = outlier_threshold
+            upper_pct = 1 - outlier_threshold
+            lower_bound = y_data.quantile(lower_pct)
+            upper_bound = y_data.quantile(upper_pct)
+
+            # Remove rows outside bounds
+            y_data = y_data[(y_data >= lower_bound) & (y_data <= upper_bound)]
+
+            if verbose:
+                removed = y_before - len(y_data)
+                print(f"Outlier removal: {removed} rows removed ({100*removed/y_before:.1f}%)")
+                print(f"  Bounds: [{lower_bound:.4f}, {upper_bound:.4f}] (p{100*lower_pct:.0f}-p{100*upper_pct:.0f})")
+
+        # Step 4: Align with target data
+        rows_before = len(x_data)
+
+        if verbose:
+            print(f"Target data has {len(y_data)} rows")
+            x_only = x_data.index.difference(y_data.index)
+            y_only = y_data.index.difference(x_data.index)
+            if len(x_only) > 0:
+                print(f"  Dates in X but not in target: {len(x_only)} (first: {x_only.min()}, last: {x_only.max()})")
+            if len(y_only) > 0:
+                print(f"  Dates in target but not in X: {len(y_only)} (first: {y_only.min()}, last: {y_only.max()})")
+
         val_dates = x_data.index.intersection(y_data.index)
         x_data = x_data.loc[val_dates]
         y_data = y_data.loc[val_dates]
 
-        # Step 4: Filter by date range if provided
+        if verbose:
+            dropped_rows = rows_before - len(x_data)
+            if dropped_rows > 0:
+                print(f"After target alignment: {len(x_data)} rows ({dropped_rows} dropped)")
+
+        # Step 5: Filter by date range if provided
         if start_date is not None:
+            rows_before = len(x_data)
             start_date = pd.to_datetime(start_date)
             x_data = x_data[x_data.index >= start_date]
             y_data = y_data[y_data.index >= start_date]
+            if verbose and rows_before - len(x_data) > 0:
+                print(f"After start_date filter: {len(x_data)} rows ({rows_before - len(x_data)} dropped)")
 
         if end_date is not None:
+            rows_before = len(x_data)
             end_date = pd.to_datetime(end_date)
             x_data = x_data[x_data.index <= end_date]
             y_data = y_data[y_data.index <= end_date]
+            if verbose and rows_before - len(x_data) > 0:
+                print(f"After end_date filter: {len(x_data)} rows ({rows_before - len(x_data)} dropped)")
 
-        # Step 5: Optionally split into train/validation sets
+        if verbose:
+            print(f"Final: {len(x_data)} rows, {len(x_data.columns)} features")
+
+        # Step 6: Optionally split into train/validation sets
         if val_split:
             # Time-series split: use earlier data for training, later for validation
             split_idx = int(len(x_data) * (1 - val_split_size))

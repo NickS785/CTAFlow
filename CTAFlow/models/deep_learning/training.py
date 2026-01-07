@@ -6,8 +6,10 @@ from typing import Callable, Dict, Optional, Tuple, Any, List
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from sklearn.preprocessing import StandardScaler
 from ...data import make_window_dataset, MomentumWindowDataset
 from ..intraday_momentum import IntradayMomentum
+
 
 @dataclass
 class TrainConfig:
@@ -58,6 +60,8 @@ def convert_IM(model_prep:IntradayMomentum, lookback_period=10, batch_size=16, t
     Otherwise: ds, dl
     """
     X, y = model_prep.get_xy()
+    if scaler is None:
+        scaler = StandardScaler()
 
     if val_split:
         # Split into train and validation (no test set in this mode)
