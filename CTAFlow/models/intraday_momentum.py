@@ -19,6 +19,7 @@ from .base_models import CTALight
 from ..features.curve.curve_features import CurveFeatures
 from ..features import deseasonalize_volatility, deseasonalize_volume
 from ..utils.tenor_interpolation import TenorInterpolator, create_tenor_grid
+from ..data import read_exported_df
 
 
 # noinspection PyDefaultArgument
@@ -5137,7 +5138,7 @@ class DeepIDMomentum(IntradayMomentum):
         if intraday_path.endswith('.parquet'):
             intraday_data = pd.read_parquet(intraday_path)
         else:
-            intraday_data = pd.read_csv(intraday_path, parse_dates=True, index_col=0)
+            intraday_data = read_exported_df(intraday_path, parse_dates=True, index_col=0)
 
         if not isinstance(intraday_data.index, pd.DatetimeIndex):
             intraday_data.index = pd.to_datetime(intraday_data.index)
@@ -5211,12 +5212,15 @@ class DeepIDMomentum(IntradayMomentum):
             vah_col: str = 'vah',
             val_col: str = 'val',
             poc_col: str = 'poc',
+            ib_high_col: Optional[str] = 'ib_high',
+            ib_low_col: Optional[str] = 'ib_low',
+            additional_cols: Optional[List[str]] = None,
             inplace: bool = True
     ) -> Optional[pd.DataFrame]:
         """Normalize/make stationary the sequential data columns.
 
-        Normalizes market profile columns (VAH, VAL, POC) by expressing them
-        relative to the close price: (value - close) / close
+        Normalizes price-like columns (market profile, initial balance, etc.) by
+        expressing them relative to the close price: (value - close) / close
 
         This makes the features scale-invariant and stationary.
 
@@ -5230,6 +5234,13 @@ class DeepIDMomentum(IntradayMomentum):
             Column name for Value Area Low
         poc_col : str, default 'poc'
             Column name for Point of Control
+        ib_high_col : str, optional, default 'ib_high'
+            Column name for Initial Balance High. Set to None to skip.
+        ib_low_col : str, optional, default 'ib_low'
+            Column name for Initial Balance Low. Set to None to skip.
+        additional_cols : list of str, optional
+            Additional column names to normalize using the same formula.
+            Useful for custom price levels, support/resistance, etc.
         inplace : bool, default True
             If True, modify self.sequential_data in place and update training_data dict.
             If False, return normalized copy without modifying original.
@@ -5246,12 +5257,33 @@ class DeepIDMomentum(IntradayMomentum):
         - Resulting values represent percentage distance from close price
         - Positive values mean above close, negative means below close
         - Original columns are replaced with normalized versions
+        - Columns that don't exist in data are silently skipped
 
         Examples
         --------
         >>> model = DeepIDMomentum(sequential_data=seq_df, intraday_data=intra_df)
+        >>> # Normalize market profile columns only
         >>> model.normalize_sequential_features(price_col='close')
-        >>> # Now seq_df['vah'], seq_df['val'], seq_df['poc'] are normalized
+        >>>
+        >>> # Include initial balance columns
+        >>> model.normalize_sequential_features(
+        ...     price_col='close',
+        ...     ib_high_col='ib_high',
+        ...     ib_low_col='ib_low'
+        ... )
+        >>>
+        >>> # Skip IB columns if not present
+        >>> model.normalize_sequential_features(
+        ...     price_col='close',
+        ...     ib_high_col=None,
+        ...     ib_low_col=None
+        ... )
+        >>>
+        >>> # Add custom columns
+        >>> model.normalize_sequential_features(
+        ...     price_col='close',
+        ...     additional_cols=['prev_high', 'prev_low', 'support', 'resistance']
+        ... )
         """
         # Determine which dataframe to work with
         if inplace:
@@ -5259,22 +5291,44 @@ class DeepIDMomentum(IntradayMomentum):
         else:
             data = self.sequential_data.copy()
 
-        # Check required columns exist
-        required_cols = [price_col]
-        profile_cols = [vah_col, val_col, poc_col]
-        available_profile_cols = [col for col in profile_cols if col in data.columns]
-
+        # Check price column exists
         if price_col not in data.columns:
             raise KeyError(f"Price column '{price_col}' not found in sequential_data. Available: {list(data.columns)}")
 
-        if not available_profile_cols:
-            raise KeyError(f"None of the profile columns {profile_cols} found in sequential_data. Available: {list(data.columns)}")
+        # Build list of all columns to normalize
+        cols_to_normalize = []
+
+        # Add profile columns
+        profile_cols = [vah_col, val_col, poc_col]
+        for col in profile_cols:
+            if col in data.columns:
+                cols_to_normalize.append(col)
+
+        # Add initial balance columns if specified
+        if ib_high_col is not None and ib_high_col in data.columns:
+            cols_to_normalize.append(ib_high_col)
+        if ib_low_col is not None and ib_low_col in data.columns:
+            cols_to_normalize.append(ib_low_col)
+
+        # Add additional columns if specified
+        if additional_cols is not None:
+            for col in additional_cols:
+                if col in data.columns:
+                    cols_to_normalize.append(col)
+
+        # Ensure we have at least one column to normalize
+        if not cols_to_normalize:
+            raise KeyError(
+                f"No columns found to normalize. Checked: {profile_cols}" +
+                f"([ib_high_col, ib_low_col] if provided) + (additional_cols if provided). "
+                f"Available: {list(data.columns)}"
+            )
 
         # Get close prices
         close_prices = data[price_col].copy()
 
-        # Normalize each profile column: (value - close) / close
-        for col in available_profile_cols:
+        # Normalize all columns: (value - close) / close
+        for col in cols_to_normalize:
             data[col] = (data[col] - close_prices) / close_prices
 
         if inplace:
@@ -5285,5 +5339,256 @@ class DeepIDMomentum(IntradayMomentum):
             return None
         else:
             return data
+
+    def _make_clf_targets(
+            self,
+            upper_threshold: float = 0.6,
+            lower_threshold: float = 0.3,
+            inplace: bool = True
+    ) -> Optional[pd.Series]:
+        """Create classification targets from continuous returns.
+
+        Divides returns into 3 classes based on quantile thresholds:
+        - Class 0: Negative returns (returns < 0)
+        - Class 1: Small absolute returns (neutral, devalued returns)
+        - Class 2: Large positive returns (returns >= upper quantile)
+
+        The quantile thresholds are computed on the absolute values of returns
+        to identify returns with the smallest magnitude.
+
+        Parameters
+        ----------
+        upper_threshold : float, default 0.6
+            Upper quantile threshold (0-1) for class 2. Returns above this
+            quantile of absolute values are classified as class 2.
+        lower_threshold : float, default 0.3
+            Lower quantile threshold (0-1) for class 1. Returns between
+            lower_threshold and upper_threshold are classified as class 1.
+        inplace : bool, default True
+            If True, replace self.target_data with classification targets.
+            If False, return new targets without modifying original.
+
+        Returns
+        -------
+        pd.Series or None
+            If inplace=True, returns None (modifies in place).
+            If inplace=False, returns classification targets as Series.
+
+        Examples
+        --------
+        >>> model = DeepIDMomentum(...)
+        >>> # Create 3-class targets with default thresholds
+        >>> model._make_clf_targets()
+        >>> # Class distribution: 0 (down), 1 (neutral), 2 (strong up)
+
+        >>> # More granular: keep more in neutral class
+        >>> model._make_clf_targets(upper_threshold=0.7, lower_threshold=0.3)
+
+        Notes
+        -----
+        - Quantiles are computed on absolute values, so symmetric thresholds
+        - Class 1 captures low-volatility / small-return periods
+        - Useful for filtering noise in high-frequency data
+        """
+        returns = self.target_data.copy()
+
+        # Compute quantiles on absolute values
+        abs_returns = returns.abs()
+        upper_q = abs_returns.quantile(upper_threshold)
+        lower_q = abs_returns.quantile(lower_threshold)
+
+        # Initialize all as class 1 (neutral/small returns)
+        clf_targets = pd.Series(1, index=returns.index, dtype=np.int64)
+
+        # Class 0: Negative returns
+        clf_targets[returns < 0] = 0
+
+        # Class 2: Large positive returns (above upper quantile of absolute values)
+        # Must be both positive AND above threshold
+        clf_targets[(returns > 0) & (abs_returns >= upper_q)] = 2
+
+        # Class 1: Everything else (small absolute returns)
+        # These are returns with absolute value below upper_q
+        # This includes:
+        # - Small positive returns (0 < return < upper_q)
+        # Already set to 1 by default, but explicitly for clarity:
+        clf_targets[(returns >= 0) & (abs_returns < upper_q)] = 1
+
+        if inplace:
+            self.target_data = clf_targets
+            return None
+        else:
+            return clf_targets
+
+    def get_loaders(
+            self,
+            start_date=None,
+            end_date=None,
+            val_split: bool = False,
+            val_split_size: float = 0.2,
+            dropna: bool = True,
+            verbose: bool = False,
+            remove_outliers: bool = False,
+            outlier_threshold: float = 0.01,
+            batch_size: int = 32,
+            shuffle_train: bool = True,
+            num_workers: int = 0,
+            max_seq_len: int = 200,
+            sequential_cols: Optional[List[str]] = None,
+    ):
+        """Create PyTorch DataLoaders for training dual-branch models.
+
+        This method wraps get_xy() functionality and returns DataLoader objects
+        using DualDataset for combined summary + sequential data.
+
+        Parameters
+        ----------
+        start_date : str, pd.Timestamp, or datetime, optional
+            Filter data from this date onwards (inclusive)
+        end_date : str, pd.Timestamp, or datetime, optional
+            Filter data up to this date (inclusive)
+        val_split : bool, default False
+            If True, split data into train and validation sets
+        val_split_size : float, default 0.2
+            Proportion of data to use for validation (only used if val_split=True)
+        dropna : bool, default True
+            If True, drop rows with NaN values
+        verbose : bool, default False
+            If True, print diagnostic info
+        remove_outliers : bool, default False
+            If True, remove extreme outliers from target data
+        outlier_threshold : float, default 0.01
+            Percentile threshold for outlier removal (0.01 = remove top/bottom 1%)
+        batch_size : int, default 32
+            Batch size for DataLoaders
+        shuffle_train : bool, default True
+            Whether to shuffle training data. Validation is never shuffled.
+        num_workers : int, default 0
+            Number of workers for DataLoader (0 = single process)
+        max_seq_len : int, default 200
+            Maximum sequence length for sequential data
+        sequential_cols : list of str, optional
+            Columns to use from sequential data. If None, uses all numeric columns.
+
+        Returns
+        -------
+        torch.utils.data.DataLoader or Tuple[DataLoader, DataLoader]
+            If val_split=False: single DataLoader for all data
+            If val_split=True: (train_loader, val_loader) tuple
+
+        Examples
+        --------
+        >>> model = DeepIDMomentum.from_files(...)
+        >>> # Single loader for all data
+        >>> loader = model.get_loaders(batch_size=64)
+        >>>
+        >>> # Train/val split
+        >>> train_loader, val_loader = model.get_loaders(
+        ...     val_split=True,
+        ...     val_split_size=0.2,
+        ...     batch_size=32,
+        ...     shuffle_train=True
+        ... )
+        """
+        # Import here to avoid requiring torch for all IntradayMomentum usage
+        try:
+            import torch
+            from torch.utils.data import DataLoader
+            from ..data.model_datasets import DualDataset
+        except ImportError as e:
+            raise ImportError(
+                "PyTorch is required for get_loaders(). "
+                "Install with: pip install torch"
+            ) from e
+
+        # Custom collate function for variable-length sequences
+        def collate_fn(batch):
+            import torch.nn.utils.rnn as rnn_utils
+            summaries, sequential_seqs, targets, lengths = zip(*batch)
+            summaries = torch.stack(summaries)
+            targets = torch.stack(targets)
+            lengths = torch.tensor(lengths)
+            sequential_padded = rnn_utils.pad_sequence(
+                sequential_seqs, batch_first=True, padding_value=0.0
+            )
+            return summaries, sequential_padded, targets, lengths
+
+        # Use get_xy to get aligned, cleaned data
+        result = self.get_xy(
+            start_date=start_date,
+            end_date=end_date,
+            val_split=val_split,
+            val_split_size=val_split_size,
+            dropna=dropna,
+            verbose=verbose,
+            remove_outliers=remove_outliers,
+            outlier_threshold=outlier_threshold,
+        )
+
+        if val_split:
+            X_train, X_val, y_train, y_val = result
+
+            # Create train dataset
+            train_dataset = DualDataset(
+                summary_data=X_train,
+                sequential_data=self.sequential_data,
+                target_data=y_train,
+                max_len=max_seq_len,
+                sequential_cols=sequential_cols,
+                target_col=None,  # Targets already aligned via y_train
+            )
+
+            # Create validation dataset
+            val_dataset = DualDataset(
+                summary_data=X_val,
+                sequential_data=self.sequential_data,
+                target_data=y_val,
+                max_len=max_seq_len,
+                sequential_cols=sequential_cols,
+                target_col=None,
+            )
+
+            # Create DataLoaders
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                shuffle=shuffle_train,
+                collate_fn=collate_fn,
+                num_workers=num_workers,
+            )
+
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,  # Never shuffle validation
+                collate_fn=collate_fn,
+                num_workers=num_workers,
+            )
+
+            return train_loader, val_loader
+
+        else:
+            X, y = result
+
+            # Create dataset
+            dataset = DualDataset(
+                summary_data=X,
+                sequential_data=self.sequential_data,
+                target_data=y,
+                max_len=max_seq_len,
+                sequential_cols=sequential_cols,
+                target_col=None,
+            )
+
+            # Create DataLoader
+            loader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=shuffle_train,
+                collate_fn=collate_fn,
+                num_workers=num_workers,
+            )
+
+            return loader
 
 

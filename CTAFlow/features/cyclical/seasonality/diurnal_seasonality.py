@@ -821,7 +821,8 @@ def deseasonalize_volume(
     rolling_days : int, optional
         Rolling window size (None = fit on all data)
     bid_ask_volume : bool, default False
-        If True, deseasonalize bid and ask volumes separately plus their difference.
+        If True, deseasonalize bid and ask volumes using a shared diurnal pattern.
+        Fits pattern once on total volume (bid + ask), then applies to all components.
         Requires bid_volume and ask_volume parameters.
     bid_volume : pd.Series, optional
         Bid volume series (required when bid_ask_volume=True)
@@ -841,12 +842,18 @@ def deseasonalize_volume(
             - 'bid_original', 'bid_seasonal', 'bid_adjusted'
             - 'ask_original', 'ask_seasonal', 'ask_adjusted'
             - 'imbalance_original', 'imbalance_seasonal', 'imbalance_adjusted'
+            Note: All '_seasonal' columns are identical (shared diurnal pattern)
     """
     if bid_ask_volume:
         if bid_volume is None or ask_volume is None:
             raise ValueError("bid_volume and ask_volume must be provided when bid_ask_volume=True")
 
-        # Calculate volume imbalance (absolute difference)
+        # OPTIMIZATION: Fit diurnal pattern ONCE on total volume, then apply to all components
+        # Bid, ask, and imbalance share the same time-of-day pattern (U-shape, etc.)
+        # Only the levels differ, not the seasonal shape
+
+        # Calculate total volume and imbalance
+        total_volume = bid_volume + ask_volume
         imbalance = (bid_volume - ask_volume).abs()
 
         # Estimate bins_per_day if not provided
@@ -869,65 +876,70 @@ def deseasonalize_volume(
             intraday_idx = pd.Series(intraday_idx.values, index=bid_volume.index)
 
         if rolling_days is not None:
-            # Use batch method for 3x speedup with rolling window
+            # Fit diurnal pattern on total volume, apply to all components
             dates = pd.Series(bid_volume.index.normalize(), index=bid_volume.index)
             adjuster = RollingDiurnalAdjuster(
                 bins_per_day=bins_per_day,
                 lookback_days=rolling_days,
                 order=order,
                 use_log=True,
-                refit_interval=refit_interval,  # OPTIMIZATION: Support refit interval
+                refit_interval=refit_interval,
             )
 
-            # Batch transform all three series with single fit per day
-            batch_results = adjuster.batch_fit_transform(
-                y_dict={'bid': bid_volume, 'ask': ask_volume, 'imbalance': imbalance},
-                intraday_idx=intraday_idx,
-                dates=dates,
-                return_seasonal=True,
+            # Fit ONCE on total volume to get the diurnal pattern
+            _, seasonal = adjuster.fit_transform(
+                total_volume, intraday_idx, dates, return_seasonal=True
             )
 
-            # Unpack results
-            bid_adjusted, bid_seasonal = batch_results['bid']
-            ask_adjusted, ask_seasonal = batch_results['ask']
-            imbalance_adjusted, imbalance_seasonal = batch_results['imbalance']
+            # Apply the same seasonal pattern to bid, ask, and imbalance
+            # The seasonal pattern is in log-space, so we need to convert
+            seasonal_factor = np.exp(seasonal)  # Convert to multiplicative factor
+
+            bid_adjusted = bid_volume / seasonal_factor
+            ask_adjusted = ask_volume / seasonal_factor
+            imbalance_adjusted = imbalance / seasonal_factor
 
             combined = pd.DataFrame(index=bid_volume.index)
             combined['bid_original'] = bid_volume
-            combined['bid_seasonal'] = bid_seasonal
+            combined['bid_seasonal'] = seasonal
             combined['bid_adjusted'] = bid_adjusted
             combined['ask_original'] = ask_volume
-            combined['ask_seasonal'] = ask_seasonal
+            combined['ask_seasonal'] = seasonal  # Same pattern
             combined['ask_adjusted'] = ask_adjusted
             combined['imbalance_original'] = imbalance
-            combined['imbalance_seasonal'] = imbalance_seasonal
+            combined['imbalance_seasonal'] = seasonal  # Same pattern
             combined['imbalance_adjusted'] = imbalance_adjusted
 
         else:
-            # Non-rolling: use existing method (fit on all data)
+            # Non-rolling: fit on total volume (all data), apply same pattern to all
             adjuster = DiurnalAdjuster(
                 bins_per_day=bins_per_day,
                 order=order,
                 use_log=True,
             )
 
-            # Fit on bid volume (representative of volume pattern)
-            adjuster.fit(bid_volume.values, intraday_idx.values)
+            # Fit on total volume (sum of bid + ask) to get the shared diurnal pattern
+            _, seasonal = adjuster.fit_transform(
+                total_volume.values, intraday_idx.values, return_seasonal=True
+            )
 
-            # Transform all series with same fitted model
-            bid_adj, bid_seas = adjuster.transform(bid_volume.values, intraday_idx.values, return_seasonal=True)
-            ask_adj, ask_seas = adjuster.transform(ask_volume.values, intraday_idx.values, return_seasonal=True)
-            imb_adj, imb_seas = adjuster.transform(imbalance.values, intraday_idx.values, return_seasonal=True)
+            # Convert seasonal pattern to multiplicative factor
+            seasonal_factor = np.exp(seasonal)  # Log-space to linear
+
+            # Apply same pattern to all components
+            bid_adj = bid_volume.values / seasonal_factor
+            ask_adj = ask_volume.values / seasonal_factor
+            imb_adj = imbalance.values / seasonal_factor
 
             combined = pd.DataFrame(index=bid_volume.index)
             combined['bid_original'] = bid_volume
-            combined['bid_seasonal'] = bid_seas
+            combined['bid_seasonal'] = seasonal
             combined['bid_adjusted'] = bid_adj
             combined['ask_original'] = ask_volume
-            combined['ask_seasonal'] = ask_seas
+            combined['ask_seasonal'] = seasonal  # Same pattern
             combined['ask_adjusted'] = ask_adj
             combined['imbalance_original'] = imbalance
-            combined['imbalance_seasonal'] = imb_seas
+            combined['imbalance_seasonal'] = seasonal  # Same pattern
             combined['imbalance_adjusted'] = imb_adj
 
         return combined
