@@ -5138,7 +5138,7 @@ class DeepIDMomentum(IntradayMomentum):
         if intraday_path.endswith('.parquet'):
             intraday_data = pd.read_parquet(intraday_path)
         else:
-            intraday_data = read_exported_df(intraday_path, parse_dates=True, index_col=0)
+            intraday_data = read_exported_df(intraday_path)
 
         if not isinstance(intraday_data.index, pd.DatetimeIndex):
             intraday_data.index = pd.to_datetime(intraday_data.index)
