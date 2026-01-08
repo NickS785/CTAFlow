@@ -18,7 +18,7 @@ class DualBranchModel(nn.Module):
             nn.BatchNorm1d(dense_hidden_dim),  # Helps with unscaled inputs
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(dense_hidden_dim, dense_hidden_dim // 2),
+            nn.Linear(dense_hidden_dim, dense_hidden_dim //2),
             nn.ReLU()
         )
 
