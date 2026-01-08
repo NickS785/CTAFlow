@@ -43,12 +43,11 @@ def _extract_single_date_worker(args: tuple) -> Dict:
 
     # Build time windows
     profile_start = pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {config.profile_start_time}")
-    profile_end = pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {config.profile_end_time}")
     vpin_start = pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {config.vpin_start_time}")
     vpin_end = pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {config.vpin_end_time}")
 
     start_dt = min(profile_start, vpin_start)
-    end_dt = max(profile_end, vpin_end)
+    end_dt = vpin_end
 
     results = {'date': dt, 'vpin': pd.DataFrame(), 'profile': pd.DataFrame()}
 
@@ -65,28 +64,64 @@ def _extract_single_date_worker(args: tuple) -> Dict:
     if df_raw.empty:
         return results
 
-    # VPIN
-    vpin_data = df_raw.between_time(vpin_start.time(), vpin_end.time(), inclusive='both')
-    if not vpin_data.empty:
-        try:
-            results['vpin'] = vpin_ext.calculate_vpin(
-                vpin_data,
-                bucket_volume=config.vpin_bucket_size or vpin_ext.bucket_volume,
-                window=config.vpin_window
-            )
-        except Exception as e:
-            logger.warning(f"VPIN calculation failed for {dt.date()}: {e}")
-
-    # Profile
-    profile_data = df_raw.between_time(profile_start.time(), profile_end.time(), inclusive='both')
+    # Profile: from profile_start to vpin_start (prior session context)
+    poc, val, vah = np.nan, np.nan, np.nan
+    profile_data = df_raw.between_time(profile_start.time(), vpin_start.time(), inclusive='left')
     if not profile_data.empty:
         try:
-            results['profile'] = profile_ext.calculate_volume_profile(
+            profile = profile_ext.calculate_volume_profile(
                 profile_data,
                 tick_size=config.profile_tick_size
             )
+            results['profile'] = profile
+
+            # Calculate summary stats
+            if not profile.empty and 'TotalVolume' in profile.columns:
+                total_vol = profile['TotalVolume'].sum()
+                poc = profile['TotalVolume'].idxmax()
+
+                # Value Area
+                sorted_profile = profile.sort_values('TotalVolume', ascending=False)
+                cumvol = sorted_profile['TotalVolume'].cumsum()
+                va_threshold = total_vol * config.value_area_pct
+                va_levels = sorted_profile[cumvol <= va_threshold].index
+                val = va_levels.min() if len(va_levels) > 0 else poc
+                vah = va_levels.max() if len(va_levels) > 0 else poc
+
         except Exception as e:
             logger.warning(f"Profile calculation failed for {dt.date()}: {e}")
+
+    # VPIN: from vpin_start to vpin_end
+    vpin_data = df_raw.between_time(vpin_start.time(), vpin_end.time(), inclusive='both')
+
+    # Calculate Initial Balance (first N minutes from profile/RTH start)
+    ib_high, ib_low = np.nan, np.nan
+    if config.include_ib:
+        ib_end = profile_start + pd.Timedelta(minutes=config.ib_minutes)
+        ib_data = df_raw.between_time(profile_start.time(), ib_end.time(), inclusive='both')
+        if not ib_data.empty and 'Close' in ib_data.columns:
+            ib_high = ib_data['Close'].max()
+            ib_low = ib_data['Close'].min()
+
+    if not vpin_data.empty:
+        try:
+            vpin_df = vpin_ext.calculate_vpin(
+                vpin_data,
+                bucket_volume=config.vpin_bucket_size or vpin_ext.bucket_volume,
+                window=config.vpin_window,
+                include_sequence_features=config.include_sequence_features
+            )
+            # Add profile levels and IB to VPIN
+            if not vpin_df.empty:
+                vpin_df['poc'] = poc
+                vpin_df['val'] = val
+                vpin_df['vah'] = vah
+                if config.include_ib:
+                    vpin_df['ib_high'] = ib_high
+                    vpin_df['ib_low'] = ib_low
+            results['vpin'] = vpin_df
+        except Exception as e:
+            logger.warning(f"VPIN calculation failed for {dt.date()}: {e}")
 
     return results
 
@@ -103,6 +138,13 @@ class FeatureExtractorConfig:
     profile_end_time: str = "09:30"
     vpin_start_time: str = "08:30"
     vpin_end_time: str = "09:30"
+    # Neural network training options
+    include_sequence_features: bool = True  # Golden Trio for LSTM
+    profile_n_bins: int = 96  # Fixed histogram size for CNN-1D
+    # Profile and IB options
+    value_area_pct: float = 0.7  # Value area percentage (default 70%)
+    include_ib: bool = True  # Include Initial Balance (first hour H/L)
+    ib_minutes: int = 60  # Initial Balance period in minutes
 
 
 class MultiFeatureExtraction(ScidBaseExtractor):
@@ -166,44 +208,82 @@ class MultiFeatureExtraction(ScidBaseExtractor):
 
         results = {'date': dt}
 
-        # Extract VPIN from subset of data
+        # Build time ranges
         vpin_start, vpin_end = self._build_time_range(
             dt, self.config.vpin_start_time, self.config.vpin_end_time
         )
-        vpin_data = df_raw.between_time(
-            vpin_start.time(), vpin_end.time(), inclusive='both'
-        )
-        if not vpin_data.empty:
-            try:
-                results['vpin'] = self.vpin_extractor.calculate_vpin(
-                    vpin_data,
-                    bucket_volume=self.config.vpin_bucket_size or self.vpin_extractor.bucket_volume,
-                    window=self.config.vpin_window
-                )
-            except Exception as e:
-                logger.warning(f"VPIN calculation failed for {dt.date()}: {e}")
-                results['vpin'] = pd.DataFrame()
-        else:
-            results['vpin'] = pd.DataFrame()
-
-        # Extract Profile from subset of data
-        profile_start, profile_end = self._build_time_range(
+        profile_start, _ = self._build_time_range(
             dt, self.config.profile_start_time, self.config.profile_end_time
         )
+
+        # Extract Profile from profile_start to vpin_start (prior session context)
         profile_data = df_raw.between_time(
-            profile_start.time(), profile_end.time(), inclusive='both'
+            profile_start.time(), vpin_start.time(), inclusive='left'
         )
+        poc, val, vah = np.nan, np.nan, np.nan
         if not profile_data.empty:
             try:
-                results['profile'] = self.profile_extractor.calculate_volume_profile(
+                profile = self.profile_extractor.calculate_volume_profile(
                     profile_data,
                     tick_size=self.config.profile_tick_size
                 )
+                results['profile'] = profile
+
+                # Calculate summary stats
+                if not profile.empty and 'TotalVolume' in profile.columns:
+                    total_vol = profile['TotalVolume'].sum()
+                    poc = profile['TotalVolume'].idxmax()
+
+                    # Value Area
+                    sorted_profile = profile.sort_values('TotalVolume', ascending=False)
+                    cumvol = sorted_profile['TotalVolume'].cumsum()
+                    va_threshold = total_vol * self.config.value_area_pct
+                    va_levels = sorted_profile[cumvol <= va_threshold].index
+                    val = va_levels.min() if len(va_levels) > 0 else poc
+                    vah = va_levels.max() if len(va_levels) > 0 else poc
+
             except Exception as e:
                 logger.warning(f"Profile calculation failed for {dt.date()}: {e}")
                 results['profile'] = pd.DataFrame()
         else:
             results['profile'] = pd.DataFrame()
+
+        # Extract VPIN from vpin_start to vpin_end
+        vpin_data = df_raw.between_time(
+            vpin_start.time(), vpin_end.time(), inclusive='both'
+        )
+
+        # Calculate Initial Balance (first N minutes from profile/RTH start)
+        ib_high, ib_low = np.nan, np.nan
+        if self.config.include_ib:
+            ib_end = profile_start + pd.Timedelta(minutes=self.config.ib_minutes)
+            ib_data = df_raw.between_time(profile_start.time(), ib_end.time(), inclusive='both')
+            if not ib_data.empty and 'Close' in ib_data.columns:
+                ib_high = ib_data['Close'].max()
+                ib_low = ib_data['Close'].min()
+
+        if not vpin_data.empty:
+            try:
+                vpin_df = self.vpin_extractor.calculate_vpin(
+                    vpin_data,
+                    bucket_volume=self.config.vpin_bucket_size or self.vpin_extractor.bucket_volume,
+                    window=self.config.vpin_window,
+                    include_sequence_features=self.config.include_sequence_features
+                )
+                # Add profile levels and IB to VPIN
+                if not vpin_df.empty:
+                    vpin_df['poc'] = poc
+                    vpin_df['val'] = val
+                    vpin_df['vah'] = vah
+                    if self.config.include_ib:
+                        vpin_df['ib_high'] = ib_high
+                        vpin_df['ib_low'] = ib_low
+                results['vpin'] = vpin_df
+            except Exception as e:
+                logger.warning(f"VPIN calculation failed for {dt.date()}: {e}")
+                results['vpin'] = pd.DataFrame()
+        else:
+            results['vpin'] = pd.DataFrame()
 
         return results
 
@@ -220,6 +300,11 @@ class MultiFeatureExtraction(ScidBaseExtractor):
             'profile_end_time': self.config.profile_end_time,
             'vpin_start_time': self.config.vpin_start_time,
             'vpin_end_time': self.config.vpin_end_time,
+            'include_sequence_features': self.config.include_sequence_features,
+            'profile_n_bins': self.config.profile_n_bins,
+            'value_area_pct': self.config.value_area_pct,
+            'include_ib': self.config.include_ib,
+            'ib_minutes': self.config.ib_minutes,
         }
 
     def extract_all(
@@ -403,3 +488,90 @@ class MultiFeatureExtraction(ScidBaseExtractor):
             return pd.DataFrame()
 
         return pd.DataFrame(summaries).set_index('date')
+
+    def export_to_npz(
+            self,
+            results: List[Dict[str, pd.DataFrame]],
+            output_dir: str,
+            prefix: str = None,
+            fit_size: float = 0.8,
+            encoder_config: Optional[Dict] = None,
+    ) -> Dict[str, str]:
+        """
+        Export extraction results to NPZ (encoded profiles) and Parquet (VPIN).
+
+        Parameters
+        ----------
+        results : List[Dict]
+            Output from extract_all()
+        output_dir : str
+            Directory to save files
+        prefix : str, optional
+            Filename prefix (default: ticker name)
+        fit_size : float, default 0.8
+            Fraction of data to use for fitting the encoder (first N days)
+        encoder_config : Dict, optional
+            Override VolumeProfileEncoderConfig parameters
+
+        Returns
+        -------
+        Dict[str, str]
+            Paths to saved files {'profiles': path, 'vpin': path}
+        """
+        from pathlib import Path
+        from .volume.profile_encoder import (
+            VolumeProfileEncoder, VolumeProfileEncoderConfig, save_profiles_npz
+        )
+
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        prefix = prefix or self.config.ticker
+
+        # Filter non-empty profiles
+        valid_results = [r for r in results if not r['profile'].empty]
+
+        if not valid_results:
+            logger.warning("No valid results to export")
+            return {}
+
+        # Extract profile DataFrames
+        profiles = [r['profile'] for r in valid_results]
+        dates = [r['date'] for r in valid_results]
+
+        # Fit encoder on training portion
+        n_train = int(len(profiles) * fit_size)
+        train_profiles = profiles[:n_train]
+
+        # Use profile_n_bins from config, allow encoder_config to override
+        enc_cfg = {'num_bins': self.config.profile_n_bins}
+        if encoder_config:
+            enc_cfg.update(encoder_config)
+        cfg = VolumeProfileEncoderConfig(**enc_cfg)
+        encoder = VolumeProfileEncoder(cfg)
+        encoder.fit(train_profiles)
+
+        # Transform all profiles -> (N, C, B)
+        encoded = encoder.transform_many(profiles)
+
+        # Save profiles NPZ
+        profile_path = output_dir / f"{prefix}_profiles.npz"
+        save_profiles_npz(profile_path, dates, encoded)
+
+        # VPIN -> Parquet (variable-length sequences with datetime index)
+        vpin_frames = []
+        for r in valid_results:
+            if not r['vpin'].empty:
+                vpin = r['vpin'].copy()
+                vpin['date'] = r['date'].date()
+                vpin_frames.append(vpin)
+
+        paths = {'profiles': str(profile_path)}
+
+        if vpin_frames:
+            vpin_df = pd.concat(vpin_frames, axis=0)
+            vpin_path = output_dir / f"{prefix}_vpin.parquet"
+            vpin_df.to_parquet(vpin_path)
+            paths['vpin'] = str(vpin_path)
+
+        logger.info(f"Exported {len(valid_results)} days (fit on {n_train}) to {output_dir}")
+        return paths

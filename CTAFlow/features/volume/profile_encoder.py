@@ -233,7 +233,7 @@ class VolumeProfileEncoder:
         hp = np.pad(h.astype(np.float32), (1, 1), mode="edge")
         return np.convolve(hp, k, mode="valid").astype(np.float32)
 
-def save_profiles_npz(path, dates, X, **extra):
+def save_profiles_npz(path, dates, profiles, **extra):
     """
     dates: array-like of datetime/date/str, len N
     X: np.ndarray shape (N, C, B)
@@ -243,7 +243,7 @@ def save_profiles_npz(path, dates, X, **extra):
 
     np.savez_compressed(
         path,
-        X=X.astype(np.float32),
+        profiles=profiles.astype(np.float32),
         dates=dates64,
         **extra
     )
