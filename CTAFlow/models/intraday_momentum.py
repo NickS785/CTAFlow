@@ -113,6 +113,82 @@ class IntradayMomentum:
 
         return
 
+    @classmethod
+    def from_files(
+            cls,
+            intraday_path: str,
+            features_path: str,
+            target_path: Optional[str] = None,
+            target_col: str = "target",
+            **kwargs,
+    ) -> "IntradayMomentum":
+        """Load IntradayMomentum from file paths.
+
+        Parameters
+        ----------
+        intraday_path : str
+            Path to intraday data (CSV or Parquet with DatetimeIndex)
+        features_path : str
+            Path to pre-computed features (CSV or Parquet)
+        target_path : str, optional
+            Path to target data. If None, expects target_col in features file.
+        target_col : str, default "target"
+            Column name for target variable
+        **kwargs
+            Additional arguments passed to IntradayMomentum.__init__
+
+        Returns
+        -------
+        IntradayMomentum
+            Initialized model with loaded data and features
+        """
+        # Load intraday data
+        if intraday_path.endswith('.parquet'):
+            intraday_data = pd.read_parquet(intraday_path)
+        else:
+            intraday_data = pd.read_csv(intraday_path, parse_dates=True, index_col=0)
+
+        if not isinstance(intraday_data.index, pd.DatetimeIndex):
+            intraday_data.index = pd.to_datetime(intraday_data.index)
+
+        # Load features
+        if features_path.endswith('.parquet'):
+            features_df = pd.read_parquet(features_path)
+        else:
+            features_df = pd.read_csv(features_path, parse_dates=True, index_col=0)
+
+        if not isinstance(features_df.index, pd.DatetimeIndex):
+            features_df.index = pd.to_datetime(features_df.index)
+
+        # Load or extract target
+        if target_path is not None:
+            if target_path.endswith('.parquet'):
+                target_df = pd.read_parquet(target_path)
+            else:
+                target_df = pd.read_csv(target_path, parse_dates=True, index_col=0)
+            if target_col in target_df.columns:
+                target_data = target_df[target_col]
+            else:
+                target_data = target_df.iloc[:, 0]
+        elif target_col in features_df.columns:
+            target_data = features_df[target_col]
+            features_df = features_df.drop(columns=[target_col])
+        else:
+            target_data = None
+
+        # Create instance
+        instance = cls(intraday_data=intraday_data, **kwargs)
+
+        # Override training_data and feature_names with loaded data
+        instance.training_data = features_df.copy()
+        instance.feature_names = list(features_df.columns)
+
+        # Override target_data if provided
+        if target_data is not None:
+            instance.target_data = target_data
+
+        return instance
+
     def _resolve_model_class(self) -> Type[object]:
         if isinstance(self.base_model, str):
             try:
@@ -3848,8 +3924,7 @@ class IntradayMomentum:
             drop_na_target: bool = True,
             drop_na_features: Optional[str] = None,
             force_keep_dates: Optional[list] = None,
-            fillna_features: Optional[dict] = None,
-    ) -> "IntradayMomentum":
+            fillna_features: Optional[dict] = None    ) -> "IntradayMomentum":
         """Prune features using feature selection and update training_data and feature_names.
 
         This method applies feature selection to the current training_data and target_data,
@@ -4965,4 +5040,238 @@ class IntradayMomentum:
             return X_train, X_val, y_train, y_val
         else:
             return x_data, y_data
+
+class DeepIDMomentum(IntradayMomentum):
+    """Deep learning variant of IntradayMomentum with sequential and optional profile data.
+
+    Extends IntradayMomentum to support multiple data modalities:
+    - Summary features (inherited from parent)
+    - Sequential data (required)
+    - Profile array data (optional)
+
+    Parameters
+    ----------
+    sequential_data : pd.DataFrame
+        Sequential/time-series data with DatetimeIndex. Typically intraday orderflow
+        or market profile data that needs to be processed as sequences.
+    profile_array : np.ndarray, optional
+        Optional 3D array of profile data (n_samples, height, width) for CNN processing.
+    **kwargs
+        All other arguments passed to IntradayMomentum.__init__
+    """
+
+    def __init__(
+            self,
+            sequential_data: pd.DataFrame,
+            profile_array: Optional[np.ndarray] = None,
+            **kwargs
+    ) -> None:
+        # Initialize parent class
+        super().__init__(**kwargs)
+
+        # Store original training_data (summary features)
+        summary_data = self.training_data.copy()
+
+        # Convert training_data to dictionary structure
+        self.training_data = {
+            'summary': summary_data,
+            'sequential': sequential_data
+        }
+
+        # Add profile array if provided
+        if profile_array is not None:
+            self.training_data['profile'] = profile_array
+
+        # Store reference to sequential data for easy access
+        self.sequential_data = sequential_data
+        self.profile_array = profile_array
+
+    @classmethod
+    def from_files(
+            cls,
+            intraday_path: str,
+            features_path: str,
+            sequential_path: str,
+            profile_path: Optional[str] = None,
+            target_path: Optional[str] = None,
+            target_col: str = "target",
+            **kwargs,
+    ) -> "DeepIDMomentum":
+        """Load DeepIDMomentum from file paths.
+
+        Parameters
+        ----------
+        intraday_path : str
+            Path to intraday OHLCV data (CSV or Parquet with DatetimeIndex)
+        features_path : str
+            Path to pre-computed summary features (CSV or Parquet)
+        sequential_path : str
+            Path to sequential data (CSV or Parquet with DatetimeIndex)
+        profile_path : str, optional
+            Path to profile array data (.npy file)
+        target_path : str, optional
+            Path to target data. If None, expects target_col in features file.
+        target_col : str, default "target"
+            Column name for target variable
+        **kwargs
+            Additional arguments passed to DeepIDMomentum.__init__
+
+        Returns
+        -------
+        DeepIDMomentum
+            Initialized model with loaded data and features
+        """
+        # Load intraday data
+        if intraday_path.endswith('.parquet'):
+            intraday_data = pd.read_parquet(intraday_path)
+        else:
+            intraday_data = pd.read_csv(intraday_path, parse_dates=True, index_col=0)
+
+        if not isinstance(intraday_data.index, pd.DatetimeIndex):
+            intraday_data.index = pd.to_datetime(intraday_data.index)
+
+        # Load features
+        if features_path.endswith('.parquet'):
+            features_df = pd.read_parquet(features_path)
+        else:
+            features_df = pd.read_csv(features_path, parse_dates=True, index_col=0)
+
+        if not isinstance(features_df.index, pd.DatetimeIndex):
+            features_df.index = pd.to_datetime(features_df.index)
+
+        # Load sequential data
+        if sequential_path.endswith('.parquet'):
+            sequential_df = pd.read_parquet(sequential_path)
+        else:
+            sequential_df = pd.read_csv(sequential_path, parse_dates=True, index_col=0)
+
+        if not isinstance(sequential_df.index, pd.DatetimeIndex):
+            sequential_df.index = pd.to_datetime(sequential_df.index)
+
+        # Load profile array if provided
+        profile_array = None
+        if profile_path is not None:
+            profile_array = np.load(profile_path)
+
+        # Load or extract target
+        if target_path is not None:
+            if target_path.endswith('.parquet'):
+                target_df = pd.read_parquet(target_path)
+            else:
+                target_df = pd.read_csv(target_path, parse_dates=True, index_col=0)
+            if target_col in target_df.columns:
+                target_data = target_df[target_col]
+            else:
+                target_data = target_df.iloc[:, 0]
+        elif target_col in features_df.columns:
+            target_data = features_df[target_col]
+            features_df = features_df.drop(columns=[target_col])
+        else:
+            target_data = None
+
+        # Remove intraday_data from kwargs if present (will be passed explicitly)
+        kwargs_copy = kwargs.copy()
+        kwargs_copy.pop('intraday_data', None)
+        kwargs_copy.pop('sequential_data', None)
+        kwargs_copy.pop('profile_array', None)
+
+        # Create instance - pass intraday_data to parent, sequential_data to child
+        instance = cls(
+            intraday_data=intraday_data,
+            sequential_data=sequential_df,
+            profile_array=profile_array,
+            **kwargs_copy
+        )
+
+        # Override training_data summary component with loaded features
+        instance.training_data['summary'] = features_df.copy()
+        instance.feature_names = list(features_df.columns)
+
+        # Override target_data if provided
+        if target_data is not None:
+            instance.target_data = target_data
+
+        return instance
+
+    def normalize_sequential_features(
+            self,
+            price_col: str = 'close',
+            vah_col: str = 'vah',
+            val_col: str = 'val',
+            poc_col: str = 'poc',
+            inplace: bool = True
+    ) -> Optional[pd.DataFrame]:
+        """Normalize/make stationary the sequential data columns.
+
+        Normalizes market profile columns (VAH, VAL, POC) by expressing them
+        relative to the close price: (value - close) / close
+
+        This makes the features scale-invariant and stationary.
+
+        Parameters
+        ----------
+        price_col : str, default 'close'
+            Column name for the close price to normalize against
+        vah_col : str, default 'vah'
+            Column name for Value Area High
+        val_col : str, default 'val'
+            Column name for Value Area Low
+        poc_col : str, default 'poc'
+            Column name for Point of Control
+        inplace : bool, default True
+            If True, modify self.sequential_data in place and update training_data dict.
+            If False, return normalized copy without modifying original.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            If inplace=True, returns None (modifies in place).
+            If inplace=False, returns normalized DataFrame.
+
+        Notes
+        -----
+        - Normalization formula: (value - close) / close
+        - Resulting values represent percentage distance from close price
+        - Positive values mean above close, negative means below close
+        - Original columns are replaced with normalized versions
+
+        Examples
+        --------
+        >>> model = DeepIDMomentum(sequential_data=seq_df, intraday_data=intra_df)
+        >>> model.normalize_sequential_features(price_col='close')
+        >>> # Now seq_df['vah'], seq_df['val'], seq_df['poc'] are normalized
+        """
+        # Determine which dataframe to work with
+        if inplace:
+            data = self.sequential_data
+        else:
+            data = self.sequential_data.copy()
+
+        # Check required columns exist
+        required_cols = [price_col]
+        profile_cols = [vah_col, val_col, poc_col]
+        available_profile_cols = [col for col in profile_cols if col in data.columns]
+
+        if price_col not in data.columns:
+            raise KeyError(f"Price column '{price_col}' not found in sequential_data. Available: {list(data.columns)}")
+
+        if not available_profile_cols:
+            raise KeyError(f"None of the profile columns {profile_cols} found in sequential_data. Available: {list(data.columns)}")
+
+        # Get close prices
+        close_prices = data[price_col].copy()
+
+        # Normalize each profile column: (value - close) / close
+        for col in available_profile_cols:
+            data[col] = (data[col] - close_prices) / close_prices
+
+        if inplace:
+            # Update the sequential_data reference
+            self.sequential_data = data
+            # Update training_data dict
+            self.training_data['sequential'] = data
+            return None
+        else:
+            return data
+
 
