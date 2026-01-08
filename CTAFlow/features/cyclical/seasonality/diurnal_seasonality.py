@@ -307,6 +307,10 @@ class RollingDiurnalAdjuster:
         Work in log-space
     min_days : int, default 5
         Minimum days required before producing estimates
+    refit_interval : int, default 1
+        Refit the model every N days instead of every day. Higher values (e.g., 5)
+        trade slight accuracy for significant speed improvements (up to Nx faster).
+        Use 1 for maximum accuracy, 5-10 for faster processing with minimal impact
 
     Examples
     --------
@@ -325,12 +329,14 @@ class RollingDiurnalAdjuster:
         order: int = 3,
         use_log: bool = True,
         min_days: int = 5,
+        refit_interval: int = 1,
     ):
         self.bins_per_day = bins_per_day
         self.lookback_days = lookback_days
         self.order = order
         self.use_log = use_log
         self.min_days = min_days
+        self.refit_interval = refit_interval  # OPTIMIZATION: Refit every N days instead of every day
 
     def fit_transform(
         self,
@@ -373,17 +379,11 @@ class RollingDiurnalAdjuster:
         unique_dates = np.sort(date_vals.unique())
         n_days = len(unique_dates)
 
-        # Pre-compute day boundaries (start/end indices for each day)
-        # This avoids repeated boolean mask creation
+        # OPTIMIZATION: Vectorized day boundary computation using searchsorted
         date_codes = pd.Categorical(date_vals, categories=unique_dates).codes
-        day_boundaries = []
-        for day_idx in range(n_days):
-            mask = date_codes == day_idx
-            indices = np.where(mask)[0]
-            if len(indices) > 0:
-                day_boundaries.append((indices[0], indices[-1] + 1))
-            else:
-                day_boundaries.append((0, 0))
+        day_start = np.searchsorted(date_codes, np.arange(n_days), side='left')
+        day_end = np.searchsorted(date_codes, np.arange(n_days), side='right')
+        day_boundaries = list(zip(day_start, day_end))
 
         # Pre-allocate result arrays
         result_vals = np.full(len(y_vals), np.nan, dtype=np.float64)
@@ -396,48 +396,61 @@ class RollingDiurnalAdjuster:
             use_log=self.use_log,
         )
 
+        # OPTIMIZATION: Track last fit day to avoid redundant refitting
+        last_fit_day = -1
+
         for i in range(self.min_days, n_days):
-            # Get lookback window indices
-            start_day = max(0, i - self.lookback_days)
-
-            # Gather training data from lookback window
-            train_slices = []
-            for j in range(start_day, i):
-                s, e = day_boundaries[j]
-                if e > s:
-                    train_slices.append((s, e))
-
-            if not train_slices:
-                continue
-
-            # Concatenate training data efficiently
-            train_y = np.concatenate([y_vals[s:e] for s, e in train_slices])
-            train_idx = np.concatenate([idx_vals[s:e] for s, e in train_slices])
-
             # Current day boundaries
             curr_start, curr_end = day_boundaries[i]
             if curr_end <= curr_start:
                 continue
 
-            try:
-                # Fit on training data
-                adjuster.fit(train_y, train_idx)
+            # OPTIMIZATION: Only refit at specified intervals
+            should_refit = (i - last_fit_day >= self.refit_interval) or (i == self.min_days)
 
-                # Transform current day
-                curr_y = y_vals[curr_start:curr_end]
-                curr_idx = idx_vals[curr_start:curr_end]
+            if should_refit:
+                # Get lookback window indices
+                start_day = max(0, i - self.lookback_days)
 
-                if return_seasonal:
-                    y_adj, seas = adjuster.transform(curr_y, curr_idx, return_seasonal=True)
-                    seasonal_vals[curr_start:curr_end] = seas
-                else:
-                    y_adj = adjuster.transform(curr_y, curr_idx)
+                # Gather training data from lookback window
+                train_slices = []
+                for j in range(start_day, i):
+                    s, e = day_boundaries[j]
+                    if e > s:
+                        train_slices.append((s, e))
 
-                result_vals[curr_start:curr_end] = y_adj
+                if not train_slices:
+                    continue
 
-            except Exception:
-                # If fitting fails, leave as NaN
-                continue
+                # Concatenate training data efficiently
+                train_y = np.concatenate([y_vals[s:e] for s, e in train_slices])
+                train_idx = np.concatenate([idx_vals[s:e] for s, e in train_slices])
+
+                try:
+                    # Fit on training data
+                    adjuster.fit(train_y, train_idx)
+                    last_fit_day = i
+                except Exception:
+                    # If fitting fails, skip this day and try again next interval
+                    continue
+
+            # Transform current day (using most recent fitted model)
+            if last_fit_day >= 0:  # Only transform if we've successfully fitted at least once
+                try:
+                    curr_y = y_vals[curr_start:curr_end]
+                    curr_idx = idx_vals[curr_start:curr_end]
+
+                    if return_seasonal:
+                        y_adj, seas = adjuster.transform(curr_y, curr_idx, return_seasonal=True)
+                        seasonal_vals[curr_start:curr_end] = seas
+                    else:
+                        y_adj = adjuster.transform(curr_y, curr_idx)
+
+                    result_vals[curr_start:curr_end] = y_adj
+
+                except Exception:
+                    # If transform fails, leave as NaN
+                    continue
 
         # Convert back to Series
         result = pd.Series(result_vals, index=y.index)
@@ -495,16 +508,11 @@ class RollingDiurnalAdjuster:
         unique_dates = np.sort(date_vals.unique())
         n_days = len(unique_dates)
 
-        # Pre-compute day boundaries
+        # OPTIMIZATION: Vectorized day boundary computation
         date_codes = pd.Categorical(date_vals, categories=unique_dates).codes
-        day_boundaries = []
-        for day_idx in range(n_days):
-            mask = date_codes == day_idx
-            indices = np.where(mask)[0]
-            if len(indices) > 0:
-                day_boundaries.append((indices[0], indices[-1] + 1))
-            else:
-                day_boundaries.append((0, 0))
+        day_start = np.searchsorted(date_codes, np.arange(n_days), side='left')
+        day_end = np.searchsorted(date_codes, np.arange(n_days), side='right')
+        day_boundaries = list(zip(day_start, day_end))
 
         # Pre-allocate result arrays for all series
         n_samples = len(ref_series)
@@ -518,47 +526,60 @@ class RollingDiurnalAdjuster:
             use_log=self.use_log,
         )
 
+        # OPTIMIZATION: Track last fit day to avoid redundant refitting
+        last_fit_day = -1
+
         for i in range(self.min_days, n_days):
-            start_day = max(0, i - self.lookback_days)
-
-            # Gather training data from lookback window
-            train_slices = []
-            for j in range(start_day, i):
-                s, e = day_boundaries[j]
-                if e > s:
-                    train_slices.append((s, e))
-
-            if not train_slices:
-                continue
-
-            # Use reference series to fit (all series share same seasonal pattern)
-            train_y = np.concatenate([y_arrays[ref_key][s:e] for s, e in train_slices])
-            train_idx = np.concatenate([idx_vals[s:e] for s, e in train_slices])
-
             curr_start, curr_end = day_boundaries[i]
             if curr_end <= curr_start:
                 continue
 
-            try:
-                # Fit ONCE on reference series
-                adjuster.fit(train_y, train_idx)
+            # OPTIMIZATION: Only refit at specified intervals
+            should_refit = (i - last_fit_day >= self.refit_interval) or (i == self.min_days)
 
-                # Transform ALL series using the same fitted model
-                curr_idx = idx_vals[curr_start:curr_end]
+            if should_refit:
+                start_day = max(0, i - self.lookback_days)
 
-                for key, y_arr in y_arrays.items():
-                    curr_y = y_arr[curr_start:curr_end]
+                # Gather training data from lookback window
+                train_slices = []
+                for j in range(start_day, i):
+                    s, e = day_boundaries[j]
+                    if e > s:
+                        train_slices.append((s, e))
 
-                    if return_seasonal:
-                        y_adj, seas = adjuster.transform(curr_y, curr_idx, return_seasonal=True)
-                        seasonal_arrays[key][curr_start:curr_end] = seas
-                    else:
-                        y_adj = adjuster.transform(curr_y, curr_idx)
+                if not train_slices:
+                    continue
 
-                    result_arrays[key][curr_start:curr_end] = y_adj
+                # Use reference series to fit (all series share same seasonal pattern)
+                train_y = np.concatenate([y_arrays[ref_key][s:e] for s, e in train_slices])
+                train_idx = np.concatenate([idx_vals[s:e] for s, e in train_slices])
 
-            except Exception:
-                continue
+                try:
+                    # Fit ONCE on reference series
+                    adjuster.fit(train_y, train_idx)
+                    last_fit_day = i
+                except Exception:
+                    # If fitting fails, skip and try again next interval
+                    continue
+
+            # Transform ALL series using the same fitted model
+            if last_fit_day >= 0:  # Only transform if we've successfully fitted at least once
+                try:
+                    curr_idx = idx_vals[curr_start:curr_end]
+
+                    for key, y_arr in y_arrays.items():
+                        curr_y = y_arr[curr_start:curr_end]
+
+                        if return_seasonal:
+                            y_adj, seas = adjuster.transform(curr_y, curr_idx, return_seasonal=True)
+                            seasonal_arrays[key][curr_start:curr_end] = seas
+                        else:
+                            y_adj = adjuster.transform(curr_y, curr_idx)
+
+                        result_arrays[key][curr_start:curr_end] = y_adj
+
+                except Exception:
+                    continue
 
         # Convert back to Series
         results = {}
@@ -673,6 +694,7 @@ def deseasonalize_volatility(
     order: int = 3,
     use_log: bool = True,
     rolling_days: Optional[int] = None,
+    refit_interval: int = 1,
 ) -> pd.DataFrame:
     """Convenience function to deseasonalize volatility.
 
@@ -691,6 +713,9 @@ def deseasonalize_volatility(
     rolling_days : int, optional
         If provided, use rolling window adjustment (avoids look-ahead bias).
         If None, fit on entire dataset.
+    refit_interval : int, default 1
+        When using rolling_days, refit every N days. Higher values (5-10) provide
+        significant speedup with minimal accuracy loss. Only used when rolling_days is set.
 
     Returns
     -------
@@ -742,6 +767,7 @@ def deseasonalize_volatility(
             lookback_days=rolling_days,
             order=order,
             use_log=use_log,
+            refit_interval=refit_interval,  # OPTIMIZATION: Support refit interval
         )
         adjusted, seasonal = adjuster.fit_transform(
             volatility, intraday_idx, dates, return_seasonal=True
@@ -775,6 +801,7 @@ def deseasonalize_volume(
     bid_ask_volume: bool = False,
     bid_volume: Optional[pd.Series] = None,
     ask_volume: Optional[pd.Series] = None,
+    refit_interval: int = 1,
 ) -> pd.DataFrame:
     """Convenience function to deseasonalize volume.
 
@@ -800,6 +827,9 @@ def deseasonalize_volume(
         Bid volume series (required when bid_ask_volume=True)
     ask_volume : pd.Series, optional
         Ask volume series (required when bid_ask_volume=True)
+    refit_interval : int, default 1
+        When using rolling_days, refit every N days. Higher values (5-10) provide
+        significant speedup with minimal accuracy loss. Only used when rolling_days is set.
 
     Returns
     -------
@@ -846,6 +876,7 @@ def deseasonalize_volume(
                 lookback_days=rolling_days,
                 order=order,
                 use_log=True,
+                refit_interval=refit_interval,  # OPTIMIZATION: Support refit interval
             )
 
             # Batch transform all three series with single fit per day
@@ -909,6 +940,7 @@ def deseasonalize_volume(
             order=order,
             use_log=True,  # Volume is strictly positive
             rolling_days=rolling_days,
+            refit_interval=refit_interval,  # OPTIMIZATION: Pass through refit interval
         )
 
 

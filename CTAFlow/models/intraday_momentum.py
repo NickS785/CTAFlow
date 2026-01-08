@@ -4187,6 +4187,7 @@ class IntradayMomentum:
             add_as_feature: bool = False,
             use_cache: bool = True,
             bid_ask_volume: bool = False,
+            refit_interval: int = 10,
     ):
         """Extract deseasonalized volatility and/or volume at target time(s).
 
@@ -4218,6 +4219,10 @@ class IntradayMomentum:
             If True, deseasonalize bid and ask volumes separately plus their imbalance.
             Requires 'BidVolume' and 'AskVolume' columns in intraday_data.
             Returns additional columns: 'bid_volume', 'ask_volume', 'volume_imbalance'.
+        refit_interval : int, default 1
+            Refit the seasonal model every N days instead of every day. Higher values
+            (e.g., 5-10) provide significant speedup with minimal accuracy loss.
+            Use 1 for maximum accuracy, 5 for balanced speed/accuracy, 10 for maximum speed.
         """
         # Helper to convert various formats to time object
         def _to_time(t):
@@ -4251,6 +4256,7 @@ class IntradayMomentum:
             return_volume,
             return_volatility or return_scaled_returns,  # Both need volatility deseasonalization
             bid_ask_volume,
+            refit_interval,  # OPTIMIZATION: Include in cache key
         )
 
         # Check if we can reuse cached deseasonalized data
@@ -4267,15 +4273,18 @@ class IntradayMomentum:
             deseasonalized_imbalance = cached.get('deseasonalized_imbalance')
         else:
             # Compute deseasonalized data from scratch
-            data = self.intraday_data.copy()
-
-            if not isinstance(data.index, pd.DatetimeIndex):
-                data.index = pd.to_datetime(data.index)
-
+            # OPTIMIZATION: Only copy when filtering is needed
             resample_rule = f"{freq_minutes}min"
 
             if use_session_times:
-                data = data.between_time(self.session_open, self.session_end, inclusive='both')
+                data = self.intraday_data.between_time(
+                    self.session_open, self.session_end, inclusive='both'
+                ).copy()  # Only copy the filtered subset
+            else:
+                data = self.intraday_data  # No copy needed - work with view
+
+            if not isinstance(data.index, pd.DatetimeIndex):
+                data.index = pd.to_datetime(data.index)
 
             prices = self._coerce_price(data, "Close")
 
@@ -4314,6 +4323,7 @@ class IntradayMomentum:
                     volatility,
                     intraday_idx=vol_idx,
                     rolling_days=rolling_days,
+                    refit_interval=refit_interval,  # OPTIMIZATION: Pass through refit interval
                 )
                 deseasonalized_vol_full = deseas_result["adjusted"]
 
@@ -4332,6 +4342,7 @@ class IntradayMomentum:
                     volume,
                     intraday_idx=vol_idx,
                     rolling_days=rolling_days,
+                    refit_interval=refit_interval,  # OPTIMIZATION: Pass through refit interval
                 )["adjusted"]
 
             # Compute deseasonalized bid/ask volumes and imbalance
@@ -4362,6 +4373,7 @@ class IntradayMomentum:
                     ask_volume=ask_vol,
                     intraday_idx=bid_idx,
                     rolling_days=rolling_days,
+                    refit_interval=refit_interval,  # OPTIMIZATION: Pass through refit interval
                 )
 
                 deseasonalized_bid_volume = bid_ask_result["bid_adjusted"]
