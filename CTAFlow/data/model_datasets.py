@@ -126,11 +126,13 @@ class DualDataset(Dataset):
 
         self.df_summary[date_col] = pd.to_datetime(self.df_summary[date_col])
         self.df_summary['date'] = self.df_summary[date_col].dt.date
+        self.df_summary = self.df_summary.reset_index(drop=True)
 
-        # Identify feature columns (exclude date/target columns)
+        # Identify feature columns (exclude date/target/datetime columns)
         exclude_cols = [date_col, 'date', 'Target', target_col] if target_col else [date_col, 'date', 'Target']
         exclude_cols = [c for c in exclude_cols if c is not None]
-        self.feature_cols = [c for c in self.df_summary.columns if c not in exclude_cols]
+        candidate_features = self.df_summary.select_dtypes(exclude=['datetime']).columns
+        self.feature_cols = [c for c in candidate_features if c not in exclude_cols]
         self.features = self.df_summary[self.feature_cols].values.astype(np.float32)
 
         # 2. Process Target Data
