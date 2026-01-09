@@ -4949,7 +4949,13 @@ class IntradayMomentum:
             If val_split=True: (X_train, X_val, y_train, y_val) tuple
         """
         # Select feature columns
-        x_data = self.training_data[self.feature_names].copy()
+        # Handle both dict (with 'summary' key) and DataFrame training_data
+        if isinstance(self.training_data, dict):
+            if 'summary' not in self.training_data:
+                raise ValueError("training_data dict must contain 'summary' key")
+            x_data = self.training_data['summary'][self.feature_names].copy()
+        else:
+            x_data = self.training_data[self.feature_names].copy()
         initial_rows = len(x_data)
         initial_cols = len(x_data.columns)
 

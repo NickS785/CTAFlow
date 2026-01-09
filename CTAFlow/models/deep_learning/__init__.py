@@ -10,6 +10,16 @@ from .training import (
     compute_class_weights,
     create_classification_targets,
 )
+from .encoders import (
+    AttnPool,
+    GatedFusion,
+    ProfileEncoder,
+    SeqEncoder,
+    SummaryEncoder,
+    SummaryMLPEnc,
+)
+from .multi_branch.dual_model import DualBranchModel
+from .multi_branch.tri_modal import TriModalLiquidityModel
 
 __all__ = [
     # Regressors
@@ -31,4 +41,14 @@ __all__ = [
     "default_classification_metrics",
     "compute_class_weights",
     "create_classification_targets",
+    # Encoders
+    "AttnPool",
+    "GatedFusion",
+    "ProfileEncoder",
+    "SeqEncoder",
+    "SummaryEncoder",
+    "SummaryMLPEnc",
+    # Multi-branch models
+    "DualBranchModel",
+    "TriModalLiquidityModel",
 ]

@@ -44,36 +44,58 @@ class GatedFusion(nn.Module):
 # ----------------------------
 class ProfileEncoder(nn.Module):
     """
-    Profile: (B, 3, 96) -> (B, D)
-    Channels = [total, imbalance, magnitude]
+    Profile encoder using MarketProfileCNN architecture.
+
+    Input: (B, in_ch, num_bins) -> Output: (B, d_out)
+    Default: (B, 3, 96) with channels [total, imbalance, magnitude]
+
+    Architecture adapted from MarketProfileCNN:
+    - Layer 1: Detects small local structures (ledges, small nodes)
+    - Layer 2: Detects larger structures (value areas, balance zones)
+    - Layer 3: High-level shape recognition (P-shape, b-shape)
+    - MaxPooling between layers for hierarchical feature extraction
     """
-    def __init__(self, in_ch=3, d_out=128, dropout=0.1):
+    def __init__(self, in_ch=3, d_out=128, dropout=0.1, num_bins=96):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv1d(in_ch, 32, kernel_size=5, padding=2, bias=False),
-            nn.BatchNorm1d(32),
-            nn.GELU(),
+        self.out_dim = d_out
 
-            nn.Conv1d(32, 64, kernel_size=5, padding=2, bias=False),
-            nn.BatchNorm1d(64),
-            nn.GELU(),
-
-            nn.Conv1d(64, 128, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm1d(128),
-            nn.GELU(),
+        # Layer 1: Detect small local structures (ledges, small nodes)
+        self.conv1 = nn.Sequential(
+            nn.Conv1d(in_ch, 16, kernel_size=5, padding=2),
+            nn.BatchNorm1d(16),
+            nn.ReLU(),
+            nn.MaxPool1d(kernel_size=2)  # Reduces size by half
         )
-        self.pool = nn.AdaptiveAvgPool1d(1)  # -> (B, 128, 1)
-        self.proj = nn.Sequential(
-            nn.Linear(128, d_out),
-            nn.GELU(),
+
+        # Layer 2: Detect larger structures (value areas, balance zones)
+        self.conv2 = nn.Sequential(
+            nn.Conv1d(16, 32, kernel_size=5, padding=2),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.MaxPool1d(kernel_size=2)  # Reduces size by half again
+        )
+
+        # Layer 3: High-level shape recognition (P-shape, b-shape)
+        self.conv3 = nn.Sequential(
+            nn.Conv1d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1)  # Global pooling: summarize entire profile
+        )
+
+        # Final projection
+        self.fc = nn.Sequential(
+            nn.Linear(64, d_out),
+            nn.ReLU(),
             nn.Dropout(dropout)
         )
 
     def forward(self, x_profile):
-        # x_profile: (B, 3, 96)
-        h = self.net(x_profile)          # (B, 128, 96)
-        h = self.pool(h).squeeze(-1)     # (B, 128)
-        z = self.proj(h)                 # (B, D)
+        # x_profile: (B, in_ch, num_bins) e.g., (B, 3, 96)
+        h = self.conv1(x_profile)    # (B, 16, num_bins/2)
+        h = self.conv2(h)            # (B, 32, num_bins/4)
+        h = self.conv3(h)            # (B, 64, 1)
+        h = h.flatten(1)             # (B, 64)
+        z = self.fc(h)               # (B, d_out)
         return z
 
 class SeqEncoder(nn.Module):
@@ -85,6 +107,7 @@ class SeqEncoder(nn.Module):
     """
     def __init__(self, f_in: int, d_out=128, d_conv=64, d_lstm=128, dropout=0.1, bidir=True):
         super().__init__()
+        self.out_dim = d_out
         self.pre = nn.Sequential(
             nn.LayerNorm(f_in),
             nn.Linear(f_in, d_conv),
@@ -134,6 +157,7 @@ class SummaryEncoder(nn.Module):
     """Summary: (B, F_sum) -> (B, D)"""
     def __init__(self, f_in: int, d_out=128, dropout=0.1):
         super().__init__()
+        self.out_dim = d_out
         self.net = nn.Sequential(
             nn.LayerNorm(f_in),
             nn.Linear(f_in, 256),
@@ -145,3 +169,34 @@ class SummaryEncoder(nn.Module):
 
     def forward(self, x_sum):
         return self.net(x_sum)
+
+
+class SummaryMLPEnc(nn.Module):
+    """Simple MLP encoder for summary features (matches DualBranchModel default).
+
+    Uses BatchNorm + ReLU instead of LayerNorm + GELU for compatibility
+    with the original DualBranchModel architecture.
+
+    Parameters
+    ----------
+    f_in : int
+        Input feature dimension
+    d_hidden : int, default 128
+        Hidden layer dimension
+    dropout : float, default 0.3
+        Dropout rate
+    """
+    def __init__(self, f_in: int, d_hidden: int = 128, dropout: float = 0.3):
+        super().__init__()
+        self.out_dim = d_hidden // 2
+        self.net = nn.Sequential(
+            nn.Linear(f_in, d_hidden),
+            nn.BatchNorm1d(d_hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_hidden, self.out_dim),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        return self.net(x)
