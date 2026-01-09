@@ -1,6 +1,6 @@
 from torch import nn as nn
 
-from CTAFlow.models.deep_learning.encoders import ProfileEncoder, SeqEncoder, SummaryEncoder, GatedFusion
+from ..encoders import ProfileEncoder, SeqEncoder, SummaryEncoder, GatedFusion
 
 
 class TriModalLiquidityModel(nn.Module):
