@@ -4897,6 +4897,7 @@ class IntradayMomentum:
             val_split: bool = False,
             val_split_size: float = 0.2,
             dropna: bool = True,
+            col_nan_threshold: float = 0.1,
             verbose: bool = False,
             remove_outliers: bool = False,
             outlier_threshold: float = 0.01,
@@ -4905,7 +4906,7 @@ class IntradayMomentum:
 
         Performs the following cleaning steps:
         1. Selects features from self.feature_names
-        2. Drops columns with >90% NaN values (keeps columns with at least 10% valid data)
+        2. Drops columns with too many NaN values (based on col_nan_threshold)
         3. Drops rows with any remaining NaN values (if dropna=True)
         4. Removes outliers from target data (if remove_outliers=True)
         5. Aligns with target data by date intersection
@@ -4925,6 +4926,12 @@ class IntradayMomentum:
         dropna : bool, default True
             If True, drop rows with NaN values. Set to False to keep all rows
             (useful for debugging or when you want to handle NaN yourself).
+        col_nan_threshold : float, default 0.1
+            Minimum fraction of non-NaN values required for each column.
+            Columns with fewer valid values are dropped. For example:
+            - 0.1 = keep columns with at least 10% valid data (drop if >90% NaN)
+            - 0.5 = keep columns with at least 50% valid data (drop if >50% NaN)
+            - 0.9 = keep columns with at least 90% valid data (drop if >10% NaN)
         verbose : bool, default False
             If True, print diagnostic info showing where rows are dropped
         remove_outliers : bool, default False
@@ -4949,15 +4956,16 @@ class IntradayMomentum:
         if verbose:
             print(f"Initial: {initial_rows} rows, {initial_cols} features")
 
-        # Step 1: Drop columns that are mostly NaN (>90% NaN)
-        # Keep columns with at least 10% non-NaN values
-        min_valid_count = max(1, int(len(x_data) * 0.1))
+        # Step 1: Drop columns with insufficient non-NaN values
+        # Keep columns with at least col_nan_threshold fraction of valid data
+        min_valid_count = max(1, int(len(x_data) * col_nan_threshold))
         x_data = x_data.dropna(axis=1, thresh=min_valid_count)
 
         if verbose:
             dropped_cols = initial_cols - len(x_data.columns)
             if dropped_cols > 0:
-                print(f"After dropping sparse columns: {len(x_data.columns)} features ({dropped_cols} dropped)")
+                print(f"After dropping sparse columns (threshold={col_nan_threshold:.1%}): "
+                      f"{len(x_data.columns)} features ({dropped_cols} dropped)")
 
         # Step 2: Drop rows with any remaining NaN values
         if dropna:
@@ -5427,6 +5435,7 @@ class DeepIDMomentum(IntradayMomentum):
             val_split: bool = False,
             val_split_size: float = 0.2,
             dropna: bool = True,
+            col_nan_threshold: float = 0.1,
             verbose: bool = False,
             remove_outliers: bool = False,
             outlier_threshold: float = 0.01,
@@ -5453,6 +5462,9 @@ class DeepIDMomentum(IntradayMomentum):
             Proportion of data to use for validation (only used if val_split=True)
         dropna : bool, default True
             If True, drop rows with NaN values
+        col_nan_threshold : float, default 0.1
+            Minimum fraction of non-NaN values required for each column.
+            Columns with fewer valid values are dropped.
         verbose : bool, default False
             If True, print diagnostic info
         remove_outliers : bool, default False
@@ -5520,6 +5532,7 @@ class DeepIDMomentum(IntradayMomentum):
             val_split=val_split,
             val_split_size=val_split_size,
             dropna=dropna,
+            col_nan_threshold=col_nan_threshold,
             verbose=verbose,
             remove_outliers=remove_outliers,
             outlier_threshold=outlier_threshold,

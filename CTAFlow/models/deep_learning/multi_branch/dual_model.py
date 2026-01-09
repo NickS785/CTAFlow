@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.nn.utils.rnn as rnn_utils
+from ..encoders import SeqEncoder
 
 
 class DualBranchModel(nn.Module):
@@ -46,12 +46,15 @@ class DualBranchModel(nn.Module):
         )
 
         # --- BRANCH B: MICRO SEQUENCE (Time-Series) ---
-        # LSTM to process the variable-length VPIN buckets
-        self.vpin_lstm = nn.LSTM(
-            input_size=vpin_input_dim,
-            hidden_size=lstm_hidden_dim,
-            num_layers=1,
-            batch_first=True
+        # SeqEncoder to process the variable-length VPIN buckets
+        # Handles packing/unpacking internally
+        self.vpin_lstm = SeqEncoder(
+            f_in=vpin_input_dim,
+            d_out=lstm_hidden_dim,
+            d_conv=64,
+            d_lstm=128,
+            dropout=0.1,
+            bidir=True
         )
 
         # --- FUSION HEAD ---
@@ -100,22 +103,11 @@ class DualBranchModel(nn.Module):
         # 1. Process Macro Data
         summary_out = self.summary_net(summary_data)
 
-        # 2. Process Micro Data (Packed)
-        # We pack the sequence so the LSTM ignores the zero-padding
-        packed_input = rnn_utils.pack_padded_sequence(
-            vpin_sequence,
-            vpin_lengths.cpu(),
-            batch_first=True,
-            enforce_sorted=False
-        )
-
-        # Run LSTM
-        # output contains all steps; hidden_state contains the final step
-        _, (hidden_state, _) = self.vpin_lstm(packed_input)
-
-        # hidden_state shape: (num_layers, batch, hidden_dim)
-        # We want the last layer's hidden state for every sample in batch
-        lstm_out = hidden_state[-1]
+        # 2. Process Micro Data
+        # SeqEncoder handles packing/unpacking internally
+        # Input: (batch, seq_len, features), seq_lengths
+        # Output: (batch, d_out)
+        lstm_out = self.vpin_lstm(vpin_sequence, vpin_lengths)
 
         # 3. Fuse
         combined = torch.cat((summary_out, lstm_out), dim=1)
