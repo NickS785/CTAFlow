@@ -4,6 +4,151 @@ import torch.nn.functional as F
 
 from ..encoders import ProfileEncoder, SeqEncoder, SummaryEncoder, GatedFusion
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn.utils.rnn as rnn_utils
+
+
+class MarketProfileCNN(nn.Module):
+    """
+    A lightweight 1D CNN specifically designed for Market Profile (histogram) data.
+    Input Shape: (Batch, Channels, Bins) -> e.g., (32, 3, 128)
+    """
+
+    def __init__(self, in_channels, out_dim=32):
+        super().__init__()
+        self.net = nn.Sequential(
+            # Block 1: Capture local shape (nodes/ledges)
+            nn.Conv1d(in_channels, 16, kernel_size=5, padding=2),
+            nn.BatchNorm1d(16),
+            nn.LeakyReLU(0.1),
+            nn.MaxPool1d(2),  # 128 -> 64
+
+            # Block 2: Capture structure (balance/imbalance)
+            nn.Conv1d(16, 32, kernel_size=5, padding=2),
+            nn.BatchNorm1d(32),
+            nn.LeakyReLU(0.1),
+            nn.MaxPool1d(2),  # 64 -> 32
+
+            # Block 3: Global abstraction
+            nn.Conv1d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
+            nn.LeakyReLU(0.1),
+            nn.AdaptiveAvgPool1d(1)  # Flatten to (Batch, 64, 1)
+        )
+
+        self.fc = nn.Linear(64, out_dim)
+
+    def forward(self, x):
+        x = self.net(x)
+        x = x.flatten(1)  # (Batch, 64)
+        return self.fc(x)  # (Batch, out_dim)
+
+
+class TriModalModel(nn.Module):
+    def __init__(
+            self,
+            f_sum: int,  # Number of summary features
+            f_seq: int = 3,  # Number of sequential features (VPIN, Return, Dur)
+            f_spatial: int = 3,  # Number of profile channels (Bid/Ask/Total)
+            d_model: int = 64,  # Hidden dimension size
+            dropout: float = 0.2,
+            task: str = 'regression',
+            num_classes: int = 3
+    ):
+        super().__init__()
+        self.task = task
+
+        # --- BRANCH 1: MACRO (Summary MLP) ---
+        self.summary_net = nn.Sequential(
+            nn.Linear(f_sum, d_model),
+            nn.BatchNorm1d(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model // 2)  # Compression
+        )
+
+        # --- BRANCH 2: MICRO (Sequential LSTM) ---
+        # Strictly akin to DualBranchModel's logic
+        self.lstm = nn.LSTM(
+            input_size=f_seq,
+            hidden_size=d_model,
+            num_layers=1,
+            batch_first=True
+        )
+
+        # --- BRANCH 3: SPATIAL (Profile CNN) ---
+        self.spatial_net = MarketProfileCNN(in_channels=f_spatial, out_dim=d_model // 2)
+
+        # --- FUSION HEAD ---
+        # Concatenate: Summary(32) + LSTM(64) + Spatial(32) = 128
+        fusion_dim = (d_model // 2) + d_model + (d_model // 2)
+
+        self.head = nn.Sequential(
+            nn.Linear(fusion_dim, 128),
+            nn.LayerNorm(128),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 64),
+            nn.GELU(),
+            nn.Linear(64, num_classes if task == 'classification' else 1)
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Kaiming initialization for better convergence."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm1d) or isinstance(m, nn.LayerNorm):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, summary_vec, seq_tensor, seq_lengths, profile_tensor, return_probs=False):
+        """
+        Args:
+            summary_vec: (Batch, f_sum)
+            seq_tensor: (Batch, Max_Len, f_seq)
+            seq_lengths: (Batch) - CPU Tensor of lengths
+            profile_tensor: (Batch, f_spatial, 128)
+        """
+        # 1. Macro Branch
+        z_sum = self.summary_net(summary_vec)
+
+        # 2. Micro Branch (Packed Sequence)
+        # Handle Packing
+        packed_seq = rnn_utils.pack_padded_sequence(
+            seq_tensor,
+            seq_lengths.cpu(),
+            batch_first=True,
+            enforce_sorted=False
+        )
+
+        # LSTM returns (output, (h_n, c_n))
+        # We only want the last hidden state (h_n)
+        _, (h_n, _) = self.lstm(packed_seq)
+        z_seq = h_n[-1]  # Shape: (Batch, d_model)
+
+        # 3. Spatial Branch
+        z_spatial = self.spatial_net(profile_tensor)
+
+        # 4. Concatenation Fusion
+        z_fused = torch.cat([z_sum, z_seq, z_spatial], dim=1)
+
+        # 5. Output Head
+        logits = self.head(z_fused)
+
+        if self.task == 'classification' and return_probs:
+            return F.softmax(logits, dim=1)
+
+        return logits
+
 
 class TriModalLiquidityModel(nn.Module):
     """
@@ -34,7 +179,7 @@ class TriModalLiquidityModel(nn.Module):
     sum_encoder : nn.Module, optional
         Custom summary encoder. Must have `out_dim` attribute.
     fusion_mode : str, default 'gated'
-        Fusion strategy: 'gated' (learned weights), 'concat' (concatenation), 'mean' (average)
+        Fusion strategy: 'gated' (learned weights), 'concat' (concatenation), 'mean' (average).
     head_mode : str, default 'default'
         Head architecture: 'default' (LayerNorm+GELU), 'classification' (ReLU, no LayerNorm),
         'simple' (single linear layer)
