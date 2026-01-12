@@ -45,6 +45,9 @@ def _extract_single_date_worker(args: tuple) -> Dict:
     config_dict, date_str = args
     dt = pd.Timestamp(date_str)
 
+    # Extract bucket_sizes if present (not part of FeatureExtractorConfig)
+    bucket_sizes = config_dict.pop('bucket_sizes', {})
+
     # Recreate config from dict
     config = FeatureExtractorConfig(**config_dict)
 
@@ -116,6 +119,7 @@ def _extract_single_date_worker(args: tuple) -> Dict:
 
     # Profile: from profile_start to vpin_start (prior session context)
     poc, val, vah = np.nan, np.nan, np.nan
+    profile_vwap = None  # Shared VWAP for NumberBars alignment
     if config.include_profile and profile_ext is not None and profile_start is not None:
         profile_data = df_raw.between_time(profile_start.time(), vpin_start.time(), inclusive='left')
         if not profile_data.empty:
@@ -137,6 +141,12 @@ def _extract_single_date_worker(args: tuple) -> Dict:
                     val = va_levels.min() if len(va_levels) > 0 else poc
                     vah = va_levels.max() if len(va_levels) > 0 else poc
 
+                # Calculate VWAP from profile period for NumberBars alignment
+                if 'Close' in profile_data.columns and 'TotalVolume' in profile_data.columns:
+                    total_vol = profile_data['TotalVolume'].sum()
+                    if total_vol > 0:
+                        profile_vwap = (profile_data['Close'] * profile_data['TotalVolume']).sum() / total_vol
+
             except Exception as e:
                 logger.warning(f"Profile calculation failed for {dt.date()}: {e}")
 
@@ -153,13 +163,16 @@ def _extract_single_date_worker(args: tuple) -> Dict:
                 inclusive='both'
             )
             if not nb_data.empty:
+                # Use profile VWAP as fixed center for alignment with profile price levels
+                # This ensures NumberBars and Profile share the same price grid for neural networks
                 tensor, meta = nb_ext.calculate_number_bars(
                     df=nb_data,
                     start_time=nb_start,
                     interval=config.num_bars_interval,
                     tick_size=config.profile_tick_size,
                     vwap_window=config.num_bars_vwap_window,
-                    num_levels=config.num_bars_levels
+                    num_levels=config.num_bars_levels,
+                    fixed_center=profile_vwap  # Align with profile
                 )
                 results['number_bars'] = tensor
                 results['number_bars_meta'] = meta
@@ -197,11 +210,19 @@ def _extract_single_date_worker(args: tuple) -> Dict:
                 'pre_low': pre_data['Close'].min()
             }
 
+    # Determine bucket size for VPIN
+    bucket_vol = config.vpin_bucket_size
+    if bucket_vol is None and config.auto_bucket:
+        # Use pre-computed bucket size for this year
+        bucket_vol = bucket_sizes.get(dt.year, vpin_ext.bucket_volume)
+    elif bucket_vol is None:
+        bucket_vol = vpin_ext.bucket_volume
+
     if not vpin_data.empty:
         try:
             vpin_df = vpin_ext.calculate_vpin(
                 vpin_data,
-                bucket_volume=config.vpin_bucket_size or vpin_ext.bucket_volume,
+                bucket_volume=bucket_vol,
                 window=config.vpin_window,
                 include_sequence_features=config.include_sequence_features
             )
@@ -212,6 +233,8 @@ def _extract_single_date_worker(args: tuple) -> Dict:
                 if config.include_ib:
                     vpin_df['ib_high'] = ib_high
                     vpin_df['ib_low'] = ib_low
+                # Add profile VWAP (shared centering reference for all modalities)
+                vpin_df['profile_vwap'] = profile_vwap if profile_vwap is not None else np.nan
                 for key, value in pre_summary.items():
                     vpin_df[key] = value
             results['vpin'] = vpin_df
@@ -233,6 +256,7 @@ class FeatureExtractorConfig:
     vpin_start_time: str = "08:30"
     vpin_end_time: str = "09:30"
     auto_bucket: bool = True  # Use auto_bucket_size when vpin_bucket_size is None
+    auto_bucket_cadence: int = 500  # Target number of buckets per day (default 500, was 50)
 
     # Profile Configuration
     include_profile: bool = True  # Toggle profile extraction
@@ -305,7 +329,7 @@ class MultiFeatureExtraction(ScidBaseExtractor):
         ) if config.include_number_bars else None
 
         self.dates = [pd.Timestamp(d) for d in dates]
-        self._bucket_size_cache: Optional[int] = None  # Cache for auto_bucket_size
+        self._bucket_size_cache: Dict[int, int] = {}  # Cache bucket sizes by year
 
     def _build_time_range(self, dt: pd.Timestamp, start_time: str, end_time: str) -> tuple:
         """Build datetime range from date and time strings."""
@@ -348,35 +372,99 @@ class MultiFeatureExtraction(ScidBaseExtractor):
 
         return min(starts), max(ends)
 
-    def _calculate_bucket_size(self, df_raw: pd.DataFrame) -> int:
+    def _get_yearly_bucket_size(self, year: int) -> int:
         """
-        Calculate optimal bucket size using auto_bucket_size.
+        Calculate optimal bucket size for a given year using previous 3 years of volume data.
+
+        This uses a rolling 3-year window to adapt to changing market volume regimes.
+        For example, 2023 data uses volume stats from 2020-2022 to determine bucket size.
 
         Args:
-            df_raw: Raw tick data with AskVolume and BidVolume columns
+            year: The year to calculate bucket size for
 
         Returns:
             Optimal bucket size for VPIN calculation
         """
-        if self._bucket_size_cache is not None:
-            return self._bucket_size_cache
+        # Define 3-year lookback window (year-3 to year-1)
+        start_year = year - 3
+        end_year = year - 1
 
-        if df_raw.empty:
-            return 50  # Default fallback
+        # Generate date range for the lookback period
+        lookback_start = pd.Timestamp(f"{start_year}-01-01")
+        lookback_end = pd.Timestamp(f"{end_year}-12-31")
 
-        # Prepare data for auto_bucket_size
-        ticks = df_raw.reset_index().rename(columns={df_raw.index.name or 'index': 'ts'})
-        if 'ts' not in ticks.columns:
-            ticks['ts'] = df_raw.index
+        logger.info(f"Calculating bucket size for year {year} using volume data from {start_year}-{end_year}")
 
         try:
-            bucket_size = auto_bucket_size(ticks, cadence_target=50)
-            self._bucket_size_cache = bucket_size
-            logger.info(f"Auto bucket size determined: {bucket_size}")
+            # Fetch volume data for the 3-year lookback period
+            # Sample trading days across the period to get representative volume stats
+            sample_dates = pd.date_range(lookback_start, lookback_end, freq='W-MON')  # Weekly sampling
+
+            all_ticks = []
+            for sample_dt in sample_dates:
+                try:
+                    # Fetch a full trading day of data
+                    day_start = pd.Timestamp(f"{sample_dt.strftime('%Y-%m-%d')} 00:00")
+                    day_end = pd.Timestamp(f"{sample_dt.strftime('%Y-%m-%d')} 23:59")
+
+                    df_sample = self.get_stitched_data(
+                        start_time=day_start,
+                        end_time=day_end,
+                        columns=["TotalVolume", "AskVolume", "BidVolume"]
+                    )
+
+                    if not df_sample.empty:
+                        # Prepare for auto_bucket_size
+                        ticks = df_sample.reset_index().rename(columns={df_sample.index.name or 'index': 'ts'})
+                        if 'ts' not in ticks.columns:
+                            ticks['ts'] = df_sample.index
+                        all_ticks.append(ticks)
+
+                except Exception as e:
+                    # Skip missing/bad dates
+                    continue
+
+            if not all_ticks:
+                logger.warning(f"No volume data found for {start_year}-{end_year}, using default bucket size 50")
+                return 50
+
+            # Concatenate all sampled ticks
+            combined_ticks = pd.concat(all_ticks, axis=0, ignore_index=True)
+
+            # Calculate bucket size using auto_bucket_size
+            bucket_size = auto_bucket_size(combined_ticks, cadence_target=self.config.auto_bucket_cadence)
+            logger.info(f"Year {year} bucket size: {bucket_size} (based on {len(all_ticks)} sample days)")
+
             return bucket_size
+
         except Exception as e:
-            logger.warning(f"auto_bucket_size failed: {e}, using default 50")
+            logger.warning(f"Failed to calculate yearly bucket size for {year}: {e}, using default 50")
             return 50
+
+    def _calculate_bucket_size(self, dt: pd.Timestamp) -> int:
+        """
+        Calculate optimal bucket size for a given date using rolling yearly fits.
+
+        Uses cached bucket size for the year if available, otherwise computes it
+        using the previous 3 years of volume data.
+
+        Args:
+            dt: Date being processed
+
+        Returns:
+            Optimal bucket size for VPIN calculation
+        """
+        year = dt.year
+
+        # Check cache
+        if year in self._bucket_size_cache:
+            return self._bucket_size_cache[year]
+
+        # Compute and cache bucket size for this year
+        bucket_size = self._get_yearly_bucket_size(year)
+        self._bucket_size_cache[year] = bucket_size
+
+        return bucket_size
 
     def _calculate_pre_summary(self, df_raw: pd.DataFrame, pre_start: pd.Timestamp,
                                pre_end: pd.Timestamp) -> Dict[str, float]:
@@ -445,6 +533,7 @@ class MultiFeatureExtraction(ScidBaseExtractor):
         # Profile-related calculations
         poc, val, vah = np.nan, np.nan, np.nan
         profile_start = None
+        profile_vwap = None  # Shared VWAP for NumberBars alignment
 
         if self.config.include_profile and self.profile_extractor is not None:
             profile_start, _ = self._build_time_range(
@@ -472,6 +561,12 @@ class MultiFeatureExtraction(ScidBaseExtractor):
                         val = va_levels.min() if len(va_levels) > 0 else poc
                         vah = va_levels.max() if len(va_levels) > 0 else poc
 
+                    # Calculate VWAP from profile period for NumberBars alignment
+                    if 'Close' in profile_data.columns and 'TotalVolume' in profile_data.columns:
+                        total_vol = profile_data['TotalVolume'].sum()
+                        if total_vol > 0:
+                            profile_vwap = (profile_data['Close'] * profile_data['TotalVolume']).sum() / total_vol
+
                 except Exception as e:
                     logger.warning(f"Profile calculation failed for {dt.date()}: {e}")
 
@@ -488,13 +583,16 @@ class MultiFeatureExtraction(ScidBaseExtractor):
                     inclusive='both'
                 )
                 if not nb_data.empty:
+                    # Use profile VWAP as fixed center for alignment with profile price levels
+                    # This ensures NumberBars and Profile share the same price grid for neural networks
                     tensor, meta = self.number_bars_extractor.calculate_number_bars(
                         df=nb_data,
                         start_time=nb_start,
                         interval=self.config.num_bars_interval,
                         tick_size=self.config.profile_tick_size,
                         vwap_window=self.config.num_bars_vwap_window,
-                        num_levels=self.config.num_bars_levels
+                        num_levels=self.config.num_bars_levels,
+                        fixed_center=profile_vwap  # Align with profile
                     )
                     results['number_bars'] = tensor
                     results['number_bars_meta'] = meta
@@ -504,7 +602,7 @@ class MultiFeatureExtraction(ScidBaseExtractor):
         # Determine bucket size for VPIN
         bucket_size = self.config.vpin_bucket_size
         if bucket_size is None and self.config.auto_bucket:
-            bucket_size = self._calculate_bucket_size(df_raw)
+            bucket_size = self._calculate_bucket_size(dt)
         elif bucket_size is None:
             bucket_size = self.vpin_extractor.bucket_volume
 
@@ -541,6 +639,8 @@ class MultiFeatureExtraction(ScidBaseExtractor):
                     if self.config.include_ib:
                         vpin_df['ib_high'] = ib_high
                         vpin_df['ib_low'] = ib_low
+                    # Add profile VWAP (shared centering reference for all modalities)
+                    vpin_df['profile_vwap'] = profile_vwap if profile_vwap is not None else np.nan
                     # Add pre-summary to VPIN
                     for key, value in pre_summary.items():
                         vpin_df[key] = value
@@ -550,9 +650,43 @@ class MultiFeatureExtraction(ScidBaseExtractor):
 
         return results
 
-    def _get_config_dict(self) -> dict:
-        """Convert config to dict for pickling in multiprocessing."""
-        return {
+    def _precompute_bucket_sizes(self, verbose: bool = False) -> Dict[int, int]:
+        """
+        Pre-compute bucket sizes for all unique years in the date range.
+
+        This is called at the start of extraction to avoid redundant computation
+        and to enable caching across parallel workers.
+
+        Args:
+            verbose: Print progress info
+
+        Returns:
+            Dict mapping year to bucket size
+        """
+        unique_years = sorted(set(dt.year for dt in self.dates))
+
+        if verbose:
+            logger.info(f"Pre-computing bucket sizes for {len(unique_years)} years: {unique_years}")
+
+        bucket_sizes = {}
+        for year in unique_years:
+            if year in self._bucket_size_cache:
+                bucket_sizes[year] = self._bucket_size_cache[year]
+            else:
+                bucket_size = self._get_yearly_bucket_size(year)
+                bucket_sizes[year] = bucket_size
+                self._bucket_size_cache[year] = bucket_size
+
+        return bucket_sizes
+
+    def _get_config_dict(self, bucket_sizes: Optional[Dict[int, int]] = None) -> dict:
+        """
+        Convert config to dict for pickling in multiprocessing.
+
+        Args:
+            bucket_sizes: Pre-computed bucket sizes by year (for auto_bucket mode)
+        """
+        config_dict = {
             'ticker': self.config.ticker,
             'data_dir': self.config.data_dir,
             'tz': self.config.tz,
@@ -562,6 +696,7 @@ class MultiFeatureExtraction(ScidBaseExtractor):
             'vpin_start_time': self.config.vpin_start_time,
             'vpin_end_time': self.config.vpin_end_time,
             'auto_bucket': self.config.auto_bucket,
+            'auto_bucket_cadence': self.config.auto_bucket_cadence,
             # Profile
             'include_profile': self.config.include_profile,
             'profile_tick_size': self.config.profile_tick_size,
@@ -586,6 +721,12 @@ class MultiFeatureExtraction(ScidBaseExtractor):
             'include_pre_summary': self.config.include_pre_summary,
             'pre_summary_start_time': self.config.pre_summary_start_time,
         }
+
+        # Add pre-computed bucket sizes for multiprocessing
+        if bucket_sizes is not None:
+            config_dict['bucket_sizes'] = bucket_sizes
+
+        return config_dict
 
     def extract_all(
             self,
@@ -612,6 +753,15 @@ class MultiFeatureExtraction(ScidBaseExtractor):
         List[Dict]
             List of dicts, each containing 'date', 'vpin', and 'profile'.
         """
+        # Pre-compute bucket sizes if auto_bucket is enabled
+        bucket_sizes = None
+        if self.config.auto_bucket and self.config.vpin_bucket_size is None:
+            if verbose:
+                logger.info("Pre-computing bucket sizes for rolling yearly fits...")
+            bucket_sizes = self._precompute_bucket_sizes(verbose=verbose)
+            if verbose:
+                logger.info(f"Bucket sizes by year: {bucket_sizes}")
+
         if n_jobs == 1:
             # Sequential processing
             results = []
@@ -649,7 +799,7 @@ class MultiFeatureExtraction(ScidBaseExtractor):
 
         else:
             # ProcessPoolExecutor - need to use module-level function
-            config_dict = self._get_config_dict()
+            config_dict = self._get_config_dict(bucket_sizes=bucket_sizes)
             work_items = [(config_dict, dt.isoformat()) for dt in self.dates]
 
             if verbose:

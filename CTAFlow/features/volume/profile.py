@@ -332,7 +332,8 @@ class NumberBarsExtractor(MarketProfileExtractor):
             vwap_window: Optional[str] = None,
             num_levels: Optional[int] = None,
             centering_method: Optional[str] = None,
-            normalize: bool = True
+            normalize: bool = True,
+            fixed_center: Optional[float] = None
     ) -> Tuple[np.ndarray, pd.DataFrame]:
         """
         Calculate Number Bars tensor from pre-fetched tick data.
@@ -362,6 +363,9 @@ class NumberBarsExtractor(MarketProfileExtractor):
                       - Channel 2: Bar return (log return, constant across levels)
                       Magnitude (log1p of total bar volume) stored in metadata.
                       If False, output raw volumes: [TotalVol, BidVol, AskVol, Delta, Trades]
+            fixed_center: If provided, use this price as the center for ALL bars instead of
+                         calculating per-bar centers. This ensures alignment with volume profile
+                         (e.g., use profile VWAP as fixed center). Will be snapped to tick_size.
 
         Returns:
             tensor: 3D array [N_Bars, 2*num_levels+1, num_features]
@@ -401,9 +405,16 @@ class NumberBarsExtractor(MarketProfileExtractor):
             # Both have timezones but different: convert start_ts to df's timezone
             start_ts = start_ts.tz_convert(raw_df.index.tz)
 
+        # Handle fixed center alignment (for profile coordination)
+        fixed_center_snapped = None
+        if fixed_center is not None:
+            # Snap fixed center to nearest tick
+            fixed_center_snapped = round(fixed_center / tick_size) * tick_size
+
         # Calculate rolling VWAP for centering (uses all data for lookback)
         vwap_series = None
-        if centering_method == "rolling_vwap":
+        if centering_method == "rolling_vwap" and fixed_center is None:
+            # Only calculate VWAP if not using fixed center
             vwap_series = self._calculate_rolling_vwap(raw_df, vwap_window)
 
         # Determine bucketing method
@@ -466,7 +477,11 @@ class NumberBarsExtractor(MarketProfileExtractor):
             buckets = self._create_volume_buckets(raw_df_filtered, interval)
 
             for bucket_end, group in buckets:
-                center_price = self._get_center_price(group, vwap_series, bucket_end, tick_size)
+                # Use fixed center if provided, otherwise calculate per-bar center
+                if fixed_center_snapped is not None:
+                    center_price = fixed_center_snapped
+                else:
+                    center_price = self._get_center_price(group, vwap_series, bucket_end, tick_size)
                 bar_grid = self._build_bar_grid(group, center_price, tick_size, num_levels)
                 bar_volume = float(group['TotalVolume'].sum())
                 bar_return = _calculate_bar_return(group)
@@ -494,14 +509,18 @@ class NumberBarsExtractor(MarketProfileExtractor):
                     tensor_list.append(np.zeros((grid_height, out_num_features)))
                     meta_list.append({
                         'Time': timestamp,
-                        'CenterPrice': np.nan,
+                        'CenterPrice': fixed_center_snapped if fixed_center_snapped is not None else np.nan,
                         'BarVolume': 0,
                         'LogMagnitude': 0.0,
                         'BarReturn': 0.0
                     })
                     continue
 
-                center_price = self._get_center_price(group, vwap_series, timestamp, tick_size)
+                # Use fixed center if provided, otherwise calculate per-bar center
+                if fixed_center_snapped is not None:
+                    center_price = fixed_center_snapped
+                else:
+                    center_price = self._get_center_price(group, vwap_series, timestamp, tick_size)
                 bar_grid = self._build_bar_grid(group, center_price, tick_size, num_levels)
                 bar_volume = float(group['TotalVolume'].sum())
                 bar_return = _calculate_bar_return(group)

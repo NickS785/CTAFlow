@@ -153,6 +153,78 @@ class SeqEncoder(nn.Module):
         z = self.pool(out, mask=mask)  # (B, D)
         return z
 
+
+class NumberBarsEncoder(nn.Module):
+    """
+    CNN-Transformer hybrid to process NumbersBars
+    x_nb: (B, T, BINS, C) -> (B, d_model)
+    """
+    def __init__(self, c_in=3, d_model=128, conv_ch=64, n_tf=2, n_heads=4, dropout=0.1, max_T=16):
+        super().__init__()
+        self.out_dim = d_model
+
+        # per-slice (over price bins) conv encoder
+        self.proj = nn.Conv1d(c_in, conv_ch, kernel_size=1)
+        self.conv = nn.Sequential(
+            nn.Conv1d(conv_ch, conv_ch, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(conv_ch, conv_ch, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.pool_bins = nn.AdaptiveAvgPool1d(1)
+        self.slice_to_model = nn.Sequential(
+            nn.Linear(conv_ch, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+        # temporal encoder across slices (T)
+        self.pos = nn.Embedding(max_T, d_model)
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=4*d_model,
+            dropout=dropout, activation="gelu", batch_first=True, norm_first=True
+        )
+        self.tf = nn.TransformerEncoder(layer, num_layers=n_tf)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x_nb, nb_lengths=None):
+        """
+        x_nb: (B, T, BINS, C)
+        nb_lengths: (B,) lengths for each sample (optional)
+        """
+        B, T, BINS, C = x_nb.shape
+
+        # (B*T, C, BINS)
+        x = x_nb.reshape(B*T, BINS, C).transpose(1, 2)
+
+        x = self.proj(x)            # (B*T, conv_ch, BINS)
+        x = self.conv(x)            # (B*T, conv_ch, BINS)
+        x = self.pool_bins(x).squeeze(-1)  # (B*T, conv_ch)
+
+        x = self.slice_to_model(x).reshape(B, T, -1)  # (B, T, d_model)
+
+        # key padding mask: True where PAD
+        key_padding_mask = None
+        if nb_lengths is not None:
+            t = torch.arange(T, device=x.device)[None, :]
+            key_padding_mask = t >= nb_lengths[:, None]  # (B,T) bool
+
+        # add positions + transformer
+        pos = torch.arange(T, device=x.device)[None, :].expand(B, T)
+        x = x + self.pos(pos)
+        x = self.tf(x, src_key_padding_mask=key_padding_mask)  # (B,T,d_model)
+
+        # masked mean pool
+        if nb_lengths is None:
+            z = x.mean(dim=1)
+        else:
+            mask = (~key_padding_mask).float()  # (B,T)
+            z = (x * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+
+        return self.norm(z)  # (B,d_model)
+
 class SummaryEncoder(nn.Module):
     """Summary: (B, F_sum) -> (B, D)"""
     def __init__(self, f_in: int, d_out=128, dropout=0.1):
