@@ -6,7 +6,6 @@ from typing import Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-
 __all__ = ["auto_bucket_size", "ticks_to_volume_buckets"]
 
 
