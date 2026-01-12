@@ -5075,6 +5075,7 @@ class DeepIDMomentum(IntradayMomentum):
     - Summary features (inherited from parent)
     - Sequential data (required)
     - Profile array data (optional)
+    - Number bars array data (optional)
 
     Parameters
     ----------
@@ -5083,6 +5084,8 @@ class DeepIDMomentum(IntradayMomentum):
         or market profile data that needs to be processed as sequences.
     profile_array : np.ndarray, optional
         Optional 3D array of profile data (n_samples, height, width) for CNN processing.
+    nb_arrays : mapping, optional
+        Optional mapping of date -> number bars array shaped (T_nb, BINS, C_nb).
     **kwargs
         All other arguments passed to IntradayMomentum.__init__
     """
@@ -5091,6 +5094,7 @@ class DeepIDMomentum(IntradayMomentum):
             self,
             sequential_data: pd.DataFrame,
             profile_array: Optional[np.ndarray] = None,
+            nb_arrays: Optional[Mapping[datetime.date, np.ndarray]] = None,
             **kwargs
     ) -> None:
         # Initialize parent class
@@ -5109,9 +5113,47 @@ class DeepIDMomentum(IntradayMomentum):
         if profile_array is not None:
             self.training_data['profile'] = profile_array
 
+        if nb_arrays is not None:
+            self.training_data['number_bars'] = nb_arrays
+
         # Store reference to sequential data for easy access
         self.sequential_data = sequential_data
         self.profile_array = profile_array
+        self.nb_arrays = nb_arrays
+
+    @staticmethod
+    def _load_number_bars(nb_filepath: str) -> Dict[datetime.date, np.ndarray]:
+        """Load number bars arrays keyed by date from a .npz file."""
+        if not nb_filepath.endswith(".npz"):
+            raise ValueError("Number bars data must be provided as a .npz file.")
+
+        npz_data = np.load(nb_filepath, allow_pickle=True)
+        keys = set(npz_data.files)
+
+        date_key = next((k for k in ("dates", "date", "datetimes", "index") if k in keys), None)
+        array_key = next((k for k in ("arrays", "nb", "number_bars", "bars", "data") if k in keys), None)
+
+        if date_key is None or array_key is None:
+            raise ValueError(
+                f"Number bars npz must include dates + arrays. Found keys: {sorted(keys)}"
+            )
+
+        dates = pd.to_datetime(npz_data[date_key]).date
+        arrays = npz_data[array_key]
+
+        if isinstance(arrays, np.ndarray) and arrays.dtype == object:
+            arrays = list(arrays)
+
+        if len(dates) != len(arrays):
+            raise ValueError(
+                f"Mismatch between dates ({len(dates)}) and arrays ({len(arrays)}) in {nb_filepath}"
+            )
+
+        nb_by_date: Dict[datetime.date, np.ndarray] = {}
+        for d, arr in zip(dates, arrays):
+            nb_by_date[pd.Timestamp(d).date()] = np.asarray(arr, dtype=np.float32)
+
+        return nb_by_date
 
     @classmethod
     def from_files(
@@ -5120,6 +5162,7 @@ class DeepIDMomentum(IntradayMomentum):
             features_path: str,
             sequential_path: str,
             profile_path: Optional[str] = None,
+            nb_filepath: Optional[str] = None,
             target_path: Optional[str] = None,
             target_col: str = "target",
             **kwargs,
@@ -5136,6 +5179,8 @@ class DeepIDMomentum(IntradayMomentum):
             Path to sequential data (CSV or Parquet with DatetimeIndex)
         profile_path : str, optional
             Path to profile array data (.npy file)
+        nb_filepath : str, optional
+            Path to number bars data (.npz with dates + arrays)
         target_path : str, optional
             Path to target data. If None, expects target_col in features file.
         target_col : str, default "target"
@@ -5180,6 +5225,10 @@ class DeepIDMomentum(IntradayMomentum):
         if profile_path is not None:
             profile_array = np.load(profile_path)
 
+        nb_arrays = None
+        if nb_filepath is not None:
+            nb_arrays = cls._load_number_bars(nb_filepath)
+
         # Load or extract target
         if target_path is not None:
             if target_path.endswith('.parquet'):
@@ -5201,12 +5250,14 @@ class DeepIDMomentum(IntradayMomentum):
         kwargs_copy.pop('intraday_data', None)
         kwargs_copy.pop('sequential_data', None)
         kwargs_copy.pop('profile_array', None)
+        kwargs_copy.pop('nb_arrays', None)
 
         # Create instance - pass intraday_data to parent, sequential_data to child
         instance = cls(
             intraday_data=intraday_data,
             sequential_data=sequential_df,
             profile_array=profile_array,
+            nb_arrays=nb_arrays,
             **kwargs_copy
         )
 
@@ -5493,6 +5544,7 @@ class DeepIDMomentum(IntradayMomentum):
         torch.utils.data.DataLoader or Tuple[DataLoader, DataLoader]
             If val_split=False: single DataLoader for all data
             If val_split=True: (train_loader, val_loader) tuple
+            If profile/number bars are present, loaders yield extra tensors accordingly.
 
         Examples
         --------
@@ -5512,15 +5564,43 @@ class DeepIDMomentum(IntradayMomentum):
         try:
             import torch
             from torch.utils.data import DataLoader
-            from ..data.model_datasets import DualDataset
+            from ..data.model_datasets import DualDataset, QuadModalDataset, TriModalDataset
         except ImportError as e:
             raise ImportError(
                 "PyTorch is required for get_loaders(). "
                 "Install with: pip install torch"
             ) from e
 
-        # Custom collate function for variable-length sequences
-        def collate_fn(batch):
+        def build_spatial_lookup():
+            if self.profile_array is None:
+                return None
+            summary_df = self.training_data.get("summary")
+            if summary_df is None or len(summary_df) != len(self.profile_array):
+                raise ValueError(
+                    "profile_array length must match summary data length to align by date."
+                )
+            summary_dates = pd.to_datetime(summary_df.index).date
+            return {
+                date: np.asarray(self.profile_array[i], dtype=np.float32)
+                for i, date in enumerate(summary_dates)
+            }
+
+        def spatial_arrays_from_lookup(spatial_by_date):
+            dates = np.array(sorted(spatial_by_date.keys()))
+            spatial_data = np.stack([spatial_by_date[date] for date in dates])
+            return spatial_data, dates
+
+        spatial_by_date = build_spatial_lookup()
+        if self.nb_arrays is not None and spatial_by_date is None:
+            raise ValueError("Number bars require profile_array to align spatial features.")
+
+        spatial_data = None
+        spatial_dates = None
+        if spatial_by_date is not None:
+            spatial_data, spatial_dates = spatial_arrays_from_lookup(spatial_by_date)
+
+        # Custom collate functions for variable-length sequences
+        def collate_dual(batch):
             import torch.nn.utils.rnn as rnn_utils
             summaries, sequential_seqs, targets, lengths = zip(*batch)
             summaries = torch.stack(summaries)
@@ -5530,6 +5610,44 @@ class DeepIDMomentum(IntradayMomentum):
                 sequential_seqs, batch_first=True, padding_value=0.0
             )
             return summaries, sequential_padded, targets, lengths
+
+        def collate_tri(batch):
+            import torch.nn.utils.rnn as rnn_utils
+            summaries, sequential_seqs, profiles, targets, lengths = zip(*batch)
+            summaries = torch.stack(summaries)
+            profiles = torch.stack(profiles)
+            targets = torch.stack(targets)
+            lengths = torch.tensor(lengths)
+            sequential_padded = rnn_utils.pad_sequence(
+                sequential_seqs, batch_first=True, padding_value=0.0
+            )
+            return summaries, sequential_padded, profiles, targets, lengths
+
+        def collate_quad(batch):
+            import torch.nn.utils.rnn as rnn_utils
+            summaries, sequential_seqs, profiles, nb_seqs, targets, lengths, nb_lengths = zip(*batch)
+            summaries = torch.stack(summaries)
+            profiles = torch.stack(profiles)
+            targets = torch.stack(targets)
+            lengths = torch.tensor(lengths)
+            nb_lengths = torch.tensor(nb_lengths)
+            sequential_padded = rnn_utils.pad_sequence(
+                sequential_seqs, batch_first=True, padding_value=0.0
+            )
+            max_nb_len = int(max(nb_lengths)) if nb_lengths.numel() > 0 else 0
+            if max_nb_len > 0:
+                nb_shape = nb_seqs[0].shape
+                nb_bins = nb_shape[1]
+                nb_channels = nb_shape[2]
+                nb_padded = torch.zeros(
+                    (len(nb_seqs), max_nb_len, nb_bins, nb_channels),
+                    dtype=nb_seqs[0].dtype,
+                )
+                for i, nb_seq in enumerate(nb_seqs):
+                    nb_padded[i, :nb_seq.shape[0]] = nb_seq
+            else:
+                nb_padded = torch.zeros((len(nb_seqs), 0, 0, 0))
+            return summaries, sequential_padded, profiles, nb_padded, targets, lengths, nb_lengths
 
         # Use get_xy to get aligned, cleaned data
         result = self.get_xy(
@@ -5547,25 +5665,70 @@ class DeepIDMomentum(IntradayMomentum):
         if val_split:
             X_train, X_val, y_train, y_val = result
 
-            # Create train dataset
-            train_dataset = DualDataset(
-                summary_data=X_train,
-                sequential_data=self.sequential_data,
-                target_data=y_train,
-                max_len=max_seq_len,
-                sequential_cols=sequential_cols,
-                target_col=None,  # Targets already aligned via y_train
-            )
-
-            # Create validation dataset
-            val_dataset = DualDataset(
-                summary_data=X_val,
-                sequential_data=self.sequential_data,
-                target_data=y_val,
-                max_len=max_seq_len,
-                sequential_cols=sequential_cols,
-                target_col=None,
-            )
+            if self.nb_arrays is not None:
+                train_dataset = QuadModalDataset(
+                    summary_data=X_train,
+                    sequential_data=self.sequential_data,
+                    spatial_data=spatial_data,
+                    spatial_dates=spatial_dates,
+                    nb_data=self.nb_arrays,
+                    target_data=y_train,
+                    max_len=max_seq_len,
+                    sequential_cols=sequential_cols,
+                    target_col=None,
+                )
+                val_dataset = QuadModalDataset(
+                    summary_data=X_val,
+                    sequential_data=self.sequential_data,
+                    spatial_data=spatial_data,
+                    spatial_dates=spatial_dates,
+                    nb_data=self.nb_arrays,
+                    target_data=y_val,
+                    max_len=max_seq_len,
+                    sequential_cols=sequential_cols,
+                    target_col=None,
+                )
+                collate_fn = collate_quad
+            elif self.profile_array is not None:
+                train_dataset = TriModalDataset(
+                    summary_data=X_train,
+                    sequential_data=self.sequential_data,
+                    spatial_data=spatial_data,
+                    spatial_dates=spatial_dates,
+                    target_data=y_train,
+                    max_len=max_seq_len,
+                    sequential_cols=sequential_cols,
+                    target_col=None,
+                )
+                val_dataset = TriModalDataset(
+                    summary_data=X_val,
+                    sequential_data=self.sequential_data,
+                    spatial_data=spatial_data,
+                    spatial_dates=spatial_dates,
+                    target_data=y_val,
+                    max_len=max_seq_len,
+                    sequential_cols=sequential_cols,
+                    target_col=None,
+                )
+                collate_fn = collate_tri
+            else:
+                train_dataset = DualDataset(
+                    summary_data=X_train,
+                    sequential_data=self.sequential_data,
+                    target_data=y_train,
+                    max_len=max_seq_len,
+                    sequential_cols=sequential_cols,
+                    target_col=None,  # Targets already aligned via y_train
+                )
+                val_dataset = DualDataset(
+                    summary_data=X_val,
+                    sequential_data=self.sequential_data,
+                    target_data=y_val,
+                    max_len=max_seq_len,
+                    sequential_cols=sequential_cols,
+                    target_col=None,
+                )
+                collate_fn = collate_dual
 
             # Create DataLoaders
             train_loader = DataLoader(
@@ -5590,14 +5753,41 @@ class DeepIDMomentum(IntradayMomentum):
             X, y = result
 
             # Create dataset
-            dataset = DualDataset(
-                summary_data=X,
-                sequential_data=self.sequential_data,
-                target_data=y,
-                max_len=max_seq_len,
-                sequential_cols=sequential_cols,
-                target_col=None,
-            )
+            if self.nb_arrays is not None:
+                dataset = QuadModalDataset(
+                    summary_data=X,
+                    sequential_data=self.sequential_data,
+                    spatial_data=spatial_data,
+                    spatial_dates=spatial_dates,
+                    nb_data=self.nb_arrays,
+                    target_data=y,
+                    max_len=max_seq_len,
+                    sequential_cols=sequential_cols,
+                    target_col=None,
+                )
+                collate_fn = collate_quad
+            elif self.profile_array is not None:
+                dataset = TriModalDataset(
+                    summary_data=X,
+                    sequential_data=self.sequential_data,
+                    spatial_data=spatial_data,
+                    spatial_dates=spatial_dates,
+                    target_data=y,
+                    max_len=max_seq_len,
+                    sequential_cols=sequential_cols,
+                    target_col=None,
+                )
+                collate_fn = collate_tri
+            else:
+                dataset = DualDataset(
+                    summary_data=X,
+                    sequential_data=self.sequential_data,
+                    target_data=y,
+                    max_len=max_seq_len,
+                    sequential_cols=sequential_cols,
+                    target_col=None,
+                )
+                collate_fn = collate_dual
 
             # Create DataLoader
             loader = DataLoader(
@@ -5609,5 +5799,3 @@ class DeepIDMomentum(IntradayMomentum):
             )
 
             return loader
-
-

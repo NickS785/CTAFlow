@@ -374,7 +374,7 @@ import torch
 from torch.utils.data import Dataset
 import pandas as pd
 import numpy as np
-from typing import Optional, List, Union
+from typing import Optional, List, Union, Mapping
 
 
 class TriModalDataset(Dataset):
@@ -628,3 +628,301 @@ class TriModalDataset(Dataset):
         target = torch.tensor(self.targets[idx])
 
         return summary_vec, seq_tensor, spatial_tensor, target, seq_len
+
+
+class QuadModalDataset(Dataset):
+    """
+    Dataset for summary, sequential, spatial, and number bars modalities.
+
+    Number bars are expected with shape (T_nb, BINS, C_nb) per date.
+    """
+    def __init__(self,
+                 summary_data: pd.DataFrame,
+                 sequential_data: pd.DataFrame,
+                 spatial_data: np.ndarray,
+                 spatial_dates: np.ndarray,
+                 nb_data: Union[np.ndarray, Mapping, None],
+                 nb_dates: Optional[np.ndarray] = None,
+                 target_data: Optional[Union[pd.DataFrame, pd.Series, np.ndarray]] = None,
+                 max_len: int = 200,
+                 sequential_cols: Optional[List[str]] = None,
+                 target_col: Optional[str] = None,
+                 date_col: str = 'Datetime',
+                 sequential_date_col: str = 'date'):
+        # ==========================================
+        # 1. Process Summary Features
+        # ==========================================
+        self.df_summary = summary_data.copy()
+
+        if date_col not in self.df_summary.columns:
+            if isinstance(self.df_summary.index, pd.DatetimeIndex):
+                self.df_summary[date_col] = self.df_summary.index
+            else:
+                raise ValueError(f"Date column '{date_col}' not found in summary_data and index is not DatetimeIndex")
+
+        self.df_summary = self.df_summary.reset_index(drop=True)
+        self.df_summary[date_col] = pd.to_datetime(self.df_summary[date_col])
+        self.df_summary['date'] = self.df_summary[date_col].dt.date
+
+        exclude_cols = [date_col, 'date', 'Target', target_col] if target_col else [date_col, 'date', 'Target']
+        exclude_cols = [c for c in exclude_cols if c is not None]
+
+        self.feature_cols = [c for c in self.df_summary.columns if c not in exclude_cols]
+        self.features = self.df_summary[self.feature_cols].values.astype(np.float32)
+
+        # ==========================================
+        # 2. Process Target Data
+        # ==========================================
+        self.target_col = target_col
+
+        if target_data is not None:
+            if isinstance(target_data, pd.Series):
+                if isinstance(target_data.index, pd.DatetimeIndex):
+                    temp_map = target_data.copy()
+                    temp_map.index = temp_map.index.date
+                    self.targets = np.array([temp_map.get(d, np.nan) for d in self.df_summary['date']],
+                                            dtype=np.float32)
+                else:
+                    self.targets = target_data.values.astype(np.float32)
+
+            elif isinstance(target_data, pd.DataFrame):
+                if target_col is None:
+                    raise ValueError("target_col must be specified when target_data is a DataFrame")
+
+                target_df = target_data.copy()
+                t_date_col = 'Datetime' if 'Datetime' in target_df.columns else date_col
+                if t_date_col in target_df.columns:
+                    target_df[t_date_col] = pd.to_datetime(target_df[t_date_col])
+                    target_df['date'] = target_df[t_date_col].dt.date
+                elif isinstance(target_df.index, pd.DatetimeIndex):
+                    target_df['date'] = target_df.index.date
+
+                if 'date' in target_df.columns:
+                    target_map = dict(zip(target_df['date'], target_df[target_col]))
+                    self.targets = np.array([target_map.get(d, np.nan) for d in self.df_summary['date']],
+                                            dtype=np.float32)
+                else:
+                    self.targets = target_df[target_col].values.astype(np.float32)
+            else:
+                self.targets = np.asarray(target_data, dtype=np.float32)
+
+        elif target_col and target_col in self.df_summary.columns:
+            self.targets = self.df_summary[target_col].values.astype(np.float32)
+        else:
+            self.targets = np.zeros(len(self.df_summary), dtype=np.float32)
+
+        # ==========================================
+        # 3. Process Sequential Data (VPIN)
+        # ==========================================
+        self.df_sequential = sequential_data.copy()
+
+        if sequential_date_col not in self.df_sequential.columns:
+            if isinstance(self.df_sequential.index, pd.DatetimeIndex):
+                self.df_sequential[sequential_date_col] = self.df_sequential.index
+            else:
+                if 'ts_end' in self.df_sequential.columns:
+                    self.df_sequential[sequential_date_col] = pd.to_datetime(self.df_sequential['ts_end'])
+                else:
+                    raise ValueError(f"Date column '{sequential_date_col}' not found in sequential_data")
+
+        if sequential_cols is None:
+            ignore = [sequential_date_col, 'ts_end', 'ts_start', 'bucket', 'date']
+            self.sequential_cols = [c for c in self.df_sequential.select_dtypes(include=[np.number]).columns if
+                                    c not in ignore]
+        else:
+            self.sequential_cols = [c for c in sequential_cols if c in self.df_sequential.columns]
+
+        self.df_sequential = self.df_sequential.reset_index(drop=True)
+        self.df_sequential['date'] = pd.to_datetime(self.df_sequential[sequential_date_col]).dt.date
+
+        self.sequential_by_date = {}
+        for d, group in self.df_sequential.groupby('date'):
+            arr = group[self.sequential_cols].values.astype(np.float32)
+            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+            self.sequential_by_date[d] = arr
+
+        self.max_len = max_len
+        self.n_sequential_features = len(self.sequential_cols)
+
+        # ==========================================
+        # 4. Process Spatial Data (Profiles)
+        # ==========================================
+        spatial_dates_dt = pd.to_datetime(spatial_dates).date
+
+        self.spatial_by_date = {
+            d: spatial_data[i].astype(np.float32)
+            for i, d in enumerate(spatial_dates_dt)
+        }
+
+        if len(self.spatial_by_date) > 0:
+            self.spatial_shape = next(iter(self.spatial_by_date.values())).shape
+        else:
+            self.spatial_shape = (1, 128)
+
+        # ==========================================
+        # 5. Process Number Bars
+        # ==========================================
+        if nb_data is None:
+            raise ValueError("nb_data must be provided for QuadModalDataset.")
+
+        if isinstance(nb_data, Mapping):
+            self.nb_by_date = {pd.Timestamp(k).date(): np.asarray(v, dtype=np.float32) for k, v in nb_data.items()}
+        else:
+            if nb_dates is None:
+                raise ValueError("nb_dates must be provided when nb_data is an array.")
+            nb_dates_dt = pd.to_datetime(nb_dates).date
+            self.nb_by_date = {
+                d: np.asarray(nb_data[i], dtype=np.float32)
+                for i, d in enumerate(nb_dates_dt)
+            }
+
+        if len(self.nb_by_date) > 0:
+            self.nb_shape = next(iter(self.nb_by_date.values())).shape
+        else:
+            self.nb_shape = (1, 1, 1)
+
+        # ==========================================
+        # 6. Alignment
+        # ==========================================
+        self._align_to_common_dates()
+
+    def _align_to_common_dates(self):
+        """Ensure summary, sequential, spatial, number bars, and target have the same dates."""
+        summary_dates = set(self.df_summary['date'].unique())
+        sequential_dates = set(self.sequential_by_date.keys())
+        spatial_dates = set(self.spatial_by_date.keys())
+        nb_dates = set(self.nb_by_date.keys())
+
+        common_dates = summary_dates & sequential_dates & spatial_dates & nb_dates
+
+        self.df_summary['__target__'] = self.targets
+        valid_target_dates = set(self.df_summary.dropna(subset=['__target__'])['date'])
+        common_dates = common_dates & valid_target_dates
+
+        if len(common_dates) == 0:
+            raise ValueError("No common dates found across all data sources.")
+
+        common_dates = sorted(common_dates)
+
+        mask = self.df_summary['date'].isin(common_dates)
+        self.df_summary = self.df_summary[mask].sort_values('date').reset_index(drop=True)
+
+        self.features = self.df_summary[self.feature_cols].values.astype(np.float32)
+        self.targets = self.df_summary['__target__'].values.astype(np.float32)
+
+        self.df_summary = self.df_summary.drop(columns=['__target__'])
+
+        self.sequential_by_date = {d: self.sequential_by_date[d] for d in common_dates}
+        self.spatial_by_date = {d: self.spatial_by_date[d] for d in common_dates}
+        self.nb_by_date = {d: self.nb_by_date[d] for d in common_dates}
+
+        print(f"✓ QuadModalDataset aligned to {len(common_dates)} common dates")
+
+    @classmethod
+    def from_files(cls, summary_path, sequential_path, spatial_path, nb_path, target_path=None, **kwargs):
+        """Helper to load from file paths."""
+        if summary_path.endswith('.parquet'):
+            summary_data = pd.read_parquet(summary_path)
+        else:
+            summary_data = pd.read_csv(summary_path)
+
+        if sequential_path.endswith('.parquet'):
+            sequential_data = pd.read_parquet(sequential_path)
+        else:
+            sequential_data = pd.read_csv(sequential_path)
+
+        try:
+            npz_data = np.load(spatial_path, allow_pickle=True)
+            spatial_data = npz_data['profiles']
+            spatial_dates = npz_data['dates']
+        except Exception as e:
+            raise ValueError(f"Failed to load spatial NPZ: {e}")
+
+        try:
+            nb_npz = np.load(nb_path, allow_pickle=True)
+            nb_dates = nb_npz['dates'] if 'dates' in nb_npz else nb_npz['date']
+            nb_arrays = nb_npz['arrays'] if 'arrays' in nb_npz else nb_npz['nb']
+        except Exception as e:
+            raise ValueError(f"Failed to load number bars NPZ: {e}")
+
+        target_data = None
+        if target_path:
+            if target_path.endswith('.parquet'):
+                target_data = pd.read_parquet(target_path)
+            else:
+                target_data = pd.read_csv(target_path)
+
+        return cls(
+            summary_data,
+            sequential_data,
+            spatial_data,
+            spatial_dates,
+            nb_arrays,
+            nb_dates=nb_dates,
+            target_data=target_data,
+            **kwargs,
+        )
+
+    def __len__(self):
+        return len(self.df_summary)
+
+    def __getitem__(self, idx):
+        summary_vec = torch.tensor(self.features[idx])
+        target_date = self.df_summary.iloc[idx]['date']
+
+        seq_data = self.sequential_by_date.get(target_date)
+        if seq_data is None:
+            seq_data = np.zeros((1, self.n_sequential_features), dtype=np.float32)
+
+        if len(seq_data) > self.max_len:
+            seq_data = seq_data[-self.max_len:]
+
+        seq_tensor = torch.tensor(seq_data)
+        seq_len = len(seq_data)
+
+        spatial_data = self.spatial_by_date.get(target_date)
+        if spatial_data is None:
+            spatial_data = np.zeros(self.spatial_shape, dtype=np.float32)
+        spatial_tensor = torch.tensor(spatial_data)
+
+        nb_data = self.nb_by_date.get(target_date)
+        if nb_data is None:
+            nb_data = np.zeros(self.nb_shape, dtype=np.float32)
+        nb_tensor = torch.tensor(nb_data)
+        nb_len = nb_tensor.shape[0]
+
+        target = torch.tensor(self.targets[idx])
+
+        return summary_vec, seq_tensor, spatial_tensor, nb_tensor, target, seq_len, nb_len
+
+
+def _sanity_check_quad_modal():
+    dates = pd.date_range("2024-01-01", periods=3, freq="D")
+    summary = pd.DataFrame({"Datetime": dates, "feat": [1.0, 2.0, 3.0]})
+    seq_rows = []
+    for d in dates:
+        for i in range(2):
+            seq_rows.append({"date": d, "vpin": i * 0.1, "ret": i * 0.2})
+    seq = pd.DataFrame(seq_rows)
+    profiles = np.random.rand(3, 3, 8).astype(np.float32)
+    nb = {
+        d.date(): np.random.rand(2 + i, 5, 3).astype(np.float32)
+        for i, d in enumerate(dates)
+    }
+    targets = pd.Series([0.1, 0.2, 0.3], index=dates)
+
+    dataset = QuadModalDataset(
+        summary_data=summary,
+        sequential_data=seq,
+        spatial_data=profiles,
+        spatial_dates=dates,
+        nb_data=nb,
+        target_data=targets,
+        max_len=5,
+    )
+    sample = dataset[0]
+    print("QuadModal sample shapes:", [x.shape for x in sample[:-2]], sample[-2:])
+
+
+if __name__ == "__main__":
+    _sanity_check_quad_modal()

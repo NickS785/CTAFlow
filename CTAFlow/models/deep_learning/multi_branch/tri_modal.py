@@ -2,7 +2,14 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from ..encoders import ProfileEncoder, SeqEncoder, SummaryEncoder, GatedFusion
+from ..encoders import (
+    GatedFusion,
+    NumberBarsEncoder,
+    ProfileEncoder,
+    SeqEncoder,
+    SpatialFuse,
+    SummaryEncoder,
+)
 
 import torch
 import torch.nn as nn
@@ -52,10 +59,12 @@ class TriModalModel(nn.Module):
             f_sum: int,  # Number of summary features
             f_seq: int = 3,  # Number of sequential features (VPIN, Return, Dur)
             f_spatial: int = 3,  # Number of profile channels (Bid/Ask/Total)
+            f_nb: int = 3,  # Number bars channels
             d_model: int = 64,  # Hidden dimension size
             dropout: float = 0.2,
             task: str = 'regression',
-            num_classes: int = 3
+            num_classes: int = 3,
+            spatial_fuse_mode: str = "gated",
     ):
         super().__init__()
         self.task = task
@@ -80,6 +89,10 @@ class TriModalModel(nn.Module):
 
         # --- BRANCH 3: SPATIAL (Profile CNN) ---
         self.spatial_net = MarketProfileCNN(in_channels=f_spatial, out_dim=d_model // 2)
+
+        # --- BRANCH 4: NUMBER BARS (Optional) ---
+        self.nb_net = NumberBarsEncoder(c_in=f_nb, d_model=d_model // 2)
+        self.spatial_fuse = SpatialFuse(d_spatial=d_model // 2, mode=spatial_fuse_mode)
 
         # --- FUSION HEAD ---
         # Concatenate: Summary(32) + LSTM(64) + Spatial(32) = 128
@@ -110,13 +123,24 @@ class TriModalModel(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, summary_vec, seq_tensor, seq_lengths, profile_tensor, return_probs=False):
+    def forward(
+        self,
+        summary_vec,
+        seq_tensor,
+        seq_lengths,
+        profile_tensor,
+        nb_tensor=None,
+        nb_lengths=None,
+        return_probs=False,
+    ):
         """
         Args:
             summary_vec: (Batch, f_sum)
             seq_tensor: (Batch, Max_Len, f_seq)
             seq_lengths: (Batch) - CPU Tensor of lengths
             profile_tensor: (Batch, f_spatial, 128)
+            nb_tensor: Optional number bars tensor (Batch, T_nb, BINS, C_nb)
+            nb_lengths: Optional lengths for number bars slices (Batch)
         """
         # 1. Macro Branch
         z_sum = self.summary_net(summary_vec)
@@ -135,7 +159,11 @@ class TriModalModel(nn.Module):
         z_seq = h_n[-1]  # Shape: (Batch, d_model)
 
         # 3. Spatial Branch
-        z_spatial = self.spatial_net(profile_tensor)
+        z_profile = self.spatial_net(profile_tensor)
+        z_nb = None
+        if nb_tensor is not None:
+            z_nb = self.nb_net(nb_tensor, nb_lengths)
+        z_spatial = self.spatial_fuse(z_profile, z_nb)
 
         # 4. Concatenation Fusion
         z_fused = torch.cat([z_sum, z_seq, z_spatial], dim=1)
