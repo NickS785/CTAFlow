@@ -39,6 +39,29 @@ class GatedFusion(nn.Module):
             z = z + zi * w[:, i:i+1]
         return z, w
 
+
+class SpatialFuse(nn.Module):
+    """Fuse spatial embeddings from profile + number bars."""
+    def __init__(self, d_spatial: int, mode: str = "gated"):
+        super().__init__()
+        self.mode = mode
+        if mode == "gated":
+            self.gate = nn.Sequential(
+                nn.Linear(d_spatial * 2, d_spatial),
+                nn.GELU(),
+                nn.Linear(d_spatial, 2),
+            )
+        elif mode != "mean":
+            raise ValueError(f"Unknown SpatialFuse mode: {mode}")
+
+    def forward(self, z_profile, z_nb=None):
+        if z_nb is None:
+            return z_profile
+        if self.mode == "mean":
+            return 0.5 * (z_profile + z_nb)
+        weights = F.softmax(self.gate(torch.cat([z_profile, z_nb], dim=-1)), dim=-1)
+        return weights[:, 0:1] * z_profile + weights[:, 1:2] * z_nb
+
 # ----------------------------
 # Encoders
 # ----------------------------

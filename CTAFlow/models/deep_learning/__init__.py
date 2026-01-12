@@ -13,8 +13,10 @@ from .training import (
 from .encoders import (
     AttnPool,
     GatedFusion,
+    NumberBarsEncoder,
     ProfileEncoder,
     SeqEncoder,
+    SpatialFuse,
     SummaryEncoder,
     SummaryMLPEnc,
 )
@@ -44,8 +46,10 @@ __all__ = [
     # Encoders
     "AttnPool",
     "GatedFusion",
+    "NumberBarsEncoder",
     "ProfileEncoder",
     "SeqEncoder",
+    "SpatialFuse",
     "SummaryEncoder",
     "SummaryMLPEnc",
     # Multi-branch models
