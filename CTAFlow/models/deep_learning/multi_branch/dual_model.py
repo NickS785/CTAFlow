@@ -44,7 +44,9 @@ class DualBranchModel(nn.Module):
         num_classes=3,
         summary_encoder=None,
         seq_encoder=None,
-        fusion_mode='default'
+        fusion_mode='default',
+        seq_dropout = 0.1,
+        fusion_dropout = 0.3
     ):
         super(DualBranchModel, self).__init__()
 
@@ -52,6 +54,7 @@ class DualBranchModel(nn.Module):
         self.num_classes = num_classes
         self.fusion_mode = fusion_mode
         self._use_custom_seq_encoder = seq_encoder is not None
+        self.seq_dropout = nn.Dropout(seq_dropout)
 
         # --- BRANCH A: MACRO SUMMARY (Static) ---
         if summary_encoder is not None:
@@ -112,20 +115,27 @@ class DualBranchModel(nn.Module):
                 self.fusion_net = nn.Linear(head_input_dim, num_classes)
             else:
                 self.fusion_net = nn.Sequential(
-                    nn.Linear(head_input_dim, 64),
-                    nn.ReLU(),
-                    nn.Dropout(0.2),
-                    nn.Linear(64, num_classes)
+                    nn.Linear(head_input_dim, 128),
+                    nn.LayerNorm(128),
+                    nn.GELU(),
+                    nn.Dropout(fusion_dropout),
+                    nn.Linear(128, 64),
+                    nn.GELU(),
+                    nn.Linear(64, 1 if task == 'regression' else num_classes)
                 )
+
         else:
             if fusion_mode == 'simple':
                 self.fusion_net = nn.Linear(head_input_dim, 1)
             else:
                 self.fusion_net = nn.Sequential(
-                    nn.Linear(head_input_dim, 64),
-                    nn.ReLU(),
-                    nn.Dropout(0.2),
-                    nn.Linear(64, 1)
+                    nn.Linear(head_input_dim, 128),
+                    nn.LayerNorm(128),
+                    nn.GELU(),
+                    nn.Dropout(fusion_dropout),
+                    nn.Linear(128, 64),
+                    nn.GELU(),
+                    nn.Linear(64, 1 if task == 'regression' else num_classes)
                 )
 
     def forward(self, summary_data, vpin_sequence, vpin_lengths, return_probs=False):
@@ -166,6 +176,7 @@ class DualBranchModel(nn.Module):
             )
             _, (hidden_state, _) = self.vpin_lstm(packed_input)
             seq_out = hidden_state[-1]
+            seq_out = self.seq_dropout(seq_out)
 
         # 3. Fuse
         if self.fusion_mode == 'gated':

@@ -192,10 +192,10 @@ class VPINExtractor(ScidBaseExtractor):
         # 4. Sequence Features ("Golden Trio" for Neural Nets)
         if include_sequence_features:
             # Bucket Return: Log return within bucket (direction signal)
-            # Multiply by 100 for more reasonable scale
+            # Raw log returns - standardize downstream if needed
             gb['bucket_return'] = np.log(
                 gb['close_last'] / gb['close_first'].replace(0, np.nan)
-            ).fillna(0) * 100
+            ).fillna(0)
 
             # Duration: Time elapsed in bucket (urgency/speed signal)
             # Log transform to compress range; add small epsilon to avoid log(0)

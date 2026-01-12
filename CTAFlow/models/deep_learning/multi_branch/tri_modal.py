@@ -122,7 +122,6 @@ class TriModalModel(nn.Module):
         z_sum = self.summary_net(summary_vec)
 
         # 2. Micro Branch (Packed Sequence)
-        # Handle Packing
         packed_seq = rnn_utils.pack_padded_sequence(
             seq_tensor,
             seq_lengths.cpu(),
