@@ -45,6 +45,7 @@ class VolumeProfileEncoderConfig:
     include_shape_total: bool = True
     include_imbalance: bool = True       # (ask - bid) / (ask + bid)
     include_magnitude: bool = True       # repeated log1p(total volume) across bins
+    include_price_labels: bool = True    # explicit bin centers (for spatial awareness)
     include_shape_bidask: bool = False   # if True, adds separate normalized bid + ask shapes
     include_grad_shape: bool = False     # gradient of total shape
 
@@ -157,6 +158,30 @@ class VolumeProfileEncoder:
             s_total = self._normalize_shape(h_total)
             grad = np.gradient(s_total).astype(np.float32)
             channels.append(grad)
+
+        # Channel: price labels (bin centers normalized by anchor, same as NumberBars)
+        if self.cfg.include_price_labels:
+            # Get bin centers in coordinate space
+            bin_centers = (edges[:-1] + edges[1:]) / 2.0  # Mid-points of bins
+
+            # Convert back to normalized price offset: (price - anchor) / anchor
+            # If log coordinates: x = log(price/anchor), so price = anchor * exp(x)
+            # Then (price - anchor) / anchor = exp(x) - 1
+            # If linear coordinates: x = price - anchor, so (price - anchor) / anchor = x / anchor
+
+            anchor = self._day_anchor(day_df)
+            if not np.isfinite(anchor) or anchor <= 0:
+                # Fallback to zeros if anchor is invalid
+                price_labels = np.zeros(B, dtype=np.float32)
+            else:
+                if self.cfg.use_log_coord:
+                    # x = log(price/anchor), so price_offset = (price - anchor) / anchor = exp(x) - 1
+                    price_labels = (np.exp(bin_centers) - 1.0).astype(np.float32)
+                else:
+                    # x = price - anchor, so price_offset = x / anchor
+                    price_labels = (bin_centers / anchor).astype(np.float32)
+
+            channels.append(price_labels)
 
         X = np.stack(channels, axis=0).astype(np.float32)  # (C, B)
         return X

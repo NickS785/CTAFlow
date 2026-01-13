@@ -259,12 +259,18 @@ class FeatureExtractorConfig:
     auto_bucket_cadence: int = 500  # Target number of buckets per day (default 500, was 50)
 
     # Profile Configuration
+    # NOTE: Profile encoder outputs 4 channels (when include_price_labels=True, default):
+    #   [VolumeShape, Imbalance, Magnitude, PriceLabels]
+    # PriceLabels = (price - vwap) / vwap for spatial alignment with NumberBars
     include_profile: bool = True  # Toggle profile extraction
     profile_tick_size: Optional[float] = None  # None = use default from contract_specs
     profile_start_time: str = "02:00"
     profile_end_time: str = "09:30"
 
     # Number Bars Configuration
+    # NOTE: NumberBars output 4 features when normalized (default):
+    #   [VolumeShape, Imbalance%, BarReturn, PriceOffset]
+    # PriceOffset = (price - center) / center for spatial alignment with Profile
     include_number_bars: bool = False  # Toggle number bars extraction
     num_bars_start_time: str = "08:30"
     num_bars_end_time: str = "09:30"
@@ -275,7 +281,7 @@ class FeatureExtractorConfig:
 
     # Neural network training options
     include_sequence_features: bool = True  # Golden Trio for LSTM
-    profile_n_bins: int = 96  # Fixed histogram size for CNN-1D
+    profile_n_bins: int = 96  # Fixed histogram size for CNN-1D (4 channels per bin)
 
     # Profile and IB options
     value_area_pct: float = 0.7  # Value area percentage (default 70%)
@@ -303,9 +309,14 @@ class MultiFeatureExtraction(ScidBaseExtractor):
     then computes all requested features from that shared data.
 
     Features:
-    - VPIN: Volume-synchronized probability of informed trading
+    - VPIN: Volume-synchronized probability of informed trading (includes profile_vwap)
     - Profile: Volume profile with POC, VAL, VAH
+      When exported via VolumeProfileEncoder: 4 channels [VolumeShape, Imbalance, Magnitude, PriceLabels]
     - Number Bars: Sierra Chart-style footprint charts as normalized tensors
+      Default output: 4 features [VolumeShape, Imbalance%, BarReturn, PriceOffset]
+
+    Both Profile and NumberBars include explicit price labels using (price - reference) / reference
+    normalization for tri-modal spatial alignment.
     """
 
     def __init__(self, config: FeatureExtractorConfig, dates: List[Union[str, pd.Timestamp, date]]):

@@ -58,8 +58,8 @@ class TriModalModel(nn.Module):
             self,
             f_sum: int,  # Number of summary features
             f_seq: int = 3,  # Number of sequential features (VPIN, Return, Dur)
-            f_spatial: int = 3,  # Number of profile channels (Bid/Ask/Total)
-            f_nb: int = 3,  # Number bars channels
+            f_spatial: int = 4,  # Number of profile channels (Bid/Ask/Total)
+            f_nb: int = 4,  # Number bars channels
             d_model: int = 64,  # Hidden dimension size
             dropout: float = 0.2,
             task: str = 'regression',

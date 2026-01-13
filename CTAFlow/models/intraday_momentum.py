@@ -5277,6 +5277,7 @@ class DeepIDMomentum(IntradayMomentum):
             vah_col: str = 'vah',
             val_col: str = 'val',
             poc_col: str = 'poc',
+            profile_vwap_col: Optional[str] = 'profile_vwap',
             ib_high_col: Optional[str] = 'ib_high',
             ib_low_col: Optional[str] = 'ib_low',
             additional_cols: Optional[List[str]] = None,
@@ -5299,6 +5300,9 @@ class DeepIDMomentum(IntradayMomentum):
             Column name for Value Area Low
         poc_col : str, default 'poc'
             Column name for Point of Control
+        profile_vwap_col : str, optional, default 'profile_vwap'
+            Column name for Profile VWAP (shared reference for tri-modal alignment).
+            Set to None to skip.
         ib_high_col : str, optional, default 'ib_high'
             Column name for Initial Balance High. Set to None to skip.
         ib_low_col : str, optional, default 'ib_low'
@@ -5368,6 +5372,10 @@ class DeepIDMomentum(IntradayMomentum):
         for col in profile_cols:
             if col in data.columns:
                 cols_to_normalize.append(col)
+
+        # Add profile VWAP if specified (for tri-modal alignment)
+        if profile_vwap_col is not None and profile_vwap_col in data.columns:
+            cols_to_normalize.append(profile_vwap_col)
 
         # Add initial balance columns if specified
         if ib_high_col is not None and ib_high_col in data.columns:

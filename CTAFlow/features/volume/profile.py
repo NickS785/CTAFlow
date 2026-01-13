@@ -361,6 +361,7 @@ class NumberBarsExtractor(MarketProfileExtractor):
                       - Channel 0: Volume shape (level_vol / bar_total_vol)
                       - Channel 1: Imbalance % ((ask - bid) / level_total_vol)
                       - Channel 2: Bar return (log return, constant across levels)
+                      - Channel 3: Price offset ((price - center) / center, for spatial awareness)
                       Magnitude (log1p of total bar volume) stored in metadata.
                       If False, output raw volumes: [TotalVol, BidVol, AskVol, Delta, Trades]
             fixed_center: If provided, use this price as the center for ALL bars instead of
@@ -369,7 +370,7 @@ class NumberBarsExtractor(MarketProfileExtractor):
 
         Returns:
             tensor: 3D array [N_Bars, 2*num_levels+1, num_features]
-                   If normalize=True: 3 features [VolumeShape, Imbalance%, BarReturn]
+                   If normalize=True: 4 features [VolumeShape, Imbalance%, BarReturn, PriceOffset]
                    If normalize=False: 5 features [TotalVol, BidVol, AskVol, Delta, Trades]
             metadata: DataFrame with [Time, CenterPrice, BarVolume, LogMagnitude, BarReturn] per bar
         """
@@ -424,21 +425,25 @@ class NumberBarsExtractor(MarketProfileExtractor):
         meta_list = []
         grid_height = (num_levels * 2) + 1
         raw_num_features = 5  # Raw grid always has 5 features
-        out_num_features = 3 if normalize else 5
+        out_num_features = 4 if normalize else 5  # 4 features when normalized (added PriceOffset)
 
-        def _normalize_bar_grid(grid: np.ndarray, bar_volume: float, bar_return: float) -> np.ndarray:
+        def _normalize_bar_grid(grid: np.ndarray, bar_volume: float, bar_return: float,
+                               center_price: float, tick_size: float, num_levels: int) -> np.ndarray:
             """
-            Normalize raw bar grid to [VolumeShape, Imbalance%, BarReturn].
+            Normalize raw bar grid to [VolumeShape, Imbalance%, BarReturn, PriceOffset].
 
             Args:
                 grid: Raw grid [levels, 5] with [TotalVol, BidVol, AskVol, Delta, Trades]
                 bar_volume: Total volume in the bar
                 bar_return: Log return for the bar (constant across levels)
+                center_price: Center price of the grid
+                tick_size: Price tick size
+                num_levels: Number of levels above/below center
 
             Returns:
-                Normalized grid [levels, 3] with [VolumeShape, Imbalance%, BarReturn]
+                Normalized grid [levels, 4] with [VolumeShape, Imbalance%, BarReturn, PriceOffset]
             """
-            normalized = np.zeros((grid.shape[0], 3), dtype=np.float32)
+            normalized = np.zeros((grid.shape[0], 4), dtype=np.float32)
 
             # Channel 0: Volume shape (level_vol / bar_total_vol)
             if bar_volume > 0:
@@ -458,6 +463,14 @@ class NumberBarsExtractor(MarketProfileExtractor):
 
             # Channel 2: Bar return (constant across all levels)
             normalized[:, 2] = bar_return
+
+            # Channel 3: Price offset from center (normalized by center price)
+            # This gives the network explicit price information for each bin
+            # Example: if center=100, tick=0.25, level 0 is at price 75 (25 ticks below)
+            # offset_ticks goes from -num_levels to +num_levels
+            offset_ticks = np.arange(-num_levels, num_levels + 1, dtype=np.float32)
+            # Normalize: (price - center) / center = (offset_ticks * tick_size) / center
+            normalized[:, 3] = (offset_ticks * tick_size) / center_price
 
             return normalized
 
@@ -487,7 +500,8 @@ class NumberBarsExtractor(MarketProfileExtractor):
                 bar_return = _calculate_bar_return(group)
 
                 if normalize:
-                    bar_grid = _normalize_bar_grid(bar_grid, bar_volume, bar_return)
+                    bar_grid = _normalize_bar_grid(bar_grid, bar_volume, bar_return,
+                                                   center_price, tick_size, num_levels)
 
                 tensor_list.append(bar_grid)
                 meta_list.append({
@@ -526,7 +540,8 @@ class NumberBarsExtractor(MarketProfileExtractor):
                 bar_return = _calculate_bar_return(group)
 
                 if normalize:
-                    bar_grid = _normalize_bar_grid(bar_grid, bar_volume, bar_return)
+                    bar_grid = _normalize_bar_grid(bar_grid, bar_volume, bar_return,
+                                                   center_price, tick_size, num_levels)
 
                 tensor_list.append(bar_grid)
                 meta_list.append({
