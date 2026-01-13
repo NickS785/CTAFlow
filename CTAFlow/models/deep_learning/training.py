@@ -11,6 +11,81 @@ from ...data import make_window_dataset, MomentumWindowDataset
 from ..intraday_momentum import IntradayMomentum
 
 
+class EarlyStopping:
+    """Stop training when validation metric stops improving."""
+
+    def __init__(self, patience=10, min_delta=0.001, mode='min'):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+
+    def __call__(self, score):
+        if self.best_score is None:
+            self.best_score = score
+        elif self._is_improvement(score):
+            self.best_score = score
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        return self.early_stop
+
+    def _is_improvement(self, score):
+        if self.mode == 'min':
+            return score < self.best_score - self.min_delta
+        return score > self.best_score + self.min_delta
+
+
+# --- OPTION 2: Focal Loss (better for imbalanced/overconfident models) ---
+class FocalLoss(nn.Module):
+    """Focal Loss - reduces loss for well-classified samples."""
+
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha  # class weights
+        self.gamma = gamma  # focusing parameter (higher = more focus on hard samples)
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, weight=self.alpha, reduction='none')
+        pt = torch.exp(-ce_loss)  # probability of correct class
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        return focal_loss
+
+
+# --- OPTION 3: Mixup Training ---
+def mixup_data(x_list, y, alpha=0.2):
+    """Apply mixup augmentation to batch."""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1.0
+
+    batch_size = y.size(0)
+    index = torch.randperm(batch_size).to(y.device)
+
+    mixed_x = []
+    for x in x_list:
+        mixed_x.append(lam * x + (1 - lam) * x[index])
+
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """Compute mixup loss."""
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+
 @dataclass
 class TrainConfig:
     epochs: int = 50

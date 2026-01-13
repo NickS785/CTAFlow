@@ -5506,9 +5506,16 @@ class DeepIDMomentum(IntradayMomentum):
             outlier_threshold: float = 0.01,
             batch_size: int = 32,
             shuffle_train: bool = True,
+            shuffle: Optional[bool] = None,
             num_workers: int = 0,
             max_seq_len: int = 200,
             sequential_cols: Optional[List[str]] = None,
+            include_spatial: Optional[bool] = None,
+            spatial_data: Optional[np.ndarray] = None,
+            spatial_dates: Optional[np.ndarray] = None,
+            include_nb: Optional[bool] = None,
+            nb_data: Optional[Union[np.ndarray, Dict]] = None,
+            nb_dates: Optional[np.ndarray] = None,
     ):
         """Create PyTorch DataLoaders for training dual-branch models.
 
@@ -5540,12 +5547,28 @@ class DeepIDMomentum(IntradayMomentum):
             Batch size for DataLoaders
         shuffle_train : bool, default True
             Whether to shuffle training data. Validation is never shuffled.
+        shuffle : bool, optional
+            Alias for shuffle_train for backward compatibility
         num_workers : int, default 0
             Number of workers for DataLoader (0 = single process)
         max_seq_len : int, default 200
             Maximum sequence length for sequential data
         sequential_cols : list of str, optional
             Columns to use from sequential data. If None, uses all numeric columns.
+        include_spatial : bool, optional
+            If True, include Profile spatial data. If None, automatically detects from
+            self.profile_array or spatial_data parameter.
+        spatial_data : np.ndarray, optional
+            Profile data to use (N, C, B). Overrides self.profile_array if provided.
+        spatial_dates : np.ndarray, optional
+            Dates corresponding to spatial_data
+        include_nb : bool, optional
+            If True, include NumberBars spatial data. If None, automatically detects from
+            self.nb_arrays or nb_data parameter.
+        nb_data : np.ndarray or dict, optional
+            NumberBars data to use. Overrides self.nb_arrays if provided.
+        nb_dates : np.ndarray, optional
+            Dates corresponding to nb_data
 
         Returns
         -------
@@ -5560,12 +5583,32 @@ class DeepIDMomentum(IntradayMomentum):
         >>> # Single loader for all data
         >>> loader = model.get_loaders(batch_size=64)
         >>>
-        >>> # Train/val split
+        >>> # Train/val split with DualBranch (no spatial)
         >>> train_loader, val_loader = model.get_loaders(
         ...     val_split=True,
-        ...     val_split_size=0.2,
-        ...     batch_size=32,
-        ...     shuffle_train=True
+        ...     include_spatial=False,
+        ...     batch_size=32
+        ... )
+        >>>
+        >>> # TriModal with external Profile data
+        >>> train_loader, val_loader = model.get_loaders(
+        ...     val_split=True,
+        ...     include_spatial=True,
+        ...     spatial_data=profile_arrays,
+        ...     spatial_dates=profile_dates,
+        ...     batch_size=32
+        ... )
+        >>>
+        >>> # QuadModal with Profile + NumberBars
+        >>> train_loader, val_loader = model.get_loaders(
+        ...     val_split=True,
+        ...     include_spatial=True,
+        ...     spatial_data=profile_arrays,
+        ...     spatial_dates=profile_dates,
+        ...     include_nb=True,
+        ...     nb_data=nb_arrays,
+        ...     nb_dates=nb_dates,
+        ...     batch_size=32
         ... )
         """
         # Import here to avoid requiring torch for all IntradayMomentum usage
@@ -5579,33 +5622,126 @@ class DeepIDMomentum(IntradayMomentum):
                 "Install with: pip install torch"
             ) from e
 
-        def build_spatial_lookup():
-            if self.profile_array is None:
+        # Handle shuffle alias
+        if shuffle is not None:
+            shuffle_train = shuffle
+
+        # Handle external spatial data
+        if spatial_data is not None:
+            # Use provided external spatial data
+            use_profile_array = spatial_data
+            use_spatial_dates = spatial_dates
+        else:
+            # Use instance profile_array
+            use_profile_array = self.profile_array
+            use_spatial_dates = None
+
+        # Handle external nb data
+        if nb_data is not None:
+            # Use provided external nb data
+            use_nb_arrays = nb_data
+            use_nb_dates = nb_dates
+        else:
+            # Use instance nb_arrays
+            use_nb_arrays = self.nb_arrays
+            use_nb_dates = None
+
+        # Determine if spatial should be included
+        if include_spatial is None:
+            # Auto-detect: include spatial if data is available
+            include_spatial = (use_profile_array is not None)
+
+        if include_nb is None:
+            # Auto-detect: include nb if data is available
+            include_nb = (use_nb_arrays is not None)
+
+        # Override with explicit flags
+        if not include_spatial:
+            use_profile_array = None
+            use_spatial_dates = None
+
+        if not include_nb:
+            use_nb_arrays = None
+            use_nb_dates = None
+
+        def build_spatial_lookup(profile_arr, dates_arr=None):
+            if profile_arr is None:
                 return None
+
+            # If external dates are provided, use them directly
+            if dates_arr is not None:
+                dates_arr = pd.to_datetime(dates_arr).date
+                return {
+                    date: np.asarray(profile_arr[i], dtype=np.float32)
+                    for i, date in enumerate(dates_arr)
+                }
+
+            # Otherwise, align with summary data
             summary_df = self.training_data.get("summary")
-            if summary_df is None or len(summary_df) != len(self.profile_array):
+            if summary_df is None or len(summary_df) != len(profile_arr):
                 raise ValueError(
                     "profile_array length must match summary data length to align by date."
                 )
             summary_dates = pd.to_datetime(summary_df.index).date
             return {
-                date: np.asarray(self.profile_array[i], dtype=np.float32)
+                date: np.asarray(profile_arr[i], dtype=np.float32)
                 for i, date in enumerate(summary_dates)
             }
 
         def spatial_arrays_from_lookup(spatial_by_date):
             dates = np.array(sorted(spatial_by_date.keys()))
-            spatial_data = np.stack([spatial_by_date[date] for date in dates])
-            return spatial_data, dates
+            spatial_data_out = np.stack([spatial_by_date[date] for date in dates])
+            return spatial_data_out, dates
 
-        spatial_by_date = build_spatial_lookup()
-        if self.nb_arrays is not None and spatial_by_date is None:
+        # Build spatial lookup for Profile
+        spatial_by_date = build_spatial_lookup(use_profile_array, use_spatial_dates)
+
+        # Build nb lookup
+        def build_nb_lookup(nb_arr, dates_arr=None):
+            if nb_arr is None:
+                return None
+
+            # Convert dict to array if needed
+            if isinstance(nb_arr, dict):
+                sorted_dates = sorted(nb_arr.keys())
+                nb_arr = np.stack([nb_arr[d] for d in sorted_dates])
+                if dates_arr is None:
+                    dates_arr = np.array(sorted_dates)
+
+            # If external dates are provided, use them directly
+            if dates_arr is not None:
+                dates_arr = pd.to_datetime(dates_arr).date
+                return {
+                    date: np.asarray(nb_arr[i], dtype=np.float32)
+                    for i, date in enumerate(dates_arr)
+                }
+
+            # Otherwise, align with summary data
+            summary_df = self.training_data.get("summary")
+            if summary_df is None or len(summary_df) != len(nb_arr):
+                raise ValueError(
+                    "nb_arrays length must match summary data length to align by date."
+                )
+            summary_dates = pd.to_datetime(summary_df.index).date
+            return {
+                date: np.asarray(nb_arr[i], dtype=np.float32)
+                for i, date in enumerate(summary_dates)
+            }
+
+        nb_by_date = build_nb_lookup(use_nb_arrays, use_nb_dates)
+
+        if use_nb_arrays is not None and spatial_by_date is None:
             raise ValueError("Number bars require profile_array to align spatial features.")
 
-        spatial_data = None
-        spatial_dates = None
+        final_spatial_data = None
+        final_spatial_dates = None
         if spatial_by_date is not None:
-            spatial_data, spatial_dates = spatial_arrays_from_lookup(spatial_by_date)
+            final_spatial_data, final_spatial_dates = spatial_arrays_from_lookup(spatial_by_date)
+
+        final_nb_data = None
+        if nb_by_date is not None:
+            # Convert nb dict back to format expected by dataset
+            final_nb_data = {date: nb_by_date[date] for date in nb_by_date}
 
         # Custom collate functions for variable-length sequences
         def collate_dual(batch):
@@ -5673,13 +5809,13 @@ class DeepIDMomentum(IntradayMomentum):
         if val_split:
             X_train, X_val, y_train, y_val = result
 
-            if self.nb_arrays is not None:
+            if final_nb_data is not None:
                 train_dataset = QuadModalDataset(
                     summary_data=X_train,
                     sequential_data=self.sequential_data,
-                    spatial_data=spatial_data,
-                    spatial_dates=spatial_dates,
-                    nb_data=self.nb_arrays,
+                    spatial_data=final_spatial_data,
+                    spatial_dates=final_spatial_dates,
+                    nb_data=final_nb_data,
                     target_data=y_train,
                     max_len=max_seq_len,
                     sequential_cols=sequential_cols,
@@ -5688,21 +5824,21 @@ class DeepIDMomentum(IntradayMomentum):
                 val_dataset = QuadModalDataset(
                     summary_data=X_val,
                     sequential_data=self.sequential_data,
-                    spatial_data=spatial_data,
-                    spatial_dates=spatial_dates,
-                    nb_data=self.nb_arrays,
+                    spatial_data=final_spatial_data,
+                    spatial_dates=final_spatial_dates,
+                    nb_data=final_nb_data,
                     target_data=y_val,
                     max_len=max_seq_len,
                     sequential_cols=sequential_cols,
                     target_col=None,
                 )
                 collate_fn = collate_quad
-            elif self.profile_array is not None:
+            elif final_spatial_data is not None:
                 train_dataset = TriModalDataset(
                     summary_data=X_train,
                     sequential_data=self.sequential_data,
-                    spatial_data=spatial_data,
-                    spatial_dates=spatial_dates,
+                    spatial_data=final_spatial_data,
+                    spatial_dates=final_spatial_dates,
                     target_data=y_train,
                     max_len=max_seq_len,
                     sequential_cols=sequential_cols,
@@ -5711,8 +5847,8 @@ class DeepIDMomentum(IntradayMomentum):
                 val_dataset = TriModalDataset(
                     summary_data=X_val,
                     sequential_data=self.sequential_data,
-                    spatial_data=spatial_data,
-                    spatial_dates=spatial_dates,
+                    spatial_data=final_spatial_data,
+                    spatial_dates=final_spatial_dates,
                     target_data=y_val,
                     max_len=max_seq_len,
                     sequential_cols=sequential_cols,
@@ -5761,25 +5897,25 @@ class DeepIDMomentum(IntradayMomentum):
             X, y = result
 
             # Create dataset
-            if self.nb_arrays is not None:
+            if final_nb_data is not None:
                 dataset = QuadModalDataset(
                     summary_data=X,
                     sequential_data=self.sequential_data,
-                    spatial_data=spatial_data,
-                    spatial_dates=spatial_dates,
-                    nb_data=self.nb_arrays,
+                    spatial_data=final_spatial_data,
+                    spatial_dates=final_spatial_dates,
+                    nb_data=final_nb_data,
                     target_data=y,
                     max_len=max_seq_len,
                     sequential_cols=sequential_cols,
                     target_col=None,
                 )
                 collate_fn = collate_quad
-            elif self.profile_array is not None:
+            elif final_spatial_data is not None:
                 dataset = TriModalDataset(
                     summary_data=X,
                     sequential_data=self.sequential_data,
-                    spatial_data=spatial_data,
-                    spatial_dates=spatial_dates,
+                    spatial_data=final_spatial_data,
+                    spatial_dates=final_spatial_dates,
                     target_data=y,
                     max_len=max_seq_len,
                     sequential_cols=sequential_cols,
