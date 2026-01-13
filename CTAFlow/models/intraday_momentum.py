@@ -5701,13 +5701,15 @@ class DeepIDMomentum(IntradayMomentum):
             if nb_arr is None:
                 return None
 
-            # Convert dict to array if needed
+            # If already a dict, normalize keys and return directly
             if isinstance(nb_arr, dict):
-                sorted_dates = sorted(nb_arr.keys())
-                nb_arr = np.stack([nb_arr[d] for d in sorted_dates])
-                if dates_arr is None:
-                    dates_arr = np.array(sorted_dates)
+                # Normalize dict keys to datetime.date objects
+                return {
+                    pd.to_datetime(k).date(): np.asarray(v, dtype=np.float32)
+                    for k, v in nb_arr.items()
+                }
 
+            # Otherwise, nb_arr is an array
             # If external dates are provided, use them directly
             if dates_arr is not None:
                 dates_arr = pd.to_datetime(dates_arr).date
@@ -5738,10 +5740,8 @@ class DeepIDMomentum(IntradayMomentum):
         if spatial_by_date is not None:
             final_spatial_data, final_spatial_dates = spatial_arrays_from_lookup(spatial_by_date)
 
-        final_nb_data = None
-        if nb_by_date is not None:
-            # Convert nb dict back to format expected by dataset
-            final_nb_data = {date: nb_by_date[date] for date in nb_by_date}
+        # nb_by_date is already in the correct dict format for the dataset
+        final_nb_data = nb_by_date
 
         # Custom collate functions for variable-length sequences
         def collate_dual(batch):
@@ -5809,7 +5809,15 @@ class DeepIDMomentum(IntradayMomentum):
         if val_split:
             X_train, X_val, y_train, y_val = result
 
+            # Debug: Print dataset type
+            if verbose:
+                print(f"\nDataset selection:")
+                print(f"  final_nb_data: {final_nb_data is not None} ({type(final_nb_data) if final_nb_data is not None else 'None'})")
+                print(f"  final_spatial_data: {final_spatial_data is not None} ({final_spatial_data.shape if final_spatial_data is not None else 'None'})")
+
             if final_nb_data is not None:
+                if verbose:
+                    print(f"  Creating QuadModalDataset")
                 train_dataset = QuadModalDataset(
                     summary_data=X_train,
                     sequential_data=self.sequential_data,
@@ -5834,6 +5842,8 @@ class DeepIDMomentum(IntradayMomentum):
                 )
                 collate_fn = collate_quad
             elif final_spatial_data is not None:
+                if verbose:
+                    print(f"  Creating TriModalDataset")
                 train_dataset = TriModalDataset(
                     summary_data=X_train,
                     sequential_data=self.sequential_data,
@@ -5856,6 +5866,8 @@ class DeepIDMomentum(IntradayMomentum):
                 )
                 collate_fn = collate_tri
             else:
+                if verbose:
+                    print(f"  Creating DualDataset")
                 train_dataset = DualDataset(
                     summary_data=X_train,
                     sequential_data=self.sequential_data,

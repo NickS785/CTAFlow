@@ -5,6 +5,7 @@ from typing import Callable, Dict, Optional, Tuple, Any, List
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from sklearn.preprocessing import StandardScaler
 from ...data import make_window_dataset, MomentumWindowDataset
