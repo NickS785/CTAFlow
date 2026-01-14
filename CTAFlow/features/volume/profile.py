@@ -11,6 +11,7 @@ from ...data.contract_expiry_rules import calculate_expiry, get_roll_buffer_days
 from ..base_extractor import ScidBaseExtractor
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class MarketProfileConfig:
     data_dir: str
@@ -658,3 +659,161 @@ class NumberBarsExtractor(MarketProfileExtractor):
                 interval = int(item.step)
 
         return self.get_number_bars(start_str, end_str, interval=interval)
+
+import torch
+
+
+class ProfileScaler:
+    def __init__(self, price_scale=100.0, log_vol_div=15.0):
+        """
+        Args:
+            price_scale (float): Multiplier for Channel 3 (Spatial/Price).
+            log_vol_div (float): Divisor for Channel 2 (Log Volume) to normalize it.
+        """
+        self.price_scale = price_scale
+        self.vol_div = log_vol_div
+
+    def load_and_process(self, npz_path):
+        """
+        Loads profiles .npz, scales features, and returns tensor and dates.
+
+        Structure of NPZ:
+          - 'profiles': (N, 4, 96) -> (Batch, Channels, Bins)
+          - 'dates': (N,)
+
+        Channels:
+          0: Volume Density (0-1)
+          1: Imbalance (-1 to 1)
+          2: Log Volume (0-14)
+          3: Relative Price (-0.02 to 0.02)
+        """
+        print(f"Loading {npz_path}...")
+        data = np.load(npz_path, allow_pickle=True)
+
+        # 1. Extract Arrays
+        raw_profiles = data['profiles']  # Shape: (N, 4, 96)
+        raw_dates = data['dates']  # Shape: (N,)
+
+        # Handle datetime objects if they are raw datetime64
+        # Convert to string YYYY-MM-DD for consistency with other loaders
+        dates_str = []
+        if np.issubdtype(raw_dates.dtype, np.datetime64):
+            dates_str = [str(d).split('T')[0] for d in raw_dates]
+        else:
+            dates_str = [str(d) for d in raw_dates]
+
+        # 2. Scale Data
+        # We process in place or copy. Let's copy to be safe.
+        scaled_profiles = raw_profiles.copy()
+
+        # --- Channel Scaling ---
+
+        # Channel 0: Volume Density (Min ~0, Max ~0.7)
+        # Action: Leave as is, it's already a good distribution.
+
+        # Channel 1: Imbalance (Min -1, Max 1)
+        # Action: Clip ensures we stay in bounds, though data looks clean.
+        scaled_profiles[:, 1, :] = np.clip(scaled_profiles[:, 1, :], -1.0, 1.0)
+
+        # Channel 2: Log Volume (Min 0, Max ~13.1)
+        # Action: Divide by 15.0 to bring range to [0, ~0.9]
+        scaled_profiles[:, 2, :] = scaled_profiles[:, 2, :] / self.vol_div
+
+        # Channel 3: Relative Price (Min -0.02, Max 0.02)
+        # Action: Multiply by 100 (Basis Points/Percent) -> [-2.0, 2.0]
+        scaled_profiles[:, 3, :] = scaled_profiles[:, 3, :] * self.price_scale
+
+        # 3. Convert to Tensor
+        # Shape: (N, 4, 96) -> Ready for 1D CNN
+        tensor_out = torch.FloatTensor(scaled_profiles)
+
+        print(f"Profile Processing Complete.")
+        print(f"  - Samples: {len(dates_str)}")
+        print(f"  - Shape: {tensor_out.shape}")
+
+        return tensor_out, dates_str
+
+class NumberBarCleaner:
+    def __init__(self, volume_log_max=10.0, price_scale=100.0):
+        """
+        Args:
+            volume_log_max (float): Divisor for log-volume scaling.
+            price_scale (float): Multiplier for price/spatial features (Basis Points).
+        """
+        self.vol_div = volume_log_max
+        self.price_scale = price_scale
+
+        # Mapping User's "1 and 4" to 0-based indices
+        # Channel 1 (Vol) -> Index 0
+        # Channel 4 (Spatial) -> Index 3
+        self.required_channels = [0, 3]
+
+    def load_and_process(self, npz_path):
+        """
+        Loads .npz, filters bad dates, scales data, returns lists of tensors.
+        """
+        print(f"Loading {npz_path}...")
+        data = np.load(npz_path)
+
+        valid_sequences = []
+        valid_dates = []
+        dropped_count = 0
+
+        # 1. Iterate through all dates (keys)
+        # Sorting ensures chronological order
+        keys = sorted(data.files)
+
+        for date_key in keys:
+            # Shape: (Time_Steps, Bins, Channels) -> e.g., (5, 64, 4)
+            arr = data[date_key]
+
+            # 2. Validity Check
+            is_valid = True
+            for ch_idx in self.required_channels:
+                # Check if the entire channel is zeros
+                channel_data = arr[..., ch_idx]
+                if np.all(channel_data == 0):
+                    is_valid = False
+                    break
+
+            if not is_valid:
+                dropped_count += 1
+                continue
+
+            # 3. Scaling (Apply to valid data only)
+            processed_arr = self._scale_tensor(arr)
+
+            # Store as Tensor
+            valid_sequences.append(torch.FloatTensor(processed_arr))
+            valid_dates.append(date_key)
+
+        print(f"Processing Complete.")
+        print(f"  - Total Files: {len(keys)}")
+        print(f"  - Dropped (Missing Ch 1 or 4): {dropped_count}")
+        print(f"  - Kept: {len(valid_sequences)}")
+
+        return valid_sequences, valid_dates
+
+    def _scale_tensor(self, arr):
+        """
+        Applies specific scaling per channel.
+        Input: Numpy array (T, Bins, 4)
+        """
+        # Copy to avoid modifying original if cached
+        out = arr.copy()
+
+        # Channel 0 (Volume): Log1p Scaling
+        # x -> log(1 + x) / 10.0
+        out[..., 0] = np.log1p(out[..., 0]) / self.vol_div
+
+        # Channel 1 (Imbalance): Already [-1, 1], Clip to be safe
+        out[..., 1] = np.clip(out[..., 1], -1.0, 1.0)
+
+        # Channel 2 (Price/Returns): Scale by 100 (Basis Points)
+        out[..., 2] = out[..., 2] * self.price_scale
+
+        # Channel 3 (Spatial Location): Scale by 100
+        out[..., 3] = out[..., 3] * self.price_scale
+
+        return out
+

@@ -787,12 +787,18 @@ class QuadModalDataset(Dataset):
         self._align_to_common_dates()
 
     def _align_to_common_dates(self):
-        """Ensure summary, sequential, spatial, number bars, and target have the same dates."""
+        """Ensure summary, sequential, spatial, number bars, and target have the same dates.
+
+        Note: This method automatically handles filtered NumberBars data. If NumberBarCleaner
+        removed dates with invalid data (all zeros in required channels), those dates will
+        not be in nb_dates and will be excluded from the common date set.
+        """
         summary_dates = set(self.df_summary['date'].unique())
         sequential_dates = set(self.sequential_by_date.keys())
         spatial_dates = set(self.spatial_by_date.keys())
         nb_dates = set(self.nb_by_date.keys())
 
+        # Intersect all data sources - dates missing from any modality are excluded
         common_dates = summary_dates & sequential_dates & spatial_dates & nb_dates
 
         self.df_summary['__target__'] = self.targets

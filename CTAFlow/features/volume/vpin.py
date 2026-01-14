@@ -257,3 +257,127 @@ class VPINExtractor(ScidBaseExtractor):
         window = self.window if window is None else window
 
         return self.get_vpin(start_str, end_str, bucket_volume=bucket_volume, window=window)
+
+
+import torch
+from datetime import datetime, timedelta
+
+
+class VPINSequenceProcessor:
+    def __init__(self,
+                 interval_minutes=15,
+                 session_start="09:30",
+                 session_end="16:15",
+                 max_len=64,
+                 price_scale=100.0):
+        """
+        Args:
+            interval_minutes (int): Length of each time bar in minutes (e.g., 15, 30, 60).
+            session_start (str): HH:MM string for session start (e.g., "09:30").
+            session_end (str): HH:MM string for session end (e.g., "16:15").
+            max_len (int): Max number of VPIN buckets allowed per interval (truncates if over, pads if under).
+            price_scale (float): Multiplier for normalized close.
+        """
+        self.interval_minutes = interval_minutes
+        self.session_start = session_start
+        self.session_end = session_end
+        self.max_len = max_len
+        self.price_scale = price_scale
+
+        # Pre-calculate session boundaries in minutes from midnight
+        h_start, m_start = map(int, session_start.split(':'))
+        h_end, m_end = map(int, session_end.split(':'))
+
+        self.start_minutes = h_start * 60 + m_start
+        self.end_minutes = h_end * 60 + m_end
+
+        # Calculate expected number of intervals per day
+        total_duration = self.end_minutes - self.start_minutes
+        self.num_intervals = int(np.ceil(total_duration / interval_minutes))
+
+        print(f"Processor Configured: {self.num_intervals} intervals of {interval_minutes}m each per day.")
+
+    def process(self, csv_path):
+        """
+        Returns:
+            tensor: (Num_Days, Num_Intervals, Max_Len, 2)
+            dates: List[str]
+        """
+        # 1. Load Data
+        df = pd.read_csv(csv_path)
+        df['ts_end'] = pd.to_datetime(df['ts_end'])
+        df['date'] = df['ts_end'].dt.date.astype(str)
+
+        # 2. Feature Engineering
+        # Normalized Close & Imbalance
+        df['norm_close'] = ((df['close'] - df['profile_vwap']) / df['profile_vwap']) * self.price_scale
+        df['imb_frac'] = df['imb_frac'].clip(-1.0, 1.0)
+
+        # 3. Calculate Interval IDs
+        # Convert timestamp to minutes from midnight
+        minutes_from_midnight = df['ts_end'].dt.hour * 60 + df['ts_end'].dt.minute
+
+        # Shift time so session start is 0
+        minutes_from_start = minutes_from_midnight - self.start_minutes
+
+        # Calculate Interval ID
+        df['interval_id'] = np.floor(minutes_from_start / self.interval_minutes).astype(int)
+
+        # Filter: Keep only buckets within the defined session
+        mask_valid = (minutes_from_start >= 0) & (minutes_from_midnight < self.end_minutes)
+        df = df[mask_valid].copy()
+
+        # 4. Grouping
+        # We need to ensure every day has exactly `self.num_intervals`
+        daily_tensors = []
+        unique_dates = sorted(df['date'].unique())
+
+        feature_cols = ['norm_close', 'imb_frac']
+
+        # Pre-group by date and interval for speed
+        # dict key: (date, interval_id) -> value: numpy array of features
+        grouped_data = {
+            name: group[feature_cols].values
+            for name, group in df.groupby(['date', 'interval_id'])
+        }
+
+        for date in unique_dates:
+            day_intervals = []
+
+            for i in range(self.num_intervals):
+                key = (date, i)
+
+                if key in grouped_data:
+                    # Get raw buckets
+                    seq = torch.tensor(grouped_data[key], dtype=torch.float32)
+
+                    # Truncate if too long
+                    if seq.size(0) > self.max_len:
+                        seq = seq[:self.max_len]
+
+                    # Pad if too short
+                    pad_size = self.max_len - seq.size(0)
+                    if pad_size > 0:
+                        padding = torch.zeros((pad_size, 2), dtype=torch.float32)
+                        seq = torch.cat([seq, padding], dim=0)
+
+                else:
+                    # Missing Interval (No buckets traded?) -> Zero Padding
+                    seq = torch.zeros((self.max_len, 2), dtype=torch.float32)
+
+                day_intervals.append(seq)
+
+            # Stack intervals for this day: (Num_Intervals, Max_Len, 2)
+            daily_tensor = torch.stack(day_intervals)
+            daily_tensors.append(daily_tensor)
+
+        # 5. Final Stack
+        if not daily_tensors:
+            print("Warning: No valid data found within session limits.")
+            return torch.empty(0), []
+
+        # Output: (Num_Days, Num_Intervals, Max_Len, 2)
+        output_tensor = torch.stack(daily_tensors)
+
+        print(f"Processing Complete. Output Shape: {output_tensor.shape}")
+        return output_tensor, unique_dates

@@ -61,7 +61,9 @@ class TriModalModel(nn.Module):
             f_spatial: int = 4,  # Number of profile channels (Bid/Ask/Total)
             f_nb: int = 4,  # Number bars channels
             d_model: int = 64,  # Hidden dimension size
-            dropout: float = 0.2,
+            summary_dropout: float = 0.1,
+            head_dropout : float = 0.3,
+            nb_dropout : float = 0.2,
             task: str = 'regression',
             num_classes: int = 3,
             spatial_fuse_mode: str = "gated",
@@ -74,7 +76,7 @@ class TriModalModel(nn.Module):
             nn.Linear(f_sum, d_model),
             nn.BatchNorm1d(d_model),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(summary_dropout),
             nn.Linear(d_model, d_model // 2)  # Compression
         )
 
@@ -91,7 +93,9 @@ class TriModalModel(nn.Module):
         self.spatial_net = MarketProfileCNN(in_channels=f_spatial, out_dim=d_model // 2)
 
         # --- BRANCH 4: NUMBER BARS (Optional) ---
-        self.nb_net = NumberBarsEncoder(c_in=f_nb, d_model=d_model // 2)
+        self.nb_net = NumberBarsEncoder(c_in=f_nb, d_model=d_model // 2, dropout=nb_dropout)
+
+
         self.spatial_fuse = SpatialFuse(d_spatial=d_model // 2, mode=spatial_fuse_mode)
 
         # --- FUSION HEAD ---
@@ -102,7 +106,7 @@ class TriModalModel(nn.Module):
             nn.Linear(fusion_dim, 128),
             nn.LayerNorm(128),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(head_dropout),
             nn.Linear(128, 64),
             nn.GELU(),
             nn.Linear(64, num_classes if task == 'classification' else 1)

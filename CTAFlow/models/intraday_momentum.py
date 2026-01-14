@@ -5122,38 +5122,98 @@ class DeepIDMomentum(IntradayMomentum):
         self.nb_arrays = nb_arrays
 
     @staticmethod
-    def _load_number_bars(nb_filepath: str) -> Dict[datetime.date, np.ndarray]:
-        """Load number bars arrays keyed by date from a .npz file."""
+    def _load_profile(profile_filepath: str, use_scaler: bool = True) -> np.ndarray:
+        """Load profile arrays from a .npz file.
+
+        Args:
+            profile_filepath: Path to .npz file containing profile data
+            use_scaler: If True, uses ProfileScaler to scale features.
+                       If False, loads raw data without scaling (legacy behavior).
+
+        Returns:
+            Profile array with shape (N, C, Bins) where N=dates, C=channels, Bins=price levels
+        """
+        if not profile_filepath.endswith(".npz"):
+            raise ValueError("Profile data must be provided as a .npz file.")
+
+        if use_scaler:
+            # Use ProfileScaler to load and scale data
+            from ..features.volume.profile import ProfileScaler
+
+            scaler = ProfileScaler(price_scale=100.0, log_vol_div=15.0)
+            tensor_out, dates_str = scaler.load_and_process(profile_filepath)
+
+            # Convert torch tensor to numpy array
+            profile_array = tensor_out.numpy().astype(np.float32)
+
+            return profile_array
+
+        else:
+            # Legacy loading without scaling
+            profile_array = np.load(profile_filepath)
+            return profile_array
+
+    @staticmethod
+    def _load_number_bars(nb_filepath: str, use_cleaner: bool = True) -> Dict[datetime.date, np.ndarray]:
+        """Load number bars arrays keyed by date from a .npz file.
+
+        Args:
+            nb_filepath: Path to .npz file containing number bars data
+            use_cleaner: If True, uses NumberBarCleaner to filter invalid dates and scale data.
+                        If False, loads raw data without filtering (legacy behavior).
+
+        Returns:
+            Dictionary mapping dates to number bars arrays
+        """
         if not nb_filepath.endswith(".npz"):
             raise ValueError("Number bars data must be provided as a .npz file.")
 
-        npz_data = np.load(nb_filepath, allow_pickle=True)
-        keys = set(npz_data.files)
+        if use_cleaner:
+            # Use NumberBarCleaner to load, filter, and scale data
+            from ..features.volume.profile import NumberBarCleaner
 
-        date_key = next((k for k in ("dates", "date", "datetimes", "index") if k in keys), None)
-        array_key = next((k for k in ("arrays", "nb", "number_bars", "bars", "data") if k in keys), None)
+            cleaner = NumberBarCleaner(volume_log_max=10.0, price_scale=100.0)
+            sequences, date_keys = cleaner.load_and_process(nb_filepath)
 
-        if date_key is None or array_key is None:
-            raise ValueError(
-                f"Number bars npz must include dates + arrays. Found keys: {sorted(keys)}"
-            )
+            # Convert to dict mapping dates to numpy arrays
+            nb_by_date: Dict[datetime.date, np.ndarray] = {}
+            for date_key, tensor in zip(date_keys, sequences):
+                # Convert date string (e.g., '2024-01-15') to datetime.date
+                date_obj = pd.to_datetime(date_key).date()
+                # Convert torch tensor to numpy array
+                nb_by_date[date_obj] = tensor.numpy().astype(np.float32)
 
-        dates = pd.to_datetime(npz_data[date_key]).date
-        arrays = npz_data[array_key]
+            return nb_by_date
 
-        if isinstance(arrays, np.ndarray) and arrays.dtype == object:
-            arrays = list(arrays)
+        else:
+            # Legacy loading without filtering
+            npz_data = np.load(nb_filepath, allow_pickle=True)
+            keys = set(npz_data.files)
 
-        if len(dates) != len(arrays):
-            raise ValueError(
-                f"Mismatch between dates ({len(dates)}) and arrays ({len(arrays)}) in {nb_filepath}"
-            )
+            date_key = next((k for k in ("dates", "date", "datetimes", "index") if k in keys), None)
+            array_key = next((k for k in ("arrays", "nb", "number_bars", "bars", "data") if k in keys), None)
 
-        nb_by_date: Dict[datetime.date, np.ndarray] = {}
-        for d, arr in zip(dates, arrays):
-            nb_by_date[pd.Timestamp(d).date()] = np.asarray(arr, dtype=np.float32)
+            if date_key is None or array_key is None:
+                raise ValueError(
+                    f"Number bars npz must include dates + arrays. Found keys: {sorted(keys)}"
+                )
 
-        return nb_by_date
+            dates = pd.to_datetime(npz_data[date_key]).date
+            arrays = npz_data[array_key]
+
+            if isinstance(arrays, np.ndarray) and arrays.dtype == object:
+                arrays = list(arrays)
+
+            if len(dates) != len(arrays):
+                raise ValueError(
+                    f"Mismatch between dates ({len(dates)}) and arrays ({len(arrays)}) in {nb_filepath}"
+                )
+
+            nb_by_date: Dict[datetime.date, np.ndarray] = {}
+            for d, arr in zip(dates, arrays):
+                nb_by_date[pd.Timestamp(d).date()] = np.asarray(arr, dtype=np.float32)
+
+            return nb_by_date
 
     @classmethod
     def from_files(
@@ -5223,7 +5283,7 @@ class DeepIDMomentum(IntradayMomentum):
         # Load profile array if provided
         profile_array = None
         if profile_path is not None:
-            profile_array = np.load(profile_path)
+            profile_array = cls._load_profile(profile_path)
 
         nb_arrays = None
         if nb_filepath is not None:

@@ -87,6 +87,32 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
+class CorrelationLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, preds, targets):
+        # Flatten
+        vx = preds - torch.mean(preds)
+        vy = targets - torch.mean(targets)
+
+        cost = torch.sum(vx * vy) / (torch.sqrt(torch.sum(vx ** 2)) * torch.sqrt(torch.sum(vy ** 2)) + 1e-8)
+
+        # We want to MAXIMIZE correlation, so we MINIMIZE (1 - correlation)
+        return 1 - cost
+
+
+# Usage: Combine it with MSE
+mse_crit = nn.MSELoss()
+corr_crit = CorrelationLoss()
+
+
+def criterion(preds, targets):
+    # Alpha controls the trade-off.
+    # Start with 0.5/0.5 or bias towards correlation (0.1/0.9)
+    return 0.5 * mse_crit(preds, targets) + 0.5 * corr_crit(preds, targets)
+
+
 @dataclass
 class TrainConfig:
     epochs: int = 50
