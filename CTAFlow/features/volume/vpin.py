@@ -92,6 +92,9 @@ class VPINExtractor(ScidBaseExtractor):
         if 'ts' not in df.columns:  # fallback if index didn't have a name
             df.rename(columns={'index': 'ts'}, inplace=True)
 
+        # Preserve timezone information for later restoration
+        original_tz = df['ts'].dt.tz if hasattr(df['ts'].dtype, 'tz') else None
+
         # 1. Volume-clock bucketing with proper boundary splitting
         vol = (df['buy_vol'] + df['sell_vol']).to_numpy(dtype=np.float64)
         if vol.sum() == 0: return pd.DataFrame()
@@ -216,6 +219,11 @@ class VPINExtractor(ScidBaseExtractor):
         gb = gb.rename(columns={'close_last': 'close'})
         gb = gb.drop(columns=['close_first', 'ts_start'], errors='ignore')
 
+        # Restore timezone to ts_end before setting as index
+        if original_tz is not None:
+            # Convert ts_end to datetime with timezone
+            gb['ts_end'] = pd.to_datetime(gb['ts_end']).dt.tz_localize('UTC').dt.tz_convert(original_tz)
+
         return gb.set_index('ts_end')
 
     def get_vpin(self,
@@ -259,8 +267,290 @@ class VPINExtractor(ScidBaseExtractor):
         return self.get_vpin(start_str, end_str, bucket_volume=bucket_volume, window=window)
 
 
+import numpy as np
+import pandas as pd
 import torch
-from datetime import datetime, timedelta
+
+
+class SequenceRasterizer:
+    """
+    Converts sequential VPIN data into spatial grid representations.
+
+    This rasterizer maps VPIN buckets onto a 2D grid where:
+    - X-axis: Time bars (e.g., 4 x 15-minute intervals)
+    - Y-axis: Price bins centered around VWAP
+
+    Output channels: [Density, LogVolume, Imbalance, Returns]
+
+    Can process individual DataFrames or batch process parquet files
+    to create date-keyed npz files for training.
+
+    Example:
+        >>> rasterizer = SequenceRasterizer(bins=64, span_pct=0.01)
+        >>> # Single date
+        >>> tensor = rasterizer.rasterize(vpin_df, num_bars=4)
+        >>> # Batch process parquet to npz
+        >>> rasterizer.parquet_to_npz('vpin.parquet', 'rasterized.npz')
+        >>> # Load from npz
+        >>> data_dict = rasterizer.load_npz('rasterized.npz')
+    """
+
+    def __init__(self, bins=64, span_pct=0.01, vol_scale=10.0, price_scale=100.0):
+        """
+        Parameters
+        ----------
+        bins : int
+            Number of vertical price levels (default: 64)
+        span_pct : float
+            Vertical range +/- from VWAP as percentage (0.01 = 1%)
+        vol_scale : float
+            Divisor for log volume normalization (default: 10.0)
+        price_scale : float
+            Multiplier for price normalization (default: 100.0)
+        """
+        self.bins = bins
+        self.span_pct = span_pct
+        self.vol_scale = vol_scale
+        self.price_scale = price_scale
+
+        # Define grid edges (Scaled space)
+        # If span is 1% and scale is 100, edges are -1.0 to 1.0
+        limit = span_pct * price_scale
+        self.edges = np.linspace(-limit, limit, bins + 1, dtype=np.float32)
+
+    def rasterize(self, df, session_start="09:30", interval_mins=15, num_bars=4):
+        """
+        Converts VPIN DataFrame -> (Num_Bars, Channels, Bins)
+        Channels: [Density, Volume, Imbalance, Returns]
+        """
+        # 1. Setup Time Edges
+        start_dt = pd.to_datetime(f"{df['date'].iloc[0]} {session_start}")
+        time_edges = [start_dt + pd.Timedelta(minutes=i * interval_mins) for i in range(num_bars + 1)]
+
+        # 2. Setup Spatial Coordinates
+        # 0.0 = VWAP, Scaled by 100
+        p_norm = ((df['close'] - df['profile_vwap']) / df['profile_vwap']) * self.price_scale
+
+        # 3. Vectorized Binning
+        t_idx = np.searchsorted(time_edges, df['ts_end']) - 1
+        b_idx = np.searchsorted(self.edges, p_norm) - 1
+
+        # Filter valid
+        valid = (t_idx >= 0) & (t_idx < num_bars) & (b_idx >= 0) & (b_idx < self.bins)
+
+        # 4. Construct Grid (T, Bins, Channels)
+        # We will use 4 Channels: [Count, LogVol, Imbalance, LastReturn]
+        grid = np.zeros((num_bars, self.bins, 4), dtype=np.float32)
+
+        if not np.any(valid):
+            return torch.tensor(grid).permute(0, 2, 1)  # Return empty (T, C, B)
+
+        t_v, b_v = t_idx[valid], b_idx[valid]
+        df_v = df.iloc[valid]
+
+        # Ch 0: Density (Count)
+        np.add.at(grid[..., 0], (t_v, b_v), 1.0)
+
+        # Ch 1: Volume (Sum then Log)
+        np.add.at(grid[..., 1], (t_v, b_v), df_v['vol'].values)
+
+        # Ch 2: Imbalance (Mean)
+        np.add.at(grid[..., 2], (t_v, b_v), df_v['imb_frac'].values)
+
+        # Ch 3: Return (Last) - Using argsort to get time-ordered overwrite
+        # Sort by time to ensure 'last' really means last
+        sort_idx = np.argsort(df_v['ts_end'].values)
+        t_s, b_s = t_v[sort_idx], b_v[sort_idx]
+        vals_s = df_v['bucket_return'].values[sort_idx] * self.price_scale
+
+        # Advanced indexing assignment overwrites, leaving the last value effective
+        grid[t_s, b_s, 3] = vals_s
+
+        # Post-process Means & Logs
+        counts = np.maximum(grid[..., 0], 1.0)
+        grid[..., 2] /= counts  # Average Imbalance
+        grid[..., 1] = np.log1p(grid[..., 1]) / self.vol_scale  # Log Volume
+
+        # Output Shape: (Num_Bars, Bins, Channels) -> Permute to (Num_Bars, Channels, Bins) for CNN
+        return torch.tensor(grid, dtype=torch.float32).permute(0, 2, 1)
+
+    def parquet_to_npz(
+        self,
+        parquet_path: str,
+        output_path: str,
+        session_start: str = "09:30",
+        interval_mins: int = 15,
+        num_bars: int = 4,
+        date_col: str = "date",
+        ts_col: str = "ts_end",
+        verbose: bool = True
+    ) -> dict:
+        """
+        Convert sequential VPIN parquet file to date-keyed npz file.
+
+        Processes all dates in the parquet file and saves rasterized tensors
+        as a numpy archive with dates as keys.
+
+        Parameters
+        ----------
+        parquet_path : str
+            Path to input VPIN parquet file. Must contain columns:
+            - date or ts_end: For grouping by date
+            - close: Price for spatial binning
+            - profile_vwap: Reference price for normalization
+            - vol: Volume per bucket
+            - imb_frac: Imbalance fraction
+            - bucket_return: Return per bucket
+        output_path : str
+            Path for output .npz file
+        session_start : str
+            Session start time HH:MM (default: "09:30")
+        interval_mins : int
+            Minutes per time bar (default: 15)
+        num_bars : int
+            Number of time bars per day (default: 4)
+        date_col : str
+            Column name for date grouping (default: "date")
+        ts_col : str
+            Column name for timestamp (default: "ts_end")
+        verbose : bool
+            Print progress information (default: True)
+
+        Returns
+        -------
+        dict
+            Dictionary with 'dates' (list) and 'shape' (tuple) info
+        """
+        if verbose:
+            print(f"Loading parquet: {parquet_path}")
+
+        df = pd.read_parquet(parquet_path)
+
+        # Ensure date column exists
+        if date_col not in df.columns:
+            if ts_col in df.columns:
+                df[date_col] = pd.to_datetime(df[ts_col]).dt.date.astype(str)
+            elif df.index.name == ts_col or isinstance(df.index, pd.DatetimeIndex):
+                df = df.reset_index()
+                df[date_col] = pd.to_datetime(df[ts_col]).dt.date.astype(str)
+            else:
+                raise ValueError(f"Cannot find date column. Expected '{date_col}' or '{ts_col}'")
+
+        # Ensure ts_end is datetime for rasterization
+        if ts_col in df.columns:
+            df[ts_col] = pd.to_datetime(df[ts_col])
+        else:
+            if isinstance(df.index, pd.DatetimeIndex):
+                df[ts_col] = df.index
+
+        # Get unique dates
+        dates = sorted(df[date_col].unique())
+        if verbose:
+            print(f"Found {len(dates)} unique dates")
+
+        # Process each date
+        rasterized_data = {}
+        skipped = 0
+
+        for i, date in enumerate(dates):
+            date_df = df[df[date_col] == date].copy()
+
+            # Check required columns
+            required = ['close', 'profile_vwap', 'vol', 'imb_frac', 'bucket_return', ts_col]
+            missing = [c for c in required if c not in date_df.columns]
+            if missing:
+                if verbose and i == 0:
+                    print(f"Warning: Missing columns {missing}, skipping dates without required data")
+                skipped += 1
+                continue
+
+            # Add date column if rasterize expects it
+            if 'date' not in date_df.columns:
+                date_df['date'] = date
+
+            try:
+                tensor = self.rasterize(
+                    date_df,
+                    session_start=session_start,
+                    interval_mins=interval_mins,
+                    num_bars=num_bars
+                )
+                # Store as numpy array (T, C, Bins)
+                rasterized_data[str(date)] = tensor.numpy()
+            except Exception as e:
+                if verbose:
+                    print(f"  Error processing {date}: {e}")
+                skipped += 1
+                continue
+
+            if verbose and (i + 1) % 500 == 0:
+                print(f"  Processed {i + 1}/{len(dates)} dates...")
+
+        if verbose:
+            print(f"Processed {len(rasterized_data)} dates, skipped {skipped}")
+
+        # Save to npz
+        np.savez_compressed(output_path, **rasterized_data)
+
+        if verbose:
+            sample_shape = next(iter(rasterized_data.values())).shape if rasterized_data else None
+            print(f"Saved to: {output_path}")
+            print(f"  Shape per date: {sample_shape}")
+
+        return {
+            'dates': list(rasterized_data.keys()),
+            'shape': sample_shape,
+            'num_dates': len(rasterized_data),
+            'skipped': skipped
+        }
+
+    @staticmethod
+    def load_npz(npz_path: str, as_tensor: bool = False) -> dict:
+        """
+        Load date-keyed rasterized data from npz file.
+
+        Parameters
+        ----------
+        npz_path : str
+            Path to .npz file created by parquet_to_npz
+        as_tensor : bool
+            If True, convert arrays to torch tensors (default: False)
+
+        Returns
+        -------
+        dict
+            Dictionary mapping date strings to arrays/tensors of shape (T, C, Bins)
+        """
+        data = np.load(npz_path, allow_pickle=True)
+
+        result = {}
+        for key in data.files:
+            arr = data[key]
+            if as_tensor:
+                result[key] = torch.tensor(arr, dtype=torch.float32)
+            else:
+                result[key] = arr.astype(np.float32)
+
+        return result
+
+    @staticmethod
+    def load_npz_with_dates(npz_path: str) -> tuple:
+        """
+        Load npz file and return arrays with aligned dates.
+
+        Parameters
+        ----------
+        npz_path : str
+            Path to .npz file
+
+        Returns
+        -------
+        tuple
+            (arrays_dict, sorted_dates_list)
+        """
+        data = SequenceRasterizer.load_npz(npz_path, as_tensor=False)
+        sorted_dates = sorted(data.keys())
+        return data, sorted_dates
 
 
 class VPINSequenceProcessor:

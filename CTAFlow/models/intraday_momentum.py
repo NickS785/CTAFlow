@@ -20,6 +20,7 @@ from ..features.curve.curve_features import CurveFeatures
 from ..features import deseasonalize_volatility, deseasonalize_volume
 from ..utils.tenor_interpolation import TenorInterpolator, create_tenor_grid
 from ..data import read_exported_df
+from ..data.dataset_utils import collate_dual, collate_tri, collate_quad, get_collate_fn
 
 
 # noinspection PyDefaultArgument
@@ -5076,6 +5077,7 @@ class DeepIDMomentum(IntradayMomentum):
     - Sequential data (required)
     - Profile array data (optional)
     - Number bars array data (optional)
+    - Rasterized VPIN data (optional)
 
     Parameters
     ----------
@@ -5086,6 +5088,9 @@ class DeepIDMomentum(IntradayMomentum):
         Optional 3D array of profile data (n_samples, height, width) for CNN processing.
     nb_arrays : mapping, optional
         Optional mapping of date -> number bars array shaped (T_nb, BINS, C_nb).
+    rasterized_data : dict or str, optional
+        Rasterized VPIN data. Either a dict mapping dates to arrays (T, C, Bins),
+        or a path to an npz file created by SequenceRasterizer.parquet_to_npz().
     **kwargs
         All other arguments passed to IntradayMomentum.__init__
     """
@@ -5095,6 +5100,7 @@ class DeepIDMomentum(IntradayMomentum):
             sequential_data: pd.DataFrame,
             profile_array: Optional[np.ndarray] = None,
             nb_arrays: Optional[Mapping[datetime.date, np.ndarray]] = None,
+            rasterized_data: Optional[Union[Dict, str]] = None,
             **kwargs
     ) -> None:
         # Initialize parent class
@@ -5116,10 +5122,14 @@ class DeepIDMomentum(IntradayMomentum):
         if nb_arrays is not None:
             self.training_data['number_bars'] = nb_arrays
 
+        if rasterized_data is not None:
+            self.training_data['rasterized'] = rasterized_data
+
         # Store reference to sequential data for easy access
         self.sequential_data = sequential_data
         self.profile_array = profile_array
         self.nb_arrays = nb_arrays
+        self.rasterized_data = rasterized_data
 
     @staticmethod
     def _load_profile(profile_filepath: str, use_scaler: bool = True) -> np.ndarray:
@@ -5215,6 +5225,34 @@ class DeepIDMomentum(IntradayMomentum):
 
             return nb_by_date
 
+    @staticmethod
+    def _load_rasterized(rasterized_path: str) -> Dict[datetime.date, np.ndarray]:
+        """Load rasterized VPIN data from an npz file.
+
+        Args:
+            rasterized_path: Path to .npz file created by SequenceRasterizer.parquet_to_npz()
+
+        Returns:
+            Dictionary mapping dates to rasterized arrays of shape (T, C, Bins)
+        """
+        if not rasterized_path.endswith(".npz"):
+            raise ValueError("Rasterized data must be provided as a .npz file.")
+
+        from ..features.volume.vpin import SequenceRasterizer
+
+        rasterized_dict = SequenceRasterizer.load_npz(rasterized_path, as_tensor=False)
+
+        # Normalize keys to datetime.date objects
+        result: Dict[datetime.date, np.ndarray] = {}
+        for key, arr in rasterized_dict.items():
+            if isinstance(key, str):
+                date_key = pd.to_datetime(key).date()
+            else:
+                date_key = pd.to_datetime(key).date()
+            result[date_key] = np.asarray(arr, dtype=np.float32)
+
+        return result
+
     @classmethod
     def from_files(
             cls,
@@ -5223,6 +5261,7 @@ class DeepIDMomentum(IntradayMomentum):
             sequential_path: str,
             profile_path: Optional[str] = None,
             nb_filepath: Optional[str] = None,
+            rasterized_path: Optional[str] = None,
             target_path: Optional[str] = None,
             target_col: str = "target",
             **kwargs,
@@ -5241,6 +5280,8 @@ class DeepIDMomentum(IntradayMomentum):
             Path to profile array data (.npy file)
         nb_filepath : str, optional
             Path to number bars data (.npz with dates + arrays)
+        rasterized_path : str, optional
+            Path to rasterized VPIN data (.npz created by SequenceRasterizer.parquet_to_npz())
         target_path : str, optional
             Path to target data. If None, expects target_col in features file.
         target_col : str, default "target"
@@ -5289,6 +5330,10 @@ class DeepIDMomentum(IntradayMomentum):
         if nb_filepath is not None:
             nb_arrays = cls._load_number_bars(nb_filepath)
 
+        rasterized_data = None
+        if rasterized_path is not None:
+            rasterized_data = cls._load_rasterized(rasterized_path)
+
         # Load or extract target
         if target_path is not None:
             if target_path.endswith('.parquet'):
@@ -5311,6 +5356,7 @@ class DeepIDMomentum(IntradayMomentum):
         kwargs_copy.pop('sequential_data', None)
         kwargs_copy.pop('profile_array', None)
         kwargs_copy.pop('nb_arrays', None)
+        kwargs_copy.pop('rasterized_data', None)
 
         # Create instance - pass intraday_data to parent, sequential_data to child
         instance = cls(
@@ -5318,6 +5364,7 @@ class DeepIDMomentum(IntradayMomentum):
             sequential_data=sequential_df,
             profile_array=profile_array,
             nb_arrays=nb_arrays,
+            rasterized_data=rasterized_data,
             **kwargs_copy
         )
 
@@ -5576,6 +5623,8 @@ class DeepIDMomentum(IntradayMomentum):
             include_nb: Optional[bool] = None,
             nb_data: Optional[Union[np.ndarray, Dict]] = None,
             nb_dates: Optional[np.ndarray] = None,
+            use_rasterized: bool = False,
+            rasterized_data: Optional[Union[Dict, str]] = None,
     ):
         """Create PyTorch DataLoaders for training dual-branch models.
 
@@ -5629,6 +5678,12 @@ class DeepIDMomentum(IntradayMomentum):
             NumberBars data to use. Overrides self.nb_arrays if provided.
         nb_dates : np.ndarray, optional
             Dates corresponding to nb_data
+        use_rasterized : bool, default False
+            If True, use RasterizedModalDataset with rasterized VPIN data instead of
+            NumberBars. Requires include_spatial=True and rasterized_data to be available.
+        rasterized_data : dict or str, optional
+            Rasterized VPIN data. Either a dict mapping dates to arrays (T, C, Bins),
+            or a path to an npz file. Overrides self.rasterized_data if provided.
 
         Returns
         -------
@@ -5670,12 +5725,24 @@ class DeepIDMomentum(IntradayMomentum):
         ...     nb_dates=nb_dates,
         ...     batch_size=32
         ... )
+        >>>
+        >>> # RasterizedModal with Profile + Rasterized VPIN
+        >>> train_loader, val_loader = model.get_loaders(
+        ...     val_split=True,
+        ...     include_spatial=True,
+        ...     use_rasterized=True,
+        ...     rasterized_data='path/to/rasterized.npz',
+        ...     batch_size=32
+        ... )
         """
         # Import here to avoid requiring torch for all IntradayMomentum usage
         try:
             import torch
             from torch.utils.data import DataLoader
-            from ..data.model_datasets import DualDataset, QuadModalDataset, TriModalDataset
+            from ..data.model_datasets import (
+                DualDataset, QuadModalDataset, TriModalDataset, RasterizedModalDataset
+            )
+            from ..data.dataset_utils import collate_rasterized
         except ImportError as e:
             raise ImportError(
                 "PyTorch is required for get_loaders(). "
@@ -5705,6 +5772,12 @@ class DeepIDMomentum(IntradayMomentum):
             # Use instance nb_arrays
             use_nb_arrays = self.nb_arrays
             use_nb_dates = None
+
+        # Handle external rasterized data
+        if rasterized_data is not None:
+            use_rasterized_data = rasterized_data
+        else:
+            use_rasterized_data = self.rasterized_data
 
         # Determine if spatial should be included
         if include_spatial is None:
@@ -5803,55 +5876,7 @@ class DeepIDMomentum(IntradayMomentum):
         # nb_by_date is already in the correct dict format for the dataset
         final_nb_data = nb_by_date
 
-        # Custom collate functions for variable-length sequences
-        def collate_dual(batch):
-            import torch.nn.utils.rnn as rnn_utils
-            summaries, sequential_seqs, targets, lengths = zip(*batch)
-            summaries = torch.stack(summaries)
-            targets = torch.stack(targets)
-            lengths = torch.tensor(lengths)
-            sequential_padded = rnn_utils.pad_sequence(
-                sequential_seqs, batch_first=True, padding_value=0.0
-            )
-            return summaries, sequential_padded, targets, lengths
-
-        def collate_tri(batch):
-            import torch.nn.utils.rnn as rnn_utils
-            summaries, sequential_seqs, profiles, targets, lengths = zip(*batch)
-            summaries = torch.stack(summaries)
-            profiles = torch.stack(profiles)
-            targets = torch.stack(targets)
-            lengths = torch.tensor(lengths)
-            sequential_padded = rnn_utils.pad_sequence(
-                sequential_seqs, batch_first=True, padding_value=0.0
-            )
-            return summaries, sequential_padded, profiles, targets, lengths
-
-        def collate_quad(batch):
-            import torch.nn.utils.rnn as rnn_utils
-            summaries, sequential_seqs, profiles, nb_seqs, targets, lengths, nb_lengths = zip(*batch)
-            summaries = torch.stack(summaries)
-            profiles = torch.stack(profiles)
-            targets = torch.stack(targets)
-            lengths = torch.tensor(lengths)
-            nb_lengths = torch.tensor(nb_lengths)
-            sequential_padded = rnn_utils.pad_sequence(
-                sequential_seqs, batch_first=True, padding_value=0.0
-            )
-            max_nb_len = int(max(nb_lengths)) if nb_lengths.numel() > 0 else 0
-            if max_nb_len > 0:
-                nb_shape = nb_seqs[0].shape
-                nb_bins = nb_shape[1]
-                nb_channels = nb_shape[2]
-                nb_padded = torch.zeros(
-                    (len(nb_seqs), max_nb_len, nb_bins, nb_channels),
-                    dtype=nb_seqs[0].dtype,
-                )
-                for i, nb_seq in enumerate(nb_seqs):
-                    nb_padded[i, :nb_seq.shape[0]] = nb_seq
-            else:
-                nb_padded = torch.zeros((len(nb_seqs), 0, 0, 0))
-            return summaries, sequential_padded, profiles, nb_padded, targets, lengths, nb_lengths
+        # Collate functions imported from dataset_utils (collate_dual, collate_tri, collate_quad)
 
         # Use get_xy to get aligned, cleaned data
         result = self.get_xy(
@@ -5874,8 +5899,37 @@ class DeepIDMomentum(IntradayMomentum):
                 print(f"\nDataset selection:")
                 print(f"  final_nb_data: {final_nb_data is not None} ({type(final_nb_data) if final_nb_data is not None else 'None'})")
                 print(f"  final_spatial_data: {final_spatial_data is not None} ({final_spatial_data.shape if final_spatial_data is not None else 'None'})")
+                print(f"  use_rasterized: {use_rasterized} ({type(use_rasterized_data) if use_rasterized_data is not None else 'None'})")
 
-            if final_nb_data is not None:
+            if use_rasterized and final_spatial_data is not None:
+                if use_rasterized_data is None:
+                    raise ValueError("use_rasterized=True but no rasterized_data available.")
+                if verbose:
+                    print(f"  Creating RasterizedModalDataset")
+                train_dataset = RasterizedModalDataset(
+                    summary_data=X_train,
+                    sequential_data=self.sequential_data,
+                    spatial_data=final_spatial_data,
+                    spatial_dates=final_spatial_dates,
+                    rasterized_data=use_rasterized_data,
+                    target_data=y_train,
+                    max_len=max_seq_len,
+                    sequential_cols=sequential_cols,
+                    target_col=None,
+                )
+                val_dataset = RasterizedModalDataset(
+                    summary_data=X_val,
+                    sequential_data=self.sequential_data,
+                    spatial_data=final_spatial_data,
+                    spatial_dates=final_spatial_dates,
+                    rasterized_data=use_rasterized_data,
+                    target_data=y_val,
+                    max_len=max_seq_len,
+                    sequential_cols=sequential_cols,
+                    target_col=None,
+                )
+                collate_fn = collate_rasterized
+            elif final_nb_data is not None:
                 if verbose:
                     print(f"  Creating QuadModalDataset")
                 train_dataset = QuadModalDataset(
@@ -5969,7 +6023,22 @@ class DeepIDMomentum(IntradayMomentum):
             X, y = result
 
             # Create dataset
-            if final_nb_data is not None:
+            if use_rasterized and final_spatial_data is not None:
+                if use_rasterized_data is None:
+                    raise ValueError("use_rasterized=True but no rasterized_data available.")
+                dataset = RasterizedModalDataset(
+                    summary_data=X,
+                    sequential_data=self.sequential_data,
+                    spatial_data=final_spatial_data,
+                    spatial_dates=final_spatial_dates,
+                    rasterized_data=use_rasterized_data,
+                    target_data=y,
+                    max_len=max_seq_len,
+                    sequential_cols=sequential_cols,
+                    target_col=None,
+                )
+                collate_fn = collate_rasterized
+            elif final_nb_data is not None:
                 dataset = QuadModalDataset(
                     summary_data=X,
                     sequential_data=self.sequential_data,

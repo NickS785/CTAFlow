@@ -8,6 +8,7 @@ from ..encoders import (
     ProfileEncoder,
     SeqEncoder,
     SpatialFuse,
+    SpatialTemporalEncoder,
     SummaryEncoder,
 )
 
@@ -54,6 +55,50 @@ class MarketProfileCNN(nn.Module):
 
 
 class TriModalModel(nn.Module):
+    """
+    Tri-modal model combining summary, sequential, and spatial (profile + number bars) data.
+
+    Supports two modes for the spatial/number bars encoder:
+    - 'numberbars': Uses NumberBarsEncoder for pre-extracted number bars data (T, BINS, C)
+    - 'rasterized': Uses SpatialTemporalEncoder for rasterized VPIN data (T, C, BINS)
+
+    The rasterized mode is designed to work with SequenceRasterizer from CTAFlow.features.volume.vpin,
+    which converts sequential VPIN buckets into a spatial grid representation.
+
+    Parameters
+    ----------
+    f_sum : int
+        Number of summary features
+    f_seq : int
+        Number of sequential features (default: 3 for VPIN, Return, Duration)
+    f_spatial : int
+        Number of profile channels (default: 4)
+    f_nb : int
+        Number of number bars / rasterized channels (default: 4)
+    d_model : int
+        Hidden dimension size (default: 64)
+    summary_dropout : float
+        Dropout for summary branch (default: 0.1)
+    head_dropout : float
+        Dropout for fusion head (default: 0.3)
+    nb_dropout : float
+        Dropout for number bars encoder (default: 0.2)
+    task : str
+        'regression' or 'classification' (default: 'regression')
+    num_classes : int
+        Number of classes for classification (default: 3)
+    spatial_fuse_mode : str
+        Mode for fusing profile and number bars ('gated' or 'mean')
+    spatial_encoder_type : str
+        Type of spatial encoder for number bars:
+        - 'numberbars': NumberBarsEncoder for (B, T, BINS, C) data
+        - 'rasterized': SpatialTemporalEncoder for (B, T, C, BINS) data from SequenceRasterizer
+    num_bars : int
+        Number of time bars for rasterized encoder (default: 4)
+    num_bins : int
+        Number of price bins for rasterized encoder (default: 64)
+    """
+
     def __init__(
             self,
             f_sum: int,  # Number of summary features
@@ -62,14 +107,18 @@ class TriModalModel(nn.Module):
             f_nb: int = 4,  # Number bars channels
             d_model: int = 64,  # Hidden dimension size
             summary_dropout: float = 0.1,
-            head_dropout : float = 0.3,
-            nb_dropout : float = 0.2,
+            head_dropout: float = 0.3,
+            nb_dropout: float = 0.2,
             task: str = 'regression',
             num_classes: int = 3,
             spatial_fuse_mode: str = "gated",
+            spatial_encoder_type: str = "numberbars",
+            num_bars: int = 4,
+            num_bins: int = 64,
     ):
         super().__init__()
         self.task = task
+        self.spatial_encoder_type = spatial_encoder_type
 
         # --- BRANCH 1: MACRO (Summary MLP) ---
         self.summary_net = nn.Sequential(
@@ -92,9 +141,21 @@ class TriModalModel(nn.Module):
         # --- BRANCH 3: SPATIAL (Profile CNN) ---
         self.spatial_net = MarketProfileCNN(in_channels=f_spatial, out_dim=d_model // 2)
 
-        # --- BRANCH 4: NUMBER BARS (Optional) ---
-        self.nb_net = NumberBarsEncoder(c_in=f_nb, d_model=d_model // 2, dropout=nb_dropout)
-
+        # --- BRANCH 4: NUMBER BARS / RASTERIZED VPIN (Optional) ---
+        if spatial_encoder_type == "rasterized":
+            # Use SpatialTemporalEncoder for rasterized VPIN data
+            # Input shape: (B, T, C, BINS) from SequenceRasterizer
+            self.nb_net = SpatialTemporalEncoder(
+                num_bars=num_bars,
+                in_ch=f_nb,
+                num_bins=num_bins,
+                d_model=d_model // 2,
+                dropout=nb_dropout
+            )
+        else:
+            # Default: NumberBarsEncoder for pre-extracted number bars
+            # Input shape: (B, T, BINS, C)
+            self.nb_net = NumberBarsEncoder(c_in=f_nb, d_model=d_model // 2, dropout=nb_dropout)
 
         self.spatial_fuse = SpatialFuse(d_spatial=d_model // 2, mode=spatial_fuse_mode)
 

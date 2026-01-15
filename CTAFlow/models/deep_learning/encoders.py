@@ -295,3 +295,192 @@ class SummaryMLPEnc(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+
+# ----------------------------
+# Spatial-Temporal Encoder (Rasterized VPIN)
+# ----------------------------
+class PositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding for transformer sequences."""
+
+    def __init__(self, d_model: int, max_len: int = 5000):
+        super().__init__()
+        import math
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # x: (Batch, Seq, Feature)
+        x = x + self.pe[:x.size(1), :]
+        return x
+
+
+class SpatialTemporalEncoder(nn.Module):
+    """
+    CNN-Transformer hybrid for rasterized VPIN sequences.
+
+    This encoder processes rasterized VPIN data where each time bar (e.g., 15-min interval)
+    is represented as a 2D grid with channels [Density, Volume, Imbalance, Returns].
+
+    Architecture:
+        1. **Spatial (CNN)**: Processes each time bar independently to extract shape features
+           (e.g., "this is a trend bar", "this is a balanced bar")
+        2. **Temporal (Transformer)**: Processes the sequence of bar embeddings to understand
+           evolution (e.g., "value is migrating higher")
+
+    Input: (B, T, C, Bins) where:
+        - B: batch size
+        - T: number of time bars (e.g., 4 x 15-min bars)
+        - C: channels [Density, LogVolume, Imbalance, Returns]
+        - Bins: price levels (e.g., 64)
+
+    Output: (B, d_model)
+
+    This is designed to work with SequenceRasterizer from CTAFlow.features.volume.vpin.
+
+    Example:
+        >>> rasterizer = SequenceRasterizer(bins=64, span_pct=0.01)
+        >>> encoder = SpatialTemporalEncoder(num_bars=4, in_ch=4, num_bins=64, d_model=128)
+        >>> # For each date's VPIN data:
+        >>> rasterized = rasterizer.rasterize(vpin_df, num_bars=4)  # (4, 4, 64)
+        >>> batch = rasterized.unsqueeze(0)  # (1, 4, 4, 64)
+        >>> embedding = encoder(batch)  # (1, 128)
+    """
+
+    def __init__(
+        self,
+        num_bars: int = 4,
+        in_ch: int = 4,
+        num_bins: int = 64,
+        d_model: int = 128,
+        nhead: int = 4,
+        n_layers: int = 2,
+        dropout: float = 0.1
+    ):
+        """
+        Parameters
+        ----------
+        num_bars : int
+            Number of time bars per sample (e.g., 4 for 4x15min bars)
+        in_ch : int
+            Number of input channels [Density, Volume, Imbalance, Returns]
+        num_bins : int
+            Number of price bins in the rasterized grid
+        d_model : int
+            Transformer/output dimension
+        nhead : int
+            Number of attention heads
+        n_layers : int
+            Number of transformer encoder layers
+        dropout : float
+            Dropout rate
+        """
+        super().__init__()
+        self.out_dim = d_model
+        self.num_bars = num_bars
+        self.num_bins = num_bins
+
+        # --- 1. Spatial Encoder (Shared CNN) ---
+        # Applies to each bar independently: (Batch*T, C, Bins)
+        self.cnn = nn.Sequential(
+            nn.Conv1d(in_ch, 32, kernel_size=3, padding=1),
+            nn.BatchNorm1d(32),
+            nn.GELU(),
+            nn.MaxPool1d(2),  # bins -> bins/2
+
+            nn.Conv1d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
+            nn.GELU(),
+            nn.MaxPool1d(2),  # bins/2 -> bins/4
+
+            nn.Conv1d(64, d_model, kernel_size=3, padding=1),
+            nn.BatchNorm1d(d_model),
+            nn.GELU(),
+            # Output: (B*T, d_model, bins/4)
+        )
+
+        # Flatten CNN output to get a vector per bar
+        # bins/4 * d_model -> d_model
+        cnn_out_size = d_model * (num_bins // 4)
+        self.adapter = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(cnn_out_size, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU()
+        )
+
+        # --- 2. Temporal Encoder (Transformer) ---
+        self.pos_encoder = PositionalEncoding(d_model, max_len=num_bars)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=4 * d_model,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+        # Final aggregation (Attention Pooling over time)
+        self.attn_pool = nn.Linear(d_model, 1)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x, lengths=None):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor
+            Shape (B, T, C, Bins) - rasterized VPIN data
+        lengths : torch.Tensor, optional
+            Shape (B,) - actual sequence lengths for masking
+
+        Returns
+        -------
+        torch.Tensor
+            Shape (B, d_model) - aggregated embedding
+        """
+        b, t, c, h = x.shape
+
+        # 1. Fold Time into Batch for CNN
+        # (B*T, C, H)
+        x_flat = x.view(b * t, c, h)
+
+        # 2. Extract Spatial Features
+        # (B*T, d_model, H/4)
+        cnn_feat = self.cnn(x_flat)
+
+        # 3. Create Bar Embeddings
+        # (B*T, d_model)
+        bar_embeds = self.adapter(cnn_feat)
+
+        # 4. Unfold Time
+        # (Batch, T, d_model)
+        x_seq = bar_embeds.view(b, t, -1)
+
+        # 5. Transformer Pass
+        x_seq = self.pos_encoder(x_seq)
+
+        # Create attention mask if lengths provided
+        key_padding_mask = None
+        if lengths is not None:
+            time_idx = torch.arange(t, device=x.device)[None, :]
+            key_padding_mask = time_idx >= lengths[:, None]  # (B, T) True where pad
+
+        # (Batch, T, d_model)
+        memory = self.transformer(x_seq, src_key_padding_mask=key_padding_mask)
+
+        # 6. Aggregation (Attention pooling)
+        # Let model decide which time bars are most important
+        scores = self.attn_pool(memory)  # (B, T, 1)
+        if key_padding_mask is not None:
+            scores = scores.masked_fill(key_padding_mask.unsqueeze(-1), -1e9)
+        weights = torch.softmax(scores, dim=1)
+        context = torch.sum(memory * weights, dim=1)  # (B, d_model)
+
+        return self.norm(context)

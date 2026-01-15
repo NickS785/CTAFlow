@@ -25,6 +25,14 @@ from .classifications_reference import (
     get_all_classifications
 )
 from .model_datasets import MomentumWindowDataset, make_window_dataset
+from .dataset_utils import (
+    collate_dual,
+    collate_tri,
+    collate_quad,
+    collate_rasterized,
+    collate_quad_rasterized,
+    get_collate_fn,
+)
 from .raw_formatting.synthetic import CrossProductEngine, IntradaySpreadEngine , CrossSpreadLeg, IntradayLeg
 from .raw_formatting.intraday_manager import read_exported_df, read_synthetic_csv
 
@@ -56,6 +64,13 @@ __all__ = [
     "ContractInfo",
     "MomentumWindowDataset",
     "make_window_dataset",
+    # Collate functions
+    "collate_dual",
+    "collate_tri",
+    "collate_quad",
+    "collate_rasterized",
+    "collate_quad_rasterized",
+    "get_collate_fn",
     # Data retrieval functions
     'fetch_market_cot_data',
     'fetch_data_sync',

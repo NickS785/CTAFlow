@@ -2,7 +2,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import numpy as np
-from typing import Optional, Dict
+from typing import Optional, Dict, Union, Mapping, List
 
 
 class MomentumWindowDataset(Dataset):
@@ -900,6 +900,283 @@ class QuadModalDataset(Dataset):
         target = torch.tensor(self.targets[idx])
 
         return summary_vec, seq_tensor, spatial_tensor, nb_tensor, target, seq_len, nb_len
+
+
+class RasterizedModalDataset(Dataset):
+    """
+    Dataset for Summary + Sequential + Profile + Rasterized VPIN data.
+
+    This dataset is designed to work with rasterized VPIN data created by
+    SequenceRasterizer.parquet_to_npz(), which converts sequential VPIN
+    buckets into spatial grid representations.
+
+    Unlike QuadModalDataset which uses NumberBars, this dataset uses
+    rasterized VPIN data with fixed shape (T, C, Bins) per date.
+
+    Parameters
+    ----------
+    summary_data : pd.DataFrame
+        Summary features with Datetime column or DatetimeIndex
+    sequential_data : pd.DataFrame
+        Sequential VPIN data with date column
+    spatial_data : np.ndarray
+        Profile arrays with shape (N, C, Bins)
+    spatial_dates : np.ndarray
+        Dates corresponding to spatial_data
+    rasterized_data : Union[dict, str]
+        Either:
+        - dict mapping date strings to arrays of shape (T, C, Bins)
+        - str path to .npz file created by SequenceRasterizer.parquet_to_npz()
+    target_data : Optional[Union[pd.DataFrame, pd.Series, np.ndarray]]
+        Target values
+    max_len : int
+        Maximum sequence length for sequential data
+    sequential_cols : Optional[List[str]]
+        Columns to use from sequential data
+    target_col : Optional[str]
+        Target column name
+    date_col : str
+        Date column name in summary_data
+    sequential_date_col : str
+        Date column name in sequential_data
+    """
+
+    def __init__(
+        self,
+        summary_data: pd.DataFrame,
+        sequential_data: pd.DataFrame,
+        spatial_data: np.ndarray,
+        spatial_dates: np.ndarray,
+        rasterized_data: Union[Dict, str],
+        target_data: Optional[Union[pd.DataFrame, pd.Series, np.ndarray]] = None,
+        max_len: int = 200,
+        sequential_cols: Optional[List[str]] = None,
+        target_col: Optional[str] = None,
+        date_col: str = 'Datetime',
+        sequential_date_col: str = 'date'
+    ):
+        # ==========================================
+        # 1. Process Summary Features
+        # ==========================================
+        self.df_summary = summary_data.copy()
+
+        if date_col not in self.df_summary.columns:
+            if isinstance(self.df_summary.index, pd.DatetimeIndex):
+                self.df_summary[date_col] = self.df_summary.index
+            else:
+                raise ValueError(f"Date column '{date_col}' not found")
+
+        self.df_summary = self.df_summary.reset_index(drop=True)
+        self.df_summary[date_col] = pd.to_datetime(self.df_summary[date_col])
+        self.df_summary['date'] = self.df_summary[date_col].dt.date
+
+        exclude_cols = [date_col, 'date', 'Target', target_col] if target_col else [date_col, 'date', 'Target']
+        exclude_cols = [c for c in exclude_cols if c is not None]
+
+        self.feature_cols = [c for c in self.df_summary.columns if c not in exclude_cols]
+        self.features = self.df_summary[self.feature_cols].values.astype(np.float32)
+
+        # ==========================================
+        # 2. Process Target Data
+        # ==========================================
+        self.target_col = target_col
+
+        if target_data is not None:
+            if isinstance(target_data, pd.Series):
+                if isinstance(target_data.index, pd.DatetimeIndex):
+                    temp_map = target_data.copy()
+                    temp_map.index = temp_map.index.date
+                    self.targets = np.array(
+                        [temp_map.get(d, np.nan) for d in self.df_summary['date']],
+                        dtype=np.float32
+                    )
+                else:
+                    self.targets = target_data.values.astype(np.float32)
+            elif isinstance(target_data, pd.DataFrame):
+                if target_col is None:
+                    raise ValueError("target_col must be specified")
+                target_df = target_data.copy()
+                t_date_col = 'Datetime' if 'Datetime' in target_df.columns else date_col
+                if t_date_col in target_df.columns:
+                    target_df[t_date_col] = pd.to_datetime(target_df[t_date_col])
+                    target_df['date'] = target_df[t_date_col].dt.date
+                elif isinstance(target_df.index, pd.DatetimeIndex):
+                    target_df['date'] = target_df.index.date
+                if 'date' in target_df.columns:
+                    target_map = dict(zip(target_df['date'], target_df[target_col]))
+                    self.targets = np.array(
+                        [target_map.get(d, np.nan) for d in self.df_summary['date']],
+                        dtype=np.float32
+                    )
+                else:
+                    self.targets = target_df[target_col].values.astype(np.float32)
+            else:
+                self.targets = np.asarray(target_data, dtype=np.float32)
+        elif target_col and target_col in self.df_summary.columns:
+            self.targets = self.df_summary[target_col].values.astype(np.float32)
+        else:
+            self.targets = np.zeros(len(self.df_summary), dtype=np.float32)
+
+        # ==========================================
+        # 3. Process Sequential Data (VPIN)
+        # ==========================================
+        self.df_sequential = sequential_data.copy()
+
+        if sequential_date_col not in self.df_sequential.columns:
+            if isinstance(self.df_sequential.index, pd.DatetimeIndex):
+                self.df_sequential[sequential_date_col] = self.df_sequential.index
+            elif 'ts_end' in self.df_sequential.columns:
+                self.df_sequential[sequential_date_col] = pd.to_datetime(self.df_sequential['ts_end'])
+            else:
+                raise ValueError(f"Date column '{sequential_date_col}' not found")
+
+        if sequential_cols is None:
+            ignore = [sequential_date_col, 'ts_end', 'ts_start', 'bucket', 'date']
+            self.sequential_cols = [
+                c for c in self.df_sequential.select_dtypes(include=[np.number]).columns
+                if c not in ignore
+            ]
+        else:
+            self.sequential_cols = [c for c in sequential_cols if c in self.df_sequential.columns]
+
+        self.df_sequential = self.df_sequential.reset_index(drop=True)
+        self.df_sequential['date'] = pd.to_datetime(self.df_sequential[sequential_date_col]).dt.date
+
+        self.sequential_by_date = {}
+        for d, group in self.df_sequential.groupby('date'):
+            arr = group[self.sequential_cols].values.astype(np.float32)
+            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+            self.sequential_by_date[d] = arr
+
+        self.max_len = max_len
+        self.n_sequential_features = len(self.sequential_cols)
+
+        # ==========================================
+        # 4. Process Spatial Data (Profiles)
+        # ==========================================
+        spatial_dates_dt = pd.to_datetime(spatial_dates).date
+
+        self.spatial_by_date = {
+            d: spatial_data[i].astype(np.float32)
+            for i, d in enumerate(spatial_dates_dt)
+        }
+
+        if len(self.spatial_by_date) > 0:
+            self.spatial_shape = next(iter(self.spatial_by_date.values())).shape
+        else:
+            self.spatial_shape = (1, 128)
+
+        # ==========================================
+        # 5. Process Rasterized VPIN Data
+        # ==========================================
+        if isinstance(rasterized_data, str):
+            # Load from npz file
+            from CTAFlow.features.volume.vpin import SequenceRasterizer
+            self.rasterized_by_date = SequenceRasterizer.load_npz(rasterized_data, as_tensor=False)
+        elif isinstance(rasterized_data, Mapping):
+            # Convert keys to date objects for consistency
+            self.rasterized_by_date = {}
+            for k, v in rasterized_data.items():
+                if isinstance(k, str):
+                    date_key = pd.to_datetime(k).date()
+                else:
+                    date_key = pd.to_datetime(k).date()
+                self.rasterized_by_date[date_key] = np.asarray(v, dtype=np.float32)
+        else:
+            raise ValueError("rasterized_data must be dict or path to npz file")
+
+        if len(self.rasterized_by_date) > 0:
+            self.rasterized_shape = next(iter(self.rasterized_by_date.values())).shape
+        else:
+            self.rasterized_shape = (4, 4, 64)  # Default: (T, C, Bins)
+
+        # ==========================================
+        # 6. Alignment
+        # ==========================================
+        self._align_to_common_dates()
+
+    def _align_to_common_dates(self):
+        """Ensure all modalities have the same dates."""
+        summary_dates = set(self.df_summary['date'].unique())
+        sequential_dates = set(self.sequential_by_date.keys())
+        spatial_dates = set(self.spatial_by_date.keys())
+
+        # Convert rasterized date keys to match
+        rasterized_dates = set()
+        for k in self.rasterized_by_date.keys():
+            if isinstance(k, str):
+                rasterized_dates.add(pd.to_datetime(k).date())
+            else:
+                rasterized_dates.add(k)
+
+        # Intersect all date sources
+        common_dates = summary_dates & sequential_dates & spatial_dates & rasterized_dates
+
+        # Also filter by valid targets
+        self.df_summary['__target__'] = self.targets
+        valid_target_dates = set(self.df_summary.dropna(subset=['__target__'])['date'])
+        common_dates = common_dates & valid_target_dates
+
+        if len(common_dates) == 0:
+            raise ValueError("No common dates found across all data sources.")
+
+        common_dates = sorted(common_dates)
+
+        # Filter summary
+        mask = self.df_summary['date'].isin(common_dates)
+        self.df_summary = self.df_summary[mask].sort_values('date').reset_index(drop=True)
+        self.features = self.df_summary[self.feature_cols].values.astype(np.float32)
+        self.targets = self.df_summary['__target__'].values.astype(np.float32)
+        self.df_summary = self.df_summary.drop(columns=['__target__'])
+
+        # Filter other modalities
+        self.sequential_by_date = {d: self.sequential_by_date[d] for d in common_dates}
+        self.spatial_by_date = {d: self.spatial_by_date[d] for d in common_dates}
+
+        # Rebuild rasterized with proper date keys
+        new_rasterized = {}
+        for d in common_dates:
+            # Try both date object and string keys
+            if d in self.rasterized_by_date:
+                new_rasterized[d] = self.rasterized_by_date[d]
+            elif str(d) in self.rasterized_by_date:
+                new_rasterized[d] = self.rasterized_by_date[str(d)]
+        self.rasterized_by_date = new_rasterized
+
+    def __len__(self):
+        return len(self.df_summary)
+
+    def __getitem__(self, idx):
+        target_date = self.df_summary.iloc[idx]['date']
+
+        # Summary features
+        summary_vec = torch.tensor(self.features[idx])
+
+        # Sequential data
+        seq_data = self.sequential_by_date.get(target_date)
+        if seq_data is None:
+            seq_data = np.zeros((1, self.n_sequential_features), dtype=np.float32)
+        if len(seq_data) > self.max_len:
+            seq_data = seq_data[:self.max_len]
+        seq_tensor = torch.tensor(seq_data)
+        seq_len = len(seq_data)
+
+        # Spatial (profile) data
+        spatial_data = self.spatial_by_date.get(target_date)
+        if spatial_data is None:
+            spatial_data = np.zeros(self.spatial_shape, dtype=np.float32)
+        spatial_tensor = torch.tensor(spatial_data)
+
+        # Rasterized VPIN data
+        raster_data = self.rasterized_by_date.get(target_date)
+        if raster_data is None:
+            raster_data = np.zeros(self.rasterized_shape, dtype=np.float32)
+        raster_tensor = torch.tensor(raster_data)
+
+        # Target
+        target = torch.tensor(self.targets[idx])
+
+        return summary_vec, seq_tensor, spatial_tensor, raster_tensor, target, seq_len
 
 
 def _sanity_check_quad_modal():

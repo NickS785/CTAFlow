@@ -14,9 +14,11 @@ from .encoders import (
     AttnPool,
     GatedFusion,
     NumberBarsEncoder,
+    PositionalEncoding,
     ProfileEncoder,
     SeqEncoder,
     SpatialFuse,
+    SpatialTemporalEncoder,
     SummaryEncoder,
     SummaryMLPEnc,
 )
@@ -47,9 +49,11 @@ __all__ = [
     "AttnPool",
     "GatedFusion",
     "NumberBarsEncoder",
+    "PositionalEncoding",
     "ProfileEncoder",
     "SeqEncoder",
     "SpatialFuse",
+    "SpatialTemporalEncoder",
     "SummaryEncoder",
     "SummaryMLPEnc",
     # Multi-branch models
