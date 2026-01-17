@@ -1,6 +1,8 @@
+import numpy as np
 import torch
-from torch import nn
+import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn.utils.rnn as rnn_utils
 
 from ..encoders import (
     GatedFusion,
@@ -11,11 +13,6 @@ from ..encoders import (
     SpatialTemporalEncoder,
     SummaryEncoder,
 )
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.nn.utils.rnn as rnn_utils
 
 
 class MarketProfileCNN(nn.Module):
@@ -202,6 +199,14 @@ class TriModalModel(nn.Module):
             nn.Linear(64, num_classes if task == 'classification' else 1)
         )
 
+        # Store branch dimensions for importance tracking
+        self.summary_dim = d_model // 2
+        self.seq_dim = lstm_hidden_dim
+        self.spatial_dim = d_model // 2
+
+        # Storage for last forward pass intermediate representations
+        self.last_branch_embeddings = None
+
         self._init_weights()
 
     def _init_weights(self):
@@ -226,15 +231,39 @@ class TriModalModel(nn.Module):
         nb_tensor=None,
         nb_lengths=None,
         return_probs=False,
+        return_importance=False,
     ):
         """
-        Args:
-            summary_vec: (Batch, f_sum)
-            seq_tensor: (Batch, Max_Len, f_seq)
-            seq_lengths: (Batch) - CPU Tensor of lengths
-            profile_tensor: (Batch, f_spatial, 128)
-            nb_tensor: Optional number bars tensor (Batch, T_nb, BINS, C_nb)
-            nb_lengths: Optional lengths for number bars slices (Batch)
+        Forward pass through the tri-modal model.
+
+        Parameters
+        ----------
+        summary_vec : torch.Tensor
+            Summary features (Batch, f_sum)
+        seq_tensor : torch.Tensor
+            Sequential features (Batch, Max_Len, f_seq)
+        seq_lengths : torch.Tensor
+            Sequence lengths (Batch,)
+        profile_tensor : torch.Tensor
+            Profile features (Batch, f_spatial, 128)
+        nb_tensor : torch.Tensor, optional
+            Number bars/rasterized tensor (Batch, T_nb, BINS, C_nb)
+        nb_lengths : torch.Tensor, optional
+            Lengths for number bars slices (Batch,)
+        return_probs : bool, default False
+            For classification: return probabilities instead of logits
+        return_importance : bool, default False
+            If True, return (output, importance_dict) tuple where importance_dict
+            contains:
+            - 'spatial_importance' (B, 2): [profile_weight, nb_weight]
+            - 'branch_importance' (B, 3): [summary_weight, sequential_weight, spatial_weight]
+            - 'branch_embeddings' dict: Raw embeddings from each branch
+
+        Returns
+        -------
+        torch.Tensor or tuple
+            If return_importance=False: model output (B, num_classes) or (B, 1)
+            If return_importance=True: (output, importance_dict) tuple
         """
         # 1. Macro Branch
         z_sum = self.summary_net(summary_vec)
@@ -252,7 +281,7 @@ class TriModalModel(nn.Module):
         # LSTM returns (output, (h_n, c_n))
         # We only want the last hidden state (h_n)
         _, (h_n, _) = self.lstm(packed_seq)
-        z_seq = h_n[-1]  # Shape: (Batch, d_model)
+        z_seq = h_n[-1]  # Shape: (Batch, lstm_hidden_dim)
 
         # 3. Spatial Branch
         z_profile = self.spatial_net(profile_tensor)
@@ -260,7 +289,19 @@ class TriModalModel(nn.Module):
         if nb_tensor is not None:
             z_nb = self.nb_net(nb_tensor, nb_lengths)
             z_nb = self.nb_proj(z_nb)  # Project to match spatial dimension
-        z_spatial = self.spatial_fuse(z_profile, z_nb)
+
+        # Spatial fusion with optional importance tracking
+        if return_importance:
+            z_spatial, spatial_importance = self.spatial_fuse(z_profile, z_nb, return_importance=True)
+        else:
+            z_spatial = self.spatial_fuse(z_profile, z_nb, return_importance=False)
+
+        # Store branch embeddings for analysis
+        self.last_branch_embeddings = {
+            'summary': z_sum.detach(),
+            'sequential': z_seq.detach(),
+            'spatial': z_spatial.detach()
+        }
 
         # 4. Concatenation Fusion
         z_fused = torch.cat([z_sum, z_seq, z_spatial], dim=1)
@@ -269,9 +310,238 @@ class TriModalModel(nn.Module):
         logits = self.head(z_fused)
 
         if self.task == 'classification' and return_probs:
-            return F.softmax(logits, dim=1)
+            output = F.softmax(logits, dim=1)
+        else:
+            output = logits
 
-        return logits
+        if return_importance:
+            # Compute branch-level importance
+            branch_importance = self._compute_branch_importance(
+                z_sum, z_seq, z_spatial, logits
+            )
+
+            importance_dict = {
+                'spatial_importance': spatial_importance,  # (B, 2): [profile_weight, nb_weight]
+                'branch_importance': branch_importance,  # (B, 3): [summary, sequential, spatial]
+                'branch_embeddings': {
+                    'summary': z_sum.detach(),
+                    'sequential': z_seq.detach(),
+                    'spatial': z_spatial.detach()
+                }
+            }
+            return output, importance_dict
+
+        return output
+
+    def _compute_branch_importance(self, z_sum, z_seq, z_spatial, logits):
+        """
+        Compute importance/contribution of each branch to the final prediction.
+
+        Uses magnitude-based importance: L2 norm of each branch's embedding
+        normalized across branches.
+
+        Parameters
+        ----------
+        z_sum : torch.Tensor
+            Summary branch embedding (B, summary_dim)
+        z_seq : torch.Tensor
+            Sequential branch embedding (B, seq_dim)
+        z_spatial : torch.Tensor
+            Spatial branch embedding (B, spatial_dim)
+        logits : torch.Tensor
+            Model output (B, num_classes) or (B, 1)
+
+        Returns
+        -------
+        torch.Tensor
+            Branch importance weights (B, 3) with values summing to 1
+            [summary_importance, sequential_importance, spatial_importance]
+        """
+        # Compute L2 norm of each branch
+        sum_magnitude = torch.norm(z_sum, p=2, dim=1, keepdim=True)  # (B, 1)
+        seq_magnitude = torch.norm(z_seq, p=2, dim=1, keepdim=True)  # (B, 1)
+        spatial_magnitude = torch.norm(z_spatial, p=2, dim=1, keepdim=True)  # (B, 1)
+
+        # Stack and normalize to get importance weights
+        magnitudes = torch.cat([sum_magnitude, seq_magnitude, spatial_magnitude], dim=1)  # (B, 3)
+        importance = F.softmax(magnitudes, dim=1)  # Normalize to sum to 1
+
+        return importance
+
+    def get_spatial_importance_stats(self):
+        """
+        Get statistics about spatial modality importance from the last forward pass.
+
+        Returns
+        -------
+        dict or None
+            Statistics about profile vs number bars importance, or None if no
+            forward pass has been made yet. Contains:
+            - 'profile_mean': Mean importance of profile modality
+            - 'nb_mean': Mean importance of number bars/rasterized modality
+            - 'profile_std': Std deviation of profile importance
+            - 'nb_std': Std deviation of nb importance
+            - 'profile_dominant': Fraction of samples where profile > nb
+        """
+        return self.spatial_fuse.get_importance_stats()
+
+    def get_branch_importance_stats(self):
+        """
+        Get statistics about branch-level importance from the last forward pass.
+
+        Requires that the last forward pass was done with return_importance=True,
+        or that the branch embeddings are stored.
+
+        Returns
+        -------
+        dict or None
+            Statistics about summary/sequential/spatial branch importance, or None
+            if no forward pass with stored embeddings has been made yet. Contains:
+            - 'summary_mean': Mean importance of summary branch
+            - 'sequential_mean': Mean importance of sequential branch
+            - 'spatial_mean': Mean importance of spatial branch
+            - 'summary_std': Std deviation of summary importance
+            - 'sequential_std': Std deviation of sequential importance
+            - 'spatial_std': Std deviation of spatial importance
+            - 'dominant_branch': Index of most frequently dominant branch (0=summary, 1=seq, 2=spatial)
+        """
+        if self.last_branch_embeddings is None:
+            return None
+
+        # Recompute importance from stored embeddings
+        z_sum = self.last_branch_embeddings['summary']
+        z_seq = self.last_branch_embeddings['sequential']
+        z_spatial = self.last_branch_embeddings['spatial']
+
+        # Dummy logits (not used in magnitude-based importance)
+        dummy_logits = torch.zeros(z_sum.size(0), 1, device=z_sum.device)
+
+        importance = self._compute_branch_importance(z_sum, z_seq, z_spatial, dummy_logits)
+
+        summary_weights = importance[:, 0].cpu().numpy()
+        seq_weights = importance[:, 1].cpu().numpy()
+        spatial_weights = importance[:, 2].cpu().numpy()
+
+        # Find most frequently dominant branch
+        dominant_indices = importance.argmax(dim=1).cpu().numpy()
+        dominant_branch = np.bincount(dominant_indices).argmax()
+
+        return {
+            'summary_mean': summary_weights.mean(),
+            'sequential_mean': seq_weights.mean(),
+            'spatial_mean': spatial_weights.mean(),
+            'summary_std': summary_weights.std(),
+            'sequential_std': seq_weights.std(),
+            'spatial_std': spatial_weights.std(),
+            'dominant_branch': int(dominant_branch),
+            'dominant_branch_name': ['summary', 'sequential', 'spatial'][dominant_branch],
+        }
+
+    def compute_gradient_based_importance(self,
+                                          summary_vec,
+                                          seq_tensor,
+                                          seq_lengths,
+                                          profile_tensor,
+                                          nb_tensor=None,
+                                          nb_lengths=None,
+                                          target_class=None):
+        """
+        Compute gradient-based importance for each branch.
+
+        This uses integrated gradients-like approach: computes gradients of
+        the output w.r.t. each branch's embedding to measure sensitivity.
+
+        Parameters
+        ----------
+        summary_vec, seq_tensor, etc.
+            Same as forward() method
+        target_class : int, optional
+            For classification: which class to compute importance for.
+            If None, uses predicted class.
+
+        Returns
+        -------
+        dict
+            Contains gradient-based importance for each branch:
+            - 'summary_grad_importance': (B,) importance scores
+            - 'sequential_grad_importance': (B,) importance scores
+            - 'spatial_grad_importance': (B,) importance scores
+        """
+        # Enable gradients for embeddings
+        summary_vec.requires_grad_(True)
+        seq_tensor.requires_grad_(True)
+        profile_tensor.requires_grad_(True)
+        if nb_tensor is not None:
+            nb_tensor.requires_grad_(True)
+
+        # Forward pass
+        outputs, importance_dict = self.forward(
+            summary_vec=summary_vec,
+            seq_tensor=seq_tensor,
+            seq_lengths=seq_lengths,
+            profile_tensor=profile_tensor,
+            nb_tensor=nb_tensor,
+            nb_lengths=nb_lengths,
+            return_importance=True
+        )
+
+        batch_size = outputs.size(0)
+
+        # Get embeddings (with gradients enabled)
+        z_sum = importance_dict['branch_embeddings']['summary'].requires_grad_(True)
+        z_seq = importance_dict['branch_embeddings']['sequential'].requires_grad_(True)
+        z_spatial = importance_dict['branch_embeddings']['spatial'].requires_grad_(True)
+
+        # Determine target for gradient computation
+        if target_class is None:
+            if self.task == 'classification':
+                target_class = outputs.argmax(dim=1)
+            else:
+                # For regression, use the output directly
+                target_output = outputs.squeeze()
+        else:
+            target_output = outputs.gather(1, target_class.unsqueeze(1)).squeeze()
+
+        # Compute gradients for each branch
+        summary_grads = []
+        seq_grads = []
+        spatial_grads = []
+
+        for i in range(batch_size):
+            if self.task == 'classification':
+                output_val = outputs[i, target_class[i]]
+            else:
+                output_val = outputs[i, 0]
+
+            # Compute gradients
+            grad_sum = torch.autograd.grad(output_val, z_sum, retain_graph=True, create_graph=False)[0][i]
+            grad_seq = torch.autograd.grad(output_val, z_seq, retain_graph=True, create_graph=False)[0][i]
+            grad_spatial = torch.autograd.grad(output_val, z_spatial, retain_graph=True, create_graph=False)[0][i]
+
+            # Importance = gradient * embedding (approximation of contribution)
+            summary_importance = (grad_sum * z_sum[i]).abs().sum()
+            seq_importance = (grad_seq * z_seq[i]).abs().sum()
+            spatial_importance = (grad_spatial * z_spatial[i]).abs().sum()
+
+            summary_grads.append(summary_importance.item())
+            seq_grads.append(seq_importance.item())
+            spatial_grads.append(spatial_importance.item())
+
+        # Normalize to sum to 1 per sample
+        summary_grads = np.array(summary_grads)
+        seq_grads = np.array(seq_grads)
+        spatial_grads = np.array(spatial_grads)
+
+        total = summary_grads + seq_grads + spatial_grads + 1e-8
+        summary_grads = summary_grads / total
+        seq_grads = seq_grads / total
+        spatial_grads = spatial_grads / total
+
+        return {
+            'summary_grad_importance': summary_grads,
+            'sequential_grad_importance': seq_grads,
+            'spatial_grad_importance': spatial_grads,
+        }
 
 
 class TriModalLiquidityModel(nn.Module):

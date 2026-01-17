@@ -41,10 +41,29 @@ class GatedFusion(nn.Module):
 
 
 class SpatialFuse(nn.Module):
-    """Fuse spatial embeddings from profile + number bars."""
+    """
+    Fuse spatial embeddings from profile + number bars with optional importance tracking.
+
+    Parameters
+    ----------
+    d_spatial : int
+        Dimension of spatial embeddings
+    mode : str, default 'gated'
+        Fusion mode:
+        - 'gated': Learned attention weights (supports importance tracking)
+        - 'mean': Simple averaging (no learned importance)
+
+    Attributes
+    ----------
+    last_importance : torch.Tensor or None
+        Most recent modality importance weights (B, 2) [profile_weight, nb_weight]
+        Updated after each forward pass in 'gated' mode
+    """
     def __init__(self, d_spatial: int, mode: str = "gated"):
         super().__init__()
         self.mode = mode
+        self.last_importance = None  # Track last importance weights
+
         if mode == "gated":
             self.gate = nn.Sequential(
                 nn.Linear(d_spatial * 2, d_spatial),
@@ -54,13 +73,89 @@ class SpatialFuse(nn.Module):
         elif mode != "mean":
             raise ValueError(f"Unknown SpatialFuse mode: {mode}")
 
-    def forward(self, z_profile, z_nb=None):
+    def forward(self, z_profile, z_nb=None, return_importance=False):
+        """
+        Fuse profile and number bars embeddings.
+
+        Parameters
+        ----------
+        z_profile : torch.Tensor
+            Profile embeddings (B, d_spatial)
+        z_nb : torch.Tensor, optional
+            Number bars/rasterized embeddings (B, d_spatial)
+        return_importance : bool, default False
+            If True, return (fused, importance_weights) tuple
+            If False, return only fused output (backward compatible)
+
+        Returns
+        -------
+        torch.Tensor or tuple
+            If return_importance=False: fused output (B, d_spatial)
+            If return_importance=True: (fused, importance) where importance is (B, 2)
+        """
         if z_nb is None:
+            if return_importance:
+                # Profile only - 100% importance to profile
+                batch_size = z_profile.size(0)
+                importance = torch.tensor(
+                    [[1.0, 0.0]],
+                    device=z_profile.device,
+                    dtype=z_profile.dtype
+                ).expand(batch_size, 2)
+                self.last_importance = importance
+                return z_profile, importance
             return z_profile
+
         if self.mode == "mean":
-            return 0.5 * (z_profile + z_nb)
+            fused = 0.5 * (z_profile + z_nb)
+            if return_importance:
+                # Equal importance for mean fusion
+                batch_size = z_profile.size(0)
+                importance = torch.tensor(
+                    [[0.5, 0.5]],
+                    device=z_profile.device,
+                    dtype=z_profile.dtype
+                ).expand(batch_size, 2)
+                self.last_importance = importance
+                return fused, importance
+            return fused
+
+        # Gated fusion with learned importance
         weights = F.softmax(self.gate(torch.cat([z_profile, z_nb], dim=-1)), dim=-1)
-        return weights[:, 0:1] * z_profile + weights[:, 1:2] * z_nb
+        self.last_importance = weights.detach()  # Store for analysis
+        fused = weights[:, 0:1] * z_profile + weights[:, 1:2] * z_nb
+
+        if return_importance:
+            return fused, weights
+        return fused
+
+    def get_importance_stats(self):
+        """
+        Get statistics about modality importance from last forward pass.
+
+        Returns
+        -------
+        dict or None
+            Dictionary with keys:
+            - 'profile_mean': Mean importance of profile modality
+            - 'nb_mean': Mean importance of number bars modality
+            - 'profile_std': Std deviation of profile importance
+            - 'nb_std': Std deviation of number bars importance
+            Returns None if no forward pass has been made yet
+        """
+        if self.last_importance is None:
+            return None
+
+        profile_weights = self.last_importance[:, 0]
+        nb_weights = self.last_importance[:, 1]
+
+        return {
+            'profile_mean': profile_weights.mean().item(),
+            'nb_mean': nb_weights.mean().item(),
+            'profile_std': profile_weights.std().item(),
+            'nb_std': nb_weights.std().item(),
+            'profile_dominant': (profile_weights > nb_weights).float().mean().item(),
+        }
 
 # ----------------------------
 # Encoders
