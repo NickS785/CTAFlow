@@ -167,10 +167,11 @@ class DualBranchModel(nn.Module):
         if self._use_custom_seq_encoder:
             seq_out = self.seq_encoder(vpin_sequence, vpin_lengths)
         else:
-            # Default LSTM with packing
+            # Default LSTM with packing (clamp to at least 1 to avoid errors)
+            vpin_lengths_clamped = vpin_lengths.clamp(min=1).cpu()
             packed_input = rnn_utils.pack_padded_sequence(
                 vpin_sequence,
-                vpin_lengths.cpu(),
+                vpin_lengths_clamped,
                 batch_first=True,
                 enforce_sorted=False
             )

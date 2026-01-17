@@ -5086,6 +5086,9 @@ class DeepIDMomentum(IntradayMomentum):
         or market profile data that needs to be processed as sequences.
     profile_array : np.ndarray, optional
         Optional 3D array of profile data (n_samples, height, width) for CNN processing.
+    profile_dates : np.ndarray, optional
+        Array of dates corresponding to profile_array. Required for date alignment
+        when profile_array length differs from summary data length.
     nb_arrays : mapping, optional
         Optional mapping of date -> number bars array shaped (T_nb, BINS, C_nb).
     rasterized_data : dict or str, optional
@@ -5099,6 +5102,7 @@ class DeepIDMomentum(IntradayMomentum):
             self,
             sequential_data: pd.DataFrame,
             profile_array: Optional[np.ndarray] = None,
+            profile_dates: Optional[np.ndarray] = None,
             nb_arrays: Optional[Mapping[datetime.date, np.ndarray]] = None,
             rasterized_data: Optional[Union[Dict, str]] = None,
             **kwargs
@@ -5128,11 +5132,12 @@ class DeepIDMomentum(IntradayMomentum):
         # Store reference to sequential data for easy access
         self.sequential_data = sequential_data
         self.profile_array = profile_array
+        self.profile_dates = profile_dates
         self.nb_arrays = nb_arrays
         self.rasterized_data = rasterized_data
 
     @staticmethod
-    def _load_profile(profile_filepath: str, use_scaler: bool = True) -> np.ndarray:
+    def _load_profile(profile_filepath: str, use_scaler: bool = True) -> Tuple[np.ndarray, np.ndarray]:
         """Load profile arrays from a .npz file.
 
         Args:
@@ -5141,7 +5146,9 @@ class DeepIDMomentum(IntradayMomentum):
                        If False, loads raw data without scaling (legacy behavior).
 
         Returns:
-            Profile array with shape (N, C, Bins) where N=dates, C=channels, Bins=price levels
+            Tuple of (profile_array, dates_array):
+            - profile_array: Shape (N, C, Bins) where N=dates, C=channels, Bins=price levels
+            - dates_array: Array of date strings corresponding to profile_array
         """
         if not profile_filepath.endswith(".npz"):
             raise ValueError("Profile data must be provided as a .npz file.")
@@ -5155,13 +5162,34 @@ class DeepIDMomentum(IntradayMomentum):
 
             # Convert torch tensor to numpy array
             profile_array = tensor_out.numpy().astype(np.float32)
+            dates_array = np.array(dates_str)
 
-            return profile_array
+            return profile_array, dates_array
 
         else:
-            # Legacy loading without scaling
-            profile_array = np.load(profile_filepath)
-            return profile_array
+            # Legacy loading without scaling - try to find dates in npz
+            npz_data = np.load(profile_filepath, allow_pickle=True)
+            keys = set(npz_data.files)
+
+            date_key = next((k for k in ("dates", "date", "datetimes", "index") if k in keys), None)
+            array_key = next((k for k in ("arrays", "profiles", "data") if k in keys), None)
+
+            if array_key:
+                profile_array = npz_data[array_key]
+            else:
+                # Try to load as date-keyed entries
+                date_keys = sorted([k for k in keys if k not in ("dates", "date", "datetimes", "index")])
+                profile_array = np.stack([npz_data[k] for k in date_keys])
+                if date_key is None:
+                    dates_array = np.array(date_keys)
+                    return profile_array.astype(np.float32), dates_array
+
+            if date_key:
+                dates_array = np.array(npz_data[date_key])
+            else:
+                dates_array = None
+
+            return profile_array.astype(np.float32), dates_array
 
     @staticmethod
     def _load_number_bars(nb_filepath: str, use_cleaner: bool = True) -> Dict[datetime.date, np.ndarray]:
@@ -5323,8 +5351,9 @@ class DeepIDMomentum(IntradayMomentum):
 
         # Load profile array if provided
         profile_array = None
+        profile_dates = None
         if profile_path is not None:
-            profile_array = cls._load_profile(profile_path)
+            profile_array, profile_dates = cls._load_profile(profile_path)
 
         nb_arrays = None
         if nb_filepath is not None:
@@ -5355,6 +5384,7 @@ class DeepIDMomentum(IntradayMomentum):
         kwargs_copy.pop('intraday_data', None)
         kwargs_copy.pop('sequential_data', None)
         kwargs_copy.pop('profile_array', None)
+        kwargs_copy.pop('profile_dates', None)
         kwargs_copy.pop('nb_arrays', None)
         kwargs_copy.pop('rasterized_data', None)
 
@@ -5363,6 +5393,7 @@ class DeepIDMomentum(IntradayMomentum):
             intraday_data=intraday_data,
             sequential_data=sequential_df,
             profile_array=profile_array,
+            profile_dates=profile_dates,
             nb_arrays=nb_arrays,
             rasterized_data=rasterized_data,
             **kwargs_copy
@@ -5759,9 +5790,9 @@ class DeepIDMomentum(IntradayMomentum):
             use_profile_array = spatial_data
             use_spatial_dates = spatial_dates
         else:
-            # Use instance profile_array
+            # Use instance profile_array and profile_dates
             use_profile_array = self.profile_array
-            use_spatial_dates = None
+            use_spatial_dates = self.profile_dates
 
         # Handle external nb data
         if nb_data is not None:

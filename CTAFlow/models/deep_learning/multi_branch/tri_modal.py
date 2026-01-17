@@ -76,7 +76,17 @@ class TriModalModel(nn.Module):
     f_nb : int
         Number of number bars / rasterized channels (default: 4)
     d_model : int
-        Hidden dimension size (default: 64)
+        Hidden dimension size for summary/spatial branches (default: 64)
+    lstm_hidden_dim : int
+        LSTM hidden dimension for sequential branch (default: 64)
+    lstm_num_layers : int
+        Number of LSTM layers (default: 1)
+    transformer_d_model : int
+        Transformer output dimension for rasterized encoder (default: 32)
+    transformer_n_layers : int
+        Number of transformer encoder layers in rasterized encoder (default: 2)
+    transformer_nhead : int
+        Number of attention heads in transformer (default: 4)
     summary_dropout : float
         Dropout for summary branch (default: 0.1)
     head_dropout : float
@@ -105,7 +115,12 @@ class TriModalModel(nn.Module):
             f_seq: int = 3,  # Number of sequential features (VPIN, Return, Dur)
             f_spatial: int = 4,  # Number of profile channels (Bid/Ask/Total)
             f_nb: int = 4,  # Number bars channels
-            d_model: int = 64,  # Hidden dimension size
+            d_model: int = 64,  # Hidden dimension size for summary/spatial
+            lstm_hidden_dim: int = 64,  # LSTM hidden dimension
+            lstm_num_layers: int = 1,  # Number of LSTM layers
+            transformer_d_model: int = 32,  # Transformer output dimension for rasterized encoder
+            transformer_n_layers: int = 2,  # Number of transformer layers
+            transformer_nhead: int = 4,  # Number of attention heads in transformer
             summary_dropout: float = 0.1,
             head_dropout: float = 0.3,
             nb_dropout: float = 0.2,
@@ -130,11 +145,10 @@ class TriModalModel(nn.Module):
         )
 
         # --- BRANCH 2: MICRO (Sequential LSTM) ---
-        # Strictly akin to DualBranchModel's logic
         self.lstm = nn.LSTM(
             input_size=f_seq,
-            hidden_size=d_model,
-            num_layers=1,
+            hidden_size=lstm_hidden_dim,
+            num_layers=lstm_num_layers,
             batch_first=True
         )
 
@@ -149,19 +163,34 @@ class TriModalModel(nn.Module):
                 num_bars=num_bars,
                 in_ch=f_nb,
                 num_bins=num_bins,
-                d_model=d_model // 2,
+                d_model=transformer_d_model,
+                n_layers=transformer_n_layers,
+                nhead=transformer_nhead,
                 dropout=nb_dropout
             )
+            nb_out_dim = transformer_d_model
+
+            # Project nb output to match spatial dimension for fusion
+            if transformer_d_model != d_model // 2:
+                self.nb_proj = nn.Sequential(
+                    nn.Linear(transformer_d_model, d_model // 2),
+                    nn.GELU()
+                )
+            else:
+                self.nb_proj = nn.Identity()
         else:
             # Default: NumberBarsEncoder for pre-extracted number bars
             # Input shape: (B, T, BINS, C)
             self.nb_net = NumberBarsEncoder(c_in=f_nb, d_model=d_model // 2, dropout=nb_dropout)
+            nb_out_dim = d_model // 2
+            self.nb_proj = nn.Identity()
 
         self.spatial_fuse = SpatialFuse(d_spatial=d_model // 2, mode=spatial_fuse_mode)
 
         # --- FUSION HEAD ---
-        # Concatenate: Summary(32) + LSTM(64) + Spatial(32) = 128
-        fusion_dim = (d_model // 2) + d_model + (d_model // 2)
+        # Concatenate: Summary(d_model//2) + LSTM(lstm_hidden_dim) + Spatial(d_model//2)
+        # Note: spatial_fuse outputs d_model//2 regardless of nb_out_dim
+        fusion_dim = (d_model // 2) + lstm_hidden_dim + (d_model // 2)
 
         self.head = nn.Sequential(
             nn.Linear(fusion_dim, 128),
@@ -211,9 +240,11 @@ class TriModalModel(nn.Module):
         z_sum = self.summary_net(summary_vec)
 
         # 2. Micro Branch (Packed Sequence)
+        # Clamp lengths to at least 1 to avoid pack_padded_sequence errors
+        seq_lengths_clamped = seq_lengths.clamp(min=1).cpu()
         packed_seq = rnn_utils.pack_padded_sequence(
             seq_tensor,
-            seq_lengths.cpu(),
+            seq_lengths_clamped,
             batch_first=True,
             enforce_sorted=False
         )
@@ -228,6 +259,7 @@ class TriModalModel(nn.Module):
         z_nb = None
         if nb_tensor is not None:
             z_nb = self.nb_net(nb_tensor, nb_lengths)
+            z_nb = self.nb_proj(z_nb)  # Project to match spatial dimension
         z_spatial = self.spatial_fuse(z_profile, z_nb)
 
         # 4. Concatenation Fusion

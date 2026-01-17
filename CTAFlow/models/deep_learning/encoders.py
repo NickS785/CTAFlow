@@ -161,9 +161,9 @@ class SeqEncoder(nn.Module):
         # Conv over time
         h = self.conv(h.transpose(1, 2)).transpose(1, 2)  # (B, T, d_conv)
 
-        # Pack for LSTM
-        seq_len_cpu = seq_len.detach().to("cpu")
-        packed = pack_padded_sequence(h, lengths=seq_len_cpu, batch_first=True, enforce_sorted=False)
+        # Pack for LSTM (clamp to at least 1 to avoid errors with zero-length sequences)
+        seq_len_clamped = seq_len.clamp(min=1).detach().to("cpu")
+        packed = pack_padded_sequence(h, lengths=seq_len_clamped, batch_first=True, enforce_sorted=False)
         packed_out, _ = self.lstm(packed)
         out, _ = pad_packed_sequence(packed_out, batch_first=True, total_length=T)  # (B, T, lstm_dim)
 

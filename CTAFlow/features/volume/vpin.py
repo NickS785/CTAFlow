@@ -271,6 +271,13 @@ import numpy as np
 import pandas as pd
 import torch
 
+# CuPy availability flag for GPU acceleration
+try:
+    import cupy as cp
+    CUPY_AVAILABLE = True
+except ImportError:
+    CUPY_AVAILABLE = False
+
 
 class SequenceRasterizer:
     """
@@ -551,6 +558,363 @@ class SequenceRasterizer:
         data = SequenceRasterizer.load_npz(npz_path, as_tensor=False)
         sorted_dates = sorted(data.keys())
         return data, sorted_dates
+
+
+class CupySequenceRasterizer:
+    """
+    GPU-accelerated version of SequenceRasterizer using CuPy.
+
+    This class provides significant speedups for batch rasterization by
+    leveraging GPU parallelism for binning and aggregation operations.
+
+    Falls back to CPU (numpy) if CuPy is not available.
+
+    Example:
+        >>> rasterizer = CupySequenceRasterizer(bins=64, span_pct=0.01)
+        >>> # Single date (returns torch tensor on CPU)
+        >>> tensor = rasterizer.rasterize(vpin_df, num_bars=4)
+        >>> # Batch process parquet to npz (GPU accelerated)
+        >>> rasterizer.parquet_to_npz('vpin.parquet', 'rasterized.npz')
+    """
+
+    def __init__(self, bins=64, span_pct=0.01, vol_scale=10.0, price_scale=100.0):
+        """
+        Parameters
+        ----------
+        bins : int
+            Number of vertical price levels (default: 64)
+        span_pct : float
+            Vertical range +/- from VWAP as percentage (0.01 = 1%)
+        vol_scale : float
+            Divisor for log volume normalization (default: 10.0)
+        price_scale : float
+            Multiplier for price normalization (default: 100.0)
+        """
+        self.bins = bins
+        self.span_pct = span_pct
+        self.vol_scale = vol_scale
+        self.price_scale = price_scale
+        self.use_gpu = CUPY_AVAILABLE
+
+        # Define grid edges
+        limit = span_pct * price_scale
+        self.edges_np = np.linspace(-limit, limit, bins + 1, dtype=np.float32)
+
+        if self.use_gpu:
+            self.edges_gpu = cp.asarray(self.edges_np)
+
+    def _rasterize_gpu(self, df, time_edges_ns, num_bars):
+        """GPU-accelerated rasterization using CuPy."""
+        n = len(df)
+
+        # Transfer data to GPU
+        p_norm = ((df['close'].values - df['profile_vwap'].values) /
+                  df['profile_vwap'].values) * self.price_scale
+        ts_end_ns = df['ts_end'].values.astype('datetime64[ns]').astype(np.int64)
+        vol = df['vol'].values.astype(np.float32)
+        imb = df['imb_frac'].values.astype(np.float32)
+        ret = df['bucket_return'].values.astype(np.float32) * self.price_scale
+
+        # Move to GPU
+        p_norm_gpu = cp.asarray(p_norm, dtype=cp.float32)
+        ts_gpu = cp.asarray(ts_end_ns, dtype=cp.int64)
+        vol_gpu = cp.asarray(vol, dtype=cp.float32)
+        imb_gpu = cp.asarray(imb, dtype=cp.float32)
+        ret_gpu = cp.asarray(ret, dtype=cp.float32)
+        time_edges_gpu = cp.asarray(time_edges_ns, dtype=cp.int64)
+
+        # Binning on GPU
+        t_idx = cp.searchsorted(time_edges_gpu, ts_gpu) - 1
+        b_idx = cp.searchsorted(self.edges_gpu, p_norm_gpu) - 1
+
+        # Valid mask
+        valid = (t_idx >= 0) & (t_idx < num_bars) & (b_idx >= 0) & (b_idx < self.bins)
+
+        # Initialize grid
+        grid = cp.zeros((num_bars, self.bins, 4), dtype=cp.float32)
+
+        if not cp.any(valid):
+            result = cp.asnumpy(grid)
+            return torch.tensor(result, dtype=torch.float32).permute(0, 2, 1)
+
+        # Extract valid indices
+        t_v = t_idx[valid]
+        b_v = b_idx[valid]
+        vol_v = vol_gpu[valid]
+        imb_v = imb_gpu[valid]
+        ret_v = ret_gpu[valid]
+
+        # Compute linear indices for scatter operations
+        linear_idx = t_v * self.bins + b_v
+
+        # Channel 0: Density (count) - use bincount
+        counts = cp.bincount(linear_idx.astype(cp.int32), minlength=num_bars * self.bins)
+        grid[..., 0] = counts.reshape(num_bars, self.bins).astype(cp.float32)
+
+        # Channel 1: Volume sum - use bincount with weights
+        vol_sum = cp.bincount(linear_idx.astype(cp.int32), weights=vol_v, minlength=num_bars * self.bins)
+        grid[..., 1] = vol_sum.reshape(num_bars, self.bins).astype(cp.float32)
+
+        # Channel 2: Imbalance sum (will divide by count later)
+        imb_sum = cp.bincount(linear_idx.astype(cp.int32), weights=imb_v, minlength=num_bars * self.bins)
+        grid[..., 2] = imb_sum.reshape(num_bars, self.bins).astype(cp.float32)
+
+        # Channel 3: Last return - need to handle "last" semantics
+        # Sort by timestamp to get correct last value
+        valid_indices = cp.where(valid)[0]
+        ts_valid = ts_gpu[valid]
+        sort_order = cp.argsort(ts_valid)
+
+        t_sorted = t_v[sort_order]
+        b_sorted = b_v[sort_order]
+        ret_sorted = ret_v[sort_order]
+
+        # Create flat indices and use advanced indexing (last write wins)
+        t_np = cp.asnumpy(t_sorted).astype(np.int64)
+        b_np = cp.asnumpy(b_sorted).astype(np.int64)
+        ret_np = cp.asnumpy(ret_sorted)
+
+        # Do the last-value assignment on CPU (more reliable for overwrites)
+        grid_ch3 = np.zeros((num_bars, self.bins), dtype=np.float32)
+        grid_ch3[t_np, b_np] = ret_np
+        grid[..., 3] = cp.asarray(grid_ch3)
+
+        # Post-process: means and logs
+        counts_safe = cp.maximum(grid[..., 0], 1.0)
+        grid[..., 2] /= counts_safe  # Average imbalance
+        grid[..., 1] = cp.log1p(grid[..., 1]) / self.vol_scale  # Log volume
+
+        # Transfer back to CPU
+        result = cp.asnumpy(grid)
+        return torch.tensor(result, dtype=torch.float32).permute(0, 2, 1)
+
+    def _rasterize_cpu(self, df, time_edges, num_bars):
+        """CPU fallback rasterization (same as SequenceRasterizer)."""
+        p_norm = ((df['close'] - df['profile_vwap']) / df['profile_vwap']) * self.price_scale
+
+        t_idx = np.searchsorted(time_edges, df['ts_end']) - 1
+        b_idx = np.searchsorted(self.edges_np, p_norm) - 1
+
+        valid = (t_idx >= 0) & (t_idx < num_bars) & (b_idx >= 0) & (b_idx < self.bins)
+
+        grid = np.zeros((num_bars, self.bins, 4), dtype=np.float32)
+
+        if not np.any(valid):
+            return torch.tensor(grid).permute(0, 2, 1)
+
+        t_v, b_v = t_idx[valid], b_idx[valid]
+        df_v = df.iloc[valid]
+
+        np.add.at(grid[..., 0], (t_v, b_v), 1.0)
+        np.add.at(grid[..., 1], (t_v, b_v), df_v['vol'].values)
+        np.add.at(grid[..., 2], (t_v, b_v), df_v['imb_frac'].values)
+
+        sort_idx = np.argsort(df_v['ts_end'].values)
+        t_s, b_s = t_v[sort_idx], b_v[sort_idx]
+        vals_s = df_v['bucket_return'].values[sort_idx] * self.price_scale
+        grid[t_s, b_s, 3] = vals_s
+
+        counts = np.maximum(grid[..., 0], 1.0)
+        grid[..., 2] /= counts
+        grid[..., 1] = np.log1p(grid[..., 1]) / self.vol_scale
+
+        return torch.tensor(grid, dtype=torch.float32).permute(0, 2, 1)
+
+    def rasterize(self, df, session_start="09:30", interval_mins=15, num_bars=4):
+        """
+        Converts VPIN DataFrame -> (Num_Bars, Channels, Bins)
+        Channels: [Density, Volume, Imbalance, Returns]
+
+        Uses GPU if CuPy is available, otherwise falls back to CPU.
+        """
+        start_dt = pd.to_datetime(f"{df['date'].iloc[0]} {session_start}")
+        time_edges = [start_dt + pd.Timedelta(minutes=i * interval_mins) for i in range(num_bars + 1)]
+
+        if self.use_gpu:
+            time_edges_ns = np.array([t.value for t in time_edges], dtype=np.int64)
+            return self._rasterize_gpu(df, time_edges_ns, num_bars)
+        else:
+            return self._rasterize_cpu(df, time_edges, num_bars)
+
+    def rasterize_batch(self, df_list, session_start="09:30", interval_mins=15, num_bars=4):
+        """
+        Batch rasterize multiple DataFrames.
+
+        Parameters
+        ----------
+        df_list : list of pd.DataFrame
+            List of VPIN DataFrames, one per date
+        session_start : str
+            Session start time
+        interval_mins : int
+            Minutes per time bar
+        num_bars : int
+            Number of time bars
+
+        Returns
+        -------
+        np.ndarray
+            Stacked array of shape (N, num_bars, channels, bins)
+        """
+        results = []
+        for df in df_list:
+            tensor = self.rasterize(df, session_start, interval_mins, num_bars)
+            results.append(tensor.numpy())
+
+        return np.stack(results, axis=0)
+
+    def parquet_to_npz(
+        self,
+        parquet_path: str,
+        output_path: str,
+        session_start: str = "09:30",
+        interval_mins: int = 15,
+        num_bars: int = 4,
+        date_col: str = "date",
+        ts_col: str = "ts_end",
+        verbose: bool = True,
+        batch_size: int = 100
+    ) -> dict:
+        """
+        Convert sequential VPIN parquet file to date-keyed npz file.
+
+        GPU-accelerated batch processing for improved performance.
+
+        Parameters
+        ----------
+        parquet_path : str
+            Path to input VPIN parquet file
+        output_path : str
+            Path for output .npz file
+        session_start : str
+            Session start time HH:MM
+        interval_mins : int
+            Minutes per time bar
+        num_bars : int
+            Number of time bars per day
+        date_col : str
+            Column name for date grouping
+        ts_col : str
+            Column name for timestamp
+        verbose : bool
+            Print progress information
+        batch_size : int
+            Number of dates to process before syncing GPU (default: 100)
+
+        Returns
+        -------
+        dict
+            Dictionary with processing info
+        """
+        if verbose:
+            backend = "GPU (CuPy)" if self.use_gpu else "CPU (NumPy)"
+            print(f"Loading parquet: {parquet_path}")
+            print(f"Backend: {backend}")
+
+        df = pd.read_parquet(parquet_path)
+
+        if date_col not in df.columns:
+            if ts_col in df.columns:
+                df[date_col] = pd.to_datetime(df[ts_col]).dt.date.astype(str)
+            elif df.index.name == ts_col or isinstance(df.index, pd.DatetimeIndex):
+                df = df.reset_index()
+                df[date_col] = pd.to_datetime(df[ts_col]).dt.date.astype(str)
+            else:
+                raise ValueError(f"Cannot find date column '{date_col}' or '{ts_col}'")
+
+        if ts_col in df.columns:
+            df[ts_col] = pd.to_datetime(df[ts_col])
+
+        dates = sorted(df[date_col].unique())
+        if verbose:
+            print(f"Found {len(dates)} unique dates")
+
+        rasterized_data = {}
+        skipped = 0
+
+        for i, date in enumerate(dates):
+            date_df = df[df[date_col] == date].copy()
+
+            required = ['close', 'profile_vwap', 'vol', 'imb_frac', 'bucket_return', ts_col]
+            missing = [c for c in required if c not in date_df.columns]
+            if missing:
+                if verbose and i == 0:
+                    print(f"Warning: Missing columns {missing}")
+                skipped += 1
+                continue
+
+            if 'date' not in date_df.columns:
+                date_df['date'] = date
+
+            try:
+                tensor = self.rasterize(
+                    date_df,
+                    session_start=session_start,
+                    interval_mins=interval_mins,
+                    num_bars=num_bars
+                )
+                rasterized_data[str(date)] = tensor.numpy()
+            except Exception as e:
+                if verbose:
+                    print(f"  Error processing {date}: {e}")
+                skipped += 1
+                continue
+
+            # Sync GPU periodically to prevent memory buildup
+            if self.use_gpu and (i + 1) % batch_size == 0:
+                cp.get_default_memory_pool().free_all_blocks()
+
+            if verbose and (i + 1) % 500 == 0:
+                print(f"  Processed {i + 1}/{len(dates)} dates...")
+
+        if verbose:
+            print(f"Processed {len(rasterized_data)} dates, skipped {skipped}")
+
+        np.savez_compressed(output_path, **rasterized_data)
+
+        if verbose:
+            sample_shape = next(iter(rasterized_data.values())).shape if rasterized_data else None
+            print(f"Saved to: {output_path}")
+            print(f"  Shape per date: {sample_shape}")
+
+        return {
+            'dates': list(rasterized_data.keys()),
+            'shape': sample_shape,
+            'num_dates': len(rasterized_data),
+            'skipped': skipped,
+            'backend': 'cupy' if self.use_gpu else 'numpy'
+        }
+
+    @staticmethod
+    def load_npz(npz_path: str, as_tensor: bool = False) -> dict:
+        """Load date-keyed rasterized data from npz file."""
+        return SequenceRasterizer.load_npz(npz_path, as_tensor=as_tensor)
+
+    @staticmethod
+    def load_npz_with_dates(npz_path: str) -> tuple:
+        """Load npz file and return arrays with aligned dates."""
+        return SequenceRasterizer.load_npz_with_dates(npz_path)
+
+
+def get_rasterizer(use_gpu: bool = True, **kwargs):
+    """
+    Factory function to get the appropriate rasterizer.
+
+    Parameters
+    ----------
+    use_gpu : bool
+        If True and CuPy is available, returns CupySequenceRasterizer.
+        Otherwise returns SequenceRasterizer.
+    **kwargs
+        Arguments passed to rasterizer constructor
+
+    Returns
+    -------
+    SequenceRasterizer or CupySequenceRasterizer
+    """
+    if use_gpu and CUPY_AVAILABLE:
+        return CupySequenceRasterizer(**kwargs)
+    return SequenceRasterizer(**kwargs)
 
 
 class VPINSequenceProcessor:

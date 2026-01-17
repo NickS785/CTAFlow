@@ -4,7 +4,13 @@ from .profile import (
     ProfileScaler,
     NumberBarCleaner,
 )
-from .vpin import VPINExtractor
+from .vpin import (
+    VPINExtractor,
+    SequenceRasterizer,
+    CupySequenceRasterizer,
+    get_rasterizer,
+    CUPY_AVAILABLE,
+)
 
 __all__ = [
     "MarketProfileExtractor",
@@ -12,4 +18,8 @@ __all__ = [
     "ProfileScaler",
     "NumberBarCleaner",
     "VPINExtractor",
+    "SequenceRasterizer",
+    "CupySequenceRasterizer",
+    "get_rasterizer",
+    "CUPY_AVAILABLE",
 ]
