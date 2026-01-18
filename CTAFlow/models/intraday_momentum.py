@@ -1122,6 +1122,217 @@ class IntradayMomentum:
 
         return result_df
 
+    def prev_hl_daily(
+            self,
+            n_days: int = 5,
+            target_time: Optional[time] = None,
+            daily_df: Optional[pd.DataFrame] = None,
+            price_col: str = "Close",
+            add_as_feature: bool = False,
+    ) -> pd.DataFrame:
+        """Calculate distance from target_time close to rolling n-day high/low on daily data.
+
+        Parameters
+        ----------
+        n_days : int, default 5
+            Rolling window in days for high/low calculation
+        target_time : Optional[time]
+            Time of day to measure distance. Uses self.target_time if None.
+        daily_df : Optional[pd.DataFrame]
+            Daily OHLCV data with DatetimeIndex (expects 'High', 'Low' columns).
+            If None, resamples self.intraday_data to daily.
+        price_col : str, default "Close"
+            Column name for reference price (used for target_time extraction)
+        add_as_feature : bool, default False
+            If True, add features to training_data with proper lagging
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with columns:
+            - 'dist_nday_high': (price - rolling_high) / rolling_high
+            - 'dist_nday_low': (price - rolling_low) / rolling_low
+            - 'range_position': (price - rolling_low) / (rolling_high - rolling_low)
+
+        Notes
+        -----
+        - Rolling high/low excludes the current day (shifted by 1) to avoid lookahead
+        - All features are normalized as percentage distances
+        - range_position is 0 at the low, 1 at the high
+        - Features are lagged if target_time is at or after self.target_time
+
+        Examples
+        --------
+        >>> model = IntradayMomentum(intraday_data)
+        >>> dist_df = model.prev_hl_daily(n_days=10, add_as_feature=True)
+        """
+        t_time = target_time or self.target_time
+
+        # Get or create daily data
+        if daily_df is not None:
+            daily = daily_df.copy()
+            if not isinstance(daily.index, pd.DatetimeIndex):
+                daily.index = pd.to_datetime(daily.index)
+            daily.index = daily.index.normalize()
+        else:
+            # Resample intraday data to daily
+            data = self.intraday_data
+            if data is None or data.empty:
+                raise ValueError("Intraday data is required for prev_hl_daily")
+            daily = data.resample('1D').agg({
+                'High': 'max',
+                'Low': 'min',
+                price_col: 'last'
+            }).dropna()
+            daily.index = daily.index.normalize()
+
+        # Validate columns
+        if 'High' not in daily.columns or 'Low' not in daily.columns:
+            raise KeyError("'High' and 'Low' columns required for prev_hl_daily")
+
+        # Filter to valid trading dates
+        daily = self._filter_to_trading_dates(daily)
+
+        # Calculate rolling high/low (shifted to exclude current day)
+        rolling_high = daily['High'].rolling(n_days, min_periods=1).max().shift(1)
+        rolling_low = daily['Low'].rolling(n_days, min_periods=1).min().shift(1)
+
+        # Get price at target_time
+        if self.intraday_data is not None:
+            prices = self._coerce_price(self.intraday_data, price_col)
+            mask = prices.index.time == t_time
+            target_prices = prices[mask]
+            target_prices.index = pd.to_datetime(target_prices.index).normalize()
+            target_prices = self._filter_to_trading_dates(target_prices)
+        else:
+            # Fall back to daily close
+            target_prices = daily[price_col]
+
+        # Align indices
+        common_idx = target_prices.index.intersection(rolling_high.index)
+        target_prices = target_prices.loc[common_idx]
+        rolling_high = rolling_high.loc[common_idx]
+        rolling_low = rolling_low.loc[common_idx]
+
+        # Calculate normalized distances
+        dist_high = (target_prices - rolling_high) / rolling_high
+        dist_low = (target_prices - rolling_low) / rolling_low
+
+        # Range position: where is price within the range (0 = at low, 1 = at high)
+        range_width = rolling_high - rolling_low
+        range_position = (target_prices - rolling_low) / range_width.replace(0, np.nan)
+
+        result_df = pd.DataFrame({
+            f'dist_{n_days}d_high': dist_high,
+            f'dist_{n_days}d_low': dist_low,
+            f'range_position_{n_days}d': range_position,
+        })
+
+        if add_as_feature:
+            # Determine if we need to shift
+            needs_shift = self._needs_shift(t_time)
+
+            for col in result_df.columns:
+                feature_series = result_df[col].shift(1) if needs_shift else result_df[col]
+                feature_name = f"pd_{col}" if needs_shift else col
+                self._add_feature(feature_series, feature_name)
+
+        return result_df
+
+    def sma_features(
+            self,
+            periods: Sequence[int] = (5, 10, 20, 50),
+            daily_df: Optional[pd.DataFrame] = None,
+            price_col: str = "Close",
+            add_as_feature: bool = False,
+    ) -> pd.DataFrame:
+        """Calculate SMA-based features (price distance to SMAs, SMA crossover signals).
+
+        Parameters
+        ----------
+        periods : Sequence[int], default (5, 10, 20, 50)
+            SMA periods in days
+        daily_df : Optional[pd.DataFrame]
+            Daily OHLCV data with DatetimeIndex.
+            If None, resamples self.intraday_data to daily.
+        price_col : str, default "Close"
+            Column name for price data
+        add_as_feature : bool, default False
+            If True, add features to training_data with proper lagging
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with columns:
+            - 'sma_dist_{n}': (price - SMA_n) / SMA_n for each period
+            - 'sma_slope_{n}': SMA change rate (SMA_t - SMA_{t-1}) / SMA_{t-1}
+            - 'sma_cross_{short}_{long}': 1 if short > long, -1 if short < long
+
+        Notes
+        -----
+        - All distance features are normalized as percentages
+        - Slope features measure daily momentum of the SMA
+        - Cross features use consecutive period pairs (e.g., 5/10, 10/20)
+        - Features are lagged by 1 day to avoid lookahead bias
+
+        Examples
+        --------
+        >>> model = IntradayMomentum(intraday_data)
+        >>> sma_df = model.sma_features(periods=[10, 20, 50], add_as_feature=True)
+        """
+        # Get or create daily data
+        if daily_df is not None:
+            daily = daily_df.copy()
+            if not isinstance(daily.index, pd.DatetimeIndex):
+                daily.index = pd.to_datetime(daily.index)
+            daily.index = daily.index.normalize()
+        else:
+            data = self.intraday_data
+            if data is None or data.empty:
+                raise ValueError("Intraday data is required for sma_features")
+            daily = data.resample('1D').agg({price_col: 'last'}).dropna()
+            daily.index = daily.index.normalize()
+
+        prices = self._coerce_price(daily, price_col)
+        prices = self._filter_to_trading_dates(prices)
+
+        feats: Dict[str, pd.Series] = {}
+        smas: Dict[int, pd.Series] = {}
+
+        # Calculate SMAs and distance/slope features
+        sorted_periods = sorted(periods)
+        for n in sorted_periods:
+            sma = prices.rolling(n, min_periods=1).mean()
+            smas[n] = sma
+
+            # Distance: (price - SMA) / SMA (lagged by 1 to avoid lookahead)
+            dist = ((prices - sma) / sma).shift(1)
+            feats[f'sma_dist_{n}'] = dist
+
+            # Slope: daily change rate of SMA (lagged by 1)
+            slope = (sma.diff() / sma.shift(1)).shift(1)
+            feats[f'sma_slope_{n}'] = slope
+
+        # Crossover signals for consecutive period pairs
+        for i in range(len(sorted_periods) - 1):
+            short_n = sorted_periods[i]
+            long_n = sorted_periods[i + 1]
+            short_sma = smas[short_n]
+            long_sma = smas[long_n]
+
+            # Cross signal: +1 if short > long, -1 if short < long (lagged by 1)
+            cross = np.sign(short_sma - long_sma).shift(1)
+            feats[f'sma_cross_{short_n}_{long_n}'] = cross
+
+        result_df = pd.DataFrame(feats)
+
+        if add_as_feature:
+            for col in result_df.columns:
+                # Features already lagged, add directly
+                self._add_feature(result_df[col], col)
+
+        return result_df
+
     def vwap_distance(
             self,
             target_time: Union[time, List[time]],
@@ -2830,23 +3041,153 @@ class IntradayMomentum:
             daily_df: pd.DataFrame,
             lookbacks: Iterable[int] = (5, 10, 20),
             price_col: str = "Close",
+            add_as_feature: bool = False,
     ) -> pd.DataFrame:
-        """Build multi-horizon market structure context (high/low/VAH/VAL)."""
+        """Build multi-horizon market structure context with normalized features.
 
-        prices = self._coerce_price(daily_df, price_col)
+        Calculates price position relative to rolling highs/lows, ATR-normalized
+        range metrics, breakout signals, and volatility regime indicators.
+
+        Parameters
+        ----------
+        daily_df : pd.DataFrame
+            Daily OHLCV data with DatetimeIndex. Expects 'High', 'Low' columns
+            for full feature set.
+        lookbacks : Iterable[int], default (5, 10, 20)
+            Rolling window sizes in days for structure calculation
+        price_col : str, default "Close"
+            Column name for price data
+        add_as_feature : bool, default False
+            If True, add features to training_data with proper lagging
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with normalized market structure features:
+            - 'dist_hh_{lb}': (price - rolling_high) / rolling_high (percentage)
+            - 'dist_ll_{lb}': (price - rolling_low) / rolling_low (percentage)
+            - 'range_position_{lb}': (price - low) / (high - low), 0 to 1
+            - 'range_pct_{lb}': (high - low) / price (normalized range width)
+            - 'atr_{lb}': Average True Range normalized by price
+            - 'breakout_high_{lb}': 1 if price > prior high, else 0
+            - 'breakout_low_{lb}': 1 if price < prior low, else 0
+            - 'dist_vah': (price - prior VAH) / prior VAH
+            - 'dist_val': (price - prior VAL) / prior VAL
+            - 'vol_regime': current ATR / long-term ATR (volatility expansion/contraction)
+
+        Notes
+        -----
+        - All features are lagged by 1 day to avoid lookahead bias
+        - Distance features are normalized as percentage deviations
+        - Range position is bounded [0, 1], indicating where price sits in range
+        - Breakout signals are binary indicators (0/1)
+        - Vol regime > 1 indicates volatility expansion, < 1 indicates contraction
+
+        Examples
+        --------
+        >>> model = IntradayMomentum(intraday_data)
+        >>> struct_df = model.market_structure_features(
+        ...     daily_df, lookbacks=[5, 10, 20], add_as_feature=True
+        ... )
+        """
+        # Ensure proper index
+        daily = daily_df.copy()
+        if not isinstance(daily.index, pd.DatetimeIndex):
+            daily.index = pd.to_datetime(daily.index)
+        daily.index = daily.index.normalize()
+
+        # Filter to valid trading dates
+        daily = self._filter_to_trading_dates(daily)
+
+        prices = self._coerce_price(daily, price_col)
         feats: Dict[str, pd.Series] = {}
-        for lb in lookbacks:
-            feats[f"hh_{lb}"] = prices.rolling(lb).max()
-            feats[f"ll_{lb}"] = prices.rolling(lb).min()
-            feats[f"range_{lb}"] = feats[f"hh_{lb}"] - feats[f"ll_{lb}"]
 
-        if {"High", "Low"}.issubset(daily_df.columns):
-            vah = daily_df["High"].rolling(1).max()
-            val = daily_df["Low"].rolling(1).min()
-            feats["vah_prev"] = vah.shift(1)
-            feats["val_prev"] = val.shift(1)
+        has_hl = {"High", "Low"}.issubset(daily.columns)
+        lookbacks_list = list(lookbacks)
 
-        return pd.DataFrame(feats)
+        for lb in lookbacks_list:
+            # Rolling high/low (shifted to exclude current day)
+            rolling_high = prices.rolling(lb, min_periods=1).max().shift(1)
+            rolling_low = prices.rolling(lb, min_periods=1).min().shift(1)
+
+            # Normalized distance to high/low (percentage)
+            feats[f"dist_hh_{lb}"] = (prices - rolling_high) / rolling_high
+            feats[f"dist_ll_{lb}"] = (prices - rolling_low) / rolling_low
+
+            # Range position: where price sits in the range [0=low, 1=high]
+            range_width = rolling_high - rolling_low
+            feats[f"range_position_{lb}"] = (
+                (prices - rolling_low) / range_width.replace(0, np.nan)
+            )
+
+            # Normalized range width (percentage of price)
+            feats[f"range_pct_{lb}"] = range_width / prices
+
+            # Breakout signals (binary)
+            feats[f"breakout_high_{lb}"] = (prices > rolling_high).astype(int)
+            feats[f"breakout_low_{lb}"] = (prices < rolling_low).astype(int)
+
+            # ATR-based features if High/Low available
+            if has_hl:
+                high = daily["High"]
+                low = daily["Low"]
+                prev_close = prices.shift(1)
+
+                # True Range = max(H-L, |H-prevC|, |L-prevC|)
+                tr = pd.concat([
+                    high - low,
+                    (high - prev_close).abs(),
+                    (low - prev_close).abs()
+                ], axis=1).max(axis=1)
+
+                # ATR normalized by price
+                atr = tr.rolling(lb, min_periods=1).mean()
+                feats[f"atr_{lb}"] = (atr / prices).shift(1)
+
+        # VAH/VAL features (prior day's high/low)
+        if has_hl:
+            vah_prev = daily["High"].shift(1)
+            val_prev = daily["Low"].shift(1)
+
+            # Normalized distance to prior day's VAH/VAL
+            feats["dist_vah"] = (prices - vah_prev) / vah_prev
+            feats["dist_val"] = (prices - val_prev) / val_prev
+
+            # Position relative to prior day's range
+            prior_range = vah_prev - val_prev
+            feats["vah_val_position"] = (
+                (prices - val_prev) / prior_range.replace(0, np.nan)
+            )
+
+        # Volatility regime indicator (short ATR / long ATR)
+        if has_hl and len(lookbacks_list) >= 2:
+            short_lb = min(lookbacks_list)
+            long_lb = max(lookbacks_list)
+
+            high = daily["High"]
+            low = daily["Low"]
+            prev_close = prices.shift(1)
+            tr = pd.concat([
+                high - low,
+                (high - prev_close).abs(),
+                (low - prev_close).abs()
+            ], axis=1).max(axis=1)
+
+            short_atr = tr.rolling(short_lb, min_periods=1).mean()
+            long_atr = tr.rolling(long_lb, min_periods=1).mean()
+            feats["vol_regime"] = (short_atr / long_atr.replace(0, np.nan)).shift(1)
+
+        # Lag all features by 1 to avoid lookahead
+        for key in feats:
+            feats[key] = feats[key].shift(1)
+
+        result_df = pd.DataFrame(feats)
+
+        if add_as_feature:
+            for col in result_df.columns:
+                self._add_feature(result_df[col], col)
+
+        return result_df
 
     def curve_levels(self,
                      fwd_curve_df: pd.DataFrame,
