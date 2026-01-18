@@ -5656,6 +5656,11 @@ class DeepIDMomentum(IntradayMomentum):
             nb_dates: Optional[np.ndarray] = None,
             use_rasterized: bool = False,
             rasterized_data: Optional[Union[Dict, str]] = None,
+            rasterize_on_fly: bool = False,
+            num_bars: int = 4,
+            n_bins: int = 64,
+            interval_mins: Optional[float] = None,
+            rasterizer_kwargs: Optional[Dict] = None,
     ):
         """Create PyTorch DataLoaders for training dual-branch models.
 
@@ -5715,6 +5720,18 @@ class DeepIDMomentum(IntradayMomentum):
         rasterized_data : dict or str, optional
             Rasterized VPIN data. Either a dict mapping dates to arrays (T, C, Bins),
             or a path to an npz file. Overrides self.rasterized_data if provided.
+        rasterize_on_fly : bool, default False
+            If True, use OnTheFlyRasterizedDataset which rasterizes raw VPIN DataFrames
+            during __getitem__. This allows dynamic adjustment of rasterization parameters
+            without pre-processing. Overrides use_rasterized if True.
+        num_bars : int, default 4
+            Number of time bars to split each VPIN sequence into (for rasterize_on_fly).
+        n_bins : int, default 64
+            Number of vertical price bins for rasterization (for rasterize_on_fly).
+        interval_mins : float, optional
+            Minutes per bar. If None, auto-computed from data's time range (for rasterize_on_fly).
+        rasterizer_kwargs : dict, optional
+            Additional kwargs for rasterizer constructor (span_pct, vol_scale, price_scale).
 
         Returns
         -------
@@ -5771,9 +5788,10 @@ class DeepIDMomentum(IntradayMomentum):
             import torch
             from torch.utils.data import DataLoader
             from ..data.model_datasets import (
-                DualDataset, QuadModalDataset, TriModalDataset, RasterizedModalDataset
+                DualDataset, QuadModalDataset, TriModalDataset, RasterizedModalDataset,
+                OnTheFlyRasterizedDataset
             )
-            from ..data.dataset_utils import collate_rasterized
+            from ..data.dataset_utils import collate_rasterized, collate_rasterized_vpin
         except ImportError as e:
             raise ImportError(
                 "PyTorch is required for get_loaders(). "
@@ -5896,6 +5914,41 @@ class DeepIDMomentum(IntradayMomentum):
 
         nb_by_date = build_nb_lookup(use_nb_arrays, use_nb_dates)
 
+        def build_vpin_dfs_by_date(sequential_df, date_col='date'):
+            """Group sequential VPIN data into list of DataFrames by date."""
+            if sequential_df is None:
+                return None, None
+
+            df = sequential_df.copy()
+
+            # Ensure date column exists
+            if date_col not in df.columns:
+                if 'ts_end' in df.columns:
+                    df[date_col] = pd.to_datetime(df['ts_end']).dt.date
+                elif isinstance(df.index, pd.DatetimeIndex):
+                    df[date_col] = df.index.date
+                else:
+                    raise ValueError(f"Cannot find date column '{date_col}' in sequential data")
+            else:
+                df[date_col] = pd.to_datetime(df[date_col]).dt.date
+
+            # Group by date and return as list of DataFrames
+            vpin_dfs = []
+            dates = []
+            for date, group_df in df.groupby(date_col):
+                vpin_dfs.append(group_df.copy())
+                dates.append(date)
+
+            return vpin_dfs, dates
+
+        # Build VPIN DataFrames by date for on-the-fly rasterization
+        vpin_dfs_by_date = None
+        vpin_dates = None
+        if rasterize_on_fly:
+            vpin_dfs_by_date, vpin_dates = build_vpin_dfs_by_date(self.sequential_data)
+            if vpin_dfs_by_date is None:
+                raise ValueError("rasterize_on_fly=True but no sequential_data available.")
+
         if use_nb_arrays is not None and spatial_by_date is None:
             raise ValueError("Number bars require profile_array to align spatial features.")
 
@@ -5931,8 +5984,88 @@ class DeepIDMomentum(IntradayMomentum):
                 print(f"  final_nb_data: {final_nb_data is not None} ({type(final_nb_data) if final_nb_data is not None else 'None'})")
                 print(f"  final_spatial_data: {final_spatial_data is not None} ({final_spatial_data.shape if final_spatial_data is not None else 'None'})")
                 print(f"  use_rasterized: {use_rasterized} ({type(use_rasterized_data) if use_rasterized_data is not None else 'None'})")
+                print(f"  rasterize_on_fly: {rasterize_on_fly}")
 
-            if use_rasterized and final_spatial_data is not None:
+            if rasterize_on_fly and final_spatial_data is not None:
+                # On-the-fly rasterization: use raw VPIN DataFrames
+                if verbose:
+                    print(f"  Creating OnTheFlyRasterizedDataset (num_bars={num_bars}, n_bins={n_bins})")
+
+                # Filter VPIN DataFrames to match train/val dates
+                train_dates = set(pd.to_datetime(X_train.index).date if hasattr(X_train.index, 'date') else pd.to_datetime(X_train['Datetime']).dt.date)
+                val_dates = set(pd.to_datetime(X_val.index).date if hasattr(X_val.index, 'date') else pd.to_datetime(X_val['Datetime']).dt.date)
+
+                # Build date-indexed dict for filtering
+                vpin_by_date = {vpin_dates[i]: vpin_dfs_by_date[i] for i in range(len(vpin_dates))}
+
+                # Filter to common dates with spatial data
+                spatial_dates_set = set(pd.to_datetime(final_spatial_dates).date)
+                common_train = sorted(train_dates & set(vpin_by_date.keys()) & spatial_dates_set)
+                common_val = sorted(val_dates & set(vpin_by_date.keys()) & spatial_dates_set)
+
+                train_vpin_dfs = [vpin_by_date[d] for d in common_train]
+                val_vpin_dfs = [vpin_by_date[d] for d in common_val]
+
+                # Build spatial lookup and filter
+                spatial_lookup = {pd.to_datetime(final_spatial_dates[i]).date(): final_spatial_data[i] for i in range(len(final_spatial_dates))}
+                train_profiles = np.stack([spatial_lookup[d] for d in common_train])
+                val_profiles = np.stack([spatial_lookup[d] for d in common_val])
+
+                # Get summary and target data for common dates
+                if hasattr(X_train.index, 'date'):
+                    X_train_filtered = X_train[pd.to_datetime(X_train.index).date.isin(common_train)]
+                    X_val_filtered = X_val[pd.to_datetime(X_val.index).date.isin(common_val)]
+                else:
+                    X_train['_date'] = pd.to_datetime(X_train['Datetime']).dt.date
+                    X_val['_date'] = pd.to_datetime(X_val['Datetime']).dt.date
+                    X_train_filtered = X_train[X_train['_date'].isin(common_train)].drop(columns=['_date'])
+                    X_val_filtered = X_val[X_val['_date'].isin(common_val)].drop(columns=['_date'])
+
+                # Filter targets
+                if hasattr(y_train.index, 'date'):
+                    y_train_filtered = y_train[pd.to_datetime(y_train.index).date.isin(common_train)]
+                    y_val_filtered = y_val[pd.to_datetime(y_val.index).date.isin(common_val)]
+                else:
+                    y_train_filtered = y_train.iloc[:len(common_train)]
+                    y_val_filtered = y_val.iloc[:len(common_val)]
+
+                # Extract summary features (exclude date columns)
+                exclude_cols = ['Datetime', 'date', '_date', 'Target']
+                feature_cols = [c for c in X_train_filtered.columns if c not in exclude_cols]
+                train_summaries = X_train_filtered[feature_cols].values.astype(np.float32)
+                val_summaries = X_val_filtered[feature_cols].values.astype(np.float32)
+
+                train_targets = y_train_filtered.values.astype(np.float32)
+                val_targets = y_val_filtered.values.astype(np.float32)
+
+                train_dataset = OnTheFlyRasterizedDataset(
+                    summaries=train_summaries,
+                    vpin_dfs=train_vpin_dfs,
+                    profiles=train_profiles,
+                    targets=train_targets,
+                    num_bars=num_bars,
+                    n_bins=n_bins,
+                    interval_mins=interval_mins,
+                    use_gpu=True,
+                    rasterizer_kwargs=rasterizer_kwargs,
+                )
+                val_dataset = OnTheFlyRasterizedDataset(
+                    summaries=val_summaries,
+                    vpin_dfs=val_vpin_dfs,
+                    profiles=val_profiles,
+                    targets=val_targets,
+                    num_bars=num_bars,
+                    n_bins=n_bins,
+                    interval_mins=interval_mins,
+                    use_gpu=True,
+                    rasterizer_kwargs=rasterizer_kwargs,
+                )
+                collate_fn = collate_rasterized_vpin
+
+                if verbose:
+                    print(f"  Train: {len(train_dataset)} samples, Val: {len(val_dataset)} samples")
+
+            elif use_rasterized and final_spatial_data is not None:
                 if use_rasterized_data is None:
                     raise ValueError("use_rasterized=True but no rasterized_data available.")
                 if verbose:
@@ -6054,7 +6187,66 @@ class DeepIDMomentum(IntradayMomentum):
             X, y = result
 
             # Create dataset
-            if use_rasterized and final_spatial_data is not None:
+            if rasterize_on_fly and final_spatial_data is not None:
+                # On-the-fly rasterization: use raw VPIN DataFrames
+                if verbose:
+                    print(f"  Creating OnTheFlyRasterizedDataset (num_bars={num_bars}, n_bins={n_bins})")
+
+                # Get dates from X
+                if hasattr(X.index, 'date'):
+                    all_dates = set(pd.to_datetime(X.index).date)
+                else:
+                    all_dates = set(pd.to_datetime(X['Datetime']).dt.date)
+
+                # Build date-indexed dict for filtering
+                vpin_by_date = {vpin_dates[i]: vpin_dfs_by_date[i] for i in range(len(vpin_dates))}
+
+                # Filter to common dates with spatial data
+                spatial_dates_set = set(pd.to_datetime(final_spatial_dates).date)
+                common_dates = sorted(all_dates & set(vpin_by_date.keys()) & spatial_dates_set)
+
+                all_vpin_dfs = [vpin_by_date[d] for d in common_dates]
+
+                # Build spatial lookup and filter
+                spatial_lookup = {pd.to_datetime(final_spatial_dates[i]).date(): final_spatial_data[i] for i in range(len(final_spatial_dates))}
+                all_profiles = np.stack([spatial_lookup[d] for d in common_dates])
+
+                # Get summary and target data for common dates
+                if hasattr(X.index, 'date'):
+                    X_filtered = X[pd.to_datetime(X.index).date.isin(common_dates)]
+                else:
+                    X['_date'] = pd.to_datetime(X['Datetime']).dt.date
+                    X_filtered = X[X['_date'].isin(common_dates)].drop(columns=['_date'])
+
+                # Filter targets
+                if hasattr(y.index, 'date'):
+                    y_filtered = y[pd.to_datetime(y.index).date.isin(common_dates)]
+                else:
+                    y_filtered = y.iloc[:len(common_dates)]
+
+                # Extract summary features (exclude date columns)
+                exclude_cols = ['Datetime', 'date', '_date', 'Target']
+                feature_cols = [c for c in X_filtered.columns if c not in exclude_cols]
+                all_summaries = X_filtered[feature_cols].values.astype(np.float32)
+                all_targets = y_filtered.values.astype(np.float32)
+
+                dataset = OnTheFlyRasterizedDataset(
+                    summaries=all_summaries,
+                    vpin_dfs=all_vpin_dfs,
+                    profiles=all_profiles,
+                    targets=all_targets,
+                    num_bars=num_bars,
+                    n_bins=n_bins,
+                    interval_mins=interval_mins,
+                    use_gpu=True,
+                    rasterizer_kwargs=rasterizer_kwargs,
+                )
+                collate_fn = collate_rasterized_vpin
+
+                if verbose:
+                    print(f"  Dataset: {len(dataset)} samples")
+
+            elif use_rasterized and final_spatial_data is not None:
                 if use_rasterized_data is None:
                     raise ValueError("use_rasterized=True but no rasterized_data available.")
                 dataset = RasterizedModalDataset(

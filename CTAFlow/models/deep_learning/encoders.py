@@ -41,88 +41,62 @@ class GatedFusion(nn.Module):
 
 
 class SpatialFuse(nn.Module):
-    """
-    Fuse spatial embeddings from profile + number bars with optional importance tracking.
-
-    Parameters
-    ----------
-    d_spatial : int
-        Dimension of spatial embeddings
-    mode : str, default 'gated'
-        Fusion mode:
-        - 'gated': Learned attention weights (supports importance tracking)
-        - 'mean': Simple averaging (no learned importance)
-
-    Attributes
-    ----------
-    last_importance : torch.Tensor or None
-        Most recent modality importance weights (B, 2) [profile_weight, nb_weight]
-        Updated after each forward pass in 'gated' mode
-    """
-    def __init__(self, d_spatial: int, mode: str = "gated"):
+    def __init__(self, d_spatial: int, mode: str = "gated", temperature: float = 2.0):
         super().__init__()
         self.mode = mode
-        self.last_importance = None  # Track last importance weights
+        self.temperature = temperature  # Add temperature scaling
+        self.last_importance = None
 
         if mode == "gated":
+            # 1. ADD THIS: Normalize inputs so they compete fairly
+            self.gate_norm = nn.LayerNorm(d_spatial * 2)
+
             self.gate = nn.Sequential(
                 nn.Linear(d_spatial * 2, d_spatial),
                 nn.GELU(),
                 nn.Linear(d_spatial, 2),
             )
+            # Initialize for fair 50/50 start
+            nn.init.xavier_uniform_(self.gate[2].weight)
+            nn.init.constant_(self.gate[2].bias, 0.0)
+
         elif mode != "mean":
             raise ValueError(f"Unknown SpatialFuse mode: {mode}")
 
     def forward(self, z_profile, z_nb=None, return_importance=False):
-        """
-        Fuse profile and number bars embeddings.
-
-        Parameters
-        ----------
-        z_profile : torch.Tensor
-            Profile embeddings (B, d_spatial)
-        z_nb : torch.Tensor, optional
-            Number bars/rasterized embeddings (B, d_spatial)
-        return_importance : bool, default False
-            If True, return (fused, importance_weights) tuple
-            If False, return only fused output (backward compatible)
-
-        Returns
-        -------
-        torch.Tensor or tuple
-            If return_importance=False: fused output (B, d_spatial)
-            If return_importance=True: (fused, importance) where importance is (B, 2)
-        """
         if z_nb is None:
+            # ... (Keep existing single-modality logic) ...
             if return_importance:
-                # Profile only - 100% importance to profile
                 batch_size = z_profile.size(0)
-                importance = torch.tensor(
-                    [[1.0, 0.0]],
-                    device=z_profile.device,
-                    dtype=z_profile.dtype
-                ).expand(batch_size, 2)
+                importance = torch.tensor([[1.0, 0.0]], device=z_profile.device).expand(batch_size, 2)
                 self.last_importance = importance
                 return z_profile, importance
             return z_profile
 
         if self.mode == "mean":
+            # ... (Keep existing mean logic) ...
             fused = 0.5 * (z_profile + z_nb)
-            if return_importance:
-                # Equal importance for mean fusion
-                batch_size = z_profile.size(0)
-                importance = torch.tensor(
-                    [[0.5, 0.5]],
-                    device=z_profile.device,
-                    dtype=z_profile.dtype
-                ).expand(batch_size, 2)
-                self.last_importance = importance
-                return fused, importance
-            return fused
+            # Update tracking for mean mode too
+            self.last_importance = torch.tensor([[0.5, 0.5]], device=z_profile.device).expand(z_profile.size(0), 2)
+            return (fused, self.last_importance) if return_importance else fused
 
-        # Gated fusion with learned importance
-        weights = F.softmax(self.gate(torch.cat([z_profile, z_nb], dim=-1)), dim=-1)
-        self.last_importance = weights.detach()  # Store for analysis
+        # --- THE FIX ---
+
+        # 1. Concatenate
+        cat_input = torch.cat([z_profile, z_nb], dim=-1)
+
+        # 2. Normalize BEFORE Gating (Crucial!)
+        gate_input = self.gate_norm(cat_input)
+
+        # 3. Calculate Logits
+        logits = self.gate(gate_input)
+
+        # 4. Apply Temperature Scaling (Softens the decision)
+        weights = F.softmax(logits / self.temperature, dim=-1)
+
+        self.last_importance = weights.detach()
+
+        # 5. Fuse (Use original inputs, not normalized ones)
         fused = weights[:, 0:1] * z_profile + weights[:, 1:2] * z_nb
 
         if return_importance:

@@ -325,14 +325,37 @@ class SequenceRasterizer:
         limit = span_pct * price_scale
         self.edges = np.linspace(-limit, limit, bins + 1, dtype=np.float32)
 
-    def rasterize(self, df, session_start="09:30", interval_mins=15, num_bars=4):
+    def rasterize(self, df, num_bars=4, interval_mins=None):
         """
         Converts VPIN DataFrame -> (Num_Bars, Channels, Bins)
         Channels: [Density, Volume, Imbalance, Returns]
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            VPIN data with 'ts_end', 'close', 'profile_vwap', 'vol', 'imb_frac', 'bucket_return'
+        num_bars : int
+            Number of time bars to split data into
+        interval_mins : float, optional
+            Minutes per bar. If None, auto-computed to evenly split data's time range.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape (num_bars, 4, bins) - channels are [Density, LogVolume, Imbalance, Returns]
         """
-        # 1. Setup Time Edges
-        start_dt = pd.to_datetime(f"{df['date'].iloc[0]} {session_start}")
-        time_edges = [start_dt + pd.Timedelta(minutes=i * interval_mins) for i in range(num_bars + 1)]
+        # 1. Get time bounds from data
+        ts_end = pd.to_datetime(df['ts_end'])
+        min_ts = ts_end.min()
+        max_ts = ts_end.max()
+
+        # Auto-compute interval if not provided
+        if interval_mins is None:
+            total_mins = (max_ts - min_ts).total_seconds() / 60
+            interval_mins = total_mins / num_bars if num_bars > 0 else 1.0
+
+        # Build time edges from data's start time
+        time_edges = [min_ts + pd.Timedelta(minutes=i * interval_mins) for i in range(num_bars + 1)]
 
         # 2. Setup Spatial Coordinates
         # 0.0 = VWAP, Scaled by 100
@@ -385,9 +408,8 @@ class SequenceRasterizer:
         self,
         parquet_path: str,
         output_path: str,
-        session_start: str = "09:30",
-        interval_mins: int = 15,
         num_bars: int = 4,
+        interval_mins: float = None,
         date_col: str = "date",
         ts_col: str = "ts_end",
         verbose: bool = True
@@ -410,12 +432,10 @@ class SequenceRasterizer:
             - bucket_return: Return per bucket
         output_path : str
             Path for output .npz file
-        session_start : str
-            Session start time HH:MM (default: "09:30")
-        interval_mins : int
-            Minutes per time bar (default: 15)
         num_bars : int
             Number of time bars per day (default: 4)
+        interval_mins : float, optional
+            Minutes per bar. If None, auto-computed per date.
         date_col : str
             Column name for date grouping (default: "date")
         ts_col : str
@@ -478,9 +498,8 @@ class SequenceRasterizer:
             try:
                 tensor = self.rasterize(
                     date_df,
-                    session_start=session_start,
-                    interval_mins=interval_mins,
-                    num_bars=num_bars
+                    num_bars=num_bars,
+                    interval_mins=interval_mins
                 )
                 # Store as numpy array (T, C, Bins)
                 rasterized_data[str(date)] = tensor.numpy()
@@ -720,15 +739,39 @@ class CupySequenceRasterizer:
 
         return torch.tensor(grid, dtype=torch.float32).permute(0, 2, 1)
 
-    def rasterize(self, df, session_start="09:30", interval_mins=15, num_bars=4):
+    def rasterize(self, df, num_bars=4, interval_mins=None):
         """
         Converts VPIN DataFrame -> (Num_Bars, Channels, Bins)
         Channels: [Density, Volume, Imbalance, Returns]
 
         Uses GPU if CuPy is available, otherwise falls back to CPU.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            VPIN data with 'ts_end', 'close', 'profile_vwap', 'vol', 'imb_frac', 'bucket_return'
+        num_bars : int
+            Number of time bars to split data into
+        interval_mins : float, optional
+            Minutes per bar. If None, auto-computed to evenly split data's time range.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape (num_bars, 4, bins) - channels are [Density, LogVolume, Imbalance, Returns]
         """
-        start_dt = pd.to_datetime(f"{df['date'].iloc[0]} {session_start}")
-        time_edges = [start_dt + pd.Timedelta(minutes=i * interval_mins) for i in range(num_bars + 1)]
+        # Get time bounds from data
+        ts_end = pd.to_datetime(df['ts_end'])
+        min_ts = ts_end.min()
+        max_ts = ts_end.max()
+
+        # Auto-compute interval if not provided
+        if interval_mins is None:
+            total_mins = (max_ts - min_ts).total_seconds() / 60
+            interval_mins = total_mins / num_bars if num_bars > 0 else 1.0
+
+        # Build time edges from data's start time
+        time_edges = [min_ts + pd.Timedelta(minutes=i * interval_mins) for i in range(num_bars + 1)]
 
         if self.use_gpu:
             time_edges_ns = np.array([t.value for t in time_edges], dtype=np.int64)
@@ -736,7 +779,7 @@ class CupySequenceRasterizer:
         else:
             return self._rasterize_cpu(df, time_edges, num_bars)
 
-    def rasterize_batch(self, df_list, session_start="09:30", interval_mins=15, num_bars=4):
+    def rasterize_batch(self, df_list, num_bars=4, interval_mins=None):
         """
         Batch rasterize multiple DataFrames.
 
@@ -744,12 +787,10 @@ class CupySequenceRasterizer:
         ----------
         df_list : list of pd.DataFrame
             List of VPIN DataFrames, one per date
-        session_start : str
-            Session start time
-        interval_mins : int
-            Minutes per time bar
         num_bars : int
-            Number of time bars
+            Number of time bars to split data into
+        interval_mins : float, optional
+            Minutes per bar. If None, each DataFrame's time range is evenly split.
 
         Returns
         -------
@@ -758,7 +799,7 @@ class CupySequenceRasterizer:
         """
         results = []
         for df in df_list:
-            tensor = self.rasterize(df, session_start, interval_mins, num_bars)
+            tensor = self.rasterize(df, num_bars=num_bars, interval_mins=interval_mins)
             results.append(tensor.numpy())
 
         return np.stack(results, axis=0)
@@ -767,9 +808,8 @@ class CupySequenceRasterizer:
         self,
         parquet_path: str,
         output_path: str,
-        session_start: str = "09:30",
-        interval_mins: int = 15,
         num_bars: int = 4,
+        interval_mins: float = None,
         date_col: str = "date",
         ts_col: str = "ts_end",
         verbose: bool = True,
@@ -786,12 +826,10 @@ class CupySequenceRasterizer:
             Path to input VPIN parquet file
         output_path : str
             Path for output .npz file
-        session_start : str
-            Session start time HH:MM
-        interval_mins : int
-            Minutes per time bar
         num_bars : int
             Number of time bars per day
+        interval_mins : float, optional
+            Minutes per bar. If None, auto-computed per date.
         date_col : str
             Column name for date grouping
         ts_col : str
@@ -849,9 +887,8 @@ class CupySequenceRasterizer:
             try:
                 tensor = self.rasterize(
                     date_df,
-                    session_start=session_start,
-                    interval_mins=interval_mins,
-                    num_bars=num_bars
+                    num_bars=num_bars,
+                    interval_mins=interval_mins
                 )
                 rasterized_data[str(date)] = tensor.numpy()
             except Exception as e:
@@ -896,7 +933,7 @@ class CupySequenceRasterizer:
         return SequenceRasterizer.load_npz_with_dates(npz_path)
 
 
-def get_rasterizer(use_gpu: bool = True, **kwargs):
+def get_rasterizer(use_gpu: bool = True, n_bins: int = None, **kwargs):
     """
     Factory function to get the appropriate rasterizer.
 
@@ -905,13 +942,24 @@ def get_rasterizer(use_gpu: bool = True, **kwargs):
     use_gpu : bool
         If True and CuPy is available, returns CupySequenceRasterizer.
         Otherwise returns SequenceRasterizer.
+    n_bins : int, optional
+        Number of vertical price levels. Alias for 'bins' kwarg.
+        If provided, overrides 'bins' in kwargs.
     **kwargs
-        Arguments passed to rasterizer constructor
+        Arguments passed to rasterizer constructor:
+        - bins: int (default 64) - number of vertical price levels
+        - span_pct: float (default 0.01) - vertical range +/- from VWAP
+        - vol_scale: float (default 10.0) - divisor for log volume
+        - price_scale: float (default 100.0) - multiplier for price normalization
 
     Returns
     -------
     SequenceRasterizer or CupySequenceRasterizer
     """
+    # Handle n_bins alias
+    if n_bins is not None:
+        kwargs['bins'] = n_bins
+
     if use_gpu and CUPY_AVAILABLE:
         return CupySequenceRasterizer(**kwargs)
     return SequenceRasterizer(**kwargs)

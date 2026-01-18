@@ -1179,6 +1179,108 @@ class RasterizedModalDataset(Dataset):
         return summary_vec, seq_tensor, spatial_tensor, raster_tensor, target, seq_len
 
 
+class OnTheFlyRasterizedDataset(Dataset):
+    """
+    Dataset that rasterizes VPIN DataFrames on-the-fly during __getitem__.
+
+    This dataset stores raw VPIN DataFrames and rasterizes them when fetched,
+    allowing dynamic adjustment of rasterization parameters without pre-processing.
+
+    Uses CupySequenceRasterizer (GPU) if available, otherwise SequenceRasterizer (CPU).
+
+    Parameters
+    ----------
+    summaries : np.ndarray or torch.Tensor
+        Summary features (N, F_sum)
+    vpin_dfs : list of pd.DataFrame
+        Raw VPIN DataFrames, one per sample. Each must have columns:
+        'ts_end', 'close', 'profile_vwap', 'vol', 'imb_frac', 'bucket_return'
+    profiles : np.ndarray or torch.Tensor
+        Profile features (N, C, Bins)
+    targets : np.ndarray or torch.Tensor
+        Target values (N,) or (N, num_classes)
+    num_bars : int
+        Number of time bars to split each VPIN sequence into (default 4)
+    n_bins : int
+        Number of vertical price bins for rasterization (default 64)
+    interval_mins : float, optional
+        Minutes per bar. If None, auto-computed from each DataFrame's time range.
+    use_gpu : bool
+        Use CupySequenceRasterizer if available (default True)
+    rasterizer_kwargs : dict, optional
+        Additional arguments passed to rasterizer constructor:
+        - span_pct: float (default 0.01) - vertical range +/- from VWAP
+        - vol_scale: float (default 10.0) - divisor for log volume
+        - price_scale: float (default 100.0) - multiplier for price normalization
+
+    Example
+    -------
+    >>> dataset = OnTheFlyRasterizedDataset(
+    ...     summaries=summary_features,
+    ...     vpin_dfs=vpin_dataframes,  # list of raw DataFrames
+    ...     profiles=profile_arrays,
+    ...     targets=target_values,
+    ...     num_bars=4,
+    ...     n_bins=64
+    ... )
+    >>> loader = DataLoader(dataset, batch_size=32, collate_fn=collate_rasterized_vpin)
+    """
+
+    def __init__(
+        self,
+        summaries,
+        vpin_dfs: List[pd.DataFrame],
+        profiles,
+        targets,
+        num_bars: int = 4,
+        n_bins: int = 64,
+        interval_mins: Optional[float] = None,
+        use_gpu: bool = True,
+        rasterizer_kwargs: Optional[Dict] = None
+    ):
+        self.summaries = torch.as_tensor(summaries, dtype=torch.float32)
+        self.vpin_dfs = vpin_dfs  # List of DataFrames
+        self.profiles = torch.as_tensor(profiles, dtype=torch.float32)
+        self.targets = torch.as_tensor(targets)
+
+        # Rasterization settings for rasterize() calls
+        self.rasterize_kwargs = {
+            'num_bars': num_bars,
+            'interval_mins': interval_mins
+        }
+
+        # Create rasterizer once (reused for all samples)
+        rasterizer_kwargs = rasterizer_kwargs or {}
+        from CTAFlow.features.volume.vpin import get_rasterizer
+        self.rasterizer = get_rasterizer(use_gpu=use_gpu, n_bins=n_bins, **rasterizer_kwargs)
+
+        # Store for shape inference
+        self.num_bars = num_bars
+        self.n_bins = n_bins
+
+        # Infer rasterized shape from first sample
+        if len(vpin_dfs) > 0:
+            sample_raster = self.rasterizer.rasterize(vpin_dfs[0], **self.rasterize_kwargs)
+            self.rasterized_shape = sample_raster.shape
+        else:
+            self.rasterized_shape = (num_bars, 4, n_bins)
+
+    def __len__(self):
+        return len(self.summaries)
+
+    def __getitem__(self, idx):
+        summary = self.summaries[idx]
+        profile = self.profiles[idx]
+        target = self.targets[idx]
+
+        # Rasterize VPIN DataFrame on-the-fly
+        vpin_df = self.vpin_dfs[idx]
+        rasterized = self.rasterizer.rasterize(vpin_df, **self.rasterize_kwargs)
+
+        # Return format matches collate_rasterized_vpin expectations
+        return (summary, profile, rasterized, target)
+
+
 def _sanity_check_quad_modal():
     dates = pd.date_range("2024-01-01", periods=3, freq="D")
     summary = pd.DataFrame({"Datetime": dates, "feat": [1.0, 2.0, 3.0]})

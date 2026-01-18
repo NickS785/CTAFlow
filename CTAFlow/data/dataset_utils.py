@@ -185,6 +185,34 @@ def collate_quad_rasterized(batch: List[Tuple]) -> Tuple[torch.Tensor, ...]:
     return summaries, sequential_padded, profiles, rasterized, targets, lengths, raster_lengths
 
 
+def collate_rasterized_vpin(batch: List[Tuple]) -> Tuple[torch.Tensor, ...]:
+    """
+    Collate function for OnTheFlyRasterizedDataset.
+
+    Input batch items: (summary, profile, rasterized, target)
+
+    This is a simpler collate than collate_rasterized since there's no sequential
+    data - just summary, profile, and rasterized tensors.
+
+    Returns
+    -------
+    tuple
+        (summaries, profiles, rasterized, targets)
+        - summaries: (B, F_sum)
+        - profiles: (B, C_profile, Bins_profile)
+        - rasterized: (B, num_bars, C_raster, Bins_raster)
+        - targets: (B,) or (B, num_classes)
+    """
+    summaries, profiles, rasterized_tensors, targets = zip(*batch)
+
+    summaries = torch.stack(summaries)
+    profiles = torch.stack(profiles)
+    rasterized = torch.stack(rasterized_tensors)
+    targets = torch.stack(targets)
+
+    return summaries, profiles, rasterized, targets
+
+
 def get_collate_fn(mode: str):
     """
     Get the appropriate collate function for a given mode.
@@ -192,7 +220,7 @@ def get_collate_fn(mode: str):
     Parameters
     ----------
     mode : str
-        One of: 'dual', 'tri', 'quad', 'rasterized', 'quad_rasterized'
+        One of: 'dual', 'tri', 'quad', 'rasterized', 'quad_rasterized', 'rasterized_vpin'
 
     Returns
     -------
@@ -205,6 +233,7 @@ def get_collate_fn(mode: str):
         'quad': collate_quad,
         'rasterized': collate_rasterized,
         'quad_rasterized': collate_quad_rasterized,
+        'rasterized_vpin': collate_rasterized_vpin,
     }
 
     if mode not in collate_fns:
@@ -220,5 +249,6 @@ __all__ = [
     'collate_quad',
     'collate_rasterized',
     'collate_quad_rasterized',
+    'collate_rasterized_vpin',
     'get_collate_fn',
 ]

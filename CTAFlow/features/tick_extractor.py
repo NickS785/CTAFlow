@@ -1,5 +1,6 @@
 from .volume import MarketProfileExtractor, VPINExtractor
 from .volume.profile import NumberBarsExtractor
+from .volume.vpin import SequenceRasterizer
 from .base_extractor import ScidBaseExtractor
 from ..config import DLY_DATA_PATH
 from ..data.raw_formatting.contract_specs import CONTRACT_SPECS_RAW, ContractSpecs
@@ -55,6 +56,7 @@ def _extract_single_date_worker(args: tuple) -> Dict:
     from .base_extractor import ScidBaseExtractor
     from .volume import VPINExtractor, MarketProfileExtractor
     from .volume.profile import NumberBarsExtractor
+    from .volume.vpin import SequenceRasterizer
 
     base = ScidBaseExtractor(config.data_dir, config.ticker, config.tz)
     vpin_ext = VPINExtractor(
@@ -70,6 +72,12 @@ def _extract_single_date_worker(args: tuple) -> Dict:
         num_levels=config.num_bars_levels,
         centering_method=config.num_bars_centering
     ) if config.include_number_bars else None
+    rasterizer = SequenceRasterizer(
+        bins=config.raster_bins,
+        span_pct=config.raster_span_pct,
+        vol_scale=config.raster_vol_scale,
+        price_scale=config.raster_price_scale
+    ) if config.include_rasterized else None
 
     # Build time windows
     vpin_start = pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {config.vpin_start_time}")
@@ -101,7 +109,8 @@ def _extract_single_date_worker(args: tuple) -> Dict:
         'vpin': pd.DataFrame(),
         'profile': pd.DataFrame(),
         'number_bars': np.array([]),
-        'number_bars_meta': pd.DataFrame()
+        'number_bars_meta': pd.DataFrame(),
+        'rasterized': np.array([])
     }
 
     try:
@@ -238,6 +247,20 @@ def _extract_single_date_worker(args: tuple) -> Dict:
                 for key, value in pre_summary.items():
                     vpin_df[key] = value
             results['vpin'] = vpin_df
+
+            # Rasterize VPIN sequence if enabled
+            if config.include_rasterized and rasterizer is not None:
+                try:
+                    rasterized_tensor = rasterizer.rasterize(
+                        vpin_df,
+                        session_start=config.raster_session_start,
+                        interval_mins=config.raster_interval_mins,
+                        num_bars=config.raster_num_bars
+                    )
+                    results['rasterized'] = rasterized_tensor
+                except Exception as e:
+                    logger.warning(f"VPIN rasterization failed for {dt.date()}: {e}")
+
         except Exception as e:
             logger.warning(f"VPIN calculation failed for {dt.date()}: {e}")
 
@@ -292,6 +315,18 @@ class FeatureExtractorConfig:
     include_pre_summary: bool = False  # Include summary stats before VPIN window
     pre_summary_start_time: Optional[str] = None  # Start of pre-period (e.g., "02:00")
 
+    # Sequential Rasterization Configuration
+    # Converts variable-length VPIN sequences into fixed spatial grids
+    # Output shape: (num_bars, channels, bins) where channels = [Density, LogVolume, Imbalance, Returns]
+    include_rasterized: bool = False  # Toggle sequential rasterization
+    raster_interval_mins: int = 15  # Time interval per bar in minutes
+    raster_num_bars: int = 4  # Number of time bars (e.g., 4 x 15min = 1 hour)
+    raster_bins: int = 64  # Number of vertical price levels
+    raster_span_pct: float = 0.01  # Vertical range +/- from VWAP (0.01 = 1%)
+    raster_session_start: str = "09:30"  # Session start for interval alignment
+    raster_vol_scale: float = 10.0  # Log volume normalization divisor
+    raster_price_scale: float = 100.0  # Price normalization multiplier
+
     def __post_init__(self):
         """Resolve default tick size from contract specs if not provided."""
         if self.profile_tick_size is None:
@@ -303,17 +338,21 @@ class FeatureExtractorConfig:
 
 class MultiFeatureExtraction(ScidBaseExtractor):
     """
-    Extracts VPIN, Volume Profile, and Number Bars features for multiple dates efficiently.
+    Extracts VPIN, Volume Profile, Number Bars, and Rasterized features for multiple dates efficiently.
 
     Uses a single get_stitched_data call per date to fetch raw tick data,
     then computes all requested features from that shared data.
 
     Features:
     - VPIN: Volume-synchronized probability of informed trading (includes profile_vwap)
+      Variable-length sequences stored as Parquet
     - Profile: Volume profile with POC, VAL, VAH
       When exported via VolumeProfileEncoder: 4 channels [VolumeShape, Imbalance, Magnitude, PriceLabels]
     - Number Bars: Sierra Chart-style footprint charts as normalized tensors
       Default output: 4 features [VolumeShape, Imbalance%, BarReturn, PriceOffset]
+    - Rasterized: VPIN sequences converted to fixed spatial grids
+      Output shape: (num_bars, channels, bins) where channels = [Density, LogVolume, Imbalance, Returns]
+      Configurable via raster_* parameters in FeatureExtractorConfig
 
     Both Profile and NumberBars include explicit price labels using (price - reference) / reference
     normalization for tri-modal spatial alignment.
@@ -338,6 +377,13 @@ class MultiFeatureExtraction(ScidBaseExtractor):
             num_levels=config.num_bars_levels,
             centering_method=config.num_bars_centering
         ) if config.include_number_bars else None
+
+        self.rasterizer = SequenceRasterizer(
+            bins=config.raster_bins,
+            span_pct=config.raster_span_pct,
+            vol_scale=config.raster_vol_scale,
+            price_scale=config.raster_price_scale
+        ) if config.include_rasterized else None
 
         self.dates = [pd.Timestamp(d) for d in dates]
         self._bucket_size_cache: Dict[int, int] = {}  # Cache bucket sizes by year
@@ -519,7 +565,8 @@ class MultiFeatureExtraction(ScidBaseExtractor):
             'vpin': pd.DataFrame(),
             'profile': pd.DataFrame(),
             'number_bars': np.array([]),
-            'number_bars_meta': pd.DataFrame()
+            'number_bars_meta': pd.DataFrame(),
+            'rasterized': np.array([])
         }
 
         # Single fetch for all data needed
@@ -656,6 +703,20 @@ class MultiFeatureExtraction(ScidBaseExtractor):
                     for key, value in pre_summary.items():
                         vpin_df[key] = value
                 results['vpin'] = vpin_df
+
+                # Rasterize VPIN sequence if enabled
+                if self.config.include_rasterized and self.rasterizer is not None:
+                    try:
+                        rasterized_tensor = self.rasterizer.rasterize(
+                            vpin_df,
+                            session_start=self.config.raster_session_start,
+                            interval_mins=self.config.raster_interval_mins,
+                            num_bars=self.config.raster_num_bars
+                        )
+                        results['rasterized'] = rasterized_tensor
+                    except Exception as e:
+                        logger.warning(f"VPIN rasterization failed for {dt.date()}: {e}")
+
             except Exception as e:
                 logger.warning(f"VPIN calculation failed for {dt.date()}: {e}")
 
@@ -731,6 +792,15 @@ class MultiFeatureExtraction(ScidBaseExtractor):
             # Pre-summary
             'include_pre_summary': self.config.include_pre_summary,
             'pre_summary_start_time': self.config.pre_summary_start_time,
+            # Rasterization
+            'include_rasterized': self.config.include_rasterized,
+            'raster_interval_mins': self.config.raster_interval_mins,
+            'raster_num_bars': self.config.raster_num_bars,
+            'raster_bins': self.config.raster_bins,
+            'raster_span_pct': self.config.raster_span_pct,
+            'raster_session_start': self.config.raster_session_start,
+            'raster_vol_scale': self.config.raster_vol_scale,
+            'raster_price_scale': self.config.raster_price_scale,
         }
 
         # Add pre-computed bucket sizes for multiprocessing
@@ -939,7 +1009,12 @@ class MultiFeatureExtraction(ScidBaseExtractor):
             encoder_config: Optional[Dict] = None,
     ) -> Dict[str, str]:
         """
-        Export extraction results to NPZ (encoded profiles) and Parquet (VPIN).
+        Export extraction results to NPZ and Parquet formats.
+
+        Exports:
+        - Profiles: NPZ with encoded volume profiles (C, B) per date
+        - VPIN: Parquet with variable-length sequential features
+        - Rasterized (if enabled): NPZ with fixed spatial grids (num_bars, channels, bins) per date
 
         Parameters
         ----------
@@ -957,7 +1032,8 @@ class MultiFeatureExtraction(ScidBaseExtractor):
         Returns
         -------
         Dict[str, str]
-            Paths to saved files {'profiles': path, 'vpin': path}
+            Paths to saved files: {'profiles': path, 'vpin': path, 'rasterized': path}
+            Keys depend on which features are enabled in config.
         """
         from pathlib import Path
         from .volume.profile_encoder import (
@@ -1013,6 +1089,23 @@ class MultiFeatureExtraction(ScidBaseExtractor):
             vpin_path = output_dir / f"{prefix}_vpin.parquet"
             vpin_df.to_parquet(vpin_path)
             paths['vpin'] = str(vpin_path)
+
+        # Rasterized sequences -> NPZ (fixed spatial grids)
+        # Format: {date_str: (num_bars, channels, bins)}
+        if self.config.include_rasterized:
+            rasterized_dict = {}
+            rasterized_dates = []
+            for r in results:
+                if r['rasterized'].size > 0:
+                    date_key = r['date'].strftime('%Y-%m-%d')
+                    rasterized_dict[date_key] = r['rasterized']
+                    rasterized_dates.append(r['date'])
+
+            if rasterized_dict:
+                raster_path = output_dir / f"{prefix}_rasterized_vpin.npz"
+                np.savez_compressed(raster_path, **rasterized_dict)
+                paths['rasterized'] = str(raster_path)
+                logger.info(f"Exported {len(rasterized_dict)} rasterized sequences to {raster_path}")
 
         logger.info(f"Exported {len(valid_results)} days (fit on {n_train}) to {output_dir}")
         return paths

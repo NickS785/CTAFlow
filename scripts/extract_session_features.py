@@ -71,17 +71,17 @@ def extract_session_features(
         auto_bucket_cadence=250,
         vpin_window=20,
         vpin_start_time="08:30",
-        vpin_end_time="09:30",
+        vpin_end_time="12:00",
         auto_bucket=True,
         # Profile settings
         include_profile=True,
         profile_tick_size=tick_size,
-        profile_start_time="02:00",
-        profile_end_time="09:30",
+        profile_start_time="08:30",
+        profile_end_time="12:00",
         # Number Bars settings
-        include_number_bars=True,
+        include_number_bars=False,
         num_bars_start_time="08:30",
-        num_bars_end_time="09:30",
+        num_bars_end_time="12:00",
         num_bars_interval="15min",
         num_bars_levels=128,
         num_bars_centering="rolling_vwap",
@@ -94,6 +94,12 @@ def extract_session_features(
         include_ib=True,
         ib_minutes=60,
         value_area_pct=0.7
+        include_rasterized=True,
+        raster_interval_mins = 10
+        raster_num_bars = 24,
+        raster_span_pct = 0.03,
+        raster_vol_scale= 10.0,
+        raster_price_scale= 100.0
     )
 
     logger.info(f"Extracting features for {ticker}")
