@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn as nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 # ----------------------------
@@ -553,3 +554,39 @@ class SpatialTemporalEncoder(nn.Module):
         context = torch.sum(memory * weights, dim=1)  # (B, d_model)
 
         return self.norm(context)
+
+
+class MarketProfileCNN(nn.Module):
+    """
+    A lightweight 1D CNN specifically designed for Market Profile (histogram) data.
+    Input Shape: (Batch, Channels, Bins) -> e.g., (32, 3, 128)
+    """
+
+    def __init__(self, in_channels, out_dim=32):
+        super().__init__()
+        self.net = nn.Sequential(
+            # Block 1: Capture local shape (nodes/ledges)
+            nn.Conv1d(in_channels, 16, kernel_size=5, padding=2),
+            nn.BatchNorm1d(16),
+            nn.LeakyReLU(0.1),
+            nn.MaxPool1d(2),  # 128 -> 64
+
+            # Block 2: Capture structure (balance/imbalance)
+            nn.Conv1d(16, 32, kernel_size=5, padding=2),
+            nn.BatchNorm1d(32),
+            nn.LeakyReLU(0.1),
+            nn.MaxPool1d(2),  # 64 -> 32
+
+            # Block 3: Global abstraction
+            nn.Conv1d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
+            nn.LeakyReLU(0.1),
+            nn.AdaptiveAvgPool1d(1)  # Flatten to (Batch, 64, 1)
+        )
+
+        self.fc = nn.Linear(64, out_dim)
+
+    def forward(self, x):
+        x = self.net(x)
+        x = x.flatten(1)  # (Batch, 64)
+        return self.fc(x)  # (Batch, out_dim)

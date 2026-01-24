@@ -1178,6 +1178,90 @@ class RasterizedModalDataset(Dataset):
 
         return summary_vec, seq_tensor, spatial_tensor, raster_tensor, target, seq_len
 
+# assumes RasterizedModalDataset is already defined above in this file
+
+
+class WindowedRasterizedModalDataset(RasterizedModalDataset):
+    """
+    Windowed version of RasterizedModalDataset.
+
+    Returns:
+      summary_days : (D, F_sum)
+      seq_days     : (D, max_len, F_seq)     (RIGHT padded inside each day)
+      profile_days : (D, C_prof, B_prof)
+      raster_days  : (D, T_nb, C_nb, B_nb)
+      target       : scalar (target for last day in the window)
+      seq_lens     : (D,) intraday lengths per day
+    """
+
+    def __init__(self, *args, window_days: int = 20, return_dates: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        if window_days < 1:
+            raise ValueError("window_days must be >= 1")
+        self.window_days = int(window_days)
+        self.return_dates = return_dates
+
+    def __len__(self):
+        n = len(self.df_summary)
+        return max(0, n - self.window_days + 1)
+
+    def __getitem__(self, idx):
+        end = idx + self.window_days - 1
+
+        # dates aligned by parent class
+        window_dates = self.df_summary.iloc[idx : end + 1]["date"].tolist()
+
+        # A) summary window (already float32 in self.features)
+        summary_days = torch.tensor(self.features[idx : end + 1], dtype=torch.float32)  # (D, F_sum)
+
+        # B) seq window: (D, max_len, F_seq) + lens (D,)
+        D = self.window_days
+        F_seq = self.n_sequential_features
+        seq_days = torch.zeros((D, self.max_len, F_seq), dtype=torch.float32)
+        seq_lens = torch.zeros((D,), dtype=torch.long)
+
+        for j, d in enumerate(window_dates):
+            arr = self.sequential_by_date.get(d)
+            if arr is None or len(arr) == 0:
+                arr = np.zeros((1, F_seq), dtype=np.float32)
+
+            # keep most recent max_len rows
+            if arr.shape[0] > self.max_len:
+                arr = arr[-self.max_len :]
+
+            T = arr.shape[0]
+            seq_lens[j] = T
+
+            # IMPORTANT: right-pad so pack_padded_sequence works (valid steps first)
+            seq_days[j, :T, :] = torch.from_numpy(arr.astype(np.float32))
+
+        # C) profile window
+        prof_list = []
+        for d in window_dates:
+            prof = self.spatial_by_date.get(d)
+            if prof is None:
+                prof = np.zeros(self.spatial_shape, dtype=np.float32)
+            prof_list.append(torch.tensor(prof, dtype=torch.float32))
+        profile_days = torch.stack(prof_list, dim=0)  # (D, C_prof, B_prof)
+
+        # D) raster window
+        rast_list = []
+        for d in window_dates:
+            rast = self.rasterized_by_date.get(d)
+            if rast is None:
+                rast = np.zeros(self.rasterized_shape, dtype=np.float32)
+            rast_list.append(torch.tensor(rast, dtype=torch.float32))
+        raster_days = torch.stack(rast_list, dim=0)   # (D, T_nb, C_nb, B_nb)
+
+        # E) target for *last day* in window
+        target = torch.tensor(self.targets[end])
+
+        if self.return_dates:
+            return summary_days, seq_days, profile_days, raster_days, target, seq_lens, window_dates
+
+        return summary_days, seq_days, profile_days, raster_days, target, seq_lens
+
+
 
 class OnTheFlyRasterizedDataset(Dataset):
     """

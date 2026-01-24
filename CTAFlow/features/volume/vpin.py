@@ -325,7 +325,7 @@ class SequenceRasterizer:
         limit = span_pct * price_scale
         self.edges = np.linspace(-limit, limit, bins + 1, dtype=np.float32)
 
-    def rasterize(self, df, num_bars=4, interval_mins=None):
+    def rasterize(self, df, num_bars=4, interval_mins=None, session_start=None):
         """
         Converts VPIN DataFrame -> (Num_Bars, Channels, Bins)
         Channels: [Density, Volume, Imbalance, Returns]
@@ -333,36 +333,65 @@ class SequenceRasterizer:
         Parameters
         ----------
         df : pd.DataFrame
-            VPIN data with 'ts_end', 'close', 'profile_vwap', 'vol', 'imb_frac', 'bucket_return'
+            VPIN data with 'ts_end', 'close', 'profile_vwap', 'vol', 'imb_frac', 'bucket_return'.
+            If ts_end is the index (common from calculate_vpin), it will be extracted.
         num_bars : int
             Number of time bars to split data into
         interval_mins : float, optional
             Minutes per bar. If None, auto-computed to evenly split data's time range.
+        session_start : str or time, optional
+            Session start time (e.g., "08:30"). If provided with interval_mins, builds
+            fixed time edges from session_start instead of data bounds.
 
         Returns
         -------
         torch.Tensor
             Shape (num_bars, 4, bins) - channels are [Density, LogVolume, Imbalance, Returns]
         """
-        # 1. Get time bounds from data
+        # Handle ts_end as index or column
+        df = df.copy()
+        if 'ts_end' not in df.columns:
+            if isinstance(df.index, pd.DatetimeIndex):
+                df['ts_end'] = df.index
+            else:
+                raise ValueError("DataFrame must have 'ts_end' column or DatetimeIndex")
+
+        # 1. Get time bounds from data - normalize timezone handling
         ts_end = pd.to_datetime(df['ts_end'])
+
+        # Normalize to tz-naive UTC for consistent comparisons
+        if ts_end.dt.tz is not None:
+            ts_end = ts_end.dt.tz_convert('UTC').dt.tz_localize(None)
+
         min_ts = ts_end.min()
         max_ts = ts_end.max()
 
-        # Auto-compute interval if not provided
-        if interval_mins is None:
-            total_mins = (max_ts - min_ts).total_seconds() / 60
-            interval_mins = total_mins / num_bars if num_bars > 0 else 1.0
+        # Build time edges - use session_start if provided, otherwise data bounds
+        if session_start is not None and interval_mins is not None:
+            # Parse session_start if string
+            if isinstance(session_start, str):
+                h, m = map(int, session_start.split(':'))
+                session_start_time = pd.Timestamp(min_ts.date()).replace(hour=h, minute=m)
+            else:
+                session_start_time = pd.Timestamp(min_ts.date()).replace(
+                    hour=session_start.hour, minute=session_start.minute
+                )
+            time_edges = [session_start_time + pd.Timedelta(minutes=i * interval_mins) for i in range(num_bars + 1)]
+        else:
+            # Auto-compute interval if not provided
+            if interval_mins is None:
+                total_mins = (max_ts - min_ts).total_seconds() / 60
+                interval_mins = total_mins / num_bars if num_bars > 0 else 1.0
 
-        # Build time edges from data's start time
-        time_edges = [min_ts + pd.Timedelta(minutes=i * interval_mins) for i in range(num_bars + 1)]
+            # Build time edges from data's start time
+            time_edges = [min_ts + pd.Timedelta(minutes=i * interval_mins) for i in range(num_bars + 1)]
 
         # 2. Setup Spatial Coordinates
         # 0.0 = VWAP, Scaled by 100
         p_norm = ((df['close'] - df['profile_vwap']) / df['profile_vwap']) * self.price_scale
 
-        # 3. Vectorized Binning
-        t_idx = np.searchsorted(time_edges, df['ts_end']) - 1
+        # 3. Vectorized Binning - use normalized ts_end for comparison
+        t_idx = np.searchsorted(time_edges, ts_end) - 1
         b_idx = np.searchsorted(self.edges, p_norm) - 1
 
         # Filter valid
@@ -389,7 +418,7 @@ class SequenceRasterizer:
 
         # Ch 3: Return (Last) - Using argsort to get time-ordered overwrite
         # Sort by time to ensure 'last' really means last
-        sort_idx = np.argsort(df_v['ts_end'].values)
+        sort_idx = np.argsort(ts_end.iloc[valid].values)
         t_s, b_s = t_v[sort_idx], b_v[sort_idx]
         vals_s = df_v['bucket_return'].values[sort_idx] * self.price_scale
 
@@ -453,22 +482,30 @@ class SequenceRasterizer:
 
         df = pd.read_parquet(parquet_path)
 
+        # Ensure ts_col exists as column (may be index from calculate_vpin)
+        if ts_col not in df.columns:
+            if isinstance(df.index, pd.DatetimeIndex):
+                df = df.reset_index()
+                if df.columns[0] != ts_col:
+                    df = df.rename(columns={df.columns[0]: ts_col})
+
         # Ensure date column exists
         if date_col not in df.columns:
             if ts_col in df.columns:
-                df[date_col] = pd.to_datetime(df[ts_col]).dt.date.astype(str)
-            elif df.index.name == ts_col or isinstance(df.index, pd.DatetimeIndex):
-                df = df.reset_index()
-                df[date_col] = pd.to_datetime(df[ts_col]).dt.date.astype(str)
+                ts_series = pd.to_datetime(df[ts_col])
+                # Normalize timezone before extracting date
+                if ts_series.dt.tz is not None:
+                    ts_series = ts_series.dt.tz_convert('UTC').dt.tz_localize(None)
+                df[date_col] = ts_series.dt.date.astype(str)
             else:
                 raise ValueError(f"Cannot find date column. Expected '{date_col}' or '{ts_col}'")
 
-        # Ensure ts_end is datetime for rasterization
+        # Ensure ts_end is datetime for rasterization (normalize timezone)
         if ts_col in df.columns:
-            df[ts_col] = pd.to_datetime(df[ts_col])
-        else:
-            if isinstance(df.index, pd.DatetimeIndex):
-                df[ts_col] = df.index
+            ts_series = pd.to_datetime(df[ts_col])
+            if ts_series.dt.tz is not None:
+                ts_series = ts_series.dt.tz_convert('UTC').dt.tz_localize(None)
+            df[ts_col] = ts_series
 
         # Get unique dates
         dates = sorted(df[date_col].unique())
@@ -739,7 +776,7 @@ class CupySequenceRasterizer:
 
         return torch.tensor(grid, dtype=torch.float32).permute(0, 2, 1)
 
-    def rasterize(self, df, num_bars=4, interval_mins=None):
+    def rasterize(self, df, num_bars=4, interval_mins=None, session_start=None):
         """
         Converts VPIN DataFrame -> (Num_Bars, Channels, Bins)
         Channels: [Density, Volume, Imbalance, Returns]
@@ -749,29 +786,61 @@ class CupySequenceRasterizer:
         Parameters
         ----------
         df : pd.DataFrame
-            VPIN data with 'ts_end', 'close', 'profile_vwap', 'vol', 'imb_frac', 'bucket_return'
+            VPIN data with 'ts_end', 'close', 'profile_vwap', 'vol', 'imb_frac', 'bucket_return'.
+            If ts_end is the index (common from calculate_vpin), it will be extracted.
         num_bars : int
             Number of time bars to split data into
         interval_mins : float, optional
             Minutes per bar. If None, auto-computed to evenly split data's time range.
+        session_start : str or time, optional
+            Session start time (e.g., "08:30"). If provided with interval_mins, builds
+            fixed time edges from session_start instead of data bounds.
 
         Returns
         -------
         torch.Tensor
             Shape (num_bars, 4, bins) - channels are [Density, LogVolume, Imbalance, Returns]
         """
-        # Get time bounds from data
+        # Handle ts_end as index or column
+        df = df.copy()
+        if 'ts_end' not in df.columns:
+            if isinstance(df.index, pd.DatetimeIndex):
+                df['ts_end'] = df.index
+            else:
+                raise ValueError("DataFrame must have 'ts_end' column or DatetimeIndex")
+
+        # Get time bounds from data - normalize timezone handling
         ts_end = pd.to_datetime(df['ts_end'])
+
+        # Normalize to tz-naive UTC for consistent comparisons
+        if ts_end.dt.tz is not None:
+            ts_end = ts_end.dt.tz_convert('UTC').dt.tz_localize(None)
+
+        # Store normalized timestamps back for GPU/CPU processing
+        df['ts_end'] = ts_end
+
         min_ts = ts_end.min()
         max_ts = ts_end.max()
 
-        # Auto-compute interval if not provided
-        if interval_mins is None:
-            total_mins = (max_ts - min_ts).total_seconds() / 60
-            interval_mins = total_mins / num_bars if num_bars > 0 else 1.0
+        # Build time edges - use session_start if provided, otherwise data bounds
+        if session_start is not None and interval_mins is not None:
+            # Parse session_start if string
+            if isinstance(session_start, str):
+                h, m = map(int, session_start.split(':'))
+                session_start_time = pd.Timestamp(min_ts.date()).replace(hour=h, minute=m)
+            else:
+                session_start_time = pd.Timestamp(min_ts.date()).replace(
+                    hour=session_start.hour, minute=session_start.minute
+                )
+            time_edges = [session_start_time + pd.Timedelta(minutes=i * interval_mins) for i in range(num_bars + 1)]
+        else:
+            # Auto-compute interval if not provided
+            if interval_mins is None:
+                total_mins = (max_ts - min_ts).total_seconds() / 60
+                interval_mins = total_mins / num_bars if num_bars > 0 else 1.0
 
-        # Build time edges from data's start time
-        time_edges = [min_ts + pd.Timedelta(minutes=i * interval_mins) for i in range(num_bars + 1)]
+            # Build time edges from data's start time
+            time_edges = [min_ts + pd.Timedelta(minutes=i * interval_mins) for i in range(num_bars + 1)]
 
         if self.use_gpu:
             time_edges_ns = np.array([t.value for t in time_edges], dtype=np.int64)
@@ -851,17 +920,29 @@ class CupySequenceRasterizer:
 
         df = pd.read_parquet(parquet_path)
 
+        # Ensure ts_col exists as column (may be index from calculate_vpin)
+        if ts_col not in df.columns:
+            if isinstance(df.index, pd.DatetimeIndex):
+                df = df.reset_index()
+                if df.columns[0] != ts_col:
+                    df = df.rename(columns={df.columns[0]: ts_col})
+
         if date_col not in df.columns:
             if ts_col in df.columns:
-                df[date_col] = pd.to_datetime(df[ts_col]).dt.date.astype(str)
-            elif df.index.name == ts_col or isinstance(df.index, pd.DatetimeIndex):
-                df = df.reset_index()
-                df[date_col] = pd.to_datetime(df[ts_col]).dt.date.astype(str)
+                ts_series = pd.to_datetime(df[ts_col])
+                # Normalize timezone before extracting date
+                if ts_series.dt.tz is not None:
+                    ts_series = ts_series.dt.tz_convert('UTC').dt.tz_localize(None)
+                df[date_col] = ts_series.dt.date.astype(str)
             else:
                 raise ValueError(f"Cannot find date column '{date_col}' or '{ts_col}'")
 
+        # Ensure ts_end is datetime for rasterization (normalize timezone)
         if ts_col in df.columns:
-            df[ts_col] = pd.to_datetime(df[ts_col])
+            ts_series = pd.to_datetime(df[ts_col])
+            if ts_series.dt.tz is not None:
+                ts_series = ts_series.dt.tz_convert('UTC').dt.tz_localize(None)
+            df[ts_col] = ts_series
 
         dates = sorted(df[date_col].unique())
         if verbose:

@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils.rnn as rnn_utils
 
+
 from ..encoders import (
     GatedFusion,
     NumberBarsEncoder,
@@ -11,44 +12,8 @@ from ..encoders import (
     SeqEncoder,
     SpatialFuse,
     SpatialTemporalEncoder,
-    SummaryEncoder,
+    SummaryEncoder, MarketProfileCNN,
 )
-
-
-class MarketProfileCNN(nn.Module):
-    """
-    A lightweight 1D CNN specifically designed for Market Profile (histogram) data.
-    Input Shape: (Batch, Channels, Bins) -> e.g., (32, 3, 128)
-    """
-
-    def __init__(self, in_channels, out_dim=32):
-        super().__init__()
-        self.net = nn.Sequential(
-            # Block 1: Capture local shape (nodes/ledges)
-            nn.Conv1d(in_channels, 16, kernel_size=5, padding=2),
-            nn.BatchNorm1d(16),
-            nn.LeakyReLU(0.1),
-            nn.MaxPool1d(2),  # 128 -> 64
-
-            # Block 2: Capture structure (balance/imbalance)
-            nn.Conv1d(16, 32, kernel_size=5, padding=2),
-            nn.BatchNorm1d(32),
-            nn.LeakyReLU(0.1),
-            nn.MaxPool1d(2),  # 64 -> 32
-
-            # Block 3: Global abstraction
-            nn.Conv1d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm1d(64),
-            nn.LeakyReLU(0.1),
-            nn.AdaptiveAvgPool1d(1)  # Flatten to (Batch, 64, 1)
-        )
-
-        self.fc = nn.Linear(64, out_dim)
-
-    def forward(self, x):
-        x = self.net(x)
-        x = x.flatten(1)  # (Batch, 64)
-        return self.fc(x)  # (Batch, out_dim)
 
 
 class TriModalModel(nn.Module):
@@ -542,6 +507,203 @@ class TriModalModel(nn.Module):
             'sequential_grad_importance': seq_grads,
             'spatial_grad_importance': spatial_grads,
         }
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn.utils.rnn as rnn_utils
+
+from CTAFlow.models.deep_learning.encoders import (
+    NumberBarsEncoder,
+    SpatialTemporalEncoder,
+    SpatialFuse,
+)
+
+
+
+class TriModalLSTM(nn.Module):
+    """
+    Windowed (day-sequence) tri-modal model:
+      - Per-day encoders: summary, intraday-seq, profile, rasterized
+      - Per-day spatial fuse: profile + rasterized -> spatial embedding
+      - Per-day tri-modal fuse: [summary, intraday, spatial] -> day embedding
+      - Day LSTM over window -> final prediction from last hidden state
+
+    Expected batch tensors:
+      summary_days : (B, D, F_sum)
+      seq_days     : (B, D, T_seq, F_seq)      (right-padded within each day)
+      seq_lens     : (B, D)                    intraday lengths per day
+      profile_days : (B, D, C_prof, B_prof)
+      raster_days  : (B, D, T_nb, C_nb, B_nb)  (SequenceRasterizer style: (T, C, Bins))
+    """
+
+    def __init__(
+        self,
+        f_sum: int,
+        f_seq: int,
+        f_profile: int = 3,
+        profile_bins: int = 96,
+        f_nb: int = 4,
+        nb_bins: int = 64,
+        num_bars: int = 4,
+        d_model: int = 256,
+        lstm_hidden_dim: int = 128,         # intraday LSTM hidden
+        day_lstm_hidden: int = 256,         # day LSTM hidden
+        day_lstm_layers: int = 1,
+        task: str = "classification",
+        num_classes: int = 3,
+        spatial_fuse_mode: str = "gated",
+        spatial_encoder_type: str = "rasterized",  # "rasterized" or "numberbars"
+        transformer_d_model: int = 128,
+        transformer_n_layers: int = 2,
+        transformer_nhead: int = 4,
+        dropout: float = 0.2,
+        head_dropout: float = 0.2,
+    ):
+        super().__init__()
+        self.task = task
+
+        # -------- per-day summary encoder --------
+        self.summary_net = nn.Sequential(
+            nn.Linear(f_sum, d_model // 2),
+            nn.LayerNorm(d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, d_model // 2),
+            nn.GELU(),
+        )
+
+        # -------- per-day intraday sequential encoder (micro) --------
+        self.seq_lstm = nn.LSTM(
+            input_size=f_seq,
+            hidden_size=lstm_hidden_dim,
+            num_layers=1,
+            batch_first=True,
+        )
+        self.seq_post = nn.Sequential(
+            nn.Linear(lstm_hidden_dim, lstm_hidden_dim),
+            nn.GELU(),
+        )
+
+        # -------- per-day profile encoder --------
+        self.profile_net = MarketProfileCNN(in_channels=f_profile, out_dim=d_model // 2)
+
+        # -------- per-day raster/nb encoder --------
+        if spatial_encoder_type == "rasterized":
+            # Input: (B, T, C, BINS) from SequenceRasterizer
+            self.nb_net = SpatialTemporalEncoder(
+                num_bars=num_bars,
+                in_ch=f_nb,
+                num_bins=nb_bins,
+                d_model=transformer_d_model,
+                n_layers=transformer_n_layers,
+                nhead=transformer_nhead,
+                dropout=dropout,
+            )
+            self.nb_proj = (
+                nn.Linear(transformer_d_model, d_model // 2)
+                if transformer_d_model != d_model // 2
+                else nn.Identity()
+            )
+        else:
+            # Input: (B, T, BINS, C)
+            self.nb_net = NumberBarsEncoder(c_in=f_nb, d_model=d_model // 2, dropout=dropout)
+            self.nb_proj = nn.Identity()
+
+        # fuse profile + nb into a single spatial embedding
+        self.spatial_fuse = SpatialFuse(d_spatial=d_model // 2, mode=spatial_fuse_mode)
+
+        # -------- per-day tri-modal fusion -> day embedding --------
+        per_day_dim = (d_model // 2) + lstm_hidden_dim + (d_model // 2)
+        self.day_fuse = nn.Sequential(
+            nn.LayerNorm(per_day_dim),
+            nn.Linear(per_day_dim, per_day_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+        # -------- day LSTM over window --------
+        self.day_lstm = nn.LSTM(
+            input_size=per_day_dim,
+            hidden_size=day_lstm_hidden,
+            num_layers=day_lstm_layers,
+            batch_first=True,
+        )
+
+        out_dim = num_classes if task == "classification" else 1
+        self.head = nn.Sequential(
+            nn.Linear(day_lstm_hidden, 128),
+            nn.LayerNorm(128),
+            nn.GELU(),
+            nn.Dropout(head_dropout),
+            nn.Linear(128, 64),
+            nn.GELU(),
+            nn.Linear(64, out_dim),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # keep consistent with your other models
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, (nn.BatchNorm1d, nn.LayerNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(
+        self,
+        summary_days: torch.Tensor,
+        seq_days: torch.Tensor,
+        seq_lens: torch.Tensor,
+        profile_days: torch.Tensor,
+        raster_days: torch.Tensor,
+        return_probs: bool = False,
+    ):
+        """
+        Returns:
+          logits/probs: (B, num_classes) or (B, 1)
+        """
+        B, D, _, _ = seq_days.shape
+        BD = B * D
+
+        # ---- flatten day dimension so we can reuse your per-day encoders ----
+        sum_flat = summary_days.reshape(BD, -1)                     # (BD, F_sum)
+        seq_flat = seq_days.reshape(BD, seq_days.size(2), -1)       # (BD, T_seq, F_seq)
+        lens_flat = seq_lens.reshape(BD).clamp(min=1).cpu()         # (BD,)
+        prof_flat = profile_days.reshape(BD, profile_days.size(2), profile_days.size(3))  # (BD, C_prof, B_prof)
+        rast_flat = raster_days.reshape(BD, raster_days.size(2), raster_days.size(3), raster_days.size(4))  # (BD, T, C, Bins)
+
+        # ---- per-day: summary ----
+        z_sum = self.summary_net(sum_flat)                          # (BD, d/2)
+
+        # ---- per-day: intraday seq ----
+        packed = rnn_utils.pack_padded_sequence(seq_flat, lens_flat, batch_first=True, enforce_sorted=False)
+        _, (h_n, _) = self.seq_lstm(packed)
+        z_seq = self.seq_post(h_n[-1])                              # (BD, lstm_hidden)
+
+        # ---- per-day: spatial = fuse(profile, raster) ----
+        z_prof = self.profile_net(prof_flat)                        # (BD, d/2)
+        z_nb = self.nb_proj(self.nb_net(rast_flat, None))            # (BD, d/2)
+        z_spatial = self.spatial_fuse(z_prof, z_nb, return_importance=False)  # (BD, d/2)
+
+        # ---- per-day fused embedding ----
+        z_day = torch.cat([z_sum, z_seq, z_spatial], dim=-1)         # (BD, per_day_dim)
+        z_day = self.day_fuse(z_day).reshape(B, D, -1)               # (B, D, per_day_dim)
+
+        # ---- day LSTM ----
+        _, (h_n_day, _) = self.day_lstm(z_day)
+        z_ctx = h_n_day[-1]                                          # (B, day_lstm_hidden)
+
+        logits = self.head(z_ctx)
+        if self.task == "classification" and return_probs:
+            return F.softmax(logits, dim=-1)
+        return logits
 
 
 class TriModalLiquidityModel(nn.Module):

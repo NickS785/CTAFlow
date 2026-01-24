@@ -253,6 +253,98 @@ class IntradayMomentum:
         mask = normalized_idx.isin(self.valid_trading_dates)
         return data[mask]
 
+    def _resample_to_daily(
+            self,
+            data: Optional[pd.DataFrame] = None,
+            price_col: str = "Close",
+    ) -> pd.DataFrame:
+        """Resample intraday data to daily OHLCV without lookahead bias.
+
+        Uses closed='right', label='right' to ensure each daily bar's timestamp
+        represents the END of the trading day, not the start. This prevents
+        lookahead bias when the daily data is used for feature calculations.
+
+        Parameters
+        ----------
+        data : pd.DataFrame, optional
+            Intraday data with OHLCV columns. If None, uses self.intraday_data.
+        price_col : str, default "Close"
+            Column to use for close price aggregation.
+
+        Returns
+        -------
+        pd.DataFrame
+            Daily OHLCV data with columns: Open, High, Low, Close, Volume (if available).
+            Index is normalized to midnight of each trading day.
+
+        Notes
+        -----
+        - Uses closed='right', label='right' to assign bars to the END of the period
+        - This means a bar at 2024-01-05 contains data from 2024-01-04 end to 2024-01-05 end
+        - Handles missing columns gracefully (only aggregates what exists)
+        - Filters to valid trading dates to remove weekends/holidays
+        """
+        if data is None:
+            data = self.intraday_data
+        if data is None or data.empty:
+            raise ValueError("No intraday data available for daily resampling")
+
+        # Build aggregation dict based on available columns
+        agg_dict = {}
+        col_map = {c.lower(): c for c in data.columns}  # case-insensitive lookup
+
+        if 'open' in col_map:
+            agg_dict[col_map['open']] = 'first'
+        if 'high' in col_map:
+            agg_dict[col_map['high']] = 'max'
+        if 'low' in col_map:
+            agg_dict[col_map['low']] = 'min'
+
+        # Handle price column (may be 'Close', 'close', 'Last', etc.)
+        price_col_actual = col_map.get(price_col.lower(), price_col)
+        if price_col_actual in data.columns:
+            agg_dict[price_col_actual] = 'last'
+        elif 'close' in col_map:
+            agg_dict[col_map['close']] = 'last'
+
+        if 'volume' in col_map:
+            agg_dict[col_map['volume']] = 'sum'
+
+        if not agg_dict:
+            raise ValueError("No valid columns found for daily aggregation")
+
+        # Resample with right-closed, right-labeled to avoid lookahead
+        # This means bar at time T contains data up to and including T
+        daily = data.resample('1D', closed='right', label='right').agg(agg_dict)
+
+        # Normalize column names
+        rename_map = {}
+        for col in daily.columns:
+            if col.lower() == 'open':
+                rename_map[col] = 'Open'
+            elif col.lower() == 'high':
+                rename_map[col] = 'High'
+            elif col.lower() == 'low':
+                rename_map[col] = 'Low'
+            elif col.lower() in ('close', 'last', price_col.lower()):
+                rename_map[col] = 'Close'
+            elif col.lower() == 'volume':
+                rename_map[col] = 'Volume'
+        daily = daily.rename(columns=rename_map)
+
+        # Normalize index to midnight and filter to trading dates
+        daily.index = daily.index.normalize()
+
+        # Remove rows where all OHLC are NaN (non-trading days)
+        ohlc_cols = [c for c in ['Open', 'High', 'Low', 'Close'] if c in daily.columns]
+        if ohlc_cols:
+            daily = daily.dropna(subset=ohlc_cols, how='all')
+
+        # Filter to valid trading dates
+        daily = self._filter_to_trading_dates(daily)
+
+        return daily
+
     def _needs_shift(self, feature_time: time) -> bool:
         """Determine if a feature at feature_time needs to be shifted to avoid lookahead bias.
 
@@ -1168,51 +1260,62 @@ class IntradayMomentum:
         """
         t_time = target_time or self.target_time
 
-        # Get or create daily data
+        # Get or create daily data using helper (avoids lookahead bias)
         if daily_df is not None:
             daily = daily_df.copy()
             if not isinstance(daily.index, pd.DatetimeIndex):
                 daily.index = pd.to_datetime(daily.index)
             daily.index = daily.index.normalize()
+            daily = self._filter_to_trading_dates(daily)
         else:
-            # Resample intraday data to daily
-            data = self.intraday_data
-            if data is None or data.empty:
-                raise ValueError("Intraday data is required for prev_hl_daily")
-            daily = data.resample('1D').agg({
-                'High': 'max',
-                'Low': 'min',
-                price_col: 'last'
-            }).dropna()
-            daily.index = daily.index.normalize()
+            # Use helper method for proper resampling (closed='right', label='right')
+            daily = self._resample_to_daily(price_col=price_col)
 
-        # Validate columns
-        if 'High' not in daily.columns or 'Low' not in daily.columns:
+        # Validate columns - check for High/Low (case-insensitive)
+        col_map = {c.lower(): c for c in daily.columns}
+        high_col = col_map.get('high')
+        low_col = col_map.get('low')
+        close_col = col_map.get('close', col_map.get(price_col.lower()))
+
+        if high_col is None or low_col is None:
             raise KeyError("'High' and 'Low' columns required for prev_hl_daily")
 
-        # Filter to valid trading dates
-        daily = self._filter_to_trading_dates(daily)
-
         # Calculate rolling high/low (shifted to exclude current day)
-        rolling_high = daily['High'].rolling(n_days, min_periods=1).max().shift(1)
-        rolling_low = daily['Low'].rolling(n_days, min_periods=1).min().shift(1)
+        # Use min_periods=1 to avoid excessive NaN at start
+        rolling_high = daily[high_col].rolling(n_days, min_periods=1).max().shift(1)
+        rolling_low = daily[low_col].rolling(n_days, min_periods=1).min().shift(1)
 
         # Get price at target_time
-        if self.intraday_data is not None:
+        if self.intraday_data is not None and not self.intraday_data.empty:
             prices = self._coerce_price(self.intraday_data, price_col)
             mask = prices.index.time == t_time
             target_prices = prices[mask]
-            target_prices.index = pd.to_datetime(target_prices.index).normalize()
-            target_prices = self._filter_to_trading_dates(target_prices)
+            if not target_prices.empty:
+                target_prices.index = pd.to_datetime(target_prices.index).normalize()
+                target_prices = self._filter_to_trading_dates(target_prices)
+                # Handle duplicate dates (multiple entries at same time) - keep last
+                if target_prices.index.duplicated().any():
+                    target_prices = target_prices[~target_prices.index.duplicated(keep='last')]
+            else:
+                # No data at target_time, fall back to daily close
+                target_prices = daily[close_col] if close_col else daily[high_col]
         else:
             # Fall back to daily close
-            target_prices = daily[price_col]
+            target_prices = daily[close_col] if close_col else daily[high_col]
 
-        # Align indices
+        # Align indices - use union then reindex to preserve all dates
         common_idx = target_prices.index.intersection(rolling_high.index)
-        target_prices = target_prices.loc[common_idx]
-        rolling_high = rolling_high.loc[common_idx]
-        rolling_low = rolling_low.loc[common_idx]
+        if common_idx.empty:
+            # No overlap - return empty DataFrame with correct columns
+            return pd.DataFrame({
+                f'dist_{n_days}d_high': pd.Series(dtype=float),
+                f'dist_{n_days}d_low': pd.Series(dtype=float),
+                f'range_position_{n_days}d': pd.Series(dtype=float),
+            })
+
+        target_prices = target_prices.reindex(common_idx)
+        rolling_high = rolling_high.reindex(common_idx)
+        rolling_low = rolling_low.reindex(common_idx)
 
         # Calculate normalized distances
         dist_high = (target_prices - rolling_high) / rolling_high
@@ -1280,21 +1383,18 @@ class IntradayMomentum:
         >>> model = IntradayMomentum(intraday_data)
         >>> sma_df = model.sma_features(periods=[10, 20, 50], add_as_feature=True)
         """
-        # Get or create daily data
+        # Get or create daily data using helper (avoids lookahead bias)
         if daily_df is not None:
             daily = daily_df.copy()
             if not isinstance(daily.index, pd.DatetimeIndex):
                 daily.index = pd.to_datetime(daily.index)
             daily.index = daily.index.normalize()
+            daily = self._filter_to_trading_dates(daily)
         else:
-            data = self.intraday_data
-            if data is None or data.empty:
-                raise ValueError("Intraday data is required for sma_features")
-            daily = data.resample('1D').agg({price_col: 'last'}).dropna()
-            daily.index = daily.index.normalize()
+            # Use helper method for proper resampling (closed='right', label='right')
+            daily = self._resample_to_daily(price_col=price_col)
 
         prices = self._coerce_price(daily, price_col)
-        prices = self._filter_to_trading_dates(prices)
 
         feats: Dict[str, pd.Series] = {}
         smas: Dict[int, pd.Series] = {}
@@ -2407,6 +2507,130 @@ class IntradayMomentum:
 
         return target_returns
 
+    def _calculate_target_returns(
+            self,
+            target_time_end: Optional[time] = None,
+            period_length: Optional[timedelta] = None,
+            make_clf: bool = False,
+            clf_percentiles: Tuple[float, ...] = (33, 67),
+            intraday_df: Optional[pd.DataFrame] = None,
+            price_col: str = "Close",
+    ) -> pd.Series:
+        """Calculate and set target returns with optional classification binning.
+
+        This method computes target returns and sets the `.target_data` attribute.
+        Use this to configure different target time windows (e.g., next 30 minutes
+        instead of last hour) or to generate classification labels from continuous returns.
+
+        Parameters
+        ----------
+        target_time_end : time, optional
+            End time for the target period. Defaults to session_end (or session_open
+            if session_target='open' was set during initialization).
+        period_length : timedelta, optional
+            Length of the target period. Defaults to closing_length from initialization.
+        make_clf : bool, default False
+            If True, convert continuous returns to classification labels using percentile thresholds.
+        clf_percentiles : tuple of float, default (33, 67)
+            Percentile thresholds for classification. For 3 classes: (33, 67) creates
+            bottom 33%, middle 34%, top 33%. For binary: (50,) creates bottom/top 50%.
+        intraday_df : pd.DataFrame, optional
+            Intraday data to use. Defaults to self.intraday_data.
+        price_col : str, default "Close"
+            Price column to use for return calculation.
+
+        Returns
+        -------
+        pd.Series
+            Target returns (continuous or classification labels)
+
+        Examples
+        --------
+        >>> # Predict last 30 minutes instead of last hour
+        >>> model._calculate_target_returns(
+        ...     target_time_end=time(15, 0),
+        ...     period_length=timedelta(minutes=30)
+        ... )
+
+        >>> # Predict next 30 minutes after session open
+        >>> model._calculate_target_returns(
+        ...     target_time_end=time(9, 0),
+        ...     period_length=timedelta(minutes=30)
+        ... )
+
+        >>> # 3-class classification target
+        >>> model._calculate_target_returns(
+        ...     make_clf=True,
+        ...     clf_percentiles=(33, 67)
+        ... )
+
+        >>> # Binary classification target
+        >>> model._calculate_target_returns(
+        ...     make_clf=True,
+        ...     clf_percentiles=(50,)
+        ... )
+
+        Notes
+        -----
+        - Updates self.target_data in place
+        - Reindexes self.training_data to match target_data dates
+        - For classification, assigns class 0 to lowest values, incrementing upward
+        """
+        # Use defaults if not provided
+        if target_time_end is None:
+            target_time_end = self.target_time
+        if period_length is None:
+            period_length = self.closing_length
+
+        # Calculate continuous returns
+        target_returns = self.target_time_returns(
+            target_time=target_time_end,
+            intraday_df=intraday_df,
+            period_length=period_length,
+            price_col=price_col,
+            add_as_feature=False,
+            use_nearest=True,
+        )
+
+        # Convert to classification if requested
+        if make_clf:
+            clf_percentiles = sorted(clf_percentiles)
+            n_classes = len(clf_percentiles) + 1
+
+            # Compute thresholds
+            thresholds = [np.percentile(target_returns, p) for p in clf_percentiles]
+
+            # Assign classes
+            class_labels = np.zeros(len(target_returns), dtype=int)
+            for i, threshold in enumerate(thresholds):
+                class_labels[target_returns > threshold] = i + 1
+
+            target_returns = pd.Series(class_labels, index=target_returns.index)
+
+            # Print distribution
+            print("\n" + "="*60)
+            print("TARGET CLASSIFICATION DISTRIBUTION")
+            print("="*60)
+            for cls in range(n_classes):
+                count = (class_labels == cls).sum()
+                pct = 100.0 * count / len(class_labels)
+                print(f"Class {cls}: {count:5d} samples ({pct:5.2f}%)")
+            print("="*60)
+            print(f"Percentile thresholds: {clf_percentiles}")
+            print(f"Threshold values: {[f'{t:.6f}' for t in thresholds]}")
+            print("="*60)
+
+        # Update target_data and align training_data
+        self.target_data = target_returns
+        if isinstance(self.training_data, pd.DataFrame):
+            # Reindex training_data to match new target_data index
+            self.training_data = self.training_data.reindex(self.target_data.index)
+        elif isinstance(self.training_data, dict) and 'summary' in self.training_data:
+            # For DeepIDMomentum with dict structure, reindex the summary DataFrame
+            self.training_data['summary'] = self.training_data['summary'].reindex(self.target_data.index)
+
+        return target_returns
+
     def target_time_volume(
             self,
             target_time: Union[time, List[time]],
@@ -3038,7 +3262,7 @@ class IntradayMomentum:
 
     def market_structure_features(
             self,
-            daily_df: pd.DataFrame,
+            daily_df: Optional[pd.DataFrame] = None,
             lookbacks: Iterable[int] = (5, 10, 20),
             price_col: str = "Close",
             add_as_feature: bool = False,
@@ -3050,9 +3274,9 @@ class IntradayMomentum:
 
         Parameters
         ----------
-        daily_df : pd.DataFrame
+        daily_df : pd.DataFrame, optional
             Daily OHLCV data with DatetimeIndex. Expects 'High', 'Low' columns
-            for full feature set.
+            for full feature set. If None, resamples from intraday_data.
         lookbacks : Iterable[int], default (5, 10, 20)
             Rolling window sizes in days for structure calculation
         price_col : str, default "Close"
@@ -3082,27 +3306,36 @@ class IntradayMomentum:
         - Range position is bounded [0, 1], indicating where price sits in range
         - Breakout signals are binary indicators (0/1)
         - Vol regime > 1 indicates volatility expansion, < 1 indicates contraction
+        - When daily_df is None, uses _resample_to_daily() which avoids lookahead
+          by using closed='right', label='right'
 
         Examples
         --------
         >>> model = IntradayMomentum(intraday_data)
-        >>> struct_df = model.market_structure_features(
-        ...     daily_df, lookbacks=[5, 10, 20], add_as_feature=True
-        ... )
+        >>> # Auto-generate daily data from intraday
+        >>> struct_df = model.market_structure_features(lookbacks=[5, 10, 20], add_as_feature=True)
+        >>> # Or provide explicit daily data
+        >>> struct_df = model.market_structure_features(daily_df, lookbacks=[5, 10, 20])
         """
-        # Ensure proper index
-        daily = daily_df.copy()
-        if not isinstance(daily.index, pd.DatetimeIndex):
-            daily.index = pd.to_datetime(daily.index)
-        daily.index = daily.index.normalize()
-
-        # Filter to valid trading dates
-        daily = self._filter_to_trading_dates(daily)
+        # Get or create daily data using helper (avoids lookahead bias)
+        if daily_df is not None:
+            daily = daily_df.copy()
+            if not isinstance(daily.index, pd.DatetimeIndex):
+                daily.index = pd.to_datetime(daily.index)
+            daily.index = daily.index.normalize()
+            daily = self._filter_to_trading_dates(daily)
+        else:
+            # Use helper method for proper resampling (closed='right', label='right')
+            daily = self._resample_to_daily(price_col=price_col)
 
         prices = self._coerce_price(daily, price_col)
         feats: Dict[str, pd.Series] = {}
 
-        has_hl = {"High", "Low"}.issubset(daily.columns)
+        # Check for High/Low columns (case-insensitive)
+        col_map = {c.lower(): c for c in daily.columns}
+        has_hl = 'high' in col_map and 'low' in col_map
+        high_col = col_map.get('high', 'High')
+        low_col = col_map.get('low', 'Low')
         lookbacks_list = list(lookbacks)
 
         for lb in lookbacks_list:
@@ -3129,8 +3362,8 @@ class IntradayMomentum:
 
             # ATR-based features if High/Low available
             if has_hl:
-                high = daily["High"]
-                low = daily["Low"]
+                high = daily[high_col]
+                low = daily[low_col]
                 prev_close = prices.shift(1)
 
                 # True Range = max(H-L, |H-prevC|, |L-prevC|)
@@ -3146,8 +3379,8 @@ class IntradayMomentum:
 
         # VAH/VAL features (prior day's high/low)
         if has_hl:
-            vah_prev = daily["High"].shift(1)
-            val_prev = daily["Low"].shift(1)
+            vah_prev = daily[high_col].shift(1)
+            val_prev = daily[low_col].shift(1)
 
             # Normalized distance to prior day's VAH/VAL
             feats["dist_vah"] = (prices - vah_prev) / vah_prev
@@ -3164,8 +3397,8 @@ class IntradayMomentum:
             short_lb = min(lookbacks_list)
             long_lb = max(lookbacks_list)
 
-            high = daily["High"]
-            low = daily["Low"]
+            high = daily[high_col]
+            low = daily[low_col]
             prev_close = prices.shift(1)
             tr = pd.concat([
                 high - low,
@@ -4414,7 +4647,7 @@ class IntradayMomentum:
 
     def add_daily_momentum_features(
             self,
-            daily_df: pd.DataFrame,
+            daily_df: Optional[pd.DataFrame] = None,
             lookbacks: Sequence[int] = (1, 5, 10, 20),
             price_col: str = "Close",
             handle_missing: str = "drop",
@@ -4427,8 +4660,8 @@ class IntradayMomentum:
 
         Parameters
         ----------
-        daily_df : pd.DataFrame
-            Daily OHLCV data with DatetimeIndex
+        daily_df : pd.DataFrame, optional
+            Daily OHLCV data with DatetimeIndex. If None, resamples from intraday_data.
         lookbacks : Sequence[int], default (1, 5, 10, 20)
             Lookback periods in days for momentum calculation
         price_col : str, default "Close"
@@ -4454,14 +4687,29 @@ class IntradayMomentum:
         - Zero or negative prices (log is undefined) -> NaN
         - Missing data at start due to shift operations
         - Index alignment with training_data
+        - When daily_df is None, uses _resample_to_daily() which avoids lookahead
+          by using closed='right', label='right'
 
         Examples
         --------
         >>> model = IntradayMomentumLight(intraday_data, ...)
+        >>> # Auto-generate daily data from intraday
+        >>> momentum_feats = model.add_daily_momentum_features(lookbacks=[5, 10, 20])
+        >>> # Or provide explicit daily data
         >>> momentum_feats = model.add_daily_momentum_features(daily_df, lookbacks=[5, 10, 20])
-        >>> # momentum_5d contains returns from T-6 to T-1 (5 days, lagged by 1)
         """
-        prices = self._coerce_price(daily_df, price_col)
+        # Get or create daily data using helper (avoids lookahead bias)
+        if daily_df is not None:
+            daily = daily_df.copy()
+            if not isinstance(daily.index, pd.DatetimeIndex):
+                daily.index = pd.to_datetime(daily.index)
+            daily.index = daily.index.normalize()
+            daily = self._filter_to_trading_dates(daily)
+        else:
+            # Use helper method for proper resampling (closed='right', label='right')
+            daily = self._resample_to_daily(price_col=price_col)
+
+        prices = self._coerce_price(daily, price_col)
 
         # Ensure index is normalized DatetimeIndex
         if not isinstance(prices.index, pd.DatetimeIndex):

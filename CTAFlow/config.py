@@ -3,12 +3,11 @@ from pathlib import Path
 import pandas as pd
 import toml
 import os
-
+from dotenv import load_dotenv
 
 # Weekly Update Configuration
 # Set to False to disable automated weekly updates
 ENABLE_WEEKLY_UPDATES = os.getenv("CTAFLOW_ENABLE_WEEKLY_UPDATES", "true").lower() in ("true", "1", "yes")
-
 # Parquet storage paths (PRIMARY intraday data storage)
 INTRADAY_DATA_PATH = Path("F:\\Data\\intraday")  # Parquet files for intraday data
 DAILY_ADB_PATH = "lmdb://F:/Data/daily"  # ArcticDB URI for daily market data
@@ -34,6 +33,8 @@ DLY_DATA_PATH = Path("F:\\", 'SierraChart', 'Data')  # DLY futures data files
 MODEL_DATA_PATH = Path("F:\\", "ML", "models")
 EXAMPLE_DATA_PATH = Path(__file__).parent / "example_data"
 APP_ROOT = Path(__file__).parent
+
+env = load_dotenv( APP_ROOT /'.env')
 with open(APP_ROOT / 'data' / 'futures_mappings.toml') as map:
     FUTURES_MAP = toml.load(map)
 

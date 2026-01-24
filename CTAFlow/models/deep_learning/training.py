@@ -6,6 +6,7 @@ from typing import Callable, Dict, Optional, Tuple, Any, List
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from sklearn.preprocessing import StandardScaler
 from ...data import make_window_dataset, MomentumWindowDataset
@@ -68,6 +69,7 @@ def mixup_data(x_list, y, alpha=0.2):
     """Apply mixup augmentation to batch."""
     if alpha > 0:
         lam = np.random.beta(alpha, alpha)
+
     else:
         lam = 1.0
 

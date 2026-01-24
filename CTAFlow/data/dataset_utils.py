@@ -67,6 +67,41 @@ def collate_tri(batch: List[Tuple]) -> Tuple[torch.Tensor, ...]:
     return summaries, sequential_padded, profiles, targets, lengths
 
 
+
+def collate_windowed_rasterized(batch):
+    """
+    Collate for WindowedRasterizedModalDataset.
+
+    Produces:
+      summary_days : (B, D, F_sum)
+      seq_days     : (B, D, T_seq, F_seq)
+      seq_lens     : (B, D)
+      profile_days : (B, D, C_prof, B_prof)
+      raster_days  : (B, D, T_nb, C_nb, B_nb)
+      targets      : (B,)
+    """
+    if len(batch[0]) == 7:
+        summaries, seqs, profiles, rasters, targets, seq_lens, dates = zip(*batch)
+        return (
+            torch.stack(summaries, dim=0),
+            torch.stack(seqs, dim=0),
+            torch.stack(seq_lens, dim=0),
+            torch.stack(profiles, dim=0),
+            torch.stack(rasters, dim=0),
+            torch.stack(targets, dim=0),
+            dates,
+        )
+
+    summaries, seqs, profiles, rasters, targets, seq_lens = zip(*batch)
+    return (
+        torch.stack(summaries, dim=0),
+        torch.stack(seqs, dim=0),
+        torch.stack(seq_lens, dim=0),
+        torch.stack(profiles, dim=0),
+        torch.stack(rasters, dim=0),
+        torch.stack(targets, dim=0),
+    )
+
 def collate_quad(batch: List[Tuple]) -> Tuple[torch.Tensor, ...]:
     """
     Collate function for QuadModalModel (Summary + Sequential + Profile + NumberBars).
