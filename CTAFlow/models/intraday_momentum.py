@@ -6387,6 +6387,7 @@ class DeepIDMomentum(IntradayMomentum):
         ...     val_split=True,
         ...     include_spatial=True,
         ...     use_rasterized=True,
+        ...     rasterized_data='path/to/rasterized.npz',
         ...     windowed=True,
         ...     window_days=10,
         ...     batch_size=16,
@@ -6613,7 +6614,7 @@ class DeepIDMomentum(IntradayMomentum):
                     max_len=max_seq_len,
                     sequential_cols=sequential_cols,
                     target_col=None,
-                    window_size=window_days,
+                    window_days=window_days,
                     return_dates=return_dates,
                 )
                 val_dataset = TriModalWindowDataset(
@@ -6626,7 +6627,7 @@ class DeepIDMomentum(IntradayMomentum):
                     max_len=max_seq_len,
                     sequential_cols=sequential_cols,
                     target_col=None,
-                    window_size=window_days,
+                    window_days=window_days,
                     return_dates=return_dates,
                 )
                 collate_fn = collate_windowed_rasterized
@@ -6852,7 +6853,7 @@ class DeepIDMomentum(IntradayMomentum):
                     max_len=max_seq_len,
                     sequential_cols=sequential_cols,
                     target_col=None,
-                    window_size=window_days,
+                    window_days=window_days,
                     return_dates=return_dates,
                 )
                 collate_fn = collate_windowed_rasterized
