@@ -6398,7 +6398,7 @@ class DeepIDMomentum(IntradayMomentum):
             from torch.utils.data import DataLoader
             from ..data.model_datasets import (
                 DualDataset, QuadModalDataset, TriModalDataset, RasterizedModalDataset,
-                OnTheFlyRasterizedDataset, WindowedRasterizedModalDataset
+                OnTheFlyRasterizedDataset, TriModalWindowDataset
             )
             from ..data.dataset_utils import collate_rasterized, collate_rasterized_vpin, collate_windowed_rasterized
         except ImportError as e:
@@ -6601,9 +6601,9 @@ class DeepIDMomentum(IntradayMomentum):
                 if use_rasterized_data is None:
                     raise ValueError("windowed=True requires rasterized_data to be available.")
                 if verbose:
-                    print(f"  Creating WindowedRasterizedModalDataset (window_days={window_days})")
+                    print(f"  Creating TriModalWindowDataset (window_days={window_days})")
 
-                train_dataset = WindowedRasterizedModalDataset(
+                train_dataset = TriModalWindowDataset(
                     summary_data=X_train,
                     sequential_data=self.sequential_data,
                     spatial_data=final_spatial_data,
@@ -6616,7 +6616,7 @@ class DeepIDMomentum(IntradayMomentum):
                     window_size=window_days,
                     return_dates=return_dates,
                 )
-                val_dataset = WindowedRasterizedModalDataset(
+                val_dataset = TriModalWindowDataset(
                     summary_data=X_val,
                     sequential_data=self.sequential_data,
                     spatial_data=final_spatial_data,
@@ -6840,9 +6840,9 @@ class DeepIDMomentum(IntradayMomentum):
                 if use_rasterized_data is None:
                     raise ValueError("windowed=True requires rasterized_data to be available.")
                 if verbose:
-                    print(f"  Creating WindowedRasterizedModalDataset (window_days={window_days})")
+                    print(f"  Creating TriModalWindowDataset (window_days={window_days})")
 
-                dataset = WindowedRasterizedModalDataset(
+                dataset = TriModalWindowDataset(
                     summary_data=X,
                     sequential_data=self.sequential_data,
                     spatial_data=final_spatial_data,

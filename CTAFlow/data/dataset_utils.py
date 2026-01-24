@@ -11,6 +11,7 @@ All collate functions handle variable-length sequences with proper padding.
 """
 
 import torch
+import torch.nn as nn
 import torch.nn.utils.rnn as rnn_utils
 from typing import List, Tuple, Any
 
