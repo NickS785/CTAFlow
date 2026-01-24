@@ -9,11 +9,21 @@ Concise guide for working on CTAFlow, a CTA positioning and orderflow analysis t
 
 ## Architecture snapshot
 - **Data (`CTAFlow/data/`)**: `data_client.py` handles HDF5 I/O and COT refresh; `retrieval.py` exposes async loaders; contract utilities live under `contract_handling/`.
-- **Features (`CTAFlow/features/`)**: `signals_processing.py` builds COT + technical indicators; `feature_engineering.py` covers intraday microstructure; `curve_analysis.py` unifies curve shape/evolution analysis.
+- **Features (`CTAFlow/features/`)**: `signals_processing.py` builds COT + technical indicators; `feature_engineering.py` covers intraday microstructure; `curve_analysis.py` unifies curve shape/evolution analysis. **CRITICAL**: Profile and NumberBars now include explicit price labels (4th channel) using unified normalization `(price - reference) / reference` for tri-modal alignment.
 - **Containers (`CTAFlow/data/contract_handling/`)**: `SpreadData`, `FuturesCurve`, `Contract`, and friends provide numpy-backed curve slices.
 - **Models (`CTAFlow/models/`)**:
   - `base_models.py`: Wrapper classes for ML models - `CTALight` (LightGBM), `CTAXGBoost`, `CTARForest`. Support regression and classification tasks with common interface (fit/predict/evaluate).
-  - `intraday_momentum.py`: `IntradayMomentumLight` wraps base models with intraday feature engineering. Key methods: `add_daily_momentum_features()`, `har_volatility_features()`, `opening_range_volatility()`, `prev_hl()`, `target_time_volume()`, `bid_ask_volume_imbalance()`. All features properly lag to avoid lookahead bias. Use `model.target_data` for consistent target calculation.
+  - `intraday_momentum.py`: `IntradayMomentumLight` wraps base models with intraday feature engineering. Key methods: `add_daily_momentum_features()`, `har_volatility_features()`, `opening_range_volatility()`, `prev_hl()`, `target_time_volume()`, `bid_ask_volume_imbalance()`. All features properly lag to avoid lookahead bias. Use `model.target_data` for consistent target calculation. `DeepIDMomentum` extends this for deep learning with `normalize_sequential_features()` that includes `profile_vwap` normalization. **Shortcut**: Use `DeepIDMomentum.get_loaders()` to quickly create train/val DataLoaders for dual/tri/quad-modal models.
+  - `deep_learning/multi_branch/`: Multi-modal deep learning models for orderflow prediction:
+    - `dual_model.py`: `DualBranchModel` combines summary (MLP) + sequential (LSTM) branches
+    - `tri_modal.py`: Three tri-modal architectures with optional NumberBars spatial data:
+      - `TriModalModel`: Main model with optional `nb_tensor` parameter for NumberBars
+      - `TriModalLiquidityModel`: Configurable with `fusion_mode` ('gated'/'concat'/'mean') and custom encoders
+      - `TriModalClassifier`: Classification-optimized with concatenation fusion and deeper head
+  - `deep_learning/encoders.py`: Modular encoder components:
+    - `ProfileEncoder`, `NumberBarsEncoder`, `SeqEncoder`, `SummaryEncoder` for feature extraction
+    - `SpatialFuse`: Combines profile + NumberBars spatial features with optional gating
+    - `GatedFusion`: Learnable multi-modal weighting for effective feature fusion
 - **Forecasting (`CTAFlow/forecaster/forecast.py`)**: family of CTA models with selective indicator calculation and weekly resampling.
 - **Strategy (`CTAFlow/strategy/`)**: `screener_pipeline.py` normalises screener payloads into gate columns; keep `_items_from_patterns` compatible with nested mappings and `PatternExtractor.concat_many` outputs. `HorizonMapper.build_xy` expects timezone-aware `ts`, `open`, `close`, `session_id` columns.
 - **Screeners (`CTAFlow/screeners/`)**:
