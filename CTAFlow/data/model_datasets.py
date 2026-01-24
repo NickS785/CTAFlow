@@ -1181,7 +1181,7 @@ class RasterizedModalDataset(Dataset):
 # assumes RasterizedModalDataset is already defined above in this file
 
 
-class WindowedRasterizedModalDataset(RasterizedModalDataset):
+class TriModalWindowDataset(RasterizedModalDataset):
     """
     Windowed version of RasterizedModalDataset.
 

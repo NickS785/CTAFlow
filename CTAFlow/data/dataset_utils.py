@@ -70,7 +70,7 @@ def collate_tri(batch: List[Tuple]) -> Tuple[torch.Tensor, ...]:
 
 def collate_windowed_rasterized(batch):
     """
-    Collate for WindowedRasterizedModalDataset.
+    Collate for TriModalWindowDataset.
 
     Produces:
       summary_days : (B, D, F_sum)

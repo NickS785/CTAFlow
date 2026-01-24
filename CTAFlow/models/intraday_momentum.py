@@ -6250,6 +6250,9 @@ class DeepIDMomentum(IntradayMomentum):
             n_bins: int = 64,
             interval_mins: Optional[float] = None,
             rasterizer_kwargs: Optional[Dict] = None,
+            windowed: bool = False,
+            window_days: int = 10,
+            return_dates: bool = False,
     ):
         """Create PyTorch DataLoaders for training dual-branch models.
 
@@ -6321,6 +6324,13 @@ class DeepIDMomentum(IntradayMomentum):
             Minutes per bar. If None, auto-computed from data's time range (for rasterize_on_fly).
         rasterizer_kwargs : dict, optional
             Additional kwargs for rasterizer constructor (span_pct, vol_scale, price_scale).
+        windowed : bool, default False
+            If True, create windowed datasets for recurrent models (TriModalLSTM).
+            Returns windows of consecutive days instead of individual samples.
+        window_days : int, default 10
+            Number of consecutive days in each window (only used if windowed=True).
+        return_dates : bool, default False
+            If True, include date information in dataset output (only used if windowed=True).
 
         Returns
         -------
@@ -6371,6 +6381,16 @@ class DeepIDMomentum(IntradayMomentum):
         ...     rasterized_data='path/to/rasterized.npz',
         ...     batch_size=32
         ... )
+        >>>
+        >>> # Windowed dataset for TriModalLSTM (recurrent model)
+        >>> train_loader, val_loader = model.get_loaders(
+        ...     val_split=True,
+        ...     include_spatial=True,
+        ...     use_rasterized=True,
+        ...     windowed=True,
+        ...     window_days=10,
+        ...     batch_size=16,
+        ... )
         """
         # Import here to avoid requiring torch for all IntradayMomentum usage
         try:
@@ -6378,9 +6398,9 @@ class DeepIDMomentum(IntradayMomentum):
             from torch.utils.data import DataLoader
             from ..data.model_datasets import (
                 DualDataset, QuadModalDataset, TriModalDataset, RasterizedModalDataset,
-                OnTheFlyRasterizedDataset
+                OnTheFlyRasterizedDataset, WindowedRasterizedModalDataset
             )
-            from ..data.dataset_utils import collate_rasterized, collate_rasterized_vpin
+            from ..data.dataset_utils import collate_rasterized, collate_rasterized_vpin, collate_windowed_rasterized
         except ImportError as e:
             raise ImportError(
                 "PyTorch is required for get_loaders(). "
@@ -6570,12 +6590,51 @@ class DeepIDMomentum(IntradayMomentum):
             # Debug: Print dataset type
             if verbose:
                 print(f"\nDataset selection:")
+                print(f"  windowed: {windowed}")
                 print(f"  final_nb_data: {final_nb_data is not None} ({type(final_nb_data) if final_nb_data is not None else 'None'})")
                 print(f"  final_spatial_data: {final_spatial_data is not None} ({final_spatial_data.shape if final_spatial_data is not None else 'None'})")
                 print(f"  use_rasterized: {use_rasterized} ({type(use_rasterized_data) if use_rasterized_data is not None else 'None'})")
                 print(f"  rasterize_on_fly: {rasterize_on_fly}")
 
-            if rasterize_on_fly and final_spatial_data is not None:
+            if windowed and use_rasterized and final_spatial_data is not None:
+                # Windowed dataset for recurrent models (TriModalLSTM)
+                if use_rasterized_data is None:
+                    raise ValueError("windowed=True requires rasterized_data to be available.")
+                if verbose:
+                    print(f"  Creating WindowedRasterizedModalDataset (window_days={window_days})")
+
+                train_dataset = WindowedRasterizedModalDataset(
+                    summary_data=X_train,
+                    sequential_data=self.sequential_data,
+                    spatial_data=final_spatial_data,
+                    spatial_dates=final_spatial_dates,
+                    rasterized_data=use_rasterized_data,
+                    target_data=y_train,
+                    max_len=max_seq_len,
+                    sequential_cols=sequential_cols,
+                    target_col=None,
+                    window_size=window_days,
+                    return_dates=return_dates,
+                )
+                val_dataset = WindowedRasterizedModalDataset(
+                    summary_data=X_val,
+                    sequential_data=self.sequential_data,
+                    spatial_data=final_spatial_data,
+                    spatial_dates=final_spatial_dates,
+                    rasterized_data=use_rasterized_data,
+                    target_data=y_val,
+                    max_len=max_seq_len,
+                    sequential_cols=sequential_cols,
+                    target_col=None,
+                    window_size=window_days,
+                    return_dates=return_dates,
+                )
+                collate_fn = collate_windowed_rasterized
+
+                if verbose:
+                    print(f"  Train: {len(train_dataset)} windows, Val: {len(val_dataset)} windows")
+
+            elif rasterize_on_fly and final_spatial_data is not None:
                 # On-the-fly rasterization: use raw VPIN DataFrames
                 if verbose:
                     print(f"  Creating OnTheFlyRasterizedDataset (num_bars={num_bars}, n_bins={n_bins})")
@@ -6776,7 +6835,32 @@ class DeepIDMomentum(IntradayMomentum):
             X, y = result
 
             # Create dataset
-            if rasterize_on_fly and final_spatial_data is not None:
+            if windowed and use_rasterized and final_spatial_data is not None:
+                # Windowed dataset for recurrent models (TriModalLSTM)
+                if use_rasterized_data is None:
+                    raise ValueError("windowed=True requires rasterized_data to be available.")
+                if verbose:
+                    print(f"  Creating WindowedRasterizedModalDataset (window_days={window_days})")
+
+                dataset = WindowedRasterizedModalDataset(
+                    summary_data=X,
+                    sequential_data=self.sequential_data,
+                    spatial_data=final_spatial_data,
+                    spatial_dates=final_spatial_dates,
+                    rasterized_data=use_rasterized_data,
+                    target_data=y,
+                    max_len=max_seq_len,
+                    sequential_cols=sequential_cols,
+                    target_col=None,
+                    window_size=window_days,
+                    return_dates=return_dates,
+                )
+                collate_fn = collate_windowed_rasterized
+
+                if verbose:
+                    print(f"  Dataset: {len(dataset)} windows")
+
+            elif rasterize_on_fly and final_spatial_data is not None:
                 # On-the-fly rasterization: use raw VPIN DataFrames
                 if verbose:
                     print(f"  Creating OnTheFlyRasterizedDataset (num_bars={num_bars}, n_bins={n_bins})")
