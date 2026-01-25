@@ -35,8 +35,6 @@ def extract_session_features(
     output_dir: Optional[str] = None,
     data_dir: str = DLY_DATA_PATH,
     verbose: bool = True,
-    bucket_cache: Optional[str] = "buckets.csv",
-    save_bucket_cache: bool = True
 ) -> Dict[str, str]:
     """
     Extract daily session features for a ticker.
@@ -83,31 +81,30 @@ def extract_session_features(
         tz="America/Chicago",
         # VPIN settings
         vpin_bucket_size=None,  # Use auto_bucket_size
-        auto_bucket_cadence=350,
+        auto_bucket_cadence=400,
         vpin_window=20,
-        vpin_start_time="08:30",
-        vpin_end_time="12:00",
+        vpin_start_time="06:30",
+        vpin_end_time="09:30",
         auto_bucket=True,
         # Profile settings - SAME WINDOW AS VPIN
         include_profile=True,
         profile_tick_size=tick_size,
-        profile_start_time="08:30",  # Profile during full session
-        profile_end_time="12:00",     # Same as VPIN end
+        profile_start_time="06:30",  # Profile during full session
+        profile_end_time="09:30",     # Same as VPIN end
         # Number Bars settings
         include_number_bars=False,
-        num_bars_start_time="08:30",
-        num_bars_end_time="12:00",
+        num_bars_start_time="06:30",
+        num_bars_end_time="09:30",
         num_bars_interval="15min",
-        num_bars_levels=50,
+        num_bars_levels=64,
         num_bars_centering="rolling_vwap",
         num_bars_vwap_window="2h",
         # Rasterization settings
         include_rasterized=True,
         raster_interval_mins=15,      # 15-minute bars
-        raster_num_bars=14,             # 14 bars for full session
+        raster_num_bars=12,             # 14 bars for full session
         raster_bins=128,                # 128 vertical price levels
         raster_span_pct=0.035,          # ±3.5% from VWAP
-        raster_session_start="08:30",  # Align with VPIN start
         raster_vol_scale=10.0,
         raster_price_scale=100.0,
         # Pre-summary settings - DISABLED (calculate at end instead)
@@ -125,32 +122,11 @@ def extract_session_features(
     logger.info(f"  Dates: {len(dates)}")
     logger.info(f"  Output: {output_dir}")
 
-    # Prepare bucket cache paths
-    cache_path = None
-    save_cache_path = None
-    if bucket_cache or save_bucket_cache:
-        cache_dir = output_dir / "cache"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_file = cache_dir / f"{ticker}_bucket_cache.csv"
-
-        if bucket_cache:
-            # Use provided cache path
-            cache_path = bucket_cache
-            logger.info(f"  Using bucket cache: {cache_path}")
-        elif cache_file.exists():
-            # Use existing cache file for this ticker
-            cache_path = str(cache_file)
-            logger.info(f"  Loading existing bucket cache: {cache_path}")
-
-        if save_bucket_cache:
-            save_cache_path = str(cache_file)
-            logger.info(f"  Will save bucket cache to: {save_cache_path}")
 
     # Create extractor and run
     extractor = MultiFeatureExtraction(
         config, dates,
-        bucket_cache=cache_path,
-        save_bucket_cache=save_cache_path
+
     )
     all_results = extractor.extract_all(verbose=verbose, n_jobs=1)
 
@@ -203,7 +179,7 @@ def extract_session_features(
                 logger.info(f"    Date {r['date']}: keys={list(r.keys())}, profile={'profile' in r}")
 
     # Save results
-    prefix = f"{ticker}_0830_1200_2"
+    prefix = f"{ticker}_0700_1000_2"
     paths = {}
 
     # 1. Save VPIN data with pre-summary
@@ -402,8 +378,10 @@ def _process_single_ticker(ticker: str, dates: List[pd.Timestamp], output_base: 
             dates=dates,
             output_dir=str(output_dir),
             verbose=True,
-            bucket_cache=bucket_cache,
-            save_bucket_cache=save_bucket_cache
+
+
+
+
         )
 
         logger.info(f"\nSaved files for {ticker}:")
@@ -489,11 +467,11 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Extract daily session features")
-    parser.add_argument("--tickers", nargs="+", default=["LE", "HE"],
+    parser.add_argument("--tickers", nargs="+", default=["GC", "CL", "RB", "HO", "NG"],
                         help="Tickers to process")
     parser.add_argument("--start", default="2011-01-01",
                         help="Start date (YYYY-MM-DD)")
-    parser.add_argument("--end", default="2026-01-12",
+    parser.add_argument("--end", default="2026-01-20",
                         help="End date (YYYY-MM-DD)")
     parser.add_argument("--output", default="F:/Upload",
                         help="Output directory")

@@ -1,11 +1,85 @@
 from __future__ import annotations
 
 import datetime
+from dataclasses import dataclass
 from datetime import time, timedelta
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Type, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Type, Union
 
 import numpy as np
 import pandas as pd
+
+
+@dataclass
+class MultiModalDim:
+    """Dataclass holding dimensions for multi-modal model inputs.
+
+    This provides a convenient way to access input shapes for configuring
+    models like RecurrentWSPR, RecurrentTriModal, etc.
+
+    Attributes
+    ----------
+    summary_dim : int
+        Number of summary features (columns in summary DataFrame)
+    seq_dim : int
+        Number of sequential features (numeric columns in sequential data)
+    profile_channels : int
+        Number of channels in profile data (e.g., 3 for bid/ask/total)
+    profile_bins : int
+        Number of price bins in profile data (e.g., 64 or 96)
+    raster_bars : int
+        Number of time bars in rasterized data (e.g., 4)
+    raster_channels : int
+        Number of channels in rasterized data (e.g., 4 for density/vol/imbal/ret)
+    raster_bins : int
+        Number of price bins in rasterized data (e.g., 64)
+    feature_names : List[str]
+        List of summary feature column names
+
+    Examples
+    --------
+    >>> model_data = DeepIDMomentum.from_files(...)
+    >>> dims = model_data.dims
+    >>> print(f"Summary: {dims.summary_dim}, Seq: {dims.seq_dim}")
+    >>> print(f"Profile: ({dims.profile_channels}, {dims.profile_bins})")
+    >>> print(f"Raster: ({dims.raster_bars}, {dims.raster_channels}, {dims.raster_bins})")
+
+    >>> # Use for model initialization
+    >>> model = RecurrentWSPR(
+    ...     f_sum=dims.summary_dim,
+    ...     f_seq=dims.seq_dim,
+    ...     f_profile=dims.profile_channels,
+    ...     f_raster=dims.raster_channels,
+    ... )
+    """
+    summary_dim: int = 0
+    seq_dim: int = 0
+    profile_channels: int = 0
+    profile_bins: int = 0
+    raster_bars: int = 0
+    raster_channels: int = 0
+    raster_bins: int = 0
+    feature_names: List[str] = None
+
+    def __post_init__(self):
+        if self.feature_names is None:
+            self.feature_names = []
+
+    @property
+    def profile_shape(self) -> Tuple[int, int]:
+        """Return profile shape as (channels, bins) tuple."""
+        return (self.profile_channels, self.profile_bins)
+
+    @property
+    def raster_shape(self) -> Tuple[int, int, int]:
+        """Return raster shape as (bars, channels, bins) tuple."""
+        return (self.raster_bars, self.raster_channels, self.raster_bins)
+
+    def __repr__(self) -> str:
+        return (
+            f"MultiModalDim(summary={self.summary_dim}, seq={self.seq_dim}, "
+            f"profile=({self.profile_channels}, {self.profile_bins}), "
+            f"raster=({self.raster_bars}, {self.raster_channels}, {self.raster_bins}))"
+        )
 
 from ..features.dt_features import build_datetime_features
 from ..features.session_features import (
@@ -7178,3 +7252,68 @@ class DeepIDMomentum(IntradayMomentum):
             )
 
             return loader
+
+    @property
+    def dims(self) -> MultiModalDim:
+        """Get dimensions of all multi-modal inputs.
+
+        Returns a MultiModalDim dataclass containing dimensions for summary,
+        sequential, profile, and rasterized data. Use this to configure
+        model architectures.
+
+        Returns
+        -------
+        MultiModalDim
+            Dataclass with summary_dim, seq_dim, profile_channels, profile_bins,
+            raster_bars, raster_channels, raster_bins, and feature_names.
+
+        Examples
+        --------
+        >>> model_data = DeepIDMomentum.from_files(...)
+        >>> dims = model_data.dims
+        >>> print(dims)
+        MultiModalDim(summary=32, seq=6, profile=(3, 64), raster=(4, 4, 64))
+
+        >>> # Use for model initialization
+        >>> model = RecurrentWSPR(
+        ...     f_sum=dims.summary_dim,
+        ...     f_seq=dims.seq_dim,
+        ...     f_profile=dims.profile_channels,
+        ...     f_raster=dims.raster_channels,
+        ... )
+        """
+        # Summary dimension
+        summary = self.training_data.get('summary')
+        summary_dim = len(summary.columns) if summary is not None else 0
+        feature_names = list(summary.columns) if summary is not None else []
+
+        # Sequential dimension
+        seq_dim = 0
+        if self.sequential_data is not None:
+            numeric_cols = self.sequential_data.select_dtypes(include=[np.number]).columns
+            seq_dim = len(numeric_cols)
+
+        # Profile shape
+        profile_channels, profile_bins = 0, 0
+        if self.profile_array is not None:
+            # profile_array shape is (N, C, Bins)
+            profile_channels = self.profile_array.shape[1]
+            profile_bins = self.profile_array.shape[2]
+
+        # Raster shape
+        raster_bars, raster_channels, raster_bins = 0, 0, 0
+        if self.rasterized_data is not None and isinstance(self.rasterized_data, dict):
+            # Get first array to determine shape (T, C, Bins)
+            first_arr = next(iter(self.rasterized_data.values()))
+            raster_bars, raster_channels, raster_bins = first_arr.shape
+
+        return MultiModalDim(
+            summary_dim=summary_dim,
+            seq_dim=seq_dim,
+            profile_channels=profile_channels,
+            profile_bins=profile_bins,
+            raster_bars=raster_bars,
+            raster_channels=raster_channels,
+            raster_bins=raster_bins,
+            feature_names=feature_names,
+        )

@@ -8,22 +8,25 @@ Concise guide for working on CTAFlow, a CTA positioning and orderflow analysis t
 - Run tests: `python -m pytest tests/`
 
 ## Architecture snapshot
-- **Data (`CTAFlow/data/`)**: `data_client.py` handles HDF5 I/O and COT refresh; `retrieval.py` exposes async loaders; contract utilities live under `contract_handling/`.
+- **Data (`CTAFlow/data/`)**: `data_client.py` handles HDF5 I/O and COT refresh; `retrieval.py` exposes async loaders; contract utilities live under `contract_handling/`. `model_datasets.py` provides PyTorch datasets for multi-modal training: `DualModalWindowDataset` (summary + spatial windows for RecurrentDualModal), `TriModalWindowDataset` (summary + seq + spatial windows for RecurrentTriModal), both extending `RasterizedModalDataset` with rolling window support.
 - **Features (`CTAFlow/features/`)**: `signals_processing.py` builds COT + technical indicators; `feature_engineering.py` covers intraday microstructure; `curve_analysis.py` unifies curve shape/evolution analysis. **CRITICAL**: Profile and NumberBars now include explicit price labels (4th channel) using unified normalization `(price - reference) / reference` for tri-modal alignment.
 - **Containers (`CTAFlow/data/contract_handling/`)**: `SpreadData`, `FuturesCurve`, `Contract`, and friends provide numpy-backed curve slices.
 - **Models (`CTAFlow/models/`)**:
   - `base_models.py`: Wrapper classes for ML models - `CTALight` (LightGBM), `CTAXGBoost`, `CTARForest`. Support regression and classification tasks with common interface (fit/predict/evaluate).
-  - `intraday_momentum.py`: `IntradayMomentumLight` wraps base models with intraday feature engineering. Key methods: `add_daily_momentum_features()`, `har_volatility_features()`, `opening_range_volatility()`, `prev_hl()`, `target_time_volume()`, `bid_ask_volume_imbalance()`. All features properly lag to avoid lookahead bias. Use `model.target_data` for consistent target calculation. `DeepIDMomentum` extends this for deep learning with `normalize_sequential_features()` that includes `profile_vwap` normalization. **Shortcut**: Use `DeepIDMomentum.get_loaders()` to quickly create train/val DataLoaders for dual/tri/quad-modal models.
+  - `intraday_momentum.py`: `IntradayMomentumLight` wraps base models with intraday feature engineering. Key methods: `add_daily_momentum_features()`, `har_volatility_features()`, `opening_range_volatility()`, `prev_hl()`, `target_time_volume()`, `bid_ask_volume_imbalance()`. All features properly lag to avoid lookahead bias. Use `model.target_data` for consistent target calculation. `DeepIDMomentum` extends this for deep learning with feature scaling methods: `normalize_sequential_features(scale_to_basis_points=True, scale_orderflow=True)` scales VPIN/sequential features to match spatial data scale (basis points); `scale_summary_data(rolling_window=252)` applies feature-specific scaling to summary features using fixed constants (no lookahead). **Shortcut**: Use `DeepIDMomentum.get_loaders()` to quickly create train/val DataLoaders for dual/tri/quad-modal models.
   - `deep_learning/multi_branch/`: Multi-modal deep learning models for orderflow prediction:
-    - `dual_model.py`: `DualBranchModel` combines summary (MLP) + sequential (LSTM) branches
-    - `tri_modal.py`: Three tri-modal architectures with optional NumberBars spatial data:
+    - `dual_model.py`:
+      - `DualBranchModel`: Combines summary (MLP) + sequential (LSTM) branches
+      - `RecurrentDualModal`: State-of-the-art windowed model with Summary MLP + MarketProfileResNet (static) + RasterResNet (dynamic) + Window LSTM for temporal modeling
+    - `tri_modal.py`: Tri-modal architectures with spatial fusion:
       - `TriModalModel`: Main model with optional `nb_tensor` parameter for NumberBars
       - `TriModalLiquidityModel`: Configurable with `fusion_mode` ('gated'/'concat'/'mean') and custom encoders
       - `TriModalClassifier`: Classification-optimized with concatenation fusion and deeper head
+      - `RecurrentTriModal`: Advanced windowed model processing Summary + Profile + Raster + Intraday Seq through spatial fusion, day fusion, then Window LSTM
   - `deep_learning/encoders.py`: Modular encoder components:
-    - `ProfileEncoder`, `NumberBarsEncoder`, `SeqEncoder`, `SummaryEncoder` for feature extraction
-    - `SpatialFuse`: Combines profile + NumberBars spatial features with optional gating
-    - `GatedFusion`: Learnable multi-modal weighting for effective feature fusion
+    - Basic encoders: `ProfileEncoder`, `NumberBarsEncoder`, `SeqEncoder`, `SummaryEncoder` for feature extraction
+    - Advanced spatial encoders: `RasterResNet` (pseudo-3D ResNet for rasterized VPIN with spatio-temporal convolutions), `MarketProfileResNet` (1D ResNet + SE attention for volume profiles)
+    - Fusion modules: `SpatialFuse` (combines profile + raster/NumberBars with optional gating), `GatedFusion` (learnable multi-modal weighting)
 - **Forecasting (`CTAFlow/forecaster/forecast.py`)**: family of CTA models with selective indicator calculation and weekly resampling.
 - **Strategy (`CTAFlow/strategy/`)**: `screener_pipeline.py` normalises screener payloads into gate columns; keep `_items_from_patterns` compatible with nested mappings and `PatternExtractor.concat_many` outputs. `HorizonMapper.build_xy` expects timezone-aware `ts`, `open`, `close`, `session_id` columns.
 - **Screeners (`CTAFlow/screeners/`)**:
@@ -103,5 +106,5 @@ Concise guide for working on CTAFlow, a CTA positioning and orderflow analysis t
 - Seasonal/orderflow outputs feed downstream notebooks; avoid changing canonical column names or shapes.
 - Keep scoring weights configurable in `PatternExtractor` helpers and maintain compatibility of screener pipelines with existing notebooks.
 - Plotting, strategy backtesting, and GPU helpers exist throughout; prefer existing utilities over ad-hoc implementations.
-- **Models**: Always use `model.target_data` for targets in `IntradayMomentum` to ensure consistency and proper lagging. When adding features, use `_add_feature()` for automatic tracking. LightGBM classification returns probabilities - convert to class labels with threshold (binary) or argmax (multiclass).
+- **Models**: Always use `model.target_data` for targets in `IntradayMomentum` to ensure consistency and proper lagging. When adding features, use `_add_feature()` for automatic tracking. LightGBM classification returns probabilities - convert to class labels with threshold (binary) or argmax (multiclass). For deep learning: call `normalize_sequential_features(scale_to_basis_points=True, scale_orderflow=True)` and `scale_summary_data()` to ensure all features are on comparable scales (~[-5, +5] basis points) matching the spatial data normalization `(price - vwap) / vwap * 100`. Rasterization: `SequenceRasterizer` should use `session_start=None` to process all VPIN data by time bounds (VPIN extraction already filters session times).
 - **Screeners/Backtesting**: `HistoricalScreenerV2` is the preferred screener. Legacy `HistoricalScreener` still has some imports but should be migrated away from. Use vectorized operations for performance. Calendar patterns need proper gate attachment to decision timestamps.

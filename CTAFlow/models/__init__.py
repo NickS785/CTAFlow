@@ -18,18 +18,20 @@ from .base_models import (
     CTAXGBoost,
     CTARForest,
 )
-from .intraday_momentum import IntradayMomentum
+from .intraday_momentum import IntradayMomentum, DeepIDMomentum, MultiModalDim
 from .volatility import RVForecast
 
 __all__ = [
     # Main forecasting class
     'CTAForecast',
-    
+
     # Individual model classes
     'CTALinear',
     'CTALight',
     'CTAXGBoost',
     'CTARForest',
     'IntradayMomentum',
+    'DeepIDMomentum',
+    'MultiModalDim',
     'RVForecast',
 ]
