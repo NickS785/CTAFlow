@@ -1262,6 +1262,80 @@ class TriModalWindowDataset(RasterizedModalDataset):
         return summary_days, seq_days, profile_days, raster_days, target, seq_lens
 
 
+class DualModalWindowDataset(RasterizedModalDataset):
+    """
+    Dataset for RecurrentDualModal model (Summary + Spatial Fusion).
+
+    Creates rolling windows of:
+    1. Summary Features (Macro/Daily stats)
+    2. Spatial Data (Profile + Rasterized VPIN)
+
+    Unlike TriModalWindowDataset, this DOES NOT return the variable-length
+    intraday sequence data (seq_days), optimizing for the DualModal architecture.
+
+    Returns per sample:
+      summary_window : (Window, F_sum)
+      profile_window : (Window, C_prof, Bins)
+      raster_window  : (Window, T_bars, C_rast, Bins)
+      target         : Scalar (for the last day in window)
+    """
+
+    def __init__(self, *args, window_days: int = 20, return_dates: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        if window_days < 1:
+            raise ValueError("window_days must be >= 1")
+        self.window_days = int(window_days)
+        self.return_dates = return_dates
+
+    def __len__(self):
+        n = len(self.df_summary)
+        return max(0, n - self.window_days + 1)
+
+    def __getitem__(self, idx):
+        # Window range: [idx, idx + window_days - 1]
+        end = idx + self.window_days - 1
+
+        # 1. Get Dates for the window
+        # self.df_summary is already aligned/sorted in parent class
+        window_dates = self.df_summary.iloc[idx: end + 1]["date"].tolist()
+
+        # 2. Summary Window
+        # (Window, F_sum)
+        summary_window = torch.tensor(
+            self.features[idx: end + 1],
+            dtype=torch.float32
+        )
+
+        # 3. Profile Window
+        # (Window, C_prof, Bins)
+        prof_list = []
+        for d in window_dates:
+            prof = self.spatial_by_date.get(d)
+            if prof is None:
+                prof = np.zeros(self.spatial_shape, dtype=np.float32)
+            prof_list.append(torch.from_numpy(prof))
+
+        profile_window = torch.stack(prof_list, dim=0)
+
+        # 4. Raster Window
+        # (Window, T_bars, C_rast, Bins)
+        rast_list = []
+        for d in window_dates:
+            rast = self.rasterized_by_date.get(d)
+            if rast is None:
+                rast = np.zeros(self.rasterized_shape, dtype=np.float32)
+            rast_list.append(torch.from_numpy(rast))
+
+        raster_window = torch.stack(rast_list, dim=0)
+
+        # 5. Target (for the last day in the window)
+        target = torch.tensor(self.targets[end])
+
+        if self.return_dates:
+            return summary_window, profile_window, raster_window, target, window_dates
+
+        return summary_window, profile_window, raster_window, target
+
 
 class OnTheFlyRasterizedDataset(Dataset):
     """

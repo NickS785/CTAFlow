@@ -1,18 +1,10 @@
 import numpy as np
-import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.nn.utils.rnn as rnn_utils
-
 
 from ..encoders import (
-    GatedFusion,
-    NumberBarsEncoder,
     ProfileEncoder,
     SeqEncoder,
-    SpatialFuse,
-    SpatialTemporalEncoder,
-    SummaryEncoder, MarketProfileCNN,
+    SummaryEncoder, MarketProfileCNN, IntradayRNN,
 )
 
 
@@ -517,6 +509,9 @@ from CTAFlow.models.deep_learning.encoders import (
     NumberBarsEncoder,
     SpatialTemporalEncoder,
     SpatialFuse,
+    MarketProfileResNet,
+    RasterResNet,
+    IntradayRNN
 )
 
 
@@ -706,184 +701,168 @@ class TriModalLSTM(nn.Module):
         return logits
 
 
-class TriModalLiquidityModel(nn.Module):
+# ------------------------------------------------------------------------
+# 2. Main RecurrentTriModal Model
+# ------------------------------------------------------------------------
+
+class RecurrentTriModal(nn.Module):
     """
-    Tri-modal model combining summary, sequential, and spatial (profile) data.
+    State-of-the-Art Recurrent Tri-Modal Model.
 
-    Supports interchangeable encoders and configurable fusion/head modes.
-
-    Parameters
-    ----------
-    f_sum : int
-        Summary feature dimension (ignored if sum_encoder provided)
-    f_seq : int
-        Sequential feature dimension (ignored if seq_encoder provided)
-    d : int, default 128
-        Encoder output dimension
-    out_dim : int, default 1
-        Output dimension (1 for regression, num_classes for classification)
-    dropout : float, default 0.1
-        Dropout rate
-    task : str, default 'regression'
-        Task type: 'regression' or 'classification'
-    num_classes : int, default 3
-        Number of classes (only used if task='classification' and out_dim not set)
-    profile_encoder : nn.Module, optional
-        Custom profile encoder. Must have `out_dim` attribute.
-    seq_encoder : nn.Module, optional
-        Custom sequential encoder. Must accept (x, lengths) and have `out_dim`.
-    sum_encoder : nn.Module, optional
-        Custom summary encoder. Must have `out_dim` attribute.
-    fusion_mode : str, default 'gated'
-        Fusion strategy: 'gated' (learned weights), 'concat' (concatenation), 'mean' (average).
-    head_mode : str, default 'default'
-        Head architecture: 'default' (LayerNorm+GELU), 'classification' (ReLU, no LayerNorm),
-        'simple' (single linear layer)
+    Processing Pipeline:
+    1.  Flatten Window Dimension (Batch * Days).
+    2.  Encode Daily Modalities independently:
+        - Summary -> MLP
+        - Profile -> MarketProfileResNet
+        - Raster  -> RasterResNet
+        - Seq     -> IntradayRNN
+    3.  Spatial Fusion: Merge Profile + Raster.
+    4.  Day Fusion: Merge Summary + Spatial + Seq.
+    5.  Window Modeling: Pass sequence of Day Embeddings to Window-LSTM.
+    6.  Prediction Head.
     """
 
     def __init__(
-        self,
-        f_sum: int,
-        f_seq: int,
-        d: int = 128,
-        out_dim: int = 1,
-        dropout: float = 0.1,
-        task: str = 'regression',
-        num_classes: int = 3,
-        profile_encoder=None,
-        seq_encoder=None,
-        sum_encoder=None,
-        fusion_mode: str = 'gated',
-        head_mode: str = 'default',
+            self,
+            f_sum: int,
+            f_seq: int,
+            f_profile: int = 3,
+            f_raster: int = 4,
+            d_model: int = 128,  # Embedding dimension per branch
+            lstm_hidden: int = 128,  # Window LSTM hidden size
+            dropout: float = 0.2,
+            task: str = "classification",
+            num_classes: int = 3
     ):
         super().__init__()
-
         self.task = task
-        self.fusion_mode = fusion_mode
-        self.head_mode = head_mode
 
-        # Determine output dimension
-        if task == 'classification' and out_dim == 1:
-            out_dim = num_classes
-        self.out_dim = out_dim
-        self.num_classes = num_classes if task == 'classification' else None
+        # --- Branch 1: Summary (Macro) ---
+        self.summary_net = nn.Sequential(
+            nn.Linear(f_sum, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model)
+        )
 
-        # --- ENCODERS ---
-        if profile_encoder is not None:
-            self.profile_enc = profile_encoder
-            profile_d = profile_encoder.out_dim
-        else:
-            self.profile_enc = ProfileEncoder(in_ch=3, d_out=d, dropout=dropout)
-            profile_d = d
+        # --- Branch 2: Spatial System (Structure) ---
+        self.profile_net = MarketProfileResNet(
+            in_channels=f_profile,
+            d_model=d_model
+        )
+        self.raster_net = RasterResNet(
+            in_ch=f_raster,
+            d_model=d_model
+        )
+        self.spatial_fuse = SpatialFuse(
+            d_spatial=d_model,
+            mode="gated"
+        )
 
-        if seq_encoder is not None:
-            self.seq_enc = seq_encoder
-            seq_d = seq_encoder.out_dim
-        else:
-            self.seq_enc = SeqEncoder(f_in=f_seq, d_out=d, dropout=dropout)
-            seq_d = d
+        # --- Branch 3: Sequential (Intraday Flow) ---
+        self.seq_net = IntradayRNN(
+            input_dim=f_seq,
+            d_model=d_model,
+            num_layers=1
+        )
 
-        if sum_encoder is not None:
-            self.sum_enc = sum_encoder
-            sum_d = sum_encoder.out_dim
-        else:
-            self.sum_enc = SummaryEncoder(f_in=f_sum, d_out=d, dropout=dropout)
-            sum_d = d
+        # --- Day Fusion ---
+        # Combines Summary (d) + SpatialFused (d) + Sequential (d) = 3*d
+        self.day_fuse = nn.Sequential(
+            nn.Linear(d_model * 3, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
 
-        # --- FUSION ---
-        if fusion_mode == 'gated':
-            # All encoders must output same dimension for gated fusion
-            assert profile_d == seq_d == sum_d, \
-                f"Gated fusion requires equal encoder dims: {profile_d}, {seq_d}, {sum_d}"
-            self.fuse = GatedFusion(d=d, n_mod=3)
-            fused_dim = d
-        elif fusion_mode == 'concat':
-            self.fuse = None
-            fused_dim = profile_d + seq_d + sum_d
-        elif fusion_mode == 'mean':
-            assert profile_d == seq_d == sum_d, \
-                f"Mean fusion requires equal encoder dims: {profile_d}, {seq_d}, {sum_d}"
-            self.fuse = None
-            fused_dim = d
-        else:
-            raise ValueError(f"Unknown fusion_mode: {fusion_mode}")
+        # --- Window Sequence Modeling ---
+        self.window_lstm = nn.LSTM(
+            input_size=d_model,
+            hidden_size=lstm_hidden,
+            num_layers=1,
+            batch_first=True
+        )
 
-        self._fused_dim = fused_dim
+        # --- Prediction Head ---
+        self.head = nn.Sequential(
+            nn.Linear(lstm_hidden, 64),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, num_classes if task == 'classification' else 1)
+        )
 
-        # --- HEAD ---
-        self.head = self._build_head(fused_dim, out_dim, dropout, head_mode, task)
+        self._init_weights()
 
-    def _build_head(self, in_dim, out_dim, dropout, head_mode, task):
-        """Build the output head based on mode and task."""
-        if head_mode == 'simple':
-            return nn.Linear(in_dim, out_dim)
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Linear, nn.Conv1d, nn.Conv2d)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None: nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (nn.BatchNorm1d, nn.LayerNorm, nn.BatchNorm2d)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
-        elif head_mode == 'classification' or (head_mode == 'default' and task == 'classification'):
-            # Classification head: ReLU activations, no LayerNorm before logits
-            return nn.Sequential(
-                nn.Linear(in_dim, 128),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(128, 64),
-                nn.ReLU(),
-                nn.Dropout(dropout * 0.5),
-                nn.Linear(64, out_dim)
-            )
-
-        else:  # 'default' regression head
-            return nn.Sequential(
-                nn.LayerNorm(in_dim),
-                nn.Linear(in_dim, 128),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(128, out_dim)
-            )
-
-    def forward(self, summary_vec, seq_tensor, profile_tensor, seq_len, return_probs=False):
+    def forward(
+            self,
+            summary_days,  # (B, W, f_sum)
+            profile_days,  # (B, W, f_prof, bins)
+            raster_days,  # (B, W, T_bars, f_rast, bins)
+            seq_days,  # (B, W, SeqLen, f_seq)
+            seq_lens=None,  # (B, W)
+            return_probs=False
+    ):
         """
-        Forward pass.
-
-        Parameters
-        ----------
-        summary_vec : torch.Tensor
-            Summary features (B, F_sum)
-        seq_tensor : torch.Tensor
-            Sequential features (B, T, F_seq)
-        profile_tensor : torch.Tensor
-            Profile/spatial features (B, 3, 96)
-        seq_len : torch.Tensor
-            Sequence lengths (B,)
-        return_probs : bool, default False
-            For classification: return probabilities instead of logits
-
-        Returns
-        -------
-        output : torch.Tensor
-            Predictions (B, out_dim)
-        gate_weights : torch.Tensor or None
-            Gate weights if fusion_mode='gated', else None
+        Forward pass handling 3 modalities over a window of days.
         """
-        # Encode each modality
-        z_profile = self.profile_enc(profile_tensor)
-        z_seq = self.seq_enc(seq_tensor, seq_len)
-        z_sum = self.sum_enc(summary_vec)
+        B, W = summary_days.shape[0], summary_days.shape[1]
+        BW = B * W
 
-        # Fuse
-        gate_w = None
-        if self.fusion_mode == 'gated':
-            z, gate_w = self.fuse([z_profile, z_seq, z_sum])
-        elif self.fusion_mode == 'concat':
-            z = torch.cat([z_profile, z_seq, z_sum], dim=-1)
-        elif self.fusion_mode == 'mean':
-            z = (z_profile + z_seq + z_sum) / 3.0
+        # 1. Flatten Batch & Window dimensions
+        # We treat every day as an independent sample first
+        flat_sum = summary_days.reshape(BW, -1)
+        flat_prof = profile_days.reshape(BW, profile_days.size(2), -1)
 
-        # Output
-        output = self.head(z)
+        # Raster: (B, W, T, C, Bins) -> (BW, T, C, Bins)
+        flat_rast = raster_days.reshape(BW, raster_days.size(2), raster_days.size(3), -1)
 
-        if self.task == 'classification' and return_probs:
-            output = F.softmax(output, dim=-1)
+        # Seq: (B, W, SeqLen, F) -> (BW, SeqLen, F)
+        flat_seq = seq_days.reshape(BW, seq_days.size(2), -1)
 
-        return output, gate_w
+        # Handle lengths flattening
+        flat_lens = None
+        if seq_lens is not None:
+            flat_lens = seq_lens.reshape(BW)
+
+        # 2. Encode Branches
+        z_sum = self.summary_net(flat_sum)  # (BW, d)
+        z_prof = self.profile_net(flat_prof)  # (BW, d)
+        z_rast = self.raster_net(flat_rast)  # (BW, d)
+        z_seq = self.seq_net(flat_seq, lengths=flat_lens)  # (BW, d)
+
+        # 3. Spatial Fusion
+        z_spatial = self.spatial_fuse(z_prof, z_rast)  # (BW, d)
+
+        # 4. Global Day Fusion
+        # Concatenate: Summary | Spatial | Sequential
+        z_day_cat = torch.cat([z_sum, z_spatial, z_seq], dim=1)  # (BW, 3d)
+        z_day = self.day_fuse(z_day_cat)  # (BW, d)
+
+        # 5. Window LSTM
+        # Unflatten: (BW, d) -> (B, W, d)
+        z_window_seq = z_day.view(B, W, -1)
+
+        # LSTM over the window of days
+        _, (h_n, _) = self.window_lstm(z_window_seq)
+        z_final = h_n[-1]  # (B, lstm_hidden)
+
+        # 6. Prediction
+        logits = self.head(z_final)
+
+        if self.task == "classification" and return_probs:
+            return F.softmax(logits, dim=1)
+
+        return logits
 
 
 class TriModalClassifier(nn.Module):

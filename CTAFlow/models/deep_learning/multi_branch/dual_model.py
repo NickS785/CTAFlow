@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils.rnn as rnn_utils
+from ..encoders import RasterResNet, MarketProfileResNet, SpatialFuse
+
 
 
 class DualBranchModel(nn.Module):
@@ -199,3 +201,139 @@ class DualBranchModel(nn.Module):
             output = F.softmax(output, dim=1)
 
         return output
+
+
+class RecurrentDualModal(nn.Module):
+    """
+    State-of-the-art Sequence Model for Market Data.
+
+    Components:
+    1. Macro: Summary MLP
+    2. Structure (Static): MarketProfileResNet (1D ResNet + SE)
+    3. Flow (Dynamic): RasterResNet (Pseudo-3D ResNet)
+    4. Sequence: Window LSTM
+    """
+
+    def __init__(
+            self,
+            f_sum: int,
+            f_profile: int = 3,
+            f_raster: int = 4,
+            num_bins: int = 64,
+            d_model: int = 128,
+            lstm_hidden: int = 128,
+            spatial_fuse_mode: str = "gated",
+            task: str = "classification",
+            num_classes: int = 3,
+            dropout: float = 0.2
+    ):
+        super().__init__()
+        self.task = task
+
+        # --- 1. Summary Encoder ---
+        self.summary_net = nn.Sequential(
+            nn.Linear(f_sum, d_model // 2),
+            nn.LayerNorm(d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, d_model // 2),
+            nn.GELU(),
+        )
+
+        # --- 2. Enhanced Spatial Encoders ---
+
+        # A. Profile (Static Structure) - NOW UPGRADED
+        self.profile_net = MarketProfileResNet(
+            in_channels=f_profile,
+            d_model=d_model // 2,
+            layers=[2, 2, 2]  # 2 blocks per layer = 6 ResBlocks total
+        )
+
+        # B. Raster (Dynamic Flow) - 3D ResNet logic
+        self.raster_net = RasterResNet(
+            in_ch=f_raster,
+            d_model=d_model // 2,
+            layers=[2, 2, 2],
+            base_filters=32
+        )
+
+        # C. Fusion
+        self.spatial_fuse = SpatialFuse(
+            d_spatial=d_model // 2,
+            mode=spatial_fuse_mode
+        )
+
+        # --- 3. Day Fusion & LSTM ---
+        self.day_fuse = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+
+        # The LSTM now tracks the evolution of these high-quality embeddings
+        self.window_lstm = nn.LSTM(
+            input_size=d_model,
+            hidden_size=lstm_hidden,
+            num_layers=1,
+            batch_first=True
+        )
+
+        self.head = nn.Sequential(
+            nn.Linear(lstm_hidden, 64),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, num_classes if task == 'classification' else 1)
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # Kaiming init for ResNets
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Conv1d, nn.Linear)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None: nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (nn.BatchNorm1d, nn.LayerNorm, nn.BatchNorm2d)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, summary_days, profile_days, raster_days, return_probs=False):
+        """
+        Input Shapes:
+        - summary_days: (Batch, Window, f_sum)
+        - profile_days: (Batch, Window, f_prof, bins)
+        - raster_days:  (Batch, Window, T_bars, f_rast, bins)
+        """
+        B, W, _, _ = profile_days.shape
+        BW = B * W
+
+        # 1. Flatten Time for shared encoders
+        flat_sum = summary_days.reshape(BW, -1)
+        flat_prof = profile_days.reshape(BW, profile_days.size(2), -1)
+        flat_rast = raster_days.reshape(BW, raster_days.size(2), raster_days.size(3), -1)
+
+        # 2. Run Encoders
+        z_sum = self.summary_net(flat_sum)  # (BW, d/2)
+        z_prof = self.profile_net(flat_prof)  # (BW, d/2) -> Uses ResNet
+        z_rast = self.raster_net(flat_rast)  # (BW, d/2) -> Uses RasterResNet
+
+        # 3. Spatial Fusion (Static + Dynamic)
+        z_spatial = self.spatial_fuse(z_prof, z_rast)  # (BW, d/2)
+
+        # 4. Day Fusion (Macro + Spatial)
+        z_day_cat = torch.cat([z_sum, z_spatial], dim=1)  # (BW, d)
+        z_day = self.day_fuse(z_day_cat)  # (BW, d)
+
+        # 5. Window LSTM
+        z_seq = z_day.view(B, W, -1)  # (B, W, d)
+        _, (h_n, _) = self.window_lstm(z_seq)
+        z_final = h_n[-1]  # (B, lstm_hidden)
+
+        # 6. Prediction
+        logits = self.head(z_final)
+
+        if self.task == "classification" and return_probs:
+            return F.softmax(logits, dim=1)
+
+        return logits

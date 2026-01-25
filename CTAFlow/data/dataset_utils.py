@@ -103,6 +103,43 @@ def collate_windowed_rasterized(batch):
         torch.stack(targets, dim=0),
     )
 
+
+def collate_recurrent_dual(batch: List[Tuple]) -> Tuple[torch.Tensor, ...]:
+    """
+    Collate function for DualModalWindowDataset.
+
+    Stacks windows for:
+    - Summary
+    - Profile
+    - Raster
+    - Target
+
+    Returns:
+      summary_batch : (B, Window, F_sum)
+      profile_batch : (B, Window, C_prof, Bins)
+      raster_batch  : (B, Window, T_bars, C_rast, Bins)
+      target_batch  : (B,)
+    """
+    # Handle optional return_dates
+    if len(batch[0]) == 5:
+        summaries, profiles, rasters, targets, dates = zip(*batch)
+        return (
+            torch.stack(summaries, dim=0),
+            torch.stack(profiles, dim=0),
+            torch.stack(rasters, dim=0),
+            torch.stack(targets, dim=0),
+            dates
+        )
+
+    summaries, profiles, rasters, targets = zip(*batch)
+
+    return (
+        torch.stack(summaries, dim=0),
+        torch.stack(profiles, dim=0),
+        torch.stack(rasters, dim=0),
+        torch.stack(targets, dim=0)
+    )
+
 def collate_quad(batch: List[Tuple]) -> Tuple[torch.Tensor, ...]:
     """
     Collate function for QuadModalModel (Summary + Sequential + Profile + NumberBars).
@@ -270,6 +307,7 @@ def get_collate_fn(mode: str):
         'rasterized': collate_rasterized,
         'quad_rasterized': collate_quad_rasterized,
         'rasterized_vpin': collate_rasterized_vpin,
+        'recurrent_dual': collate_recurrent_dual,
     }
 
     if mode not in collate_fns:

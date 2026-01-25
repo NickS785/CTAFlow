@@ -367,6 +367,245 @@ class SummaryMLPEnc(nn.Module):
         return self.net(x)
 
 
+class BasicBlock(nn.Module):
+    """
+    Standard ResNet Basic Block adapted for Financial Time-Price grids.
+    """
+    expansion = 1
+
+    def __init__(self, in_planes, planes, stride=1):
+        super(BasicBlock, self).__init__()
+        # Conv2d over (Time, PriceBins)
+        self.conv1 = nn.Conv2d(
+            in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(
+            planes, planes, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion * planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(
+                    in_planes,
+                    self.expansion * planes,
+                    kernel_size=1,
+                    stride=stride,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(self.expansion * planes),
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+
+class RasterResNet(nn.Module):
+    """
+    "3D" ResNet implementation for Rasterized VPIN data.
+
+    Treats the input (Batch, Time, Channels, Bins) as an image of shape
+    (Batch, Channels, Height=Time, Width=Bins).
+
+    This effectively performs Spatio-Temporal convolution:
+    - Vertical patterns = Temporal evolution (velocity)
+    - Horizontal patterns = Price structure (nodes/ledges)
+    """
+
+    def __init__(
+            self,
+            in_ch=4,  # Channels (Density, Vol, Imbal, Ret)
+            d_model=128,  # Output dimension
+            layers=[2, 2, 2],  # Depth of ResNet blocks
+            base_filters=32
+    ):
+        super().__init__()
+        self.in_planes = base_filters
+
+        # 1. Stem: Initial processing
+        # Note: We do NOT downsample Time immediately if it's short
+        self.conv1 = nn.Conv2d(in_ch, base_filters, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(base_filters)
+
+        # 2. ResNet Layers
+        # Layer 1: Keep dimensions (capture fine details)
+        self.layer1 = self._make_layer(BasicBlock, base_filters, layers[0], stride=1)
+
+        # Layer 2: Downsample Price Bins (Width), keep Time (Height) or downsample both?
+        # Stride (2, 2) reduces both Time and Price resolution
+        self.layer2 = self._make_layer(BasicBlock, base_filters * 2, layers[1], stride=2)
+
+        # Layer 3: Downsample again
+        self.layer3 = self._make_layer(BasicBlock, base_filters * 4, layers[2], stride=2)
+
+        # 3. Aggregation Head
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))  # Pools remaining Time & Price
+        self.fc = nn.Linear(base_filters * 4 * BasicBlock.expansion, d_model)
+        self.norm = nn.LayerNorm(d_model)
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+        return nn.Sequential(*layers)
+
+    def forward(self, x, lengths=None):
+        """
+        x: (Batch, T, C, Bins)
+        lengths: Ignored (CNNs handle padding via masking or just learning zero-features)
+        """
+        # Permute to (Batch, Channels, Time, Bins) for Conv2d
+        x = x.permute(0, 2, 1, 3)
+
+        x = F.relu(self.bn1(self.conv1(x)))
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+
+        x = self.avgpool(x)  # (B, C_out, 1, 1)
+        x = x.flatten(1)  # (B, C_out)
+        x = self.fc(x)  # (B, d_model)
+        return self.norm(x)
+
+
+
+class SEBlock1D(nn.Module):
+    """
+    Squeeze-and-Excitation Block for 1D.
+    Allows the model to dynamically weight channels (e.g., focus on Delta vs Volume).
+    """
+
+    def __init__(self, channel, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1)
+        return x * y.expand_as(x)
+
+
+class ResBlock1D(nn.Module):
+    """
+    1D Residual Block with optional SE attention.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, downsample=None):
+        super().__init__()
+        padding = kernel_size // 2
+
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding, bias=False)
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, 1, padding, bias=False)
+        self.bn2 = nn.BatchNorm1d(out_channels)
+
+        self.se = SEBlock1D(out_channels)
+        self.downsample = downsample
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        # Squeeze-and-Excitation
+        out = self.se(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(x)
+
+        out += residual
+        out = self.relu(out)
+        return out
+
+
+class MarketProfileResNet(nn.Module):
+    """
+    Enhanced Market Profile Encoder.
+    Replaces the simple CNN with a ResNet-1D + SE Attention.
+
+    Structure:
+    1. Stem (Conv1d -> BN -> ReLU)
+    2. Layer 1 (ResBlock - extract fine details like ledges)
+    3. Layer 2 (ResBlock - extract shape like P/b profiles)
+    4. Layer 3 (ResBlock - extract global balance/imbalance)
+    5. Global Pool -> Output
+    """
+
+    def __init__(self, in_channels=3, d_model=128, layers=[2, 2, 2]):
+        super().__init__()
+        self.inplanes = 32
+
+        # 1. Stem
+        self.conv1 = nn.Conv1d(in_channels, 32, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm1d(32)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+
+        # 2. ResNet Layers
+        self.layer1 = self._make_layer(32, layers[0])
+        self.layer2 = self._make_layer(64, layers[1], stride=2)
+        self.layer3 = self._make_layer(128, layers[2], stride=2)
+
+        # 3. Output Head
+        self.avgpool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(128, d_model)
+        self.norm = nn.LayerNorm(d_model)
+
+    def _make_layer(self, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes:
+            downsample = nn.Sequential(
+                nn.Conv1d(self.inplanes, planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm1d(planes),
+            )
+
+        layers = []
+        layers.append(ResBlock1D(self.inplanes, planes, stride=stride, downsample=downsample))
+        self.inplanes = planes
+        for _ in range(1, blocks):
+            layers.append(ResBlock1D(self.inplanes, planes))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        # x: (B, C, Bins)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+
+        x = self.avgpool(x)
+        x = x.flatten(1)
+        x = self.fc(x)
+        return self.norm(x)
+
 # ----------------------------
 # Spatial-Temporal Encoder (Rasterized VPIN)
 # ----------------------------
@@ -590,3 +829,35 @@ class MarketProfileCNN(nn.Module):
         x = self.net(x)
         x = x.flatten(1)  # (Batch, 64)
         return self.fc(x)  # (Batch, out_dim)
+
+
+class IntradayRNN(nn.Module):
+    """
+    Encoder for the Sequential branch (Intraday VPIN time-series).
+    """
+
+    def __init__(self, input_dim, d_model=128, num_layers=1, dropout=0.2):
+        super().__init__()
+        self.rnn = nn.GRU(
+            input_size=input_dim,
+            hidden_size=d_model,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x, lengths=None):
+        # x: (B, SeqLen, Features)
+        if lengths is not None:
+            # Handle variable lengths if provided
+            x_packed = nn.utils.rnn.pack_padded_sequence(
+                x, lengths.cpu(), batch_first=True, enforce_sorted=False
+            )
+            _, h_n = self.rnn(x_packed)
+        else:
+            _, h_n = self.rnn(x)
+
+        # Take last hidden state: (NumLayers, B, Hidden) -> (B, Hidden)
+        embedding = h_n[-1]
+        return self.norm(embedding)
