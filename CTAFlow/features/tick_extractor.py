@@ -89,9 +89,12 @@ def _extract_single_date_worker(args: tuple) -> Dict:
     ends = [vpin_end]
 
     profile_start = None
+    profile_end = None
     if config.include_profile:
         profile_start = pd.Timestamp(f"{date_str_fmt} {config.profile_start_time}").tz_localize(tz)
+        profile_end = pd.Timestamp(f"{date_str_fmt} {config.profile_end_time}").tz_localize(tz)
         starts.append(profile_start)
+        ends.append(profile_end)
 
     if config.include_number_bars:
         nb_start = pd.Timestamp(f"{date_str_fmt} {config.num_bars_start_time}").tz_localize(tz)
@@ -132,11 +135,12 @@ def _extract_single_date_worker(args: tuple) -> Dict:
         df_raw.index = df_raw.index.tz_localize('UTC')
     df_raw.index = df_raw.index.tz_convert(config.tz)
 
-    # Profile: from profile_start to vpin_start (prior session context)
+    # Profile: from profile_start to profile_end (full profile window)
     poc, val, vah = np.nan, np.nan, np.nan
     profile_vwap = None  # Shared VWAP for NumberBars alignment
     if config.include_profile and profile_ext is not None and profile_start is not None:
-        profile_data = df_raw.between_time(profile_start.time(), vpin_start.time(), inclusive='left')
+        profile_end_time = profile_end.time() if profile_end is not None else vpin_start.time()
+        profile_data = df_raw.between_time(profile_start.time(), profile_end_time, inclusive='left')
         if not profile_data.empty:
             try:
                 profile = profile_ext.calculate_volume_profile(
@@ -603,14 +607,15 @@ class MultiFeatureExtraction(ScidBaseExtractor):
         # Profile-related calculations
         poc, val, vah = np.nan, np.nan, np.nan
         profile_start = None
+        profile_end = None
         profile_vwap = None  # Shared VWAP for NumberBars alignment
 
         if self.config.include_profile and self.profile_extractor is not None:
-            profile_start, _ = self._build_time_range(
+            profile_start, profile_end = self._build_time_range(
                 dt, self.config.profile_start_time, self.config.profile_end_time
             )
             profile_data = df_raw.between_time(
-                profile_start.time(), vpin_start.time(), inclusive='left'
+                profile_start.time(), profile_end.time(), inclusive='left'
             )
             if not profile_data.empty:
                 try:
