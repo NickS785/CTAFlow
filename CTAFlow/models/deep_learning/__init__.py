@@ -22,8 +22,8 @@ from .encoders import (
     SummaryEncoder,
     SummaryMLPEnc,
 )
-from .multi_branch.dual_model import DualBranchModel
-from .multi_branch.tri_modal import TriModalModel, TriModalLiquidityModel, TriModalClassifier
+from .multi_branch.dual_model import DualBranchModel, RecurrentDualModal
+from .multi_branch.tri_modal import TriModalModel, RecurrentTriModal
 
 __all__ = [
     # Regressors
@@ -58,7 +58,7 @@ __all__ = [
     "SummaryMLPEnc",
     # Multi-branch models
     "DualBranchModel",
+    "RecurrentDualModal"
+    "RecurrentTriModal"
     "TriModalModel",
-    "TriModalLiquidityModel",
-    "TriModalClassifier",
 ]

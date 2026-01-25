@@ -337,3 +337,126 @@ class RecurrentDualModal(nn.Module):
             return F.softmax(logits, dim=1)
 
         return logits
+
+
+class RecurrentWSPR(nn.Module):
+    """
+    Recurrent Windowed Summary, Profile, and recent Raster/Sequential/Fused model.
+
+    This model processes inputs through multiple parallel paths as per user spec:
+    - Path 1 (Windowed Summary): LSTM over a window of summary embeddings.
+    - Path 2 (Windowed Profile): LSTM over a window of profile embeddings.
+    - Path 3 (Recent Raster): Encoder processes only the most recent raster data.
+    - Path 4 (Recent Sequential): Encoder processes only the most recent sequential data.
+    - Path 5 (Recent Spatial Fusion): Spatially fuses the most recent profile and raster data.
+
+    The outputs of all five paths are concatenated for final prediction.
+    """
+    def __init__(
+            self,
+            f_sum: int,
+            f_profile: int,
+            f_raster: int,
+            f_seq: int,
+            d_model: int = 128,
+            sum_lstm_hidden: int = 64,
+            prof_lstm_hidden: int = 128,
+            task: str = "classification",
+            num_classes: int = 3,
+            dropout: float = 0.3
+    ):
+        super().__init__()
+        self.task = task
+        self.d_model = d_model
+
+        # --- Branch Encoders ---
+        self.summary_net = nn.Sequential(
+            nn.Linear(f_sum, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU()
+        )
+        self.profile_net = MarketProfileResNet(in_channels=f_profile, d_model=d_model)
+        self.raster_net = RasterResNet(in_ch=f_raster, d_model=d_model)
+        self.seq_net = IntradayRNN(input_dim=f_seq, d_model=d_model, num_layers=1)
+        self.spatial_fuse = SpatialFuse(d_spatial=d_model, mode="gated")
+
+        # --- Path 1 & 2: Windowed LSTMs ---
+        self.summary_lstm = nn.LSTM(input_size=d_model, hidden_size=sum_lstm_hidden, batch_first=True)
+        self.profile_lstm = nn.LSTM(input_size=d_model, hidden_size=prof_lstm_hidden, batch_first=True)
+
+        # --- Final Fusion Head ---
+        final_fusion_dim = (
+            sum_lstm_hidden      # Path 1
+            + prof_lstm_hidden   # Path 2
+            + d_model            # Path 3 (Recent Raster)
+            + d_model            # Path 4 (Recent Seq)
+            + d_model            # Path 5 (Recent Spatial Fuse)
+        )
+        self.head = nn.Sequential(
+            nn.Linear(final_fusion_dim, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.Linear(128, num_classes if task == 'classification' else 1)
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Conv1d, nn.Linear)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None: nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (nn.BatchNorm1d, nn.LayerNorm, nn.BatchNorm2d)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, summary_days, profile_days, raster_recent, seq_recent, seq_lens_recent, return_probs=False):
+        B, W = summary_days.shape[0:2]
+        BW = B * W
+
+        # --- Encode all days for windowed paths ---
+        flat_sum = summary_days.reshape(BW, -1)
+        z_sum_all = self.summary_net(flat_sum) # (BW, d)
+
+        flat_prof = profile_days.reshape(BW, profile_days.size(2), -1)
+        z_prof_all = self.profile_net(flat_prof) # (BW, d)
+
+        # --- Path 1: Windowed Summary LSTM ---
+        z_sum_seq = z_sum_all.view(B, W, -1)
+        _, (h_n_sum, _) = self.summary_lstm(z_sum_seq)
+        z_summary_temporal = h_n_sum[-1] # (B, sum_lstm_hidden)
+
+        # --- Path 2: Windowed Profile LSTM ---
+        z_prof_seq = z_prof_all.view(B, W, -1)
+        _, (h_n_prof, _) = self.profile_lstm(z_prof_seq)
+        z_profile_temporal = h_n_prof[-1] # (B, prof_lstm_hidden)
+
+        # --- Path 3: Recent Raster ---
+        z_raster_recent = self.raster_net(raster_recent) # (B, d)
+
+        # --- Path 4: Recent Sequential ---
+        z_seq_recent = self.seq_net(seq_recent, lengths=seq_lens_recent) # (B, d)
+
+        # --- Path 5: Recent Spatial Fusion ---
+        # We need the profile embedding for the most recent day
+        z_prof_recent = z_prof_seq[:, -1, :] # (B, d)
+        # We need a raster embedding for fusion. We can reuse the one from Path 3.
+        z_spatial_fused_recent = self.spatial_fuse(z_prof_recent, z_raster_recent) # (B, d)
+
+        # --- Final Concatenation ---
+        z_final_cat = torch.cat([
+            z_summary_temporal,
+            z_profile_temporal,
+            z_raster_recent,
+            z_seq_recent,
+            z_spatial_fused_recent
+        ], dim=1)
+
+        # --- Prediction Head ---
+        logits = self.head(z_final_cat)
+
+        if self.task == "classification" and return_probs:
+            return F.softmax(logits, dim=1)
+        return logits

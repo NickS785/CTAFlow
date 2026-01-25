@@ -730,7 +730,8 @@ class RecurrentTriModal(nn.Module):
             f_raster: int = 4,
             d_model: int = 128,  # Embedding dimension per branch
             lstm_hidden: int = 128,  # Window LSTM hidden size
-            dropout: float = 0.2,
+            head_dropout: float = 0.2,
+            fusion_dropout : float = 0.3,
             task: str = "classification",
             num_classes: int = 3
     ):
@@ -773,7 +774,7 @@ class RecurrentTriModal(nn.Module):
             nn.Linear(d_model * 3, d_model),
             nn.LayerNorm(d_model),
             nn.GELU(),
-            nn.Dropout(dropout)
+            nn.Dropout(fusion_dropout)
         )
 
         # --- Window Sequence Modeling ---
@@ -781,14 +782,14 @@ class RecurrentTriModal(nn.Module):
             input_size=d_model,
             hidden_size=lstm_hidden,
             num_layers=1,
-            batch_first=True
+            batch_first=Trueto
         )
 
         # --- Prediction Head ---
         self.head = nn.Sequential(
             nn.Linear(lstm_hidden, 64),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(head_dropout),
             nn.Linear(64, num_classes if task == 'classification' else 1)
         )
 
@@ -806,10 +807,10 @@ class RecurrentTriModal(nn.Module):
     def forward(
             self,
             summary_days,  # (B, W, f_sum)
+            seq_days,  # (B, W, SeqLen, f_seq)
+            seq_lens,  # (B, W)
             profile_days,  # (B, W, f_prof, bins)
             raster_days,  # (B, W, T_bars, f_rast, bins)
-            seq_days,  # (B, W, SeqLen, f_seq)
-            seq_lens=None,  # (B, W)
             return_probs=False
     ):
         """
