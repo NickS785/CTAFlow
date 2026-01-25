@@ -6008,6 +6008,8 @@ class DeepIDMomentum(IntradayMomentum):
             ib_high_col: Optional[str] = 'ib_high',
             ib_low_col: Optional[str] = 'ib_low',
             additional_cols: Optional[List[str]] = None,
+            scale_to_basis_points: bool = True,
+            scale_orderflow: bool = True,
             inplace: bool = True
     ) -> Optional[pd.DataFrame]:
         """Normalize/make stationary the sequential data columns.
@@ -6015,7 +6017,12 @@ class DeepIDMomentum(IntradayMomentum):
         Normalizes price-like columns (market profile, initial balance, etc.) by
         expressing them relative to the close price: (value - close) / close
 
-        This makes the features scale-invariant and stationary.
+        When scale_to_basis_points=True, all normalized values are multiplied by 100
+        to match the spatial data scale used in tri-modal models.
+
+        When scale_orderflow=True, also scales VPIN, volume, and imbalance features
+        to match the basis points scale of the spatial data. This ensures all
+        sequential features are on comparable scales without lookahead bias.
 
         Parameters
         ----------
@@ -6037,6 +6044,17 @@ class DeepIDMomentum(IntradayMomentum):
         additional_cols : list of str, optional
             Additional column names to normalize using the same formula.
             Useful for custom price levels, support/resistance, etc.
+        scale_to_basis_points : bool, default True
+            If True, multiply normalized price columns by 100 to convert to basis
+            points, matching the spatial data scale: (price - vwap) / vwap * 100.
+        scale_orderflow : bool, default True
+            If True, scale orderflow features (vpin, vol, imbalance) to match the
+            basis points scale. Uses fixed scaling factors (no lookahead bias):
+            - vpin: (vpin - 0.5) * 10 → centered around 0, range ~[-5, 5]
+            - signed_imbalance: * 5 → range [-5, 5]
+            - imb_frac: (imb_frac - 0.5) * 10 → centered, range ~[-5, 5]
+            - vol: log1p(vol) - 2.5 → log-compressed, centered around 0
+            - bucket_return: * 100 → convert to basis points
         inplace : bool, default True
             If True, modify self.sequential_data in place and update training_data dict.
             If False, return normalized copy without modifying original.
@@ -6049,37 +6067,21 @@ class DeepIDMomentum(IntradayMomentum):
 
         Notes
         -----
-        - Normalization formula: (value - close) / close
+        - Normalization formula: (value - close) / close [* 100 if scale_to_basis_points]
         - Resulting values represent percentage distance from close price
         - Positive values mean above close, negative means below close
         - Original columns are replaced with normalized versions
         - Columns that don't exist in data are silently skipped
+        - Orderflow scaling uses fixed factors to avoid lookahead bias
 
         Examples
         --------
         >>> model = DeepIDMomentum(sequential_data=seq_df, intraday_data=intra_df)
-        >>> # Normalize market profile columns only
-        >>> model.normalize_sequential_features(price_col='close')
+        >>> # Full normalization with basis points scaling (recommended for tri-modal)
+        >>> model.normalize_sequential_features(scale_to_basis_points=True, scale_orderflow=True)
         >>>
-        >>> # Include initial balance columns
-        >>> model.normalize_sequential_features(
-        ...     price_col='close',
-        ...     ib_high_col='ib_high',
-        ...     ib_low_col='ib_low'
-        ... )
-        >>>
-        >>> # Skip IB columns if not present
-        >>> model.normalize_sequential_features(
-        ...     price_col='close',
-        ...     ib_high_col=None,
-        ...     ib_low_col=None
-        ... )
-        >>>
-        >>> # Add custom columns
-        >>> model.normalize_sequential_features(
-        ...     price_col='close',
-        ...     additional_cols=['prev_high', 'prev_low', 'support', 'resistance']
-        ... )
+        >>> # Legacy behavior (no basis points scaling)
+        >>> model.normalize_sequential_features(scale_to_basis_points=False, scale_orderflow=False)
         """
         # Determine which dataframe to work with
         if inplace:
@@ -6127,15 +6129,210 @@ class DeepIDMomentum(IntradayMomentum):
         # Get close prices
         close_prices = data[price_col].copy()
 
-        # Normalize all columns: (value - close) / close
+        # Normalize price columns: (value - close) / close [* 100]
+        scale_factor = 100.0 if scale_to_basis_points else 1.0
         for col in cols_to_normalize:
-            data[col] = (data[col] - close_prices) / close_prices
+            data[col] = ((data[col] - close_prices) / close_prices) * scale_factor
+
+        # Scale orderflow features to match basis points scale
+        # Uses fixed scaling factors to avoid lookahead bias
+        if scale_orderflow:
+            # VPIN [0, 1] → center and scale to ~[-5, 5]
+            if 'vpin' in data.columns:
+                data['vpin'] = (data['vpin'] - 0.5) * 10.0
+
+            # Signed imbalance [-1, 1] → scale to [-5, 5]
+            if 'signed_imbalance' in data.columns:
+                data['signed_imbalance'] = data['signed_imbalance'] * 5.0
+
+            # Imbalance fraction [0, 1] → center and scale to ~[-5, 5]
+            if 'imb_frac' in data.columns:
+                data['imb_frac'] = (data['imb_frac'] - 0.5) * 10.0
+
+            # Volume: log-compress and center
+            # log1p(vol) typically ranges ~[0.7, 4] for vol in [2, 50]
+            # Subtract 2.5 to center around 0, giving range ~[-2, 1.5]
+            if 'vol' in data.columns:
+                data['vol'] = np.log1p(data['vol']) - 2.5
+
+            # Bucket return: convert to basis points
+            # Raw returns are ~[-0.01, 0.01], * 100 gives ~[-1, 1]
+            if 'bucket_return' in data.columns:
+                data['bucket_return'] = data['bucket_return'] * 100.0
+
+            # Log duration: already has wide range [-7, 9], scale down
+            # Divide by 2 to compress to ~[-3.5, 4.5]
+            if 'log_duration' in data.columns:
+                data['log_duration'] = data['log_duration'] / 2.0
 
         if inplace:
             # Update the sequential_data reference
             self.sequential_data = data
             # Update training_data dict
             self.training_data['sequential'] = data
+            return None
+        else:
+            return data
+
+    def scale_summary_data(
+            self,
+            rolling_window: int = 252,
+            inplace: bool = True
+    ) -> Optional[pd.DataFrame]:
+        """Scale summary features to match spatial data scale (basis points).
+
+        Applies feature-specific scaling based on feature name patterns to ensure
+        all summary features are on comparable scales without lookahead bias.
+        Uses fixed scaling factors where possible, or rolling statistics for
+        features that require normalization.
+
+        Scaling Rules by Feature Type
+        -----------------------------
+        **Fixed scaling (no lookahead):**
+        - Distance features (*dist_prior*, *session_dist_vwap*): * 100 (basis points)
+        - RSV features (rsv_*): * 1000 (scale up tiny values)
+        - Impact coefficients (*impact_coeff*): * 1000
+        - Impact volumes (*impact_vol*): log1p(x) - 5 (log compress, center)
+        - Norm range hist (*norm_range_hist*): (x - 1) * 5 (center around 0)
+        - Intraday curve slope changes (*intraday_curve_slope_change*): * 10
+        - Intraday basis changes (*intraday_rel_basis_change*): * 5
+        - Scaled returns (*scaled_returns*): clip to [-10, 10], then / 2
+
+        **Rolling z-score (long-term, minimal lookahead):**
+        - Calendar features (weeks_until_expiration, days_until_eia, days_since_eia)
+
+        **Already scaled (no change):**
+        - Deseasonalized features (*deseasonalized*): already z-scored
+        - Curve slope/basis features (*curve_slope*, *rel_basis* without 'intraday')
+        - Binary features (is_*): [0, 1]
+
+        Parameters
+        ----------
+        rolling_window : int, default 252
+            Window size for rolling z-score normalization (trading days).
+            Used for calendar features.
+        inplace : bool, default True
+            If True, modify self.summary_data in place.
+            If False, return scaled copy.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            If inplace=False, returns scaled DataFrame.
+
+        Notes
+        -----
+        - Fixed scaling factors avoid lookahead bias entirely
+        - Rolling z-score uses only past data (no future leakage)
+        - All scaled features target approximate range [-5, +5] to match
+          spatial data scale: (price - vwap) / vwap * 100
+        """
+        if inplace:
+            data = self.summary_data
+        else:
+            data = self.summary_data.copy()
+
+        if data is None or data.empty:
+            return None if inplace else data
+
+        # Track which columns we've processed
+        scaled_cols = set()
+
+        # --- FIXED SCALING (no lookahead) ---
+
+        # 1. Distance features: fractional -> basis points, clip outliers
+        dist_patterns = ['dist_prior', 'session_dist_vwap']
+        for col in data.columns:
+            if any(p in col.lower() for p in dist_patterns):
+                # Clip before scaling to handle outliers (e.g., gap days)
+                data[col] = data[col].clip(-0.05, 0.05) * 100.0
+                scaled_cols.add(col)
+
+        # 2. RSV features: very small values, scale up, clip outliers
+        for col in data.columns:
+            if col.startswith('rsv_'):
+                # RSV > 0.01 is extreme, clip first
+                data[col] = data[col].clip(0, 0.01) * 500.0
+                scaled_cols.add(col)
+
+        # 3. Impact coefficients: small values, scale up, clip
+        for col in data.columns:
+            if 'impact_coeff' in col.lower():
+                data[col] = data[col].clip(0, 0.01) * 500.0
+                scaled_cols.add(col)
+
+        # 4. Impact volumes: log compress and center
+        for col in data.columns:
+            if 'impact_vol' in col.lower():
+                data[col] = np.log1p(data[col]) - 5.0
+                scaled_cols.add(col)
+
+        # 5. Norm range hist: centered around 1, shift and scale, clip
+        for col in data.columns:
+            if 'norm_range_hist' in col.lower():
+                # Norm range > 3 is extreme
+                data[col] = (data[col].clip(0, 3) - 1.0) * 5.0
+                scaled_cols.add(col)
+
+        # 6. Intraday curve slope changes: small values, scale up
+        for col in data.columns:
+            if 'intraday_curve_slope_change' in col.lower():
+                data[col] = data[col].clip(-0.5, 0.5) * 10.0
+                scaled_cols.add(col)
+
+        # 7. Intraday basis changes: moderate range, slight scale
+        for col in data.columns:
+            if 'intraday_rel_basis_change' in col.lower():
+                data[col] = data[col].clip(-1, 1) * 5.0
+                scaled_cols.add(col)
+
+        # 8. Scaled returns: clip extremes and scale down
+        for col in data.columns:
+            if 'scaled_returns' in col.lower():
+                data[col] = data[col].clip(-10, 10) / 2.0
+                scaled_cols.add(col)
+
+        # --- ROLLING Z-SCORE (calendar features) ---
+
+        calendar_cols = ['weeks_until_expiration', 'days_until_eia', 'days_since_eia']
+        for col in calendar_cols:
+            if col in data.columns and col not in scaled_cols:
+                rolling_mean = data[col].rolling(window=rolling_window, min_periods=20).mean()
+                rolling_std = data[col].rolling(window=rolling_window, min_periods=20).std()
+                # Avoid division by zero
+                rolling_std = rolling_std.replace(0, 1)
+                data[col] = (data[col] - rolling_mean) / rolling_std
+                # Scale and clip to target range
+                data[col] = (data[col] * 2.0).clip(-5, 5)
+                scaled_cols.add(col)
+
+        # --- CLIP WIDE FEATURES ---
+
+        # Non-intraday rel_basis: already reasonable but has outliers
+        for col in data.columns:
+            if 'rel_basis' in col.lower() and 'intraday' not in col.lower():
+                data[col] = data[col].clip(-5, 5)
+                scaled_cols.add(col)
+
+        # Curve slope (non-intraday): clip outliers
+        for col in data.columns:
+            if 'curve_slope' in col.lower() and 'intraday' not in col.lower():
+                data[col] = data[col].clip(-5, 5)
+                scaled_cols.add(col)
+
+        # Deseasonalized features: already z-scored but clip extreme outliers
+        for col in data.columns:
+            if 'deseasonalized' in col.lower():
+                data[col] = data[col].clip(-5, 5)
+                scaled_cols.add(col)
+
+        # --- ALREADY SCALED (no change needed) ---
+        # - is_* binary features: keep as [0, 1]
+
+        if inplace:
+            self.summary_data = data
+            if hasattr(self, 'training_data') and 'summary' in self.training_data:
+                self.training_data['summary'] = data
             return None
         else:
             return data

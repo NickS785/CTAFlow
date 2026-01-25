@@ -140,7 +140,7 @@ def _extract_single_date_worker(args: tuple) -> Dict:
     profile_vwap = None  # Shared VWAP for NumberBars alignment
     if config.include_profile and profile_ext is not None and profile_start is not None:
         profile_end_time = profile_end.time() if profile_end is not None else vpin_start.time()
-        profile_data = df_raw.between_time(profile_start.time(), profile_end_time, inclusive='left')
+        profile_data = df_raw.between_time(profile_start.time(), profile_end_time, inclusive='both')
         if not profile_data.empty:
             try:
                 profile = profile_ext.calculate_volume_profile(
@@ -615,7 +615,7 @@ class MultiFeatureExtraction(ScidBaseExtractor):
                 dt, self.config.profile_start_time, self.config.profile_end_time
             )
             profile_data = df_raw.between_time(
-                profile_start.time(), profile_end.time(), inclusive='left'
+                profile_start.time(), profile_end.time(), inclusive='both'
             )
             if not profile_data.empty:
                 try:
