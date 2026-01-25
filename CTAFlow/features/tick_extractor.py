@@ -80,25 +80,27 @@ def _extract_single_date_worker(args: tuple) -> Dict:
     ) if config.include_rasterized else None
 
     # Build time windows
-    vpin_start = pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {config.vpin_start_time}")
-    vpin_end = pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {config.vpin_end_time}")
+    date_str_fmt = dt.strftime('%Y-%m-%d')
+    tz = config.tz
+    vpin_start = pd.Timestamp(f"{date_str_fmt} {config.vpin_start_time}").tz_localize(tz)
+    vpin_end = pd.Timestamp(f"{date_str_fmt} {config.vpin_end_time}").tz_localize(tz)
 
     starts = [vpin_start]
     ends = [vpin_end]
 
     profile_start = None
     if config.include_profile:
-        profile_start = pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {config.profile_start_time}")
+        profile_start = pd.Timestamp(f"{date_str_fmt} {config.profile_start_time}").tz_localize(tz)
         starts.append(profile_start)
 
     if config.include_number_bars:
-        nb_start = pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {config.num_bars_start_time}")
-        nb_end = pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {config.num_bars_end_time}")
+        nb_start = pd.Timestamp(f"{date_str_fmt} {config.num_bars_start_time}").tz_localize(tz)
+        nb_end = pd.Timestamp(f"{date_str_fmt} {config.num_bars_end_time}").tz_localize(tz)
         starts.append(nb_start)
         ends.append(nb_end)
 
     if config.include_pre_summary and config.pre_summary_start_time:
-        pre_start = pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {config.pre_summary_start_time}")
+        pre_start = pd.Timestamp(f"{date_str_fmt} {config.pre_summary_start_time}").tz_localize(tz)
         starts.append(pre_start)
 
     start_dt = min(starts)
@@ -125,6 +127,10 @@ def _extract_single_date_worker(args: tuple) -> Dict:
 
     if df_raw.empty:
         return results
+
+    if df_raw.index.tz is None:
+        df_raw.index = df_raw.index.tz_localize('UTC')
+    df_raw.index = df_raw.index.tz_convert(config.tz)
 
     # Profile: from profile_start to vpin_start (prior session context)
     poc, val, vah = np.nan, np.nan, np.nan
@@ -161,8 +167,8 @@ def _extract_single_date_worker(args: tuple) -> Dict:
 
     # Number Bars extraction - use calculate_number_bars with pre-fetched data
     if config.include_number_bars and nb_ext is not None:
-        nb_start = pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {config.num_bars_start_time}")
-        nb_end = pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {config.num_bars_end_time}")
+        nb_start = pd.Timestamp(f"{date_str_fmt} {config.num_bars_start_time}").tz_localize(tz)
+        nb_end = pd.Timestamp(f"{date_str_fmt} {config.num_bars_end_time}").tz_localize(tz)
         try:
             # Filter data to number bars window (with VWAP lookback for centering)
             lookback = pd.Timedelta(config.num_bars_vwap_window) * 2
@@ -203,7 +209,7 @@ def _extract_single_date_worker(args: tuple) -> Dict:
     # Pre-summary calculation
     pre_summary = {}
     if config.include_pre_summary and config.pre_summary_start_time:
-        pre_start = pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {config.pre_summary_start_time}")
+        pre_start = pd.Timestamp(f"{date_str_fmt} {config.pre_summary_start_time}").tz_localize(tz)
         pre_data = df_raw.between_time(pre_start.time(), vpin_start.time(), inclusive='left')
         if not pre_data.empty:
             total_vol = pre_data['TotalVolume'].sum()
@@ -390,8 +396,8 @@ class MultiFeatureExtraction(ScidBaseExtractor):
 
     def _build_time_range(self, dt: pd.Timestamp, start_time: str, end_time: str) -> tuple:
         """Build datetime range from date and time strings."""
-        start_dt = pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {start_time}")
-        end_dt = pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {end_time}")
+        start_dt = pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {start_time}").tz_localize(self.config.tz)
+        end_dt = pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {end_time}").tz_localize(self.config.tz)
         return start_dt, end_dt
 
     def _get_combined_window(self, dt: pd.Timestamp) -> tuple:
@@ -424,7 +430,9 @@ class MultiFeatureExtraction(ScidBaseExtractor):
 
         # Pre-summary window
         if self.config.include_pre_summary and self.config.pre_summary_start_time:
-            pre_start = pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {self.config.pre_summary_start_time}")
+            pre_start = pd.Timestamp(
+                f"{dt.strftime('%Y-%m-%d')} {self.config.pre_summary_start_time}"
+            ).tz_localize(self.config.tz)
             starts.append(pre_start)
 
         return min(starts), max(ends)
@@ -583,6 +591,10 @@ class MultiFeatureExtraction(ScidBaseExtractor):
         if df_raw.empty:
             return results
 
+        if df_raw.index.tz is None:
+            df_raw.index = df_raw.index.tz_localize('UTC')
+        df_raw.index = df_raw.index.tz_convert(self.config.tz)
+
         # Build time ranges
         vpin_start, vpin_end = self._build_time_range(
             dt, self.config.vpin_start_time, self.config.vpin_end_time
@@ -679,7 +691,9 @@ class MultiFeatureExtraction(ScidBaseExtractor):
         # Pre-summary calculation
         pre_summary = {}
         if self.config.include_pre_summary and self.config.pre_summary_start_time:
-            pre_start = pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {self.config.pre_summary_start_time}")
+            pre_start = pd.Timestamp(
+                f"{dt.strftime('%Y-%m-%d')} {self.config.pre_summary_start_time}"
+            ).tz_localize(self.config.tz)
             pre_summary = self._calculate_pre_summary(df_raw, pre_start, vpin_start)
 
         if not vpin_data.empty:
