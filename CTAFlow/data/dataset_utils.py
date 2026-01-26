@@ -80,9 +80,19 @@ def collate_windowed_rasterized(batch):
       profile_days : (B, D, C_prof, B_prof)
       raster_days  : (B, D, T_nb, C_nb, B_nb)
       targets      : (B,)
+      raw_returns  : (B,) - optional, if add_raw_returns=True
+      dates        : tuple of lists - optional, if return_dates=True
+
+    Handles variable outputs:
+      - 6 items: base (no raw_returns, no dates)
+      - 7 items: with raw_returns OR with dates (disambiguate by type)
+      - 8 items: with raw_returns AND dates
     """
-    if len(batch[0]) == 7:
-        summaries, seqs, profiles, rasters, targets, seq_lens, dates = zip(*batch)
+    n_items = len(batch[0])
+
+    if n_items == 8:
+        # All outputs: raw_returns AND dates
+        summaries, seqs, profiles, rasters, targets, seq_lens, raw_rets, dates = zip(*batch)
         return (
             torch.stack(summaries, dim=0),
             torch.stack(seqs, dim=0),
@@ -90,9 +100,39 @@ def collate_windowed_rasterized(batch):
             torch.stack(profiles, dim=0),
             torch.stack(rasters, dim=0),
             torch.stack(targets, dim=0),
+            torch.stack(raw_rets, dim=0),
             dates,
         )
 
+    if n_items == 7:
+        # Either raw_returns OR dates - disambiguate by checking if last element is a list
+        last_elements = [b[-1] for b in batch]
+        if isinstance(last_elements[0], (list, tuple)):
+            # Last element is dates (list of date objects)
+            summaries, seqs, profiles, rasters, targets, seq_lens, dates = zip(*batch)
+            return (
+                torch.stack(summaries, dim=0),
+                torch.stack(seqs, dim=0),
+                torch.stack(seq_lens, dim=0),
+                torch.stack(profiles, dim=0),
+                torch.stack(rasters, dim=0),
+                torch.stack(targets, dim=0),
+                dates,
+            )
+        else:
+            # Last element is raw_returns (tensor)
+            summaries, seqs, profiles, rasters, targets, seq_lens, raw_rets = zip(*batch)
+            return (
+                torch.stack(summaries, dim=0),
+                torch.stack(seqs, dim=0),
+                torch.stack(seq_lens, dim=0),
+                torch.stack(profiles, dim=0),
+                torch.stack(rasters, dim=0),
+                torch.stack(targets, dim=0),
+                torch.stack(raw_rets, dim=0),
+            )
+
+    # Base case: 6 items (no raw_returns, no dates)
     summaries, seqs, profiles, rasters, targets, seq_lens = zip(*batch)
     return (
         torch.stack(summaries, dim=0),
@@ -108,37 +148,45 @@ def collate_recurrent_dual(batch: List[Tuple]) -> Tuple[torch.Tensor, ...]:
     """
     Collate function for DualModalWindowDataset.
 
-    Stacks windows for:
-    - Summary
-    - Profile
-    - Raster
-    - Target
+    Handles variable outputs:
+      - 4 items: base (no raw_returns, no dates)
+      - 5 items: with raw_returns OR with dates
+      - 6 items: with raw_returns AND dates
 
     Returns:
       summary_batch : (B, Window, F_sum)
       profile_batch : (B, Window, C_prof, Bins)
       raster_batch  : (B, Window, T_bars, C_rast, Bins)
       target_batch  : (B,)
+      raw_returns   : (B,) - optional
+      dates         : tuple of lists - optional
     """
-    # Handle optional return_dates
-    if len(batch[0]) == 5:
-        summaries, profiles, rasters, targets, dates = zip(*batch)
-        return (
-            torch.stack(summaries, dim=0),
-            torch.stack(profiles, dim=0),
-            torch.stack(rasters, dim=0),
-            torch.stack(targets, dim=0),
-            dates
-        )
+    n_items = len(batch[0])
+    unzipped = list(zip(*batch))
 
-    summaries, profiles, rasters, targets = zip(*batch)
+    summaries = torch.stack(unzipped[0], dim=0)
+    profiles = torch.stack(unzipped[1], dim=0)
+    rasters = torch.stack(unzipped[2], dim=0)
+    targets = torch.stack(unzipped[3], dim=0)
 
-    return (
-        torch.stack(summaries, dim=0),
-        torch.stack(profiles, dim=0),
-        torch.stack(rasters, dim=0),
-        torch.stack(targets, dim=0)
-    )
+    if n_items == 4:
+        return summaries, profiles, rasters, targets
+
+    if n_items == 5:
+        # Disambiguate between dates (list) and raw_returns (tensor)
+        if isinstance(unzipped[4][0], (list, tuple)):
+            return summaries, profiles, rasters, targets, unzipped[4]  # Dates
+        else:
+            return summaries, profiles, rasters, targets, torch.stack(unzipped[4], dim=0)  # Raw returns
+
+    if n_items == 6:
+        # Order is fixed: raw_returns then dates
+        raw_rets = torch.stack(unzipped[4], dim=0)
+        dates = unzipped[5]
+        return summaries, profiles, rasters, targets, raw_rets, dates
+
+    # Should not be reached, but as a fallback
+    return summaries, profiles, rasters, targets
 
 def collate_quad(batch: List[Tuple]) -> Tuple[torch.Tensor, ...]:
     """
@@ -193,23 +241,24 @@ def collate_rasterized(batch: List[Tuple]) -> Tuple[torch.Tensor, ...]:
     """
     Collate function for RasterizedModal (Summary + Sequential + Profile + Rasterized VPIN).
 
-    Input batch items: (summary, sequential_seq, profile, rasterized, target, seq_length)
+    Input batch items:
+    - (summary, sequential_seq, profile, rasterized, target, seq_length)
+    - (summary, sequential_seq, profile, rasterized, target, seq_length, raw_return) - if add_raw_returns=True
 
-    Rasterized data has fixed shape (T, C, Bins) from SequenceRasterizer,
-    so no padding is needed - just stack.
+    Rasterized data has fixed shape (T, C, Bins) and does not need padding.
 
     Returns
     -------
     tuple
-        (summaries, sequential_padded, profiles, rasterized, targets, lengths)
-        - summaries: (B, F_sum)
-        - sequential_padded: (B, max_T, F_seq)
-        - profiles: (B, C_profile, Bins_profile)
-        - rasterized: (B, T_bars, C_raster, Bins_raster)
-        - targets: (B,) or (B, num_classes)
-        - lengths: (B,)
+        (summaries, sequential_padded, profiles, rasterized, targets, lengths) OR
+        (summaries, sequential_padded, profiles, rasterized, targets, lengths, raw_returns)
     """
-    summaries, sequential_seqs, profiles, rasterized_tensors, targets, lengths = zip(*batch)
+    if len(batch[0]) == 7:
+        summaries, sequential_seqs, profiles, rasterized_tensors, targets, lengths, raw_rets = zip(*batch)
+    else:
+        summaries, sequential_seqs, profiles, rasterized_tensors, targets, lengths = zip(*batch)
+        raw_rets = None
+
     summaries = torch.stack(summaries)
     profiles = torch.stack(profiles)
     rasterized = torch.stack(rasterized_tensors)
@@ -218,6 +267,10 @@ def collate_rasterized(batch: List[Tuple]) -> Tuple[torch.Tensor, ...]:
     sequential_padded = rnn_utils.pad_sequence(
         sequential_seqs, batch_first=True, padding_value=0.0
     )
+
+    if raw_rets is not None:
+        return summaries, sequential_padded, profiles, rasterized, targets, lengths, torch.stack(raw_rets)
+
     return summaries, sequential_padded, profiles, rasterized, targets, lengths
 
 
