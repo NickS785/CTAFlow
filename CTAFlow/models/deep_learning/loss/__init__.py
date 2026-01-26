@@ -1,50 +1,87 @@
 """
 Custom Loss Functions for Deep Learning Models.
 
-This module provides specialized loss functions for:
-1. Classification with ordinal awareness and anti-collapse regularization
-2. Regression with directional penalties for trading applications
+This module provides specialized loss functions for trading applications:
 
-Classification Losses
----------------------
+Classification Losses (Ordinal & Trading-Inspired)
+---------------------------------------------------
+Base Ordinal:
 - DistanceWeightedCE: CE with penalty scaled by class distance
 - OrdinalCEWithAntiCollapse: Ordinal CE + anti-collapse regularization
 
-Regression Losses (with directional penalties)
+Trading-Inspired Classification:
+- TradingCostAwareCE: Incorporates transaction/opportunity costs
+- ProfitWeightedCE: Weights samples by potential P&L
+- ConfidencePenalizedCE: Penalizes overconfident wrong predictions
+- FocalDirectionalLoss: Focal loss with direction awareness
+- ExpectedPnLLoss: Directly optimizes expected profit
+- MarginOrdinalLoss: Requires margin between class logits
+- AsymmetricDirectionalCE: Different costs for bullish/bearish mistakes
+- SharpeInspiredCE: Variance penalty + direction awareness
+- HierarchicalDirectionalLoss: Two-stage (direction then full class)
+
+Regression Losses (with Directional Penalties)
 ----------------------------------------------
+Base Directional:
 - DirectionalMSE: MSE + wrong sign penalty
 - DirectionalMAE: MAE + wrong sign penalty
 - DirectionalHuber: Huber + wrong sign penalty
+
+Asymmetric & Quantile:
 - AsymmetricMSE: Different weights for over/under prediction
 - QuantileDirectional: Quantile loss + wrong sign penalty
+
+Sign-Focused:
 - SignAccuracyLoss: Directly optimizes sign prediction
 - SignAwareLoss: Composite loss balancing magnitude + sign
-- SharpePenaltyLoss: Sharpe-inspired loss with variance penalty
+
+Trading-Inspired Regression:
+- SharpePenaltyLoss: Sharpe-inspired with variance penalty
 - TradingPnLLoss: Direct PnL optimization
-- WeightedDirectionalMSE: Sample-weighted MSE with direction penalty
-- CombinedRegressionLoss: Flexible multi-component loss
+- WeightedDirectionalMSE: Sample-weighted with direction penalty
+
+Flexible:
+- CombinedRegressionLoss: Multi-component configurable loss
 
 Usage Examples
 --------------
->>> from CTAFlow.models.deep_learning.loss import DirectionalMSE, SignAwareLoss
+>>> from CTAFlow.models.deep_learning.loss import (
+...     DirectionalMSE,
+...     SignAwareLoss,
+...     TradingCostAwareCE,
+...     ExpectedPnLLoss,
+... )
 
->>> # Simple directional MSE
->>> criterion = DirectionalMSE(direction_penalty=1.0)
->>> loss = criterion(predictions, targets)
+>>> # Regression: penalize wrong direction
+>>> reg_criterion = DirectionalMSE(direction_penalty=2.0)
+>>> loss = reg_criterion(pred, target)
 
->>> # Composite loss prioritizing sign accuracy
->>> criterion = SignAwareLoss(mse_weight=0.3, sign_weight=0.7)
->>> loss = criterion(predictions, targets)
+>>> # Classification: trading cost aware
+>>> clf_criterion = TradingCostAwareCE(direction_cost=3.0)
+>>> loss = clf_criterion(logits, labels)
 
->>> # Classification with ordinal awareness
->>> criterion = OrdinalCEWithAntiCollapse(alpha=1.0, reg_lambda=0.05)
->>> loss = criterion(logits, labels)
+>>> # Classification: optimize expected P&L directly
+>>> pnl_criterion = ExpectedPnLLoss(ce_weight=0.1)
+>>> loss = pnl_criterion(logits, labels, returns=actual_returns)
 """
 
-# Classification losses
+# Classification losses - Base
 from .clf import (
     DistanceWeightedCE,
     OrdinalCEWithAntiCollapse,
+)
+
+# Classification losses - Trading-Inspired
+from .clf import (
+    TradingCostAwareCE,
+    ProfitWeightedCE,
+    ConfidencePenalizedCE,
+    FocalDirectionalLoss,
+    ExpectedPnLLoss,
+    MarginOrdinalLoss,
+    AsymmetricDirectionalCE,
+    SharpeInspiredCE,
+    HierarchicalDirectionalLoss,
 )
 
 # Regression losses with directional penalties
@@ -63,9 +100,19 @@ from .regression import (
 )
 
 __all__ = [
-    # Classification
+    # Classification - Base
     'DistanceWeightedCE',
     'OrdinalCEWithAntiCollapse',
+    # Classification - Trading
+    'TradingCostAwareCE',
+    'ProfitWeightedCE',
+    'ConfidencePenalizedCE',
+    'FocalDirectionalLoss',
+    'ExpectedPnLLoss',
+    'MarginOrdinalLoss',
+    'AsymmetricDirectionalCE',
+    'SharpeInspiredCE',
+    'HierarchicalDirectionalLoss',
     # Regression
     'DirectionalMSE',
     'DirectionalMAE',
