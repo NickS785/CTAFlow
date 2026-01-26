@@ -928,7 +928,13 @@ class RasterizedModalDataset(Dataset):
         - dict mapping date strings to arrays of shape (T, C, Bins)
         - str path to .npz file created by SequenceRasterizer.parquet_to_npz()
     target_data : Optional[Union[pd.DataFrame, pd.Series, np.ndarray]]
-        Target values
+        Target values (may be classification labels if binned)
+    raw_returns : Optional[Union[pd.Series, np.ndarray]]
+        Raw continuous returns before any classification binning.
+        Used with profit-weighted losses like ExpectedPnLLoss.
+    add_raw_returns : bool
+        If True, __getitem__ returns raw_returns as additional output.
+        Default False for backward compatibility.
     max_len : int
         Maximum sequence length for sequential data
     sequential_cols : Optional[List[str]]
@@ -949,12 +955,16 @@ class RasterizedModalDataset(Dataset):
         spatial_dates: np.ndarray,
         rasterized_data: Union[Dict, str],
         target_data: Optional[Union[pd.DataFrame, pd.Series, np.ndarray]] = None,
+        raw_returns: Optional[Union[pd.Series, np.ndarray]] = None,
+        add_raw_returns: bool = False,
         max_len: int = 200,
         sequential_cols: Optional[List[str]] = None,
         target_col: Optional[str] = None,
         date_col: str = 'Datetime',
         sequential_date_col: str = 'date'
     ):
+        self.add_raw_returns = add_raw_returns
+        self._raw_returns_input = raw_returns  # Store for alignment later
         # ==========================================
         # 1. Process Summary Features
         # ==========================================
@@ -1016,6 +1026,26 @@ class RasterizedModalDataset(Dataset):
             self.targets = self.df_summary[target_col].values.astype(np.float32)
         else:
             self.targets = np.zeros(len(self.df_summary), dtype=np.float32)
+
+        # ==========================================
+        # 2b. Process Raw Returns (for profit-weighted losses)
+        # ==========================================
+        if self._raw_returns_input is not None:
+            if isinstance(self._raw_returns_input, pd.Series):
+                if isinstance(self._raw_returns_input.index, pd.DatetimeIndex):
+                    temp_map = self._raw_returns_input.copy()
+                    temp_map.index = temp_map.index.date
+                    self.raw_returns = np.array(
+                        [temp_map.get(d, np.nan) for d in self.df_summary['date']],
+                        dtype=np.float32
+                    )
+                else:
+                    self.raw_returns = self._raw_returns_input.values.astype(np.float32)
+            else:
+                self.raw_returns = np.asarray(self._raw_returns_input, dtype=np.float32)
+        else:
+            # If no raw_returns provided, use targets as fallback (for regression tasks)
+            self.raw_returns = None
 
         # ==========================================
         # 3. Process Sequential Data (VPIN)
@@ -1114,6 +1144,8 @@ class RasterizedModalDataset(Dataset):
 
         # Also filter by valid targets
         self.df_summary['__target__'] = self.targets
+        if self.raw_returns is not None:
+            self.df_summary['__raw_returns__'] = self.raw_returns
         valid_target_dates = set(self.df_summary.dropna(subset=['__target__'])['date'])
         common_dates = common_dates & valid_target_dates
 
@@ -1127,7 +1159,11 @@ class RasterizedModalDataset(Dataset):
         self.df_summary = self.df_summary[mask].sort_values('date').reset_index(drop=True)
         self.features = self.df_summary[self.feature_cols].values.astype(np.float32)
         self.targets = self.df_summary['__target__'].values.astype(np.float32)
-        self.df_summary = self.df_summary.drop(columns=['__target__'])
+        if '__raw_returns__' in self.df_summary.columns:
+            self.raw_returns = self.df_summary['__raw_returns__'].values.astype(np.float32)
+            self.df_summary = self.df_summary.drop(columns=['__target__', '__raw_returns__'])
+        else:
+            self.df_summary = self.df_summary.drop(columns=['__target__'])
 
         # Filter other modalities
         self.sequential_by_date = {d: self.sequential_by_date[d] for d in common_dates}
@@ -1175,6 +1211,15 @@ class RasterizedModalDataset(Dataset):
 
         # Target
         target = torch.tensor(self.targets[idx])
+
+        # Optionally return raw returns for profit-weighted losses
+        if self.add_raw_returns:
+            if self.raw_returns is not None:
+                raw_ret = torch.tensor(self.raw_returns[idx])
+            else:
+                # Fallback to target if no raw_returns provided
+                raw_ret = target.clone()
+            return summary_vec, seq_tensor, spatial_tensor, raster_tensor, target, seq_len, raw_ret
 
         return summary_vec, seq_tensor, spatial_tensor, raster_tensor, target, seq_len
 
@@ -1256,6 +1301,16 @@ class TriModalWindowDataset(RasterizedModalDataset):
         # E) target for *last day* in window
         target = torch.tensor(self.targets[end])
 
+        # F) optional raw returns for profit-weighted losses
+        if self.add_raw_returns:
+            if self.raw_returns is not None:
+                raw_ret = torch.tensor(self.raw_returns[end])
+            else:
+                raw_ret = target.clone()
+            if self.return_dates:
+                return summary_days, seq_days, profile_days, raster_days, target, seq_lens, raw_ret, window_dates
+            return summary_days, seq_days, profile_days, raster_days, target, seq_lens, raw_ret
+
         if self.return_dates:
             return summary_days, seq_days, profile_days, raster_days, target, seq_lens, window_dates
 
@@ -1330,6 +1385,16 @@ class DualModalWindowDataset(RasterizedModalDataset):
 
         # 5. Target (for the last day in the window)
         target = torch.tensor(self.targets[end])
+
+        # 6. Optional raw returns for profit-weighted losses
+        if self.add_raw_returns:
+            if self.raw_returns is not None:
+                raw_ret = torch.tensor(self.raw_returns[end])
+            else:
+                raw_ret = target.clone()
+            if self.return_dates:
+                return summary_window, profile_window, raster_window, target, raw_ret, window_dates
+            return summary_window, profile_window, raster_window, target, raw_ret
 
         if self.return_dates:
             return summary_window, profile_window, raster_window, target, window_dates

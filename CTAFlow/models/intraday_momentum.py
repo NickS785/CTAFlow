@@ -6526,6 +6526,8 @@ class DeepIDMomentum(IntradayMomentum):
         clf_targets[(returns >= 0) & (abs_returns < upper_q)] = 1
 
         if inplace:
+            # Store raw returns before overwriting with classification targets
+            self._raw_target_data = returns.copy()
             self.target_data = clf_targets
             return None
         else:
@@ -6564,6 +6566,7 @@ class DeepIDMomentum(IntradayMomentum):
             windowed: bool = False,
             window_days: int = 10,
             return_dates: bool = False,
+            add_raw_returns: bool = False,
     ):
         """Create PyTorch DataLoaders for training dual-branch models.
 
@@ -6896,8 +6899,30 @@ class DeepIDMomentum(IntradayMomentum):
             outlier_threshold=outlier_threshold,
         )
 
+        # Get raw returns for profit-weighted losses (before any clf binning)
+        # If _raw_target_data exists (set by _make_clf_targets), use it; otherwise use target_data
+        if add_raw_returns:
+            raw_returns_source = getattr(self, '_raw_target_data', None)
+            if raw_returns_source is None:
+                # No clf binning was done, targets ARE the raw returns
+                raw_returns_source = self.target_data
+        else:
+            raw_returns_source = None
+
         if val_split:
             X_train, X_val, y_train, y_val = result
+
+            # Split raw_returns the same way as targets
+            if add_raw_returns and raw_returns_source is not None:
+                # Align raw_returns to the same index as targets
+                common_idx = y_train.index.union(y_val.index)
+                raw_returns_aligned = raw_returns_source.reindex(common_idx)
+                split_idx = len(y_train)
+                raw_returns_train = raw_returns_aligned.iloc[:split_idx]
+                raw_returns_val = raw_returns_aligned.iloc[split_idx:]
+            else:
+                raw_returns_train = None
+                raw_returns_val = None
 
             # Debug: Print dataset type
             if verbose:
@@ -6922,6 +6947,8 @@ class DeepIDMomentum(IntradayMomentum):
                     spatial_dates=final_spatial_dates,
                     rasterized_data=use_rasterized_data,
                     target_data=y_train,
+                    raw_returns=raw_returns_train,
+                    add_raw_returns=add_raw_returns,
                     max_len=max_seq_len,
                     sequential_cols=sequential_cols,
                     target_col=None,
@@ -6935,6 +6962,8 @@ class DeepIDMomentum(IntradayMomentum):
                     spatial_dates=final_spatial_dates,
                     rasterized_data=use_rasterized_data,
                     target_data=y_val,
+                    raw_returns=raw_returns_val,
+                    add_raw_returns=add_raw_returns,
                     max_len=max_seq_len,
                     sequential_cols=sequential_cols,
                     target_col=None,
@@ -7037,6 +7066,8 @@ class DeepIDMomentum(IntradayMomentum):
                     spatial_dates=final_spatial_dates,
                     rasterized_data=use_rasterized_data,
                     target_data=y_train,
+                    raw_returns=raw_returns_train,
+                    add_raw_returns=add_raw_returns,
                     max_len=max_seq_len,
                     sequential_cols=sequential_cols,
                     target_col=None,
@@ -7048,6 +7079,8 @@ class DeepIDMomentum(IntradayMomentum):
                     spatial_dates=final_spatial_dates,
                     rasterized_data=use_rasterized_data,
                     target_data=y_val,
+                    raw_returns=raw_returns_val,
+                    add_raw_returns=add_raw_returns,
                     max_len=max_seq_len,
                     sequential_cols=sequential_cols,
                     target_col=None,
@@ -7146,6 +7179,12 @@ class DeepIDMomentum(IntradayMomentum):
         else:
             X, y = result
 
+            # Get raw_returns for non-split case
+            if add_raw_returns and raw_returns_source is not None:
+                raw_returns_all = raw_returns_source.reindex(y.index)
+            else:
+                raw_returns_all = None
+
             # Create dataset
             if windowed and use_rasterized and final_spatial_data is not None:
                 # Windowed dataset for recurrent models (TriModalLSTM)
@@ -7161,6 +7200,8 @@ class DeepIDMomentum(IntradayMomentum):
                     spatial_dates=final_spatial_dates,
                     rasterized_data=use_rasterized_data,
                     target_data=y,
+                    raw_returns=raw_returns_all,
+                    add_raw_returns=add_raw_returns,
                     max_len=max_seq_len,
                     sequential_cols=sequential_cols,
                     target_col=None,
@@ -7241,6 +7282,8 @@ class DeepIDMomentum(IntradayMomentum):
                     spatial_dates=final_spatial_dates,
                     rasterized_data=use_rasterized_data,
                     target_data=y,
+                    raw_returns=raw_returns_all,
+                    add_raw_returns=add_raw_returns,
                     max_len=max_seq_len,
                     sequential_cols=sequential_cols,
                     target_col=None,
