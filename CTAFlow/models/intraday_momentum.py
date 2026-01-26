@@ -22,6 +22,8 @@ class MultiModalDim:
         Number of summary features (columns in summary DataFrame)
     seq_dim : int
         Number of sequential features (numeric columns in sequential data)
+    seq_cols : List[str]
+        List of sequential feature column names (only numeric, training-relevant)
     profile_channels : int
         Number of channels in profile data (e.g., 3 for bid/ask/total)
     profile_bins : int
@@ -50,9 +52,13 @@ class MultiModalDim:
     ...     f_profile=dims.profile_channels,
     ...     f_raster=dims.raster_channels,
     ... )
+
+    >>> # Get seq_cols for RL environment or custom dataset
+    >>> print(f"Sequential columns: {dims.seq_cols}")
     """
     summary_dim: int = 0
     seq_dim: int = 0
+    seq_cols: List[str] = None
     profile_channels: int = 0
     profile_bins: int = 0
     raster_bars: int = 0
@@ -60,9 +66,18 @@ class MultiModalDim:
     raster_bins: int = 0
     feature_names: List[str] = None
 
+    # Columns to exclude from sequential features (non-training data)
+    _EXCLUDED_SEQ_COLS = frozenset({
+        'date', 'datetime', 'time', 'timestamp', 'index',
+        'bucket_id', 'bucket_idx', 'bucket_num', 'bar_id', 'bar_idx',
+        'session_id', 'trade_date', 'session_date',
+    })
+
     def __post_init__(self):
         if self.feature_names is None:
             self.feature_names = []
+        if self.seq_cols is None:
+            self.seq_cols = []
 
     @property
     def profile_shape(self) -> Tuple[int, int]:
@@ -73,6 +88,31 @@ class MultiModalDim:
     def raster_shape(self) -> Tuple[int, int, int]:
         """Return raster shape as (bars, channels, bins) tuple."""
         return (self.raster_bars, self.raster_channels, self.raster_bins)
+
+    def with_seq_cols(self, seq_cols: List[str]) -> 'MultiModalDim':
+        """Return a copy with filtered sequential columns.
+
+        Parameters
+        ----------
+        seq_cols : List[str]
+            Specific columns to use for sequential features
+
+        Returns
+        -------
+        MultiModalDim
+            New instance with updated seq_dim and seq_cols
+        """
+        return MultiModalDim(
+            summary_dim=self.summary_dim,
+            seq_dim=len(seq_cols),
+            seq_cols=list(seq_cols),
+            profile_channels=self.profile_channels,
+            profile_bins=self.profile_bins,
+            raster_bars=self.raster_bars,
+            raster_channels=self.raster_channels,
+            raster_bins=self.raster_bins,
+            feature_names=self.feature_names,
+        )
 
     def __repr__(self) -> str:
         return (
@@ -7287,11 +7327,18 @@ class DeepIDMomentum(IntradayMomentum):
         summary_dim = len(summary.columns) if summary is not None else 0
         feature_names = list(summary.columns) if summary is not None else []
 
-        # Sequential dimension
+        # Sequential dimension - filter to numeric AND exclude non-training columns
         seq_dim = 0
+        seq_cols = []
         if self.sequential_data is not None:
-            numeric_cols = self.sequential_data.select_dtypes(include=[np.number]).columns
-            seq_dim = len(numeric_cols)
+            numeric_cols = self.sequential_data.select_dtypes(include=[np.number]).columns.tolist()
+            # Filter out index/identifier columns that shouldn't be used in training
+            seq_cols = [
+                c for c in numeric_cols
+                if c.lower() not in MultiModalDim._EXCLUDED_SEQ_COLS
+                and not c.lower().startswith(('unnamed', '_'))
+            ]
+            seq_dim = len(seq_cols)
 
         # Profile shape
         profile_channels, profile_bins = 0, 0
@@ -7310,6 +7357,7 @@ class DeepIDMomentum(IntradayMomentum):
         return MultiModalDim(
             summary_dim=summary_dim,
             seq_dim=seq_dim,
+            seq_cols=seq_cols,
             profile_channels=profile_channels,
             profile_bins=profile_bins,
             raster_bars=raster_bars,
