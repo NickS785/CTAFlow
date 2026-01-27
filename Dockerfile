@@ -26,22 +26,19 @@ RUN wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && \
 RUN git clone https://github.com/NickS785/SierraPy.git /app/SierraPy && \
     pip install --no-cache-dir -e /app/SierraPy
 
-# Clone CTAFlow repository
-RUN git clone https://github.com/NickS785/CTAFlow.git /app/CTAFlow
+# Copy CTAFlow project into the container
+COPY . .
 
 # Install CTAFlow requirements and package
-RUN pip install --no-cache-dir -r /app/CTAFlow/requirements.txt && \
+RUN pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir TA-Lib && \
-    pip install --no-cache-dir -e /app/CTAFlow
+    pip install --no-cache-dir -e .
 
 # Environment variables for GCS bucket paths
 # Data bucket: gs://fin_data_eod2/{ticker.lower()}
 # Environment bucket: gs://ctaflow-env/
 ENV DATA_GCS_BUCKET="gs://fin_data_eod2"
 ENV ENV_GCS_BUCKET="gs://ctaflow-env"
-
-# Set working directory to CTAFlow
-WORKDIR /app/CTAFlow
 
 # The training script will be the entrypoint.
 # The arguments to the script will be passed by Vertex AI at runtime.
