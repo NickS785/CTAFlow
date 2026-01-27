@@ -27,6 +27,11 @@ Concise guide for working on CTAFlow, a CTA positioning and orderflow analysis t
     - Basic encoders: `ProfileEncoder`, `NumberBarsEncoder`, `SeqEncoder`, `SummaryEncoder` for feature extraction
     - Advanced spatial encoders: `RasterResNet` (pseudo-3D ResNet for rasterized VPIN with spatio-temporal convolutions), `MarketProfileResNet` (1D ResNet + SE attention for volume profiles)
     - Fusion modules: `SpatialFuse` (combines profile + raster/NumberBars with optional gating), `GatedFusion` (learnable multi-modal weighting)
+  - `multi_asset.py`: `MultiAssetMomentum` for multi-ticker training with automatic schema alignment. Expects directory structure `<root>/<TICKER>/` with `features.csv`, `profiles.npz`, `vpin.parquet`, `rasterized.npz`, `target.csv`. Three summary alignment strategies:
+    - `"exact"`: Strict column intersection (fast, may be small)
+    - `"signature"`: Match features by (window, remainder) signatures across different anchors (e.g., `0930_60min_vol` matches `1000_60min_vol`)
+    - `"recompute"`: Ignore features.csv, recompute universal session return/volatility features
+    - Supports parallel loading (`parallel_load=True`, `max_workers=4`) and dataset caching (`save_cache=True`, `cache_path=...`)
 - **Forecasting (`CTAFlow/forecaster/forecast.py`)**: family of CTA models with selective indicator calculation and weekly resampling.
 - **Strategy (`CTAFlow/strategy/`)**: `screener_pipeline.py` normalises screener payloads into gate columns; keep `_items_from_patterns` compatible with nested mappings and `PatternExtractor.concat_many` outputs. `HorizonMapper.build_xy` expects timezone-aware `ts`, `open`, `close`, `session_id` columns.
 - **Screeners (`CTAFlow/screeners/`)**:
@@ -48,6 +53,7 @@ Concise guide for working on CTAFlow, a CTA positioning and orderflow analysis t
 ### Models (`CTAFlow/models/`)
 - `base_models.py`: Core ML wrappers - `CTALight`, `CTAXGBoost`, `CTARForest`, `CTALinear`. Common interface with `fit/predict/evaluate`.
 - `intraday_momentum.py`: `IntradayMomentum` class for intraday feature engineering + model training.
+- `multi_asset.py`: `MultiAssetMomentum` for training across multiple tickers with schema alignment. Key classes: `GenericFiles` (filename specs), `SummarySelectionConfig` (alignment strategy). Uses parallel file loading (`ThreadPoolExecutor`) and supports dataset caching to avoid recomputation.
 - `volatility.py`: `RVForecast` class extending `CTALinear` for realized volatility forecasting.
 - `feature_selection.py`: `FeatureSelector` and `FeatureXplainer` for SHAP-based feature importance and selection.
 - `pattern_forecast.py`: `PatternMLBuilder` for building ML models from pattern data.

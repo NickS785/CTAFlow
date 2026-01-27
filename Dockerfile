@@ -7,32 +7,27 @@ WORKDIR /app
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget \
     build-essential \
     git \
     && rm -rf /var/lib/apt/lists/*
-
-# Install TA-Lib
-RUN wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && \
-    tar -xzf ta-lib-0.4.0-src.tar.gz && \
-    cd ta-lib/ && \
-    ./configure --prefix=/usr && \
-    make && \
-    make install && \
-    cd .. && \
-    rm -rf ta-lib-0.4.0-src.tar.gz ta-lib
 
 # Clone and install SierraPy (dependency for CTAFlow)
 RUN git clone https://github.com/NickS785/SierraPy.git /app/SierraPy && \
     pip install --no-cache-dir -e /app/SierraPy
 
-# Copy CTAFlow project into the container
+# Copy requirements and pyproject.toml first for better layer caching
+COPY requirements.txt pyproject.toml ./
+COPY CTAFlow/__init__.py CTAFlow/__init__.py
+
+# Install CTAFlow requirements
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the rest of the CTAFlow project
+# .dockerignore will filter out unnecessary files
 COPY . .
 
-# Install CTAFlow requirements and package
-RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir TA-Lib && \
-    pip install --no-cache-dir -e .
+# Install CTAFlow package
+RUN pip install --no-cache-dir -e .
 
 # Environment variables for GCS bucket paths
 # Data bucket: gs://fin_data_eod2/{ticker.lower()}

@@ -71,8 +71,18 @@ def main(args):
     local_data_dir.mkdir(exist_ok=True, parents=True)
 
     # Download data from GCS
+    # Parse bucket and path: gs://bucket-name/optional/path
     bucket_name = args.data_gcs_path.split('/')[2]
-    source_directory = '/'.join(args.data_gcs_path.split('/')[3:]) + f"/{args.ticker}"
+
+    # Get any prefix after bucket name (e.g., "data" in gs://bucket/data)
+    path_parts = args.data_gcs_path.split('/')[3:]
+    prefix = '/'.join(path_parts) if path_parts and path_parts[0] else ""
+
+    # Construct source directory: prefix/{ticker.lower()} or just {ticker.lower()}
+    ticker_lower = args.ticker.lower()
+    source_directory = f"{prefix}/{ticker_lower}" if prefix else ticker_lower
+
+    logging.info(f"Downloading from gs://{bucket_name}/{source_directory}")
     download_gcs_directory(bucket_name, source_directory, str(local_data_dir))
     
     # Define local file paths from the downloaded data
