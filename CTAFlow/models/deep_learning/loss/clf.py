@@ -106,7 +106,7 @@ class OrdinalCEWithAntiCollapse(nn.Module):
 # =============================================================================
 
 
-class TradingCostAwareCE(nn.Module):
+class CostAwareCE(nn.Module):
     """
     Cross-entropy that incorporates trading/transaction costs.
 
@@ -130,7 +130,7 @@ class TradingCostAwareCE(nn.Module):
 
     Examples
     --------
-    >>> criterion = TradingCostAwareCE(transaction_cost=0.001, direction_cost=3.0)
+    >>> criterion = CostAwareCE(transaction_cost=0.001, direction_cost=3.0)
     >>> loss = criterion(logits, labels)
     """
 
@@ -777,7 +777,7 @@ __all__ = [
     'DistanceWeightedCE',
     'OrdinalCEWithAntiCollapse',
     # Trading-inspired losses
-    'TradingCostAwareCE',
+    'CostAwareCE',
     'ProfitWeightedCE',
     'ConfidencePenalizedCE',
     'FocalDirectionalLoss',

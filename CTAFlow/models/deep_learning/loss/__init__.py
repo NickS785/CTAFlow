@@ -48,7 +48,7 @@ Usage Examples
 >>> from CTAFlow.models.deep_learning.loss import (
 ...     DirectionalMSE,
 ...     SignAwareLoss,
-...     TradingCostAwareCE,
+...     CostAwareCE,
 ...     ExpectedPnLLoss,
 ... )
 
@@ -57,7 +57,7 @@ Usage Examples
 >>> loss = reg_criterion(pred, target)
 
 >>> # Classification: trading cost aware
->>> clf_criterion = TradingCostAwareCE(direction_cost=3.0)
+>>> clf_criterion = CostAwareCE(direction_cost=3.0)
 >>> loss = clf_criterion(logits, labels)
 
 >>> # Classification: optimize expected P&L directly
@@ -73,7 +73,7 @@ from .clf import (
 
 # Classification losses - Trading-Inspired
 from .clf import (
-    TradingCostAwareCE,
+    CostAwareCE,
     ProfitWeightedCE,
     ConfidencePenalizedCE,
     FocalDirectionalLoss,
@@ -104,7 +104,7 @@ __all__ = [
     'DistanceWeightedCE',
     'OrdinalCEWithAntiCollapse',
     # Classification - Trading
-    'TradingCostAwareCE',
+    'CostAwareCE',
     'ProfitWeightedCE',
     'ConfidencePenalizedCE',
     'FocalDirectionalLoss',
