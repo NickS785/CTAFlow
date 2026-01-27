@@ -12,6 +12,12 @@ from google.cloud import storage
 
 from CTAFlow.models.intraday_momentum import DeepIDMomentum
 from CTAFlow.models.deep_learning.multi_branch.dual_model import RecurrentWSPR
+from CTAFlow.models.deep_learning.loss import (
+    ExpectedPnLLoss,
+    OrdinalCEWithAntiCollapse,
+    HierarchicalDirectionalLoss,
+    CostAwareCE,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -38,6 +44,21 @@ def upload_to_gcs(bucket_name, source_file_name, destination_blob_name):
 
     blob.upload_from_filename(source_file_name)
     logging.info(f"File {source_file_name} uploaded to gs://{bucket_name}/{destination_blob_name}")
+
+
+def _get_loss_function(loss_name: str, num_classes: int = 3):
+    """Get the appropriate loss function based on name."""
+    loss_map = {
+        'CrossEntropy': nn.CrossEntropyLoss(),
+        'ExpectedPnL': ExpectedPnLLoss(ce_weight=0.1, transaction_cost=0.001),
+        'OrdinalCE': OrdinalCEWithAntiCollapse(alpha=1.0, reg_lambda=0.05),
+        'Hierarchical': HierarchicalDirectionalLoss(direction_weight=0.5, full_weight=0.5),
+        'CostAwareCE': CostAwareCE(transaction_cost=0.001, direction_cost=2.0),
+    }
+    if loss_name not in loss_map:
+        raise ValueError(f"Unknown loss function: {loss_name}. Available: {list(loss_map.keys())}")
+    logging.info(f"Using loss function: {loss_name}")
+    return loss_map[loss_name]
 
 
 def main(args):
@@ -110,7 +131,7 @@ def main(args):
     if args.task == 'regression':
         criterion = nn.MSELoss()
     else:
-        criterion = nn.CrossEntropyLoss()
+        criterion = _get_loss_function(args.loss, args.num_classes)
         
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5)
@@ -138,7 +159,13 @@ def main(args):
 
             optimizer.zero_grad()
             outputs = model(summary_days, profile_days, raster_recent, seq_recent, seq_lens_recent)
-            loss = criterion(outputs, targets)
+
+            # Handle loss functions that require raw_returns (e.g., ExpectedPnLLoss)
+            if args.loss == 'ExpectedPnL':
+                returns_batch = raw_returns.to(device).float()
+                loss = criterion(outputs, targets, returns=returns_batch)
+            else:
+                loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
             
@@ -165,7 +192,13 @@ def main(args):
                     targets = targets.to(device).long()
                 
                 outputs = model(summary_days, profile_days, raster_recent, seq_recent, seq_lens_recent)
-                loss = criterion(outputs, targets)
+
+                # Handle loss functions that require raw_returns
+                if args.loss == 'ExpectedPnL':
+                    returns_batch = raw_returns.to(device).float()
+                    loss = criterion(outputs, targets, returns=returns_batch)
+                else:
+                    loss = criterion(outputs, targets)
                 val_loss += loss.item()
 
         val_loss /= len(val_loader)
@@ -205,12 +238,15 @@ if __name__ == '__main__':
     parser.add_argument('--prof_lstm_hidden', type=int, default=128)
     parser.add_argument('--task', type=str, default='regression', choices=['regression', 'classification'])
     parser.add_argument('--num_classes', type=int, default=3)
+    parser.add_argument('--loss', type=str, default='CrossEntropy',
+                        choices=['CrossEntropy', 'ExpectedPnL', 'OrdinalCE', 'Hierarchical', 'CostAwareCE'],
+                        help='Loss function for classification tasks')
 
     # Training Hyperparameters
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--learning-rate', type=float, default=1e-4)
     parser.add_argument('--window-days', type=int, default=10)
-
+    
     args = parser.parse_args()
     main(args)
