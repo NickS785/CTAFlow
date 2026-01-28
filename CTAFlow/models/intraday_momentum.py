@@ -7238,7 +7238,37 @@ class DeepIDMomentum(IntradayMomentum):
                 raw_returns_all = None
 
             # Create dataset
-            if windowed and use_rasterized and final_spatial_data is not None:
+            if use_wspr and use_rasterized and final_spatial_data is not None:
+                # WSPR dataset for MultiAssetWSPR / RecurrentWSPR models (no val_split case)
+                from ..data.model_datasets import WSPRWindowDataset, wspr_collate_fn
+
+                if use_rasterized_data is None:
+                    raise ValueError("use_wspr=True requires rasterized_data to be available.")
+                if verbose:
+                    print(f"  Creating WSPRWindowDataset (window_days={window_days}, ticker_id={ticker_id})")
+
+                dataset = WSPRWindowDataset(
+                    summary_data=X,
+                    sequential_data=self.sequential_data,
+                    spatial_data=final_spatial_data,
+                    spatial_dates=final_spatial_dates,
+                    rasterized_data=use_rasterized_data,
+                    target_data=y,
+                    max_len=max_seq_len,
+                    sequential_cols=sequential_cols,
+                    target_col=None,
+                    window_days=window_days,
+                    return_dates=return_dates,
+                    ticker_id=ticker_id,
+                    asset_class_id=asset_class_id,
+                    asset_subclass_id=asset_subclass_id,
+                )
+                collate_fn = wspr_collate_fn
+
+                if verbose:
+                    print(f"  Dataset: {len(dataset)} windows")
+
+            elif windowed and use_rasterized and final_spatial_data is not None:
                 # Windowed dataset for recurrent models (TriModalLSTM)
                 if use_rasterized_data is None:
                     raise ValueError("windowed=True requires rasterized_data to be available.")
