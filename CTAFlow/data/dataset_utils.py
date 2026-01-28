@@ -9,11 +9,14 @@ This module provides collate functions for DataLoader that handle:
 
 All collate functions handle variable-length sequences with proper padding.
 """
+import math
+from datetime import date, datetime
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.utils.rnn as rnn_utils
-from typing import List, Tuple, Any
+from typing import List, Tuple, Any, Optional, Dict
 
 
 def collate_dual(batch: List[Tuple]) -> Tuple[torch.Tensor, ...]:
@@ -379,3 +382,164 @@ __all__ = [
     'collate_rasterized_vpin',
     'get_collate_fn',
 ]
+
+
+def _is_date_like(x: Any) -> bool:
+    return isinstance(x, (date, datetime, np.datetime64)) or hasattr(x, "to_pydatetime")
+
+
+def _to_pydate(x: Any) -> date:
+    if isinstance(x, datetime):
+        return x.date()
+    if isinstance(x, date):
+        return x
+    if hasattr(x, "to_pydatetime"):
+        return x.to_pydatetime().date()
+    if isinstance(x, np.datetime64):
+        s = np.datetime_as_string(x, unit="D")  # 'YYYY-MM-DD'
+        y, m, d = map(int, s.split("-"))
+        return date(y, m, d)
+    raise TypeError(f"Unsupported date type: {type(x)}")
+
+
+def _parse_extras(extras: Tuple[Any, ...]) -> Tuple[Optional[torch.Tensor], Optional[List[Any]], Optional[torch.Tensor], Optional[Dict]]:
+    """Parse optional extras from a sample.
+    Returns: raw_ret, window_dates, meta_ids_tensor, meta_dict
+    """
+    raw_ret = None
+    window_dates = None
+    meta_ids = None
+    meta_dict = None
+
+    for e in extras:
+        if isinstance(e, (list, tuple)) and len(e) > 0 and _is_date_like(e[0]):
+            window_dates = list(e)
+            continue
+        if isinstance(e, dict):
+            meta_dict = e
+            continue
+        if torch.is_tensor(e):
+            # raw returns tends to be float scalar
+            if e.dtype.is_floating_point and (e.ndim == 0 or e.numel() == 1):
+                raw_ret = e.reshape(())
+                continue
+            # meta ids tends to be long vector (K,)
+            if e.dtype in (torch.int64, torch.long) and e.ndim == 1 and 1 <= e.numel() <= 8:
+                meta_ids = e
+                continue
+
+    return raw_ret, window_dates, meta_ids, meta_dict
+
+
+def _time_tensors(dates_batch: List[List[Any]], device) -> Dict[str, torch.Tensor]:
+    B = len(dates_batch)
+    W = len(dates_batch[0])
+
+    month = torch.zeros((B, W), dtype=torch.long, device=device)
+    dow = torch.zeros((B, W), dtype=torch.long, device=device)
+    doy = torch.zeros((B, W), dtype=torch.long, device=device)
+
+    for i in range(B):
+        for j in range(W):
+            d = _to_pydate(dates_batch[i][j])
+            month[i, j] = d.month  # 1..12
+            dow[i, j] = d.weekday()  # 0..6
+            doy[i, j] = d.timetuple().tm_yday  # 1..366
+
+    angle = 2.0 * math.pi * (doy.float() / 365.25)
+    doy_sin = torch.sin(angle)
+    doy_cos = torch.cos(angle)
+
+    return {"month": month, "dow": dow, "doy_sin": doy_sin, "doy_cos": doy_cos}
+
+
+def collate_windowed_wspr_with_meta(batch):
+    """Collate for training RecurrentWSPR-like models from TriModalWindowDataset outputs.
+
+    Consumes per-sample tuples like:
+      (summary_days, seq_days, profile_days, raster_days, target, seq_lens, [raw_ret], [window_dates], [meta_ids or meta_dict])
+
+    Produces (core):
+      summary_days     : (B, W, F_sum)
+      profile_days     : (B, W, C_prof, B_prof)
+      raster_recent    : (B, T_nb, C_nb, B_nb)   # last day
+      seq_recent       : (B, T_seq, F_seq)       # last day
+      seq_lens_recent  : (B,)                    # last day
+      meta             : dict with ticker/class/subclass + time tensors (if dates present)
+      targets          : (B,)
+
+    Plus optional:
+      raw_returns      : (B,) if present for all samples
+      dates_batch      : tuple(list[date]) if present for all samples
+    """
+
+    summaries, seqs, profiles, rasters, targets, seq_lens = zip(*[b[:6] for b in batch])
+
+    summary_days = torch.stack(summaries, dim=0)
+    seq_days = torch.stack(seqs, dim=0)
+    profile_days = torch.stack(profiles, dim=0)
+    raster_days = torch.stack(rasters, dim=0)
+    targets = torch.stack(targets, dim=0)
+    seq_lens = torch.stack(seq_lens, dim=0)
+
+    raster_recent = raster_days[:, -1]
+    seq_recent = seq_days[:, -1]
+    seq_lens_recent = seq_lens[:, -1]
+
+    # parse extras
+    raw_list, dates_list, meta_ids_list, meta_dict_list = [], [], [], []
+    for b in batch:
+        raw, dates, meta_ids, meta_dict = _parse_extras(tuple(b[6:]))
+        raw_list.append(raw)
+        dates_list.append(dates)
+        meta_ids_list.append(meta_ids)
+        meta_dict_list.append(meta_dict)
+
+    has_raw = all(x is not None for x in raw_list)
+    has_dates = all(x is not None for x in dates_list)
+
+    # --- build meta dict ---
+    device = summary_days.device
+    meta: Dict[str, torch.Tensor] = {}
+
+    # priority: meta_dict if provided (already keyed), else meta_ids vector [ticker, class, subclass]
+    if any(md is not None for md in meta_dict_list):
+        # stack per key
+        md0 = next(md for md in meta_dict_list if md is not None)
+        for k in md0.keys():
+            vals = []
+            for md in meta_dict_list:
+                if md is None:
+                    raise ValueError("Some samples missing meta_dict while others have it. Make it consistent.")
+                v = md[k]
+                if not torch.is_tensor(v):
+                    v = torch.tensor(v, dtype=torch.long)
+                vals.append(v)
+            meta[k] = torch.stack(vals, dim=0).to(device=device)
+    else:
+        # meta_ids
+        if all(mi is not None for mi in meta_ids_list):
+            mt = torch.stack([mi for mi in meta_ids_list], dim=0).to(device=device).long()
+            if mt.size(1) >= 1: meta["ticker_id"] = mt[:, 0]
+            if mt.size(1) >= 2: meta["asset_class_id"] = mt[:, 1]
+            if mt.size(1) >= 3: meta["asset_subclass_id"] = mt[:, 2]
+        else:
+            B = summary_days.size(0)
+            meta["ticker_id"] = torch.zeros((B,), dtype=torch.long, device=device)
+            meta["asset_class_id"] = torch.zeros((B,), dtype=torch.long, device=device)
+            meta["asset_subclass_id"] = torch.zeros((B,), dtype=torch.long, device=device)
+
+    if has_dates:
+        meta.update(_time_tensors(dates_list, device=device))
+
+    core = (summary_days, profile_days, raster_recent, seq_recent, seq_lens_recent, meta, targets)
+
+    if has_raw and has_dates:
+        raw_returns = torch.stack(raw_list, dim=0).to(device=device)
+        return core + (raw_returns, tuple(dates_list))
+    if has_raw:
+        raw_returns = torch.stack(raw_list, dim=0).to(device=device)
+        return core + (raw_returns,)
+    if has_dates:
+        return core + (tuple(dates_list),)
+    return core

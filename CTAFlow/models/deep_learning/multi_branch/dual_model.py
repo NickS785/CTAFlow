@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils.rnn as rnn_utils
+from torch import nn as nn
+from torch.nn import functional as F
+
 from ..encoders import RasterResNet, MarketProfileResNet, SpatialFuse, IntradayRNN
 
 
@@ -457,6 +460,153 @@ class RecurrentWSPR(nn.Module):
         # --- Prediction Head ---
         logits = self.head(z_final_cat)
 
+        if self.task == "classification" and return_probs:
+            return F.softmax(logits, dim=1)
+        return logits
+
+
+class MultiAssetWSPR (nn.Module):
+    """RecurrentWSPR + an explicit meta modality (ticker/class/subclass + time).
+
+    Adds a 6th path:
+      - Path 6 (Meta): MetaModalityEncoder over W days -> pooled meta_hidden vector
+    """
+
+    def __init__(
+        self,
+        f_sum: int,
+        f_profile: int,
+        f_raster: int,
+        f_seq: int,
+        d_model: int = 128,
+        sum_lstm_hidden: int = 64,
+        prof_lstm_hidden: int = 128,
+        meta_hidden: int = 64,
+        n_tickers: int = 1,
+        n_asset_classes: int = 1,
+        n_asset_subclasses: int = 1,
+        task: str = "classification",
+        num_classes: int = 3,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+        self.task = task
+        self.d_model = d_model
+        self.meta_hidden = meta_hidden
+
+        # --- Branch Encoders (same as RecurrentWSPR) ---
+        self.summary_net = nn.Sequential(
+            nn.Linear(f_sum, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU()
+        )
+        self.profile_net = MarketProfileResNet(in_channels=f_profile, d_model=d_model)
+        self.raster_net = RasterResNet(in_ch=f_raster, d_model=d_model)
+        self.seq_net = IntradayRNN(input_dim=f_seq, d_model=d_model, num_layers=1)
+        self.spatial_fuse = SpatialFuse(d_spatial=d_model, mode="gated")
+
+        # --- Path 1 & 2: Windowed LSTMs ---
+        self.summary_lstm = nn.LSTM(input_size=d_model, hidden_size=sum_lstm_hidden, batch_first=True)
+        self.profile_lstm = nn.LSTM(input_size=d_model, hidden_size=prof_lstm_hidden, batch_first=True)
+
+        # --- Path 6: Meta modality ---
+        self.meta_net = MetaModalityEncoder(
+            d_model=d_model,
+            ctx_dim=max(16, d_model // 2),
+            time_dim=max(16, d_model // 2),
+            meta_hidden=meta_hidden,
+            n_tickers=n_tickers,
+            n_asset_classes=n_asset_classes,
+            n_asset_subclasses=n_asset_subclasses,
+            dropout=min(0.3, dropout),
+        )
+
+        # --- Final Fusion Head ---
+        final_fusion_dim = (
+            sum_lstm_hidden      # Path 1
+            + prof_lstm_hidden   # Path 2
+            + d_model            # Path 3
+            + d_model            # Path 4
+            + d_model            # Path 5
+            + meta_hidden        # Path 6
+        )
+
+        self.head = nn.Sequential(
+            nn.Linear(final_fusion_dim, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.Linear(128, num_classes if task == 'classification' else 1)
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Conv1d, nn.Linear)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None: nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (nn.BatchNorm1d, nn.LayerNorm, nn.BatchNorm2d)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(
+        self,
+        summary_days,
+        profile_days,
+        raster_recent,
+        seq_recent,
+        seq_lens_recent,
+        meta: dict,
+        return_probs: bool = False
+    ):
+        B, W = summary_days.shape[0:2]
+        BW = B * W
+
+        # --- Encode all days for windowed paths ---
+        flat_sum = summary_days.reshape(BW, -1)
+        z_sum_all = self.summary_net(flat_sum)  # (BW, d)
+
+        flat_prof = profile_days.reshape(BW, profile_days.size(2), -1)
+        z_prof_all = self.profile_net(flat_prof)  # (BW, d)
+
+        # --- Path 1: Windowed Summary LSTM ---
+        z_sum_seq = z_sum_all.view(B, W, -1)
+        _, (h_n_sum, _) = self.summary_lstm(z_sum_seq)
+        z_summary_temporal = h_n_sum[-1]  # (B, sum_lstm_hidden)
+
+        # --- Path 2: Windowed Profile LSTM ---
+        z_prof_seq = z_prof_all.view(B, W, -1)
+        _, (h_n_prof, _) = self.profile_lstm(z_prof_seq)
+        z_profile_temporal = h_n_prof[-1]  # (B, prof_lstm_hidden)
+
+        # --- Path 3: Recent Raster ---
+        z_raster_recent = self.raster_net(raster_recent)  # (B, d)
+
+        # --- Path 4: Recent Sequential ---
+        z_seq_recent = self.seq_net(seq_recent, lengths=seq_lens_recent)  # (B, d)
+
+        # --- Path 5: Recent Spatial Fusion ---
+        z_prof_recent = z_prof_seq[:, -1, :]  # (B, d)
+        z_spatial_fused_recent = self.spatial_fuse(z_prof_recent, z_raster_recent)  # (B, d)
+
+        # --- Path 6: Meta modality ---
+        # meta contains identity ids + per-day time features (month/dow/doy_sin/cos)
+        _, z_meta_window = self.meta_net(meta, W=W, device=summary_days.device)  # (B, meta_hidden)
+
+        # --- Final Concatenation ---
+        z_final_cat = torch.cat([
+            z_summary_temporal,
+            z_profile_temporal,
+            z_raster_recent,
+            z_seq_recent,
+            z_spatial_fused_recent,
+            z_meta_window,
+        ], dim=1)
+
+        logits = self.head(z_final_cat)
         if self.task == "classification" and return_probs:
             return F.softmax(logits, dim=1)
         return logits

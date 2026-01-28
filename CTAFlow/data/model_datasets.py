@@ -1504,6 +1504,198 @@ class OnTheFlyRasterizedDataset(Dataset):
         return (summary, profile, rasterized, target)
 
 
+class WSPRWindowDataset(RasterizedModalDataset):
+    """
+    Dataset for RecurrentWSPR / MultiAssetWSPR models.
+
+    Returns windowed summary/profile data but only the MOST RECENT day's
+    raster and sequential data (as these models process recent data separately).
+
+    Returns per sample:
+      summary_days : (W, F_sum)           - windowed summary features
+      profile_days : (W, C_prof, Bins)    - windowed profile data
+      raster_recent: (T_bars, C_rast, Bins) - most recent day's raster
+      seq_recent   : (max_len, F_seq)     - most recent day's sequential (right-padded)
+      target       : scalar               - target for last day in window
+      seq_len_recent: scalar              - length of most recent day's sequence
+      window_dates : List[date]           - dates in the window (if return_dates=True)
+
+    The meta dict for MultiAssetWSPR is NOT included here; use WSPRCollate
+    to add ticker/time metadata during batching.
+    """
+
+    def __init__(
+        self,
+        *args,
+        window_days: int = 20,
+        return_dates: bool = False,
+        ticker_id: int = 0,
+        asset_class_id: int = 0,
+        asset_subclass_id: int = 0,
+        **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        if window_days < 1:
+            raise ValueError("window_days must be >= 1")
+        self.window_days = int(window_days)
+        self.return_dates = return_dates
+
+        # Store ticker metadata for collate function
+        self.ticker_id = ticker_id
+        self.asset_class_id = asset_class_id
+        self.asset_subclass_id = asset_subclass_id
+
+    def __len__(self):
+        n = len(self.df_summary)
+        return max(0, n - self.window_days + 1)
+
+    def __getitem__(self, idx):
+        end = idx + self.window_days - 1
+        window_dates = self.df_summary.iloc[idx: end + 1]["date"].tolist()
+
+        # 1. Summary Window (W, F_sum)
+        summary_days = torch.tensor(
+            self.features[idx: end + 1],
+            dtype=torch.float32
+        )
+
+        # 2. Profile Window (W, C_prof, Bins)
+        prof_list = []
+        for d in window_dates:
+            prof = self.spatial_by_date.get(d)
+            if prof is None:
+                prof = np.zeros(self.spatial_shape, dtype=np.float32)
+            prof_list.append(torch.from_numpy(prof.astype(np.float32)))
+        profile_days = torch.stack(prof_list, dim=0)
+
+        # 3. Raster - ONLY most recent day (T_bars, C_rast, Bins)
+        recent_date = window_dates[-1]
+        rast = self.rasterized_by_date.get(recent_date)
+        if rast is None:
+            rast = np.zeros(self.rasterized_shape, dtype=np.float32)
+        raster_recent = torch.from_numpy(rast.astype(np.float32))
+
+        # 4. Sequential - ONLY most recent day (max_len, F_seq), right-padded
+        seq_data = self.sequential_by_date.get(recent_date)
+        if seq_data is None or len(seq_data) == 0:
+            seq_data = np.zeros((1, self.n_sequential_features), dtype=np.float32)
+        if len(seq_data) > self.max_len:
+            seq_data = seq_data[-self.max_len:]
+
+        seq_len_recent = len(seq_data)
+        seq_recent = torch.zeros((self.max_len, self.n_sequential_features), dtype=torch.float32)
+        seq_recent[:seq_len_recent, :] = torch.from_numpy(seq_data.astype(np.float32))
+
+        # 5. Target (for last day in window)
+        target = torch.tensor(self.targets[end])
+
+        # 6. Time features for meta (for each day in window)
+        # month: (W,), dow: (W,), doy_sin: (W,), doy_cos: (W,)
+        months = []
+        dows = []
+        doy_sins = []
+        doy_coss = []
+        for d in window_dates:
+            dt = pd.Timestamp(d)
+            months.append(dt.month)
+            dows.append(dt.dayofweek)
+            doy = dt.dayofyear
+            doy_sin = np.sin(2 * np.pi * doy / 365.0)
+            doy_cos = np.cos(2 * np.pi * doy / 365.0)
+            doy_sins.append(doy_sin)
+            doy_coss.append(doy_cos)
+
+        time_features = {
+            'month': torch.tensor(months, dtype=torch.long),
+            'dow': torch.tensor(dows, dtype=torch.long),
+            'doy_sin': torch.tensor(doy_sins, dtype=torch.float32),
+            'doy_cos': torch.tensor(doy_coss, dtype=torch.float32),
+        }
+
+        # Identity features (scalars, will be expanded in collate)
+        identity = {
+            'ticker_id': torch.tensor(self.ticker_id, dtype=torch.long),
+            'asset_class_id': torch.tensor(self.asset_class_id, dtype=torch.long),
+            'asset_subclass_id': torch.tensor(self.asset_subclass_id, dtype=torch.long),
+        }
+
+        if self.return_dates:
+            return (
+                summary_days, profile_days, raster_recent, seq_recent, target,
+                torch.tensor(seq_len_recent, dtype=torch.long),
+                time_features, identity, window_dates
+            )
+
+        return (
+            summary_days, profile_days, raster_recent, seq_recent, target,
+            torch.tensor(seq_len_recent, dtype=torch.long),
+            time_features, identity
+        )
+
+
+def wspr_collate_fn(batch):
+    """
+    Collate function for WSPRWindowDataset that builds the meta dict
+    required by MultiAssetWSPR's MetaModalityEncoder.
+
+    Args:
+        batch: List of tuples from WSPRWindowDataset.__getitem__
+
+    Returns:
+        Tuple of:
+        - summary_days: (B, W, F_sum)
+        - profile_days: (B, W, C, Bins)
+        - raster_recent: (B, T, C, Bins)
+        - seq_recent: (B, max_len, F_seq)
+        - seq_lens_recent: (B,)
+        - targets: (B,)
+        - meta: dict with keys:
+            - ticker_id: (B,)
+            - asset_class_id: (B,)
+            - asset_subclass_id: (B,)
+            - month: (B, W)
+            - dow: (B, W)
+            - doy_sin: (B, W)
+            - doy_cos: (B, W)
+    """
+    # Handle both with and without return_dates
+    if len(batch[0]) == 9:
+        # With dates
+        (summaries, profiles, rasters, seqs, targets,
+         seq_lens, time_feats, identities, dates_list) = zip(*batch)
+        has_dates = True
+    else:
+        (summaries, profiles, rasters, seqs, targets,
+         seq_lens, time_feats, identities) = zip(*batch)
+        has_dates = False
+
+    # Stack tensors
+    summary_days = torch.stack(summaries, dim=0)      # (B, W, F_sum)
+    profile_days = torch.stack(profiles, dim=0)       # (B, W, C, Bins)
+    raster_recent = torch.stack(rasters, dim=0)       # (B, T, C, Bins)
+    seq_recent = torch.stack(seqs, dim=0)             # (B, max_len, F_seq)
+    seq_lens_recent = torch.stack(seq_lens, dim=0)    # (B,)
+    targets_tensor = torch.stack(targets, dim=0)      # (B,)
+
+    # Build meta dict
+    meta = {
+        'ticker_id': torch.stack([id['ticker_id'] for id in identities]),           # (B,)
+        'asset_class_id': torch.stack([id['asset_class_id'] for id in identities]), # (B,)
+        'asset_subclass_id': torch.stack([id['asset_subclass_id'] for id in identities]),  # (B,)
+        'month': torch.stack([tf['month'] for tf in time_feats]),      # (B, W)
+        'dow': torch.stack([tf['dow'] for tf in time_feats]),          # (B, W)
+        'doy_sin': torch.stack([tf['doy_sin'] for tf in time_feats]),  # (B, W)
+        'doy_cos': torch.stack([tf['doy_cos'] for tf in time_feats]),  # (B, W)
+    }
+
+    if has_dates:
+        return (summary_days, profile_days, raster_recent, seq_recent,
+                seq_lens_recent, targets_tensor, meta, dates_list)
+
+    return (summary_days, profile_days, raster_recent, seq_recent,
+            seq_lens_recent, targets_tensor, meta)
+
+
 def _sanity_check_quad_modal():
     dates = pd.date_range("2024-01-01", periods=3, freq="D")
     summary = pd.DataFrame({"Datetime": dates, "feat": [1.0, 2.0, 3.0]})

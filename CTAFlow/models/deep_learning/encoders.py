@@ -861,3 +861,123 @@ class IntradayRNN(nn.Module):
         # Take last hidden state: (NumLayers, B, Hidden) -> (B, Hidden)
         embedding = h_n[-1]
         return self.norm(embedding)
+
+
+class MetaModalityEncoder(nn.Module):
+    """Encodes asset identity + calendar time as its own modality.
+
+    Expects a `meta` dict with (recommended):
+      - ticker_id:         (B,) long
+      - asset_class_id:    (B,) long
+      - asset_subclass_id: (B,) long
+      - month:             (B, W) long in [1..12] (0 allowed for unknown)
+      - dow:               (B, W) long in [0..6]
+      - doy_sin:           (B, W) float
+      - doy_cos:           (B, W) float
+
+    Returns:
+      - z_meta_days:    (B, W, d_model)  per-day meta embeddings
+      - z_meta_window:  (B, meta_hidden) pooled/window representation
+    """
+
+    def __init__(
+        self,
+        d_model: int = 128,
+        ctx_dim: int = 64,
+        time_dim: int = 64,
+        meta_hidden: int = 64,
+        n_tickers: int = 1,
+        n_asset_classes: int = 1,
+        n_asset_subclasses: int = 1,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        # --- identity / context ---
+        self.ticker_emb = nn.Embedding(n_tickers, ctx_dim)
+        self.class_emb = nn.Embedding(n_asset_classes, ctx_dim)
+        self.subclass_emb = nn.Embedding(n_asset_subclasses, ctx_dim)
+
+        # --- calendar time ---
+        # month uses 1..12; reserve 0 for unknown/pad
+        self.month_emb = nn.Embedding(13, time_dim, padding_idx=0)
+        self.dow_emb = nn.Embedding(7, time_dim)
+        self.doy_proj = nn.Sequential(
+            nn.Linear(2, time_dim),
+            nn.GELU(),
+            nn.LayerNorm(time_dim),
+        )
+
+        # --- fuse ctx + time into per-day token ---
+        self.fuse = nn.Sequential(
+            nn.Linear(ctx_dim + time_dim, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+        # --- temporal aggregator (seasonality detector) ---
+        self.lstm = nn.LSTM(input_size=d_model, hidden_size=meta_hidden, batch_first=True)
+
+        self.out_dim = meta_hidden
+        self.d_model = d_model
+        self.meta_hidden = meta_hidden
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+
+    def forward(self, meta: dict, W: int, device=None):
+        # If meta is missing, emit zeros (still a modality, but blank)
+        if meta is None:
+            B = 1 if device is None else None  # cannot infer B safely
+            raise ValueError("MetaModalityEncoder requires a meta dict (ticker/time).")
+
+        # --- required ids ---
+        ticker_id = meta.get("ticker_id", None)
+        asset_class_id = meta.get("asset_class_id", None)
+        asset_subclass_id = meta.get("asset_subclass_id", None)
+
+        if ticker_id is None or asset_class_id is None or asset_subclass_id is None:
+            raise ValueError("meta dict must include ticker_id, asset_class_id, asset_subclass_id")
+
+        if device is None:
+            device = ticker_id.device
+
+        B = ticker_id.shape[0]
+
+        # --- context embedding (B, ctx_dim) -> expand to (B, W, ctx_dim) ---
+        z_ctx = (
+            self.ticker_emb(ticker_id)
+            + self.class_emb(asset_class_id)
+            + self.subclass_emb(asset_subclass_id)
+        )
+        z_ctx = z_ctx.unsqueeze(1).expand(B, W, z_ctx.size(-1))
+
+        # --- time embedding (B, W, time_dim) ---
+        month = meta.get("month", None)
+        dow = meta.get("dow", None)
+        doy_sin = meta.get("doy_sin", None)
+        doy_cos = meta.get("doy_cos", None)
+
+        if month is None or dow is None or doy_sin is None or doy_cos is None:
+            # allow identity-only meta if dates weren't provided
+            z_time = torch.zeros((B, W, self.month_emb.embedding_dim), device=device)
+        else:
+            # shapes: month/dow (B,W), doy_sin/cos (B,W)
+            z_time = self.month_emb(month.clamp(0, 12)) + self.dow_emb(dow.clamp(0, 6))
+            doy = torch.stack([doy_sin, doy_cos], dim=-1).to(z_time.dtype)  # (B,W,2)
+            z_time = z_time + self.doy_proj(doy)
+
+        # --- per-day meta token + temporal pooling ---
+        z_meta_days = self.fuse(torch.cat([z_ctx, z_time], dim=-1))  # (B,W,d_model)
+        _, (h_n, _) = self.lstm(z_meta_days)                         # h_n: (1,B,meta_hidden)
+        z_meta_window = h_n[-1]                                      # (B,meta_hidden)
+        return z_meta_days, z_meta_window
