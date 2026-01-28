@@ -994,10 +994,15 @@ class RasterizedModalDataset(Dataset):
         if target_data is not None:
             if isinstance(target_data, pd.Series):
                 if isinstance(target_data.index, pd.DatetimeIndex):
-                    temp_map = target_data.copy()
-                    temp_map.index = temp_map.index.date
+                    # Group by date and take last value (handles duplicate timestamps on same day)
+                    temp_series = target_data.copy()
+                    temp_series.index = temp_series.index.date
+                    # If duplicates exist, keep last value per date
+                    if temp_series.index.duplicated().any():
+                        temp_series = temp_series.groupby(level=0).last()
+                    target_map = temp_series.to_dict()
                     self.targets = np.array(
-                        [temp_map.get(d, np.nan) for d in self.df_summary['date']],
+                        [target_map.get(d, np.nan) for d in self.df_summary['date']],
                         dtype=np.float32
                     )
                 else:
