@@ -950,6 +950,8 @@ class MultiAssetMomentum(DeepIDMomentum):  # type: ignore[misc]
         asset_class_id_map: Optional[Mapping[str, int]] = None,
         asset_subclass_id_map: Optional[Mapping[str, int]] = None,
         meta_default: Tuple[int, int, int] = (0, 0, 0),
+        # WSPR mode for MultiAssetWSPR models
+        use_wspr: bool = False,
         # caching controls
         cache_path: Optional[Union[str, Path]] = None,
         use_cache: bool = False,
@@ -979,7 +981,16 @@ class MultiAssetMomentum(DeepIDMomentum):  # type: ignore[misc]
             'concat': Concatenate all ticker datasets into single train/val loaders
             'dict': Return dict mapping ticker -> (train_loader, val_loader)
         add_meta : bool, default False
-            If True, append (ticker_id, asset_class_id, subclass_id) tensor to each sample
+            If True, append (ticker_id, asset_class_id, subclass_id) tensor to each sample.
+            Ignored when use_wspr=True (metadata is embedded in WSPRWindowDataset).
+        use_wspr : bool, default False
+            If True, use WSPRWindowDataset which provides:
+            - Windowed summary/profile for LSTM processing
+            - Only recent day's raster/sequential (not windowed)
+            - Full meta dict with ticker IDs + calendar features (month, dow, doy)
+            Required for MultiAssetWSPR / RecurrentWSPR models.
+            When True, ticker_id_map/asset_class_id_map/asset_subclass_id_map are
+            injected into each ticker's dataset for wspr_collate_fn to use.
         val_cutoff_date : str or pd.Timestamp, optional
             Explicit cutoff date for train/val split. Dates < cutoff are training,
             dates >= cutoff are validation. If None and auto_align_dates=True,
@@ -1014,6 +1025,20 @@ class MultiAssetMomentum(DeepIDMomentum):  # type: ignore[misc]
         ...     val_split=True,
         ...     val_cutoff_date='2024-01-01',
         ...     batch_size=64
+        ... )
+        >>>
+        >>> # WSPR mode for MultiAssetWSPR models (includes calendar meta)
+        >>> train_loader, val_loader = mam.get_loaders(
+        ...     val_split=True,
+        ...     use_wspr=True,
+        ...     ticker_id_map={'HE': 0, 'LE': 1},
+        ...     asset_class_id_map={'HE': 0, 'LE': 0},  # Both livestock
+        ...     asset_subclass_id_map={'HE': 0, 'LE': 1},
+        ...     use_rasterized=True,
+        ...     include_spatial=True,
+        ...     windowed=True,
+        ...     window_days=10,
+        ...     batch_size=16
         ... )
         """
         use_tickers = list(tickers) if tickers is not None else self._tickers
@@ -1062,21 +1087,37 @@ class MultiAssetMomentum(DeepIDMomentum):  # type: ignore[misc]
             """Build loaders for a single ticker (thread-safe: no shared state mutation)."""
             m = self.get_model(t, target_col=target_col)
 
+            # Build kwargs for this ticker
+            ticker_kwargs = {**loader_kwargs}
+
+            # If WSPR mode, inject ticker metadata into the loader kwargs
+            if use_wspr:
+                tid = (ticker_id_map or {}).get(t, meta_default[0])
+                cid = (asset_class_id_map or {}).get(t, meta_default[1])
+                sid = (asset_subclass_id_map or {}).get(t, meta_default[2])
+                ticker_kwargs.update({
+                    "use_wspr": True,
+                    "ticker_id": tid,
+                    "asset_class_id": cid,
+                    "asset_subclass_id": sid,
+                })
+
             if cutoff_date is not None and wants_val_split:
                 # Date-based split: build train and val loaders separately
                 # This prevents lookahead bias when concatenating across tickers
                 # Note: DeepIDMomentum uses inclusive end_date, so train ends 1 day before cutoff
                 train_end = cutoff_date - pd.Timedelta(days=1)
-                train_kwargs = {**loader_kwargs, "val_split": False, "end_date": train_end}
-                val_kwargs = {**loader_kwargs, "val_split": False, "start_date": cutoff_date}
+                train_kwargs = {**ticker_kwargs, "val_split": False, "end_date": train_end}
+                val_kwargs = {**ticker_kwargs, "val_split": False, "start_date": cutoff_date}
 
                 train_loader = m.get_loaders(**train_kwargs)
                 val_loader = m.get_loaders(**val_kwargs)
                 out = (train_loader, val_loader)
             else:
-                out = m.get_loaders(**loader_kwargs)
+                out = m.get_loaders(**ticker_kwargs)
 
-            if add_meta:
+            # add_meta is ignored when use_wspr=True (metadata already in dataset)
+            if add_meta and not use_wspr:
                 tid = (ticker_id_map or {}).get(t, meta_default[0])
                 cid = (asset_class_id_map or {}).get(t, meta_default[1])
                 sid = (asset_subclass_id_map or {}).get(t, meta_default[2])

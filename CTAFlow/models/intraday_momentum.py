@@ -94,7 +94,7 @@ class MultiModalDim:
 
         Parameters
         ----------
-        seq_cols : List[str]
+        seq_cols : List[str]F
             Specific columns to use for sequential features
 
         Returns
@@ -6567,6 +6567,11 @@ class DeepIDMomentum(IntradayMomentum):
             window_days: int = 10,
             return_dates: bool = False,
             add_raw_returns: bool = False,
+            # WSPR-specific parameters for multi-asset training
+            use_wspr: bool = False,
+            ticker_id: int = 0,
+            asset_class_id: int = 0,
+            asset_subclass_id: int = 0,
     ):
         """Create PyTorch DataLoaders for training dual-branch models.
 
@@ -6933,7 +6938,54 @@ class DeepIDMomentum(IntradayMomentum):
                 print(f"  use_rasterized: {use_rasterized} ({type(use_rasterized_data) if use_rasterized_data is not None else 'None'})")
                 print(f"  rasterize_on_fly: {rasterize_on_fly}")
 
-            if windowed and use_rasterized and final_spatial_data is not None:
+            if use_wspr and use_rasterized and final_spatial_data is not None:
+                # WSPR dataset for MultiAssetWSPR / RecurrentWSPR models
+                # Uses windowed summary/profile but only recent raster/sequential
+                from ..data.model_datasets import WSPRWindowDataset, wspr_collate_fn
+
+                if use_rasterized_data is None:
+                    raise ValueError("use_wspr=True requires rasterized_data to be available.")
+                if verbose:
+                    print(f"  Creating WSPRWindowDataset (window_days={window_days}, ticker_id={ticker_id})")
+
+                train_dataset = WSPRWindowDataset(
+                    summary_data=X_train,
+                    sequential_data=self.sequential_data,
+                    spatial_data=final_spatial_data,
+                    spatial_dates=final_spatial_dates,
+                    rasterized_data=use_rasterized_data,
+                    target_data=y_train,
+                    max_len=max_seq_len,
+                    sequential_cols=sequential_cols,
+                    target_col=None,
+                    window_days=window_days,
+                    return_dates=return_dates,
+                    ticker_id=ticker_id,
+                    asset_class_id=asset_class_id,
+                    asset_subclass_id=asset_subclass_id,
+                )
+                val_dataset = WSPRWindowDataset(
+                    summary_data=X_val,
+                    sequential_data=self.sequential_data,
+                    spatial_data=final_spatial_data,
+                    spatial_dates=final_spatial_dates,
+                    rasterized_data=use_rasterized_data,
+                    target_data=y_val,
+                    max_len=max_seq_len,
+                    sequential_cols=sequential_cols,
+                    target_col=None,
+                    window_days=window_days,
+                    return_dates=return_dates,
+                    ticker_id=ticker_id,
+                    asset_class_id=asset_class_id,
+                    asset_subclass_id=asset_subclass_id,
+                )
+                collate_fn = wspr_collate_fn
+
+                if verbose:
+                    print(f"  Train: {len(train_dataset)} windows, Val: {len(val_dataset)} windows")
+
+            elif windowed and use_rasterized and final_spatial_data is not None:
                 # Windowed dataset for recurrent models (TriModalLSTM)
                 if use_rasterized_data is None:
                     raise ValueError("windowed=True requires rasterized_data to be available.")
