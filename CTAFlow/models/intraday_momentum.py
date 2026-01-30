@@ -2629,6 +2629,8 @@ class IntradayMomentum:
             clf_percentiles: Tuple[float, ...] = (33, 67),
             intraday_df: Optional[pd.DataFrame] = None,
             price_col: str = "Close",
+            train_end_date: Optional[Union[str, pd.Timestamp]] = None,
+            train_ratio: Optional[float] = None,
     ) -> pd.Series:
         """Calculate and set target returns with optional classification binning.
 
@@ -2652,6 +2654,14 @@ class IntradayMomentum:
             Intraday data to use. Defaults to self.intraday_data.
         price_col : str, default "Close"
             Price column to use for return calculation.
+        train_end_date : str or pd.Timestamp, optional
+            If provided, compute classification percentile thresholds using only data
+            up to this date (exclusive). This prevents lookahead bias by ensuring
+            thresholds are computed only on training data. Format: 'YYYY-MM-DD'.
+        train_ratio : float, optional
+            Alternative to train_end_date. If provided (e.g., 0.8), compute thresholds
+            using only the first train_ratio fraction of the data. Ignored if
+            train_end_date is provided.
 
         Returns
         -------
@@ -2672,10 +2682,17 @@ class IntradayMomentum:
         ...     period_length=timedelta(minutes=30)
         ... )
 
-        >>> # 3-class classification target
+        >>> # 3-class classification target (NO lookahead protection)
         >>> model._calculate_target_returns(
         ...     make_clf=True,
         ...     clf_percentiles=(33, 67)
+        ... )
+
+        >>> # 3-class classification with lookahead protection (RECOMMENDED)
+        >>> model._calculate_target_returns(
+        ...     make_clf=True,
+        ...     clf_percentiles=(33, 67),
+        ...     train_ratio=0.8  # compute thresholds on first 80% only
         ... )
 
         >>> # Binary classification target
@@ -2689,6 +2706,8 @@ class IntradayMomentum:
         - Updates self.target_data in place
         - Reindexes self.training_data to match target_data dates
         - For classification, assigns class 0 to lowest values, incrementing upward
+        - IMPORTANT: When using make_clf=True, always provide train_end_date or
+          train_ratio to prevent lookahead bias from percentile computation.
         """
         # Use defaults if not provided
         if target_time_end is None:
@@ -2711,10 +2730,30 @@ class IntradayMomentum:
             clf_percentiles = sorted(clf_percentiles)
             n_classes = len(clf_percentiles) + 1
 
-            # Compute thresholds
-            thresholds = [np.percentile(target_returns, p) for p in clf_percentiles]
+            # Determine which data to use for computing thresholds (avoid lookahead)
+            if train_end_date is not None:
+                # Use data up to train_end_date for threshold computation
+                train_end = pd.Timestamp(train_end_date)
+                train_mask = target_returns.index < train_end
+                train_returns = target_returns[train_mask]
+                threshold_source = "train_end_date"
+                n_train = train_mask.sum()
+            elif train_ratio is not None:
+                # Use first train_ratio fraction for threshold computation
+                n_total = len(target_returns)
+                n_train = int(n_total * train_ratio)
+                train_returns = target_returns.iloc[:n_train]
+                threshold_source = f"train_ratio={train_ratio}"
+            else:
+                # WARNING: Using all data (potential lookahead bias)
+                train_returns = target_returns
+                threshold_source = "ALL DATA (potential lookahead!)"
+                n_train = len(target_returns)
 
-            # Assign classes
+            # Compute thresholds from training data only
+            thresholds = [np.percentile(train_returns.dropna(), p) for p in clf_percentiles]
+
+            # Assign classes to ALL data using train-derived thresholds
             class_labels = np.zeros(len(target_returns), dtype=int)
             for i, threshold in enumerate(thresholds):
                 class_labels[target_returns > threshold] = i + 1
@@ -2725,6 +2764,9 @@ class IntradayMomentum:
             print("\n" + "="*60)
             print("TARGET CLASSIFICATION DISTRIBUTION")
             print("="*60)
+            print(f"Threshold source: {threshold_source}")
+            print(f"Samples used for thresholds: {n_train} / {len(class_labels)}")
+            print("-"*60)
             for cls in range(n_classes):
                 count = (class_labels == cls).sum()
                 pct = 100.0 * count / len(class_labels)

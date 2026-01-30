@@ -509,7 +509,8 @@ class MultiAssetMomentum(DeepIDMomentum):  # type: ignore[misc]
             "profiles": self.path_for(ticker, gf.profiles, must_exist=must_exist),
             "vpin": self.path_for(ticker, gf.vpin, must_exist=must_exist),
             "rasterized": self.path_for(ticker, gf.rasterized, must_exist=must_exist),
-            "target": self.path_for(ticker, gf.target, must_exist=must_exist),
+            # Target is optional - can be computed from intraday if missing
+            "target": self.path_for(ticker, gf.target, must_exist=False),
         }
         if gf.intraday:
             out["intraday"] = self.path_for(ticker, gf.intraday, must_exist=False)
@@ -712,7 +713,24 @@ class MultiAssetMomentum(DeepIDMomentum):  # type: ignore[misc]
         paths = self.paths_for_ticker(ticker, must_exist=True)
 
         sequential_df = _read_tabular(paths["vpin"])
-        target_series = _read_target(paths["target"], target_col=target_col)
+
+        # Target: load from file if exists, otherwise create placeholder (to be computed later)
+        target_path = paths.get("target")
+        if target_path is not None and target_path.exists():
+            target_series = _read_target(target_path, target_col=target_col)
+        else:
+            # No target file - create placeholder Series aligned with sequential data dates
+            # User should call _calculate_target_returns() to compute actual targets
+            warnings.warn(
+                f"[{ticker}] target.csv not found. Creating placeholder targets. "
+                f"Call model._calculate_target_returns() to compute targets from intraday data."
+            )
+            # Use sequential data dates to create placeholder
+            if isinstance(sequential_df.index, pd.DatetimeIndex):
+                dates = sequential_df.index.normalize().unique()
+            else:
+                dates = pd.to_datetime(sequential_df.index).normalize().unique()
+            target_series = pd.Series(np.nan, index=dates, name="target")
 
         # intraday: prefer file if present, else synthesize
         intraday_df: pd.DataFrame
