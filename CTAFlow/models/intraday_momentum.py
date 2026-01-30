@@ -6383,12 +6383,20 @@ class DeepIDMomentum(IntradayMomentum):
         - All scaled features target approximate range [-5, +5] to match
           spatial data scale: (price - vwap) / vwap * 100
         """
-        if inplace:
-            data = self.summary_data
-        else:
-            data = self.summary_data.copy()
+        # Get summary data from either summary_data or training_data['summary']
+        source_data = getattr(self, 'summary_data', None)
+        if source_data is None and hasattr(self, 'training_data'):
+            source_data = self.training_data.get('summary')
 
-        if data is None or data.empty:
+        if source_data is None or (hasattr(source_data, 'empty') and source_data.empty):
+            return None if inplace else source_data
+
+        if inplace:
+            data = source_data
+        else:
+            data = source_data.copy()
+
+        if data is None or (hasattr(data, 'empty') and data.empty):
             return None if inplace else data
 
         # Track which columns we've processed

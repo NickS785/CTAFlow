@@ -2,7 +2,6 @@ Metadata-Version: 2.4
 Name: CTAFlow
 Version: 1.0.0
 Summary: CTA positioning prediction system using COT data and technical analysis
-Author: CTA Research Team
 Author-email: CTA Research Team <research@example.com>
 Project-URL: Homepage, https://github.com/yourusername/CTAFlow
 Project-URL: Documentation, https://ctaflow.readthedocs.io/
@@ -38,5 +37,3 @@ Requires-Dist: flake8>=3.8; extra == "dev"
 Requires-Dist: mypy>=0.900; extra == "dev"
 Requires-Dist: jupyter>=1.0; extra == "dev"
 Requires-Dist: ipykernel>=6.0; extra == "dev"
-Dynamic: author
-Dynamic: requires-python
