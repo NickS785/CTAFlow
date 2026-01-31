@@ -1594,6 +1594,15 @@ class WSPRWindowDataset(RasterizedModalDataset):
         # 5. Target (for last day in window)
         target = torch.tensor(self.targets[end])
 
+        # 5b. Raw returns (for profit-weighted losses)
+        if self.add_raw_returns:
+            if self.raw_returns is not None:
+                raw_ret = torch.tensor(self.raw_returns[end])
+            else:
+                raw_ret = target.clone()
+        else:
+            raw_ret = None
+
         # 6. Time features for meta (for each day in window)
         # month: (W,), dow: (W,), doy_sin: (W,), doy_cos: (W,)
         months = []
@@ -1624,18 +1633,21 @@ class WSPRWindowDataset(RasterizedModalDataset):
             'asset_subclass_id': torch.tensor(self.asset_subclass_id, dtype=torch.long),
         }
 
-        if self.return_dates:
-            return (
-                summary_days, profile_days, raster_recent, seq_recent, target,
-                torch.tensor(seq_len_recent, dtype=torch.long),
-                time_features, identity, window_dates
-            )
-
-        return (
+        # Build return tuple based on options
+        base_return = (
             summary_days, profile_days, raster_recent, seq_recent, target,
             torch.tensor(seq_len_recent, dtype=torch.long),
             time_features, identity
         )
+
+        if self.add_raw_returns and self.return_dates:
+            return base_return[:5] + (raw_ret,) + base_return[5:] + (window_dates,)
+        elif self.add_raw_returns:
+            return base_return[:5] + (raw_ret,) + base_return[5:]
+        elif self.return_dates:
+            return base_return + (window_dates,)
+        else:
+            return base_return
 
 
 def wspr_collate_fn(batch):

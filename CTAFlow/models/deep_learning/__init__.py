@@ -1,14 +1,15 @@
 from .tcn import TCNRegressor, TCNClassifier, train_simple_tcn, train_tcn_classifier
 from .gru import GRUAttnRegressor, GRUAttnClassifier, train_gru_classifier
 from .training import (
-    fit,
-    evaluate,
-    convert_IM,
-    TrainConfig,
-    default_regression_metrics,
-    default_classification_metrics,
+    TrainingMetrics,
+    compute_trading_metrics,
+    train_classification_epoch,
+    evaluate_classification,
+    train_regression_epoch,
+    evaluate_regression,
     compute_class_weights,
     create_classification_targets,
+    evaluate,
 )
 from .training.loss import *
 from .training import loss as loss
@@ -38,13 +39,14 @@ __all__ = [
     "train_simple_tcn",
     "train_tcn_classifier",
     "train_gru_classifier",
-    "fit",
     "evaluate",
-    "convert_IM",
-    "TrainConfig",
+    "TrainingMetrics",
+    "compute_trading_metrics",
+    "train_classification_epoch",
+    "evaluate_classification",
+    "train_regression_epoch",
+    "evaluate_regression",
     # Metrics and utilities
-    "default_regression_metrics",
-    "default_classification_metrics",
     "compute_class_weights",
     "create_classification_targets",
     # Encoders
@@ -60,9 +62,8 @@ __all__ = [
     "SummaryMLPEnc",
     # Multi-branch models
     "DualBranchModel",
-    "RecurrentDualModal"
-    "RecurrentTriModal"
+    "RecurrentDualModal",
+    "RecurrentTriModal",
     "TriModalModel",
-    "loss"
-
+    "loss",
 ]
