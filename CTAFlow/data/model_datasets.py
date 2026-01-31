@@ -1522,10 +1522,11 @@ class WSPRWindowDataset(RasterizedModalDataset):
       raster_recent: (T_bars, C_rast, Bins) - most recent day's raster
       seq_recent   : (max_len, F_seq)     - most recent day's sequential (right-padded)
       target       : scalar               - target for last day in window
+      raw_returns  : scalar               - raw returns (if add_raw_returns=True)
       seq_len_recent: scalar              - length of most recent day's sequence
       window_dates : List[date]           - dates in the window (if return_dates=True)
 
-    The meta dict for MultiAssetWSPR is NOT included here; use WSPRCollate
+    The meta dict for MultiAssetWSPR is NOT included here; use wspr_collate_fn
     to add ticker/time metadata during batching.
     """
 
@@ -1666,6 +1667,7 @@ def wspr_collate_fn(batch):
         - seq_recent: (B, max_len, F_seq)
         - seq_lens_recent: (B,)
         - targets: (B,)
+        - raw_returns: (B,) - optional, if add_raw_returns=True
         - meta: dict with keys:
             - ticker_id: (B,)
             - asset_class_id: (B,)
@@ -1674,17 +1676,46 @@ def wspr_collate_fn(batch):
             - dow: (B, W)
             - doy_sin: (B, W)
             - doy_cos: (B, W)
+        - dates_list: list of date lists - optional, if return_dates=True
     """
-    # Handle both with and without return_dates
-    if len(batch[0]) == 9:
-        # With dates
-        (summaries, profiles, rasters, seqs, targets,
+    n_items = len(batch[0])
+
+    # Determine what's included based on item count
+    # Base: 8 items (summary, profile, raster, seq, target, seq_len, time_feats, identity)
+    # +1 for raw_returns or dates
+    # +2 for both raw_returns and dates
+
+    if n_items == 10:
+        # All outputs: raw_returns AND dates
+        (summaries, profiles, rasters, seqs, targets, raw_rets,
          seq_lens, time_feats, identities, dates_list) = zip(*batch)
+        has_returns = True
         has_dates = True
+    elif n_items == 9:
+        # Either raw_returns OR dates - disambiguate by checking if last element is a list
+        last_elements = [b[-1] for b in batch]
+        if isinstance(last_elements[0], list):
+            # Last element is dates
+            (summaries, profiles, rasters, seqs, targets,
+             seq_lens, time_feats, identities, dates_list) = zip(*batch)
+            has_returns = False
+            has_dates = True
+            raw_rets = None
+        else:
+            # Last element is raw_returns (tensor)
+            (summaries, profiles, rasters, seqs, targets, raw_rets,
+             seq_lens, time_feats, identities) = zip(*batch)
+            has_returns = True
+            has_dates = False
+            dates_list = None
     else:
+        # Base case: 8 items (no raw_returns, no dates)
         (summaries, profiles, rasters, seqs, targets,
          seq_lens, time_feats, identities) = zip(*batch)
+        has_returns = False
         has_dates = False
+        raw_rets = None
+        dates_list = None
 
     # Stack tensors
     summary_days = torch.stack(summaries, dim=0)      # (B, W, F_sum)
@@ -1693,6 +1724,12 @@ def wspr_collate_fn(batch):
     seq_recent = torch.stack(seqs, dim=0)             # (B, max_len, F_seq)
     seq_lens_recent = torch.stack(seq_lens, dim=0)    # (B,)
     targets_tensor = torch.stack(targets, dim=0)      # (B,)
+
+    # Stack raw_returns if present
+    if has_returns:
+        raw_returns_tensor = torch.stack(raw_rets, dim=0)  # (B,)
+    else:
+        raw_returns_tensor = None
 
     # Build meta dict
     meta = {
@@ -1705,12 +1742,18 @@ def wspr_collate_fn(batch):
         'doy_cos': torch.stack([tf['doy_cos'] for tf in time_feats]),  # (B, W)
     }
 
-    if has_dates:
-        return (summary_days, profile_days, raster_recent, seq_recent,
-                seq_lens_recent, targets_tensor, meta, dates_list)
+    # Build return tuple
+    base_return = (summary_days, profile_days, raster_recent, seq_recent,
+                   seq_lens_recent, targets_tensor)
 
-    return (summary_days, profile_days, raster_recent, seq_recent,
-            seq_lens_recent, targets_tensor, meta)
+    if has_returns and has_dates:
+        return base_return + (raw_returns_tensor, meta, dates_list)
+    elif has_returns:
+        return base_return + (raw_returns_tensor, meta)
+    elif has_dates:
+        return base_return + (meta, dates_list)
+    else:
+        return base_return + (meta,)
 
 
 def _sanity_check_quad_modal():

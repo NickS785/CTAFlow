@@ -71,13 +71,19 @@ def _unpack_batch(batch_data: Union[tuple, list]) -> Tuple[Union[torch.Tensor, t
 
     # Now batch_data contains only tensors
 
-    # MultiAssetWSPR format: (summary, profile, raster, seq, seq_lens, targets)
-    # After meta removed, we have 6 elements: first 5 are inputs, last is target
+    # MultiAssetWSPR format: (summary, profile, raster, seq, seq_lens, targets, returns?)
+    # After meta removed, we have 6 or 7 elements
     if has_meta:
         if len(batch_data) == 6:
+            # No returns
             inputs = tuple(batch_data[:5])  # (summary, profile, raster, seq, seq_lens)
             targets = batch_data[5]
             returns = None
+        elif len(batch_data) == 7:
+            # With returns
+            inputs = tuple(batch_data[:5])  # (summary, profile, raster, seq, seq_lens)
+            targets = batch_data[5]
+            returns = batch_data[6]
         else:
             # Unexpected format with meta
             *inputs, targets = batch_data
