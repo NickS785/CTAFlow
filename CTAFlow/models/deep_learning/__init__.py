@@ -10,6 +10,8 @@ from .training import (
     compute_class_weights,
     create_classification_targets,
 )
+from .training.loss import *
+from .training import loss as loss
 from .encoders import (
     AttnPool,
     GatedFusion,
@@ -61,4 +63,6 @@ __all__ = [
     "RecurrentDualModal"
     "RecurrentTriModal"
     "TriModalModel",
+    "loss"
+
 ]
