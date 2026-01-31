@@ -9,8 +9,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from sklearn.preprocessing import StandardScaler
-from ...data import make_window_dataset, MomentumWindowDataset
-from ..intraday_momentum import IntradayMomentum
+from CTAFlow.data import make_window_dataset, MomentumWindowDataset
+from CTAFlow.models.deep_learning.training.loops import evaluate
+from CTAFlow.models.intraday_momentum import IntradayMomentum
 
 
 class EarlyStopping:
@@ -345,63 +346,6 @@ def create_classification_targets(
         labels[returns > threshold] = i + 1
 
     return labels
-
-
-
-@torch.no_grad()
-def evaluate(
-    model: torch.nn.Module,
-    loader: DataLoader,
-    loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-    device: str,
-    metrics_fn: Optional[Callable[[np.ndarray, np.ndarray], Dict[str, float]]] = default_regression_metrics,
-    use_amp: bool = False,
-    debug: bool = False,
-) -> Dict[str, float]:
-    was_training = model.training
-    model.eval()
-    total_loss = 0.0
-    n = 0
-
-    preds: List[np.ndarray] = []
-    trues: List[np.ndarray] = []
-
-    batch_count = 0
-    for xb, yb in loader:
-        xb = xb.to(device, non_blocking=True)  # xb: (B, C, L)
-        yb = yb.to(device, non_blocking=True).float()
-
-        with torch.cuda.amp.autocast(enabled=(use_amp and device.startswith("cuda"))):
-            out = model(xb).float()
-            loss = loss_fn(out, yb)
-
-        bs = xb.size(0)
-        total_loss += loss.item() * bs
-        n += bs
-
-        preds.append(out.detach().cpu().numpy())
-        trues.append(yb.detach().cpu().numpy())
-
-        if debug and batch_count == 0:
-            print(f"[DEBUG] First batch: out min={out.min().item():.6f}, max={out.max().item():.6f}, mean={out.mean().item():.6f}")
-            print(f"[DEBUG] Model params sum: {sum(p.sum().item() for p in model.parameters()):.6f}")
-        batch_count += 1
-
-    if debug:
-        print(f"[DEBUG] Total batches processed: {batch_count}")
-
-    y_pred = np.concatenate(preds, axis=0)
-    y_true = np.concatenate(trues, axis=0)
-
-    results = {"loss": float(total_loss / max(n, 1))}
-    if metrics_fn is not None:
-        results.update(metrics_fn(y_true, y_pred))
-
-    # Restore training state
-    if was_training:
-        model.train()
-
-    return results
 
 
 def fit(
