@@ -2606,6 +2606,10 @@ class IntradayMomentum:
         else:
             target_returns.index = pd.to_datetime(target_returns.index).normalize()
 
+        # Ensure exactly one value per date (deduplicate if mask returned multiple per day)
+        if target_returns.index.duplicated().any():
+            target_returns = target_returns.groupby(target_returns.index).last()
+
         # Filter to only valid trading dates (removes weekends/holidays)
         target_returns = self._filter_to_trading_dates(target_returns)
 

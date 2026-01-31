@@ -92,6 +92,12 @@ except Exception:
         DeepIDMomentum = None  # type: ignore
         _IMPORT_ERR = e
 
+# ---- intraday CSV reader ----
+try:
+    from CTAFlow.data.raw_formatting.intraday_manager import read_exported_df
+except Exception:
+    read_exported_df = None  # type: ignore
+
 # ---- session feature recompute utilities ----
 try:
     from CTAFlow.features.session.session_features import (
@@ -242,6 +248,8 @@ def _read_tabular(path: Union[str, Path]) -> pd.DataFrame:
         df = pd.read_parquet(p)
     else:
         df = pd.read_csv(p, parse_dates=True, index_col=0)
+    # Strip whitespace from column names (handles "Date, Time, Last" style CSVs)
+    df.columns = df.columns.str.strip()
     if not isinstance(df.index, pd.DatetimeIndex):
         # Try to recover a datetime index from a "Datetime" col
         for c in ("Datetime", "datetime", "DateTime", "ts", "date", "Date"):
@@ -736,14 +744,17 @@ class MultiAssetMomentum(DeepIDMomentum):  # type: ignore[misc]
         intraday_df: pd.DataFrame
         ip = paths.get("intraday")
         if ip is not None and ip.exists():
-            intraday_df = _read_tabular(ip)
-            if "Close" not in intraday_df.columns:
-                for c in ("close", "Last", "last", "price"):
-                    if c in intraday_df.columns:
-                        intraday_df = intraday_df.rename(columns={c: "Close"})
-                        break
-            if "Close" not in intraday_df.columns:
-                intraday_df["Close"] = 1.0
+            if read_exported_df is not None:
+                # Use the standard intraday reader (handles column names, datetime index, Last->Close)
+                intraday_df = read_exported_df(str(ip))
+            else:
+                # Fallback if import failed
+                intraday_df = _read_tabular(ip)
+                if "Close" not in intraday_df.columns:
+                    for c in ("close", "Last", "last", "price"):
+                        if c in intraday_df.columns:
+                            intraday_df = intraday_df.rename(columns={c: "Close"})
+                            break
         else:
             intraday_df = _synthesize_intraday_from_sequential(sequential_df)
 
