@@ -16,6 +16,10 @@ dash>=2.0.0
 # Data storage and I/O
 tables>=3.6.0  # For HDF5 support
 toml>=0.10.0   # For configuration files
+pyarrow>=10.0.0  # For Parquet support (preferred storage format)
+
+# AWS S3 integration (optional)
+boto3>=1.26.0  # AWS SDK for S3 data downloads
 
 # Utilities
 tqdm>=4.60.0   # Progress bars
