@@ -12,8 +12,15 @@ Concise guide for working on CTAFlow, a CTA positioning and orderflow analysis t
 - **Features (`CTAFlow/features/`)**: `signals_processing.py` builds COT + technical indicators; `feature_engineering.py` covers intraday microstructure; `curve_analysis.py` unifies curve shape/evolution analysis.
 - **Containers (`CTAFlow/data/contract_handling/`)**: `SpreadData`, `FuturesCurve`, `Contract`, and friends provide numpy-backed curve slices.
 - **Forecasting (`CTAFlow/forecaster/forecast.py`)**: family of CTA models with selective indicator calculation and weekly resampling.
+- **Models (`CTAFlow/models/`)**: `base_models.py` contains `CTAForecast` orchestrator with COT/technical feature preparation and model training; `pattern_forecast.py` builds ML-ready datasets for pattern prediction; `volatility.py` provides HAR-style realised-volatility forecasting; `intraday_momentum.py` handles intraday momentum signals. WSPR models in `dual_model.py` (when added) will provide dual-model ensemble forecasting.
 - **Strategy (`CTAFlow/strategy/`)**: `screener_pipeline.py` normalises screener payloads into gate columns; keep `_items_from_patterns` compatible with nested mappings and `PatternExtractor.concat_many` outputs. `HorizonMapper.build_xy` expects timezone-aware `ts`, `open`, `close`, `session_id` columns.
 - **Screeners (`CTAFlow/screeners/`)**: `pattern_extractor.py` preserves `SUMMARY_COLUMNS`, `_strength_raw`, and async loaders; `orderflow_screen.py` provides orderflow seasonality metrics.
+
+## Dashboard app (`app/`)
+- **Structure**: `app/` contains the Dash frontend; `app/results/` stores model outputs.
+- **Storage**: Parquet is the preferred format for model results and intermediate data; use `pyarrow` or `fastparquet`.
+- **AWS S3**: Data downloads handled via `app/storage/s3_client.py`; credentials loaded from environment or `~/.aws/credentials`.
+- **Existing apps**: `CTAFlow/apps/cot_dashboard.py` provides a reference Dash implementation for COT feature visualization.
 
 ## Working notes
 - Seasonal/orderflow outputs feed downstream notebooks; avoid changing canonical column names or shapes.
