@@ -10,6 +10,9 @@ from .training import (
     compute_class_weights,
     create_classification_targets,
     evaluate,
+    BacktestAttributionResult,
+    predictions_to_positions,
+    backtest_from_predictions,
 )
 from .training.loss import *
 from .training import loss as loss
@@ -26,6 +29,13 @@ from .encoders import (
     SummaryMLPEnc,
 )
 from .multi_branch.dual_model import DualBranchModel, RecurrentDualModal
+from .multi_branch.mamba_model import (
+    MambaFusionHead,
+    SpatioTemporalMambaFusion,
+    MultiModalMamba,
+    MultiAssetMamba,
+    MambaWeightTracker,
+)
 from .multi_branch.tri_modal import TriModalModel, RecurrentTriModal
 
 __all__ = [
@@ -49,6 +59,9 @@ __all__ = [
     # Metrics and utilities
     "compute_class_weights",
     "create_classification_targets",
+    "BacktestAttributionResult",
+    "predictions_to_positions",
+    "backtest_from_predictions",
     # Encoders
     "AttnPool",
     "GatedFusion",
@@ -63,6 +76,11 @@ __all__ = [
     # Multi-branch models
     "DualBranchModel",
     "RecurrentDualModal",
+    "SpatioTemporalMambaFusion",
+    "MambaFusionHead",
+    "MultiModalMamba",
+    "MultiAssetMamba",
+    "MambaWeightTracker",
     "RecurrentTriModal",
     "TriModalModel",
     "loss",

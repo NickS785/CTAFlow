@@ -73,14 +73,6 @@ class EndOfDayTradingEnv(gym.Env):
 
         return next_obs, reward, terminated, truncated, info
 
-
-import gymnasium as gym
-from gymnasium import spaces
-import numpy as np
-import pandas as pd
-import torch
-
-
 class MultiModalTradingEnv(gym.Env):
     """
     RL Environment that consumes a CTAFlow DeepIDMomentum object.
@@ -118,7 +110,6 @@ class MultiModalTradingEnv(gym.Env):
         # --- 1. Data Ingestion & Alignment ---
         # We align everything to the target_data index (Trading Days)
         self.dates = model_data.target_data.index
-        valid_dates_set = set(self.dates.date)
 
         # A. Summary Data (DataFrame -> Float32 Array)
         # Ensure we select only the features intended for the model

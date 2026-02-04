@@ -71,8 +71,9 @@ from __future__ import annotations
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import time, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import warnings
 
@@ -212,6 +213,12 @@ class SummarySelectionConfig:
       Columns that are kept if present per ticker (added after alignment), useful
       for ubiquitous scalars like "rv_open" or "rsv_pos_open". These still must exist
       in *all* tickers if you want a consistent schema.
+    recompute_periods:
+      Rolling windows to use when strategy='recompute' or when running the
+      summary template pipeline.
+    allow_relaxed_signature_fallback:
+      If True, signature alignment will fall back to less restrictive matching
+      when strict intersection under `require_substrings` is empty.
     """
     strategy: str = "signature"
     prefer_windows: Tuple[str, ...] = ("240min", "120min", "60min", "1d", "5d", "10d", "20d")
@@ -220,6 +227,84 @@ class SummarySelectionConfig:
     strict: bool = False
     drop_datetime_cols: bool = True
     always_include: Tuple[str, ...] = ("rv_open", "rsv_pos_open", "rsv_neg_open")
+    recompute_periods: Tuple[int, ...] = (1, 5, 10)
+    allow_relaxed_signature_fallback: bool = True
+
+
+@dataclass(frozen=True)
+class ReturnsFeatureConfig:
+    enabled: bool = True
+    add_daily_momentum: bool = True
+    momentum_lookbacks: Tuple[int, ...] = (1, 5, 10, 20)
+    add_overnight_returns: bool = True
+    add_prev_hl: bool = True
+    prev_hl_time: Tuple[int, int] = (9, 30)
+    add_vwap_distance: bool = True
+    vwap_times: Tuple[Tuple[int, int], ...] = ((9, 30), (10, 30), (12, 30))
+    vwap_period_mins: int = 60
+
+
+@dataclass(frozen=True)
+class VolatilityFeatureConfig:
+    enabled: bool = True
+    add_opening_range_volatility: bool = True
+    opening_range_period_mins: int = 60
+    add_har_features: bool = True
+    har_horizons: Tuple[int, ...] = (1, 5)
+    add_normalized_range: bool = True
+    normalized_range_times: Tuple[Tuple[int, int], ...] = ((10, 30), (12, 30))
+    normalized_range_period_mins: int = 60
+    add_vol_ratios: bool = True
+    vol_ratio_pairs: Tuple[Tuple[int, int], ...] = ((1, 3), (5, 10), (1, 20))
+    add_liquidity_impact: bool = True
+    liquidity_impact_times: Tuple[Tuple[int, int], ...] = ((9, 30), (10, 30), (12, 30))
+    liquidity_period_mins: int = 60
+    add_deseasonalized_vol: bool = True
+    deseasonalized_targets: Tuple[Tuple[int, int], ...] = ((10, 30), (12, 30))
+    deseasonalized_period_mins: int = 60
+    deseasonalized_refit_interval: int = 120
+
+
+@dataclass(frozen=True)
+class CurveFeatureConfig:
+    enabled: bool = False
+    add_curve_levels: bool = True
+    curve_level_time: Tuple[int, int] = (9, 30)
+    slope_mos: Tuple[int, int] = (1, 3)
+    spread_pair_1: Tuple[int, int] = (1, 2)
+    spread_pair_2: Tuple[int, int] = (2, 3)
+    add_intraday_curve_changes: bool = True
+    curve_change_time_1: Tuple[int, int] = (8, 30)
+    curve_change_time_2: Tuple[int, int] = (9, 30)
+    curve_change_period_mins: int = 60
+
+
+@dataclass(frozen=True)
+class VolatilityScalingConfig:
+    enabled: bool = False
+    rolling_window: int = 252
+    min_periods: int = 20
+    use_target_vol: bool = True
+    target_col_substrings: Tuple[str, ...] = ("return", "ret", "momentum", "range", "impact")
+    eps: float = 1e-6
+
+
+@dataclass(frozen=True)
+class SummaryPipelineConfig:
+    returns: ReturnsFeatureConfig = ReturnsFeatureConfig()
+    volatility: VolatilityFeatureConfig = VolatilityFeatureConfig()
+    curve: CurveFeatureConfig = CurveFeatureConfig()
+    volatility_scaling: VolatilityScalingConfig = VolatilityScalingConfig()
+    add_calendar_features: bool = True
+    add_eia_features: bool = False
+    # Optional per-feature version overrides.
+    # Example:
+    # {
+    #   "opening_range_volatility": {"period_length": [timedelta(minutes=30), timedelta(minutes=60)]},
+    #   "vwap_distance": {"period_length": [timedelta(minutes=30), timedelta(minutes=60)], "use_nearest": [True]}
+    # }
+    # List-valued args must have matching lengths or length 1 (broadcast).
+    feature_versions: Optional[Mapping[str, Mapping[str, Any]]] = None
 
 def _split_name_ext(filename: str) -> Tuple[str, str]:
     p = Path(filename)
@@ -393,6 +478,8 @@ def _filter_by_substrings(remainder: str, required: Sequence[str]) -> bool:
     r = remainder.lower()
     return all(s.lower() in r for s in required)
 
+_DATE_COL_CANDIDATES = ("Datetime", "datetime", "DateTime", "ts", "date", "Date")
+
 
 # -----------------------------
 # Multi-asset wrapper
@@ -446,6 +533,8 @@ class MultiAssetMomentum(DeepIDMomentum):  # type: ignore[misc]
         # cache for aligned summary schema
         self._aligned_summary_cols: Optional[List[str]] = None
         self._per_ticker_summary_cols: Optional[Dict[str, List[str]]] = None
+        self._per_ticker_summary_rename: Optional[Dict[str, Dict[str, str]]] = None
+        self._recomputed_summaries: Dict[str, pd.DataFrame] = {}
 
     # ---------- naming / discovery ----------
 
@@ -534,7 +623,7 @@ class MultiAssetMomentum(DeepIDMomentum):  # type: ignore[misc]
             p = self.path_for(t, self.generic_files.summary, must_exist=True)
             df = _read_tabular(p)
             if drop_cols:
-                for c in ("Datetime", "datetime", "DateTime", "ts", "date", "Date"):
+                for c in _DATE_COL_CANDIDATES:
                     if c in df.columns:
                         df = df.drop(columns=[c])
             return t, df
@@ -556,17 +645,22 @@ class MultiAssetMomentum(DeepIDMomentum):  # type: ignore[misc]
     def _align_summary_exact(self, summaries: Dict[str, pd.DataFrame]) -> Tuple[List[str], Dict[str, List[str]]]:
         cols_sets = [set(df.columns) for df in summaries.values()]
         common = set.intersection(*cols_sets) if cols_sets else set()
-        common = [c for c in sorted(common) if c not in ("Datetime", "datetime", "DateTime", "ts", "date", "Date")]
+        common = [c for c in sorted(common) if c not in _DATE_COL_CANDIDATES]
         per = {t: common for t in summaries.keys()}
         return common, per
 
-    def _align_summary_signature(self, summaries: Dict[str, pd.DataFrame]) -> Tuple[List[str], Dict[str, List[str]]]:
+    def _align_summary_signature(
+        self,
+        summaries: Dict[str, pd.DataFrame],
+    ) -> Tuple[List[str], Dict[str, List[str]], Dict[str, Dict[str, str]]]:
         cfg = self.summary_config
 
         # Build per ticker: signature -> list of columns that match
         sig_map: Dict[str, Dict[Tuple[str, str], List[str]]] = {}
+        remainder_map: Dict[str, Dict[str, Dict[str, List[str]]]] = {}
         for t, df in summaries.items():
             m: Dict[Tuple[str, str], List[str]] = {}
+            by_remainder: Dict[str, Dict[str, List[str]]] = {}
             for c in df.columns:
                 sig = feature_signature(c)
                 if sig is None:
@@ -575,11 +669,12 @@ class MultiAssetMomentum(DeepIDMomentum):  # type: ignore[misc]
                 if cfg.require_substrings and not _filter_by_substrings(remainder, cfg.require_substrings):
                     continue
                 m.setdefault((window, remainder), []).append(c)
+                by_remainder.setdefault(remainder, {}).setdefault(window, []).append(c)
             sig_map[t] = m
+            remainder_map[t] = by_remainder
 
         # Candidate windows
         # For each preferred window, compute intersection size
-        best_window = None
         best_sigs: List[Tuple[str, str]] = []
         best_count = -1
 
@@ -593,21 +688,34 @@ class MultiAssetMomentum(DeepIDMomentum):  # type: ignore[misc]
                 continue
             inter = set.intersection(*per_sets) if per_sets else set()
             cnt = len(inter)
-            if cnt >= cfg.min_common and best_window is None:
-                best_window = w
+            if cnt >= cfg.min_common:
                 best_sigs = sorted(inter)
                 break
             if cnt > best_count:
                 best_count = cnt
-                best_window = w if cnt > 0 else best_window
                 best_sigs = sorted(inter) if cnt > 0 else best_sigs
+
+        if not best_sigs and cfg.allow_relaxed_signature_fallback:
+            # Fall back to window-agnostic remainder intersection if strict
+            # (window, remainder) matching yields no overlap.
+            remainder_sets = [set(rm.keys()) for rm in remainder_map.values()]
+            common_remainders = set.intersection(*remainder_sets) if remainder_sets else set()
+            if cfg.require_substrings:
+                common_remainders = {
+                    r for r in common_remainders if _filter_by_substrings(r, cfg.require_substrings)
+                }
+            if common_remainders:
+                best_sigs = []
+                for rem in sorted(common_remainders):
+                    # Use a synthetic window key so aligned names stay deterministic.
+                    best_sigs.append(("mixed", rem))
 
         if not best_sigs:
             msg = "Could not find any shared summary feature signatures across tickers."
             if cfg.strict or self.strict:
                 raise ValueError(msg)
             warnings.warn(msg)
-            return [], {t: [] for t in summaries.keys()}
+            return [], {t: [] for t in summaries.keys()}, {t: {} for t in summaries.keys()}
 
         # Add always_include (must exist in all tickers to remain schema-consistent)
         always = []
@@ -616,32 +724,53 @@ class MultiAssetMomentum(DeepIDMomentum):  # type: ignore[misc]
                 if all(c in df.columns for df in summaries.values()):
                     always.append(c)
 
-        # Choose one actual column per signature per ticker
+        # Build aligned names for signature columns.
+        sig_aligned_names = [f"{window}__{remainder}" for (window, remainder) in best_sigs]
+        aligned_names = list(always) + sig_aligned_names
+
+        # Choose one actual column per signature per ticker with deterministic rename mapping.
         per_cols: Dict[str, List[str]] = {}
-        # Build global aligned names as canonical remainder names + window to avoid anchor differences
-        aligned_names: List[str] = []
-        for (window, remainder) in best_sigs:
-            aligned_names.append(f"{window}__{remainder}")
+        per_rename: Dict[str, Dict[str, str]] = {}
 
         for t, df in summaries.items():
             cols: List[str] = []
-            for (window, remainder), aligned in zip(best_sigs, aligned_names):
-                candidates = sig_map[t].get((window, remainder), [])
+            rename_map: Dict[str, str] = {}
+
+            # Always include cols keep original names for canonical stability.
+            for c in always:
+                cols.append(c)
+                rename_map[c] = c
+
+            for (window, remainder), aligned in zip(best_sigs, sig_aligned_names):
+                if window == "mixed":
+                    # Pick best window per ticker by preference for this remainder.
+                    windows = remainder_map[t].get(remainder, {})
+                    selected_window = None
+                    for w in cfg.prefer_windows:
+                        if w in windows:
+                            selected_window = w
+                            break
+                    if selected_window is None and windows:
+                        selected_window = sorted(windows.keys())[0]
+                    candidates = windows.get(selected_window, []) if selected_window else []
+                else:
+                    candidates = sig_map[t].get((window, remainder), [])
                 if not candidates:
-                    # should not happen given intersection, but keep safe
+                    # Keep shape stable by adding a synthetic placeholder column.
+                    # It will be filled with zeros in _select_and_align_summary().
+                    synthetic = f"__missing__{aligned}"
+                    cols.append(synthetic)
+                    rename_map[synthetic] = aligned
                     continue
                 # deterministic pick: smallest column name
                 chosen = sorted(candidates)[0]
                 cols.append(chosen)
-            # prepend always include (exact names)
-            cols = always + cols
-            per_cols[t] = cols
+                rename_map[chosen] = aligned
 
-        # The "common schema" is represented as the aligned_names, but the actual
-        # per-ticker columns may differ (anchors). We return aligned_names for reference
-        # and per-ticker columns for selection.
-        # For DeepIDMomentum, we must supply actual columns; we keep aligned_names in cache.
-        return aligned_names, per_cols
+            per_cols[t] = cols
+            per_rename[t] = rename_map
+
+        return aligned_names, per_cols, per_rename
 
     def _recompute_summary_universal(
         self,
@@ -681,22 +810,595 @@ class MultiAssetMomentum(DeepIDMomentum):  # type: ignore[misc]
         cfg = self.summary_config
 
         if cfg.strategy == "recompute":
-            # schema is determined by recompute method; fixed names
-            self._aligned_summary_cols = ["session_return_1", "session_return_5", "session_return_10",
-                                         "session_volatility_1", "session_volatility_5", "session_volatility_10"]
+            periods = tuple(int(p) for p in cfg.recompute_periods)
+            self._aligned_summary_cols = (
+                [f"session_return_{p}" for p in periods]
+                + [f"session_volatility_{p}" for p in periods]
+            )
             self._per_ticker_summary_cols = None
+            self._per_ticker_summary_rename = None
             return
 
         summaries = self._load_raw_summaries(use_tickers)
         if cfg.strategy == "exact":
             aligned, per = self._align_summary_exact(summaries)
+            rename = {t: {c: c for c in cols} for t, cols in per.items()}
         elif cfg.strategy == "signature":
-            aligned, per = self._align_summary_signature(summaries)
+            aligned, per, rename = self._align_summary_signature(summaries)
         else:
             raise ValueError(f"Unknown summary_config.strategy={cfg.strategy!r}")
 
+        if not aligned and cfg.strategy == "signature" and not (cfg.strict or self.strict):
+            warnings.warn(
+                "Signature schema alignment produced no shared columns. "
+                "Falling back to recomputed universal summary template."
+            )
+            self.rebuild_summary_template(
+                tickers=use_tickers,
+                n_periods=cfg.recompute_periods,
+                parallel=True,
+                max_workers=min(8, max(1, len(use_tickers))),
+                prefer_gpu=True,
+                save_to_summary_file=False,
+            )
+            return
+
         self._aligned_summary_cols = aligned
         self._per_ticker_summary_cols = per
+        self._per_ticker_summary_rename = rename
+
+    def detect_summary_schema(
+        self,
+        tickers: Optional[Sequence[str]] = None,
+        *,
+        max_workers: int = 8,
+    ) -> Dict[str, Any]:
+        """
+        Diagnose summary schema compatibility across tickers.
+
+        Returns a compact report with exact-overlap and signature-overlap stats.
+        """
+        use_tickers = list(tickers) if tickers is not None else self._tickers
+        summaries = self._load_raw_summaries(use_tickers, max_workers=max_workers)
+        exact_cols, _ = self._align_summary_exact(summaries)
+
+        signature_count_by_window: Dict[str, int] = {}
+        for w in self.summary_config.prefer_windows:
+            per_sets: List[set] = []
+            for t, df in summaries.items():
+                sigs = set()
+                for c in df.columns:
+                    sig = feature_signature(c)
+                    if sig is None:
+                        continue
+                    if sig[0] != w:
+                        continue
+                    if self.summary_config.require_substrings and not _filter_by_substrings(
+                        sig[1], self.summary_config.require_substrings
+                    ):
+                        continue
+                    sigs.add(sig)
+                per_sets.append(sigs)
+            inter = set.intersection(*per_sets) if per_sets else set()
+            signature_count_by_window[w] = len(inter)
+
+        return {
+            "tickers": use_tickers,
+            "n_tickers": len(use_tickers),
+            "exact_common_cols": len(exact_cols),
+            "signature_count_by_window": signature_count_by_window,
+            "require_substrings": list(self.summary_config.require_substrings),
+            "recommended_strategy": (
+                "exact"
+                if len(exact_cols) >= self.summary_config.min_common
+                else "signature"
+            ),
+        }
+
+    # Backward-compatible alias.
+    def detect_schema(
+        self,
+        tickers: Optional[Sequence[str]] = None,
+        *,
+        max_workers: int = 8,
+    ) -> Dict[str, Any]:
+        return self.detect_summary_schema(tickers=tickers, max_workers=max_workers)
+
+    def _finalize_summary_frame(self, df: pd.DataFrame, *, prefer_gpu: bool = True) -> pd.DataFrame:
+        """Fill invalid values efficiently, preferring GPU if available."""
+        if df.empty:
+            return df
+
+        values = df.values.astype(np.float32, copy=False)
+        if prefer_gpu and torch.cuda.is_available():
+            try:
+                t = torch.tensor(values, dtype=torch.float32, device="cuda")
+                t = torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+                values = t.cpu().numpy()
+            except Exception:
+                values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+        else:
+            values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return pd.DataFrame(values, index=df.index, columns=df.columns)
+
+    @staticmethod
+    def _to_time(hm: Tuple[int, int]) -> time:
+        return time(int(hm[0]), int(hm[1]))
+
+    @staticmethod
+    def _expand_feature_versions(
+        feature_key: str,
+        base_kwargs: Mapping[str, Any],
+        feature_versions: Optional[Mapping[str, Mapping[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        """Expand list-based per-feature args into versioned kwargs.
+
+        Rules:
+        - non-list args are shared across all versions
+        - list args must have length == N or 1 (broadcast)
+        - N is the maximum list length for this feature
+        """
+        overrides = dict((feature_versions or {}).get(feature_key, {}) or {})
+        if not overrides:
+            return [dict(base_kwargs)]
+
+        list_lengths = [len(v) for v in overrides.values() if isinstance(v, list)]
+        if not list_lengths:
+            merged = dict(base_kwargs)
+            merged.update(overrides)
+            return [merged]
+
+        n_versions = max(list_lengths)
+        bad = [k for k, v in overrides.items() if isinstance(v, list) and len(v) not in (1, n_versions)]
+        if bad:
+            lengths = {k: len(v) for k, v in overrides.items() if isinstance(v, list)}
+            raise ValueError(
+                f"Feature '{feature_key}' has incompatible list dimensions: {lengths}. "
+                f"All list lengths must match or be 1."
+            )
+
+        out: List[Dict[str, Any]] = []
+        for i in range(n_versions):
+            row = dict(base_kwargs)
+            for k, v in overrides.items():
+                if isinstance(v, list):
+                    row[k] = v[0] if len(v) == 1 else v[i]
+                else:
+                    row[k] = v
+            out.append(row)
+        return out
+
+    def _apply_volatility_scaling(
+        self,
+        features: pd.DataFrame,
+        target: pd.Series,
+        cfg: VolatilityScalingConfig,
+        *,
+        prefer_gpu: bool = True,
+    ) -> pd.DataFrame:
+        """Scale selected features by lagged rolling target volatility."""
+        if not cfg.enabled or features.empty:
+            return features
+
+        target = pd.to_numeric(target, errors="coerce")
+        if cfg.use_target_vol:
+            scale = (
+                target.rolling(cfg.rolling_window, min_periods=cfg.min_periods)
+                .std()
+                .shift(1)
+            )
+        else:
+            scale = target.abs().ewm(span=max(10, cfg.min_periods), adjust=False).std().shift(1)
+
+        scale = scale.reindex(features.index).replace(0.0, np.nan).ffill().bfill().fillna(1.0)
+        scale_values = np.maximum(scale.values.astype(np.float32), cfg.eps)
+
+        candidates = [
+            c for c in features.columns
+            if any(s in c.lower() for s in cfg.target_col_substrings)
+        ]
+        if not candidates:
+            return features
+
+        out = features.copy()
+        if prefer_gpu and torch.cuda.is_available():
+            try:
+                x = torch.tensor(out[candidates].values.astype(np.float32), device="cuda")
+                s = torch.tensor(scale_values, dtype=torch.float32, device="cuda").unsqueeze(-1)
+                x = x / s
+                out[candidates] = x.cpu().numpy()
+                return out
+            except Exception:
+                pass
+
+        out[candidates] = out[candidates].div(scale_values, axis=0)
+        return out
+
+    def _build_summary_one_ticker(
+        self,
+        ticker: str,
+        *,
+        cfg: SummaryPipelineConfig,
+        target_col: str,
+        curve_df: Optional[pd.DataFrame],
+        force_reload_model: bool,
+        prefer_gpu: bool,
+    ) -> Tuple[str, pd.DataFrame]:
+        model = self.get_model(
+            ticker,
+            target_col=target_col,
+            force_reload=force_reload_model,
+            use_profile_scaler=True,
+        )
+
+        # Start from a clean summary table. Feature builders in IntradayMomentum
+        # write into `self.training_data` only when it is a DataFrame.
+        original_training_data = model.training_data
+        working_summary = pd.DataFrame(index=model.target_data.index)
+        model.training_data = working_summary
+        model.feature_names = []
+
+        intraday = model.intraday_data
+
+        # Returns bucket
+        if cfg.returns.enabled:
+            if cfg.returns.add_daily_momentum:
+                for kwargs in self._expand_feature_versions(
+                    "add_daily_momentum_features",
+                    {"lookbacks": cfg.returns.momentum_lookbacks},
+                    cfg.feature_versions,
+                ):
+                    model.add_daily_momentum_features(**kwargs)
+            if cfg.returns.add_overnight_returns:
+                for kwargs in self._expand_feature_versions(
+                    "overnight_returns",
+                    {"intraday_df": intraday, "add_as_feature": True},
+                    cfg.feature_versions,
+                ):
+                    model.overnight_returns(**kwargs)
+            if cfg.returns.add_prev_hl:
+                for kwargs in self._expand_feature_versions(
+                    "prev_hl",
+                    {
+                        "target_time": self._to_time(cfg.returns.prev_hl_time),
+                        "intraday_df": intraday,
+                        "add_as_feature": True,
+                    },
+                    cfg.feature_versions,
+                ):
+                    model.prev_hl(**kwargs)
+            if cfg.returns.add_vwap_distance:
+                for kwargs in self._expand_feature_versions(
+                    "vwap_distance",
+                    {
+                        "target_time": [self._to_time(t) for t in cfg.returns.vwap_times],
+                        "intraday_df": intraday,
+                        "period_length": timedelta(minutes=int(cfg.returns.vwap_period_mins)),
+                        "add_as_feature": True,
+                    },
+                    cfg.feature_versions,
+                ):
+                    model.vwap_distance(**kwargs)
+
+        # Volatility bucket
+        if cfg.volatility.enabled:
+            if cfg.volatility.add_opening_range_volatility:
+                for kwargs in self._expand_feature_versions(
+                    "opening_range_volatility",
+                    {
+                        "intraday_df": intraday,
+                        "period_length": timedelta(minutes=int(cfg.volatility.opening_range_period_mins)),
+                        "add_as_feature": True,
+                    },
+                    cfg.feature_versions,
+                ):
+                    model.opening_range_volatility(**kwargs)
+            if cfg.volatility.add_har_features:
+                for kwargs in self._expand_feature_versions(
+                    "har_volatility_features",
+                    {
+                        "intraday_df": intraday,
+                        "horizons": cfg.volatility.har_horizons,
+                        "add_as_feature": True,
+                    },
+                    cfg.feature_versions,
+                ):
+                    model.har_volatility_features(**kwargs)
+            if cfg.volatility.add_normalized_range:
+                for hm in cfg.volatility.normalized_range_times:
+                    for kwargs in self._expand_feature_versions(
+                        "normalized_range",
+                        {
+                            "target_time": self._to_time(hm),
+                            "intraday_df": intraday,
+                            "period_length": timedelta(minutes=int(cfg.volatility.normalized_range_period_mins)),
+                            "add_as_feature": True,
+                        },
+                        cfg.feature_versions,
+                    ):
+                        model.normalized_range(**kwargs)
+            if cfg.volatility.add_vol_ratios:
+                for kwargs in self._expand_feature_versions(
+                    "vol_ratios",
+                    {
+                        "intraday_df": intraday,
+                        "short_long_pairs": cfg.volatility.vol_ratio_pairs,
+                        "add_as_feature": True,
+                    },
+                    cfg.feature_versions,
+                ):
+                    model.vol_ratios(**kwargs)
+            if cfg.volatility.add_liquidity_impact:
+                for kwargs in self._expand_feature_versions(
+                    "liquidity_impact",
+                    {
+                        "target_time": [self._to_time(t) for t in cfg.volatility.liquidity_impact_times],
+                        "intraday_df": intraday,
+                        "period_length": timedelta(minutes=int(cfg.volatility.liquidity_period_mins)),
+                        "add_as_feature": True,
+                    },
+                    cfg.feature_versions,
+                ):
+                    model.liquidity_impact(**kwargs)
+            if cfg.volatility.add_deseasonalized_vol:
+                for hm in cfg.volatility.deseasonalized_targets:
+                    for kwargs in self._expand_feature_versions(
+                        "deseasonalized_vol",
+                        {
+                            "target_time": self._to_time(hm),
+                            "period_length": timedelta(minutes=int(cfg.volatility.deseasonalized_period_mins)),
+                            "return_scaled_returns": True,
+                            "return_volatility": True,
+                            "add_as_feature": True,
+                            "refit_interval": int(cfg.volatility.deseasonalized_refit_interval),
+                        },
+                        cfg.feature_versions,
+                    ):
+                        model.deseasonalized_vol(**kwargs)
+
+        # Curve bucket
+        if cfg.curve.enabled and curve_df is not None and not curve_df.empty:
+            if cfg.curve.add_curve_levels:
+                for kwargs in self._expand_feature_versions(
+                    "curve_levels",
+                    {
+                        "fwd_curve_df": curve_df,
+                        "target_time": self._to_time(cfg.curve.curve_level_time),
+                        "slope_mos": cfg.curve.slope_mos,
+                        "spread_pair_1": cfg.curve.spread_pair_1,
+                        "spread_pair_2": cfg.curve.spread_pair_2,
+                        "add_as_feature": True,
+                    },
+                    cfg.feature_versions,
+                ):
+                    model.curve_levels(**kwargs)
+            if cfg.curve.add_intraday_curve_changes:
+                for kwargs in self._expand_feature_versions(
+                    "intraday_curve_changes",
+                    {
+                        "fwd_curve_df": curve_df,
+                        "time_1": self._to_time(cfg.curve.curve_change_time_1),
+                        "time_2": self._to_time(cfg.curve.curve_change_time_2),
+                        "period_length": timedelta(minutes=int(cfg.curve.curve_change_period_mins)),
+                        "slope_mos": cfg.curve.slope_mos,
+                        "spread_pair_1": cfg.curve.spread_pair_1,
+                        "spread_pair_2": cfg.curve.spread_pair_2,
+                        "add_as_feature": True,
+                    },
+                    cfg.feature_versions,
+                ):
+                    model.intraday_curve_changes(**kwargs)
+
+        if cfg.add_calendar_features:
+            model.add_calendar_datetime_features(ticker=ticker)
+        if cfg.add_eia_features:
+            model.add_eia_release_features(ticker=ticker, add_as_feature=True)
+
+        summary = model.training_data.copy() if isinstance(model.training_data, pd.DataFrame) else working_summary.copy()
+        summary = self._apply_volatility_scaling(
+            summary,
+            model.target_data,
+            cfg.volatility_scaling,
+            prefer_gpu=prefer_gpu,
+        )
+        summary = self._finalize_summary_frame(summary, prefer_gpu=prefer_gpu)
+
+        # Restore DeepIDMomentum storage shape while persisting summary features.
+        if isinstance(original_training_data, dict):
+            original_training_data["summary"] = summary
+            model.training_data = original_training_data
+        else:
+            model.training_data = summary
+        model.feature_names = list(summary.columns)
+
+        return ticker, summary
+
+    def _select_and_align_summary(self, ticker: str, raw: pd.DataFrame) -> pd.DataFrame:
+        """Select ticker summary columns and rename to canonical aligned schema."""
+        per_cols = self._per_ticker_summary_cols or {}
+        per_rename = self._per_ticker_summary_rename or {}
+        selected = per_cols.get(ticker, [])
+        rename_map = per_rename.get(ticker, {})
+
+        if not selected:
+            if self._aligned_summary_cols:
+                # fallback to exact-name columns present in this ticker
+                selected = [c for c in raw.columns if c in self._aligned_summary_cols]
+                rename_map = {c: c for c in selected}
+            else:
+                return raw.copy()
+
+        data: Dict[str, pd.Series] = {}
+        for src in selected:
+            out_col = rename_map.get(src, src)
+            if src in raw.columns:
+                data[out_col] = raw[src]
+            else:
+                # missing synthetic placeholder -> fill zeros
+                data[out_col] = pd.Series(0.0, index=raw.index, dtype=np.float32)
+
+        out = pd.DataFrame(data, index=raw.index)
+        if self._aligned_summary_cols:
+            out = out.reindex(columns=self._aligned_summary_cols)
+        return out
+
+    def rebuild_summary_template(
+        self,
+        tickers: Optional[Sequence[str]] = None,
+        *,
+        n_periods: Optional[Sequence[int]] = None,
+        tz: str = "America/New_York",
+        session_start: Optional[Tuple[int, int]] = None,
+        session_end: Optional[Tuple[int, int]] = None,
+        parallel: bool = True,
+        max_workers: int = 8,
+        prefer_gpu: bool = True,
+        save_to_summary_file: bool = False,
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        Build a universal summary template from intraday data for all tickers.
+
+        This is useful when existing `features.csv` schemas are inconsistent.
+        """
+        use_tickers = list(tickers) if tickers is not None else self._tickers
+        periods = tuple(int(p) for p in (n_periods or self.summary_config.recompute_periods))
+        template_cols = [f"session_return_{p}" for p in periods] + [f"session_volatility_{p}" for p in periods]
+
+        def _build_one(t: str) -> Tuple[str, pd.DataFrame]:
+            paths = self.paths_for_ticker(t, must_exist=True)
+            seq = _read_tabular(paths["vpin"])
+
+            ip = paths.get("intraday")
+            if ip is not None and ip.exists():
+                if read_exported_df is not None:
+                    intraday_df = read_exported_df(str(ip))
+                else:
+                    intraday_df = _read_tabular(ip)
+            else:
+                intraday_df = _synthesize_intraday_from_sequential(seq)
+
+            feat = self._recompute_summary_universal(
+                t,
+                intraday_df,
+                tz=tz,
+                session_start=session_start,
+                session_end=session_end,
+                n_periods=periods,
+            )
+            feat = feat.reindex(columns=template_cols)
+            feat = self._finalize_summary_frame(feat, prefer_gpu=prefer_gpu)
+            return t, feat
+
+        out: Dict[str, pd.DataFrame] = {}
+        use_parallel = parallel and len(use_tickers) > 1
+        if use_parallel:
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(use_tickers))) as executor:
+                futures = {executor.submit(_build_one, t): t for t in use_tickers}
+                for future in as_completed(futures):
+                    t, feat = future.result()
+                    out[t] = feat
+        else:
+            for t in use_tickers:
+                _, feat = _build_one(t)
+                out[t] = feat
+
+        # cache for fast subsequent get_model() calls
+        self._recomputed_summaries.update(out)
+        self._aligned_summary_cols = list(template_cols)
+        self._per_ticker_summary_cols = None
+        self._per_ticker_summary_rename = None
+
+        if save_to_summary_file:
+            for t, feat in out.items():
+                p = self.path_for(t, self.generic_files.summary, must_exist=False)
+                feat.to_csv(p, index=True)
+
+        return out
+
+    def build_summary_from_pipeline(
+        self,
+        tickers: Optional[Sequence[str]] = None,
+        *,
+        config: SummaryPipelineConfig = SummaryPipelineConfig(),
+        curve_data_by_ticker: Optional[Mapping[str, pd.DataFrame]] = None,
+        curve_loader: Optional[Callable[[str], Optional[pd.DataFrame]]] = None,
+        target_col: str = "target",
+        parallel: bool = True,
+        max_workers: int = 8,
+        prefer_gpu: bool = True,
+        force_reload_model: bool = True,
+        save_to_summary_file: bool = False,
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        Build summary features using IntradayMomentum/DeepIDMomentum feature methods.
+
+        This is the "from scratch" feature-engineering path designed for
+        multi-ticker consistency when raw summary files are not aligned.
+        """
+        use_tickers = list(tickers) if tickers is not None else self._tickers
+        if not use_tickers:
+            return {}
+
+        def _curve_df(t: str) -> Optional[pd.DataFrame]:
+            if curve_data_by_ticker is not None:
+                return curve_data_by_ticker.get(t)
+            if curve_loader is not None:
+                return curve_loader(t)
+            return None
+
+        out: Dict[str, pd.DataFrame] = {}
+
+        def _run_one(t: str) -> Tuple[str, pd.DataFrame]:
+            return self._build_summary_one_ticker(
+                t,
+                cfg=config,
+                target_col=target_col,
+                curve_df=_curve_df(t),
+                force_reload_model=force_reload_model,
+                prefer_gpu=prefer_gpu,
+            )
+
+        use_parallel = parallel and len(use_tickers) > 1
+        if use_parallel:
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(use_tickers))) as executor:
+                futures = {executor.submit(_run_one, t): t for t in use_tickers}
+                for future in as_completed(futures):
+                    t, feat = future.result()
+                    out[t] = feat
+        else:
+            for t in use_tickers:
+                _, feat = _run_one(t)
+                out[t] = feat
+
+        # Canonicalize schema across tickers with deterministic ordered union.
+        canonical_cols: List[str] = []
+        seen: set = set()
+        for t in use_tickers:
+            for c in out[t].columns:
+                if c not in seen:
+                    seen.add(c)
+                    canonical_cols.append(c)
+
+        for t in use_tickers:
+            out[t] = out[t].reindex(columns=canonical_cols, fill_value=0.0)
+            out[t] = self._finalize_summary_frame(out[t], prefer_gpu=prefer_gpu)
+            # Keep cached model summary aligned too.
+            if t in self._models:
+                self._models[t].training_data["summary"] = out[t]
+                self._models[t].feature_names = list(canonical_cols)
+
+        self._aligned_summary_cols = canonical_cols
+        self._per_ticker_summary_cols = {t: list(canonical_cols) for t in use_tickers}
+        self._per_ticker_summary_rename = {t: {c: c for c in canonical_cols} for t in use_tickers}
+        self._recomputed_summaries.update(out)
+
+        if save_to_summary_file:
+            for t, feat in out.items():
+                p = self.path_for(t, self.generic_files.summary, must_exist=False)
+                feat.to_csv(p, index=True)
+
+        return out
 
     # ---------- per-ticker model build ----------
 
@@ -760,23 +1462,24 @@ class MultiAssetMomentum(DeepIDMomentum):  # type: ignore[misc]
 
         # summary features selection / recompute
         if self.summary_config.strategy == "recompute":
-            features_df = self._recompute_summary_universal(ticker, intraday_df)
+            features_df = self._recomputed_summaries.get(ticker)
+            if features_df is None:
+                features_df = self._recompute_summary_universal(
+                    ticker,
+                    intraday_df,
+                    n_periods=self.summary_config.recompute_periods,
+                )
+            if self._aligned_summary_cols:
+                features_df = features_df.reindex(columns=self._aligned_summary_cols)
+            features_df = self._finalize_summary_frame(features_df, prefer_gpu=True)
         else:
             raw = _read_tabular(paths["summary"])
             if self.summary_config.drop_datetime_cols:
-                for c in ("Datetime", "datetime", "DateTime", "ts", "date", "Date"):
+                for c in _DATE_COL_CANDIDATES:
                     if c in raw.columns:
                         raw = raw.drop(columns=[c])
-            # select per ticker columns
-            per = self._per_ticker_summary_cols or {}
-            sel = per.get(ticker)
-            if sel is None:
-                # fall back: if exact, aligned are real columns; if signature, choose intersection of actual cols
-                sel = [c for c in raw.columns if c in (self._aligned_summary_cols or [])]
-            if sel:
-                features_df = raw[sel].copy()
-            else:
-                features_df = raw.copy()
+            features_df = self._select_and_align_summary(ticker, raw)
+            features_df = self._finalize_summary_frame(features_df, prefer_gpu=True)
 
         # Profile arrays
         try:
@@ -1321,4 +2024,14 @@ class MultiAssetMomentum(DeepIDMomentum):  # type: ignore[misc]
         return _make_loader(train_ds, payload["train_loader_cfg"], shuffle=loader_kwargs.get("shuffle_train", True))
 
 
-__all__ = ["GenericFiles", "SummarySelectionConfig", "MultiAssetMomentum", "feature_signature"]
+__all__ = [
+    "GenericFiles",
+    "SummarySelectionConfig",
+    "ReturnsFeatureConfig",
+    "VolatilityFeatureConfig",
+    "CurveFeatureConfig",
+    "VolatilityScalingConfig",
+    "SummaryPipelineConfig",
+    "MultiAssetMomentum",
+    "feature_signature",
+]

@@ -2,8 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils.rnn as rnn_utils
-from torch import nn as nn
-from torch.nn import functional as F
 
 from ..encoders import RasterResNet, MarketProfileResNet, SpatialFuse, IntradayRNN, MetaModalityEncoder
 

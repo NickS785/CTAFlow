@@ -7,12 +7,13 @@ import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional, Union, Tuple, Any
 import warnings
+import re
 from datetime import datetime
 from scipy import stats
 from scipy.stats import skew, kurtosis
 import plotly.io as pio
 from numpy.linalg import svd
-from ...data.raw_formatting.spread_manager import FuturesCurve, SpreadData, SpreadFeature
+from ...data.raw_formatting.spread_manager import FuturesCurve, SpreadData
 from ...utils.seasonal import deseasonalize_monthly
 pio.renderers.default = "browser"
 # Import data client and utilities if available
@@ -37,7 +38,6 @@ except ImportError:
             return True
 
 # Additional imports for advanced analysis
-from numba import jit, prange
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -484,11 +484,10 @@ def calculate_microstructure_features(spread_data: SpreadData) -> Dict[str, floa
 
 
 # ====================================================================================
-# JIT-COMPILED UTILITY FUNCTIONS
+# CORE NUMERICAL UTILITY FUNCTIONS
 # ====================================================================================
 
-@jit(nopython=True)
-def _calculate_log_levy_areas_numba(log_prices: np.ndarray, window: int) -> np.ndarray:
+def _calculate_log_levy_areas(log_prices: np.ndarray, window: int) -> np.ndarray:
     """
     JIT-optimized Lévy area calculation on log prices
 
@@ -505,7 +504,7 @@ def _calculate_log_levy_areas_numba(log_prices: np.ndarray, window: int) -> np.n
     n_dates, n_contracts = log_prices.shape
     levy_areas = np.full((n_dates, n_contracts - 1), np.nan)
 
-    for contract_pair in prange(n_contracts - 1):
+    for contract_pair in range(n_contracts - 1):
         front_log = log_prices[:, contract_pair]
         back_log = log_prices[:, contract_pair + 1]
 
@@ -786,9 +785,6 @@ class CurveEvolutionAnalyzer:
         try:
             # Import necessary functions
             from ..data.raw_formatting.dly_contract_manager import calculate_contract_expiry
-            import pandas as pd
-            import numpy as np
-            import re
 
             # Determine symbol and get price data
             symbol = self.symbol or getattr(self.spread_data, 'symbol', None)
@@ -837,7 +833,6 @@ class CurveEvolutionAnalyzer:
                 return False
 
             # Create expiry data Series
-            import pandas as pd
             self.expiry_data = pd.Series(expiry_dict, name='expiry_date')
             self.expiry_data.index.name = 'contract_id'
             self.expiry_data = pd.to_datetime(self.expiry_data)
@@ -970,16 +965,13 @@ class CurveEvolutionAnalyzer:
 
         return deseasonalized.to_numpy()
     
-    def _calculate_log_levy_areas_jit(self, 
-                                     log_prices: np.ndarray,
-                                     window: int) -> np.ndarray:
+    def _calculate_log_levy_areas_jit(self,
+                                      log_prices: np.ndarray,
+                                      window: int) -> np.ndarray:
         """
-        Wrapper for JIT-optimized Lévy area calculation on log prices
-        
-        Computes Lévy areas between consecutive contract months using log prices
-        to detect fundamental drivers of curve evolution
+        Backward-compatible wrapper for Lévy area calculation on log prices.
         """
-        return _calculate_log_levy_areas_numba(log_prices, window)
+        return _calculate_log_levy_areas(log_prices, window)
 
 
 

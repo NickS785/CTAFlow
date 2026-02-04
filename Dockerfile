@@ -38,7 +38,6 @@ RUN pip install --no-cache-dir -e .
 
 # Environment Variables (S3 Buckets)
 ENV DATA_S3_BUCKET="s3://fin_data_eod2"
-ENV ENV_S3_BUCKET="s3://ctaflow-env"
 
 # Expose the standard Jupyter port
 EXPOSE 8888

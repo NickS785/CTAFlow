@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime
 from dataclasses import dataclass
 from datetime import time, timedelta
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Type, Union
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Type, Union
 
 import numpy as np
 import pandas as pd
@@ -134,7 +134,7 @@ from ..features.curve.curve_features import CurveFeatures
 from ..features import deseasonalize_volatility, deseasonalize_volume
 from ..utils.tenor_interpolation import TenorInterpolator, create_tenor_grid
 from ..data import read_exported_df
-from ..data.dataset_utils import collate_dual, collate_tri, collate_quad, get_collate_fn
+from ..data.dataset_utils import collate_dual, collate_tri, collate_quad
 
 
 # noinspection PyDefaultArgument
@@ -6768,7 +6768,6 @@ class DeepIDMomentum(IntradayMomentum):
         """
         # Import here to avoid requiring torch for all IntradayMomentum usage
         try:
-            import torch
             from torch.utils.data import DataLoader
             from ..data.model_datasets import (
                 DualDataset, QuadModalDataset, TriModalDataset, RasterizedModalDataset,

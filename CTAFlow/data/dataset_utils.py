@@ -14,7 +14,6 @@ from datetime import date, datetime
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.utils.rnn as rnn_utils
 from typing import List, Tuple, Any, Optional, Dict
 

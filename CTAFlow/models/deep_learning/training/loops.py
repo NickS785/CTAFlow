@@ -10,7 +10,7 @@ Provides specialized loops for:
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Dict, List, Tuple, Any, Union
+from typing import Callable, Optional, Dict, List, Tuple, Union
 from dataclasses import dataclass
 
 import numpy as np
@@ -21,8 +21,6 @@ from torch.utils.data import DataLoader
 from CTAFlow.models.deep_learning.training.loss.clf import (
     ProfitWeightedCE,
     ExpectedPnLLoss,
-    HierarchicalDirectionalLoss,
-    CostAwareCE,
 )
 
 

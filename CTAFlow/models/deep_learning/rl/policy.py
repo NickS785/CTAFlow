@@ -34,14 +34,13 @@ Usage:
     model = PPO("MultiInputPolicy", env, policy_kwargs=policy_kwargs)
 """
 
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Optional, Type
 
 import gymnasium as gym
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from stable_baselines3 import PPO
-from stable_baselines3.common.policies import ActorCriticPolicy, MultiInputActorCriticPolicy
+from stable_baselines3.common.policies import MultiInputActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.type_aliases import Schedule
 

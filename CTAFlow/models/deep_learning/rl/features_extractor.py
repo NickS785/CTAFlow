@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import gymnasium as gym
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
@@ -11,7 +10,6 @@ from ..encoders import (
     IntradayRNN,
     SpatialFuse,
     MetaModalityEncoder,
-    GatedFusion,
 )
 
 

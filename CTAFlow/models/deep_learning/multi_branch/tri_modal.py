@@ -501,7 +501,6 @@ class TriModalModel(nn.Module):
         }
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils.rnn as rnn_utils
 
@@ -511,7 +510,6 @@ from CTAFlow.models.deep_learning.encoders import (
     SpatialFuse,
     MarketProfileResNet,
     RasterResNet,
-    IntradayRNN
 )
 
 
@@ -743,7 +741,7 @@ class RecurrentTriModal(nn.Module):
             nn.Linear(f_sum, d_model),
             nn.LayerNorm(d_model),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(fusion_dropout),
             nn.Linear(d_model, d_model)
         )
 
@@ -782,7 +780,7 @@ class RecurrentTriModal(nn.Module):
             input_size=d_model,
             hidden_size=lstm_hidden,
             num_layers=1,
-            batch_first=Trueto
+            batch_first=True
         )
 
         # --- Prediction Head ---

@@ -370,13 +370,6 @@ class DualDataset(Dataset):
         return summary_vec, sequential_tensor, target, length
 
 
-import torch
-from torch.utils.data import Dataset
-import pandas as pd
-import numpy as np
-from typing import Optional, List, Union, Mapping
-
-
 class TriModalDataset(Dataset):
     def __init__(self,
                  summary_data: pd.DataFrame,

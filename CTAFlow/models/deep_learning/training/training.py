@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from sklearn.preprocessing import StandardScaler
 from CTAFlow.data import make_window_dataset, MomentumWindowDataset
 from CTAFlow.models.deep_learning.training.loops import evaluate
 from CTAFlow.models.intraday_momentum import IntradayMomentum
@@ -165,8 +164,6 @@ def convert_IM(model_prep:IntradayMomentum, lookback_period=10, batch_size=16, t
     Otherwise: ds, dl
     """
     X, y = model_prep.get_xy()
-    if scaler is None:
-        scaler = StandardScaler()
 
     if val_split:
         # Split into train and validation (no test set in this mode)
