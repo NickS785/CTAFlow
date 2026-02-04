@@ -11,9 +11,11 @@ pyarrow>=10.0.0  # For parquet support
 scikit-learn>=1.0.0
 lightgbm>=3.0.0
 xgboost>=1.5.0
+shap>=0.42.0  # SHAP explanations for feature importance
 
 # Deep learning
 torch>=2.0.0
+optuna>=3.0.0  # Hyperparameter optimization
 
 # Google Cloud dependencies (for Vertex AI training)
 google-cloud-storage>=2.10.0
@@ -55,5 +57,8 @@ python-dotenv>=0.19.0  # Environment variable management
 # gymnasium>=0.29.0
 # stable-baselines3>=2.0.0
 
-# Optional: Mamba SSM stack (for CTAFlow/models/deep_learning/multi_branch/mamba_model.py)
-# mamba-ssm>=2.2.0
+# Mamba SSM stack (for CTAFlow/models/deep_learning/multi_branch/mamba_model.py)
+# NOTE: Install with: pip install mamba-ssm --no-build-isolation
+# Requires CUDA toolkit and PyTorch with CUDA support
+causal-conv1d>=1.4.0  # Mamba dependency
+mamba-ssm>=2.2.0
