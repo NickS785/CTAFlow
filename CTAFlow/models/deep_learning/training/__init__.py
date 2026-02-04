@@ -8,7 +8,13 @@ from .loops import (
     train_regression_epoch,
     evaluate_regression,
 )
-from .backtest import BacktestAttributionResult, backtest_from_predictions, predictions_to_positions
+from .backtest import (
+    BacktestAttributionResult,
+    TradingMode,
+    backtest_from_predictions,
+    backtest_eod_momentum,
+    predictions_to_positions,
+)
 from .loss import (
     ConfidencePenalizedCE,
     CostAwareCE,
@@ -35,8 +41,10 @@ __all__ = [
     "evaluate_regression",
     "evaluate",  # Legacy
     "BacktestAttributionResult",
+    "TradingMode",
     "predictions_to_positions",
     "backtest_from_predictions",
+    "backtest_eod_momentum",
     # Classification losses
     "ConfidencePenalizedCE",
     "CostAwareCE",

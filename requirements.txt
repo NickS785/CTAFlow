@@ -1,6 +1,7 @@
 # Core data processing and numerical computing
 numpy>=1.20.0
 pandas>=1.3.0
+scipy>=1.9.0
 jupyterlab>=4.5.3
 ipywidgets>=8.1.8
 matplotlib>=3.8.3
@@ -19,7 +20,6 @@ google-cloud-storage>=2.10.0
 gcsfs>=2023.6.0
 
 # Data visualization
-matplotlib>=3.3.0
 seaborn>=0.11.0
 plotly>=5.0.0
 dash>=2.0.0
@@ -50,4 +50,10 @@ python-dotenv>=0.19.0  # Environment variable management
 
 # Optional: Alternative GPU frameworks (uncomment if needed)
 # pycuda>=2021.1  # Lower-level CUDA interface (not used in current implementation)
-# numba>=0.56.0   # JIT compilation with CUDA support
+
+# Optional: RL stack (for CTAFlow/models/deep_learning/rl/*)
+# gymnasium>=0.29.0
+# stable-baselines3>=2.0.0
+
+# Optional: Mamba SSM stack (for CTAFlow/models/deep_learning/multi_branch/mamba_model.py)
+# mamba-ssm>=2.2.0
