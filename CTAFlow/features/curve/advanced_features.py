@@ -2258,7 +2258,7 @@ class CurveEvolutionAnalyzer:
             seasonal_mean = series.rolling(window=window, center=True).mean()
             
             # Forward fill and backward fill to handle edges
-            seasonal_pattern = seasonal_mean.fillna(method='bfill').fillna(method='ffill')
+            seasonal_pattern = seasonal_mean.bfill().ffill()
             
             return seasonal_pattern.values
             

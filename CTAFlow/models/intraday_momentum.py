@@ -758,7 +758,7 @@ class IntradayMomentum:
         volatility_scale = volatility_scale.reindex(self.target_data.index)
 
         # Forward fill any missing values (in case of gaps)
-        volatility_scale = volatility_scale.fillna(method='ffill')
+        volatility_scale = volatility_scale.ffill()
 
         # Store in instance variable
         self.volatility_scale = volatility_scale
@@ -4906,7 +4906,7 @@ class IntradayMomentum:
             # Handle missing values based on strategy
             if handle_missing == "fill":
                 # Forward fill NaNs (use with caution - may propagate stale data)
-                momentum_lagged = momentum_lagged.fillna(method='ffill')
+                momentum_lagged = momentum_lagged.ffill()
             elif handle_missing == "zero":
                 # Replace NaNs with 0 (neutral return)
                 momentum_lagged = momentum_lagged.fillna(0)

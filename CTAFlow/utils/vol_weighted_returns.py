@@ -82,7 +82,7 @@ def vol_weighted_returns(
     
     # Forward fill volatility if requested
     if forward_fill_vol:
-        vol_estimates = vol_estimates.fillna(method='ffill')
+        vol_estimates = vol_estimates.ffill()
     
     # Apply minimum volatility floor
     if isinstance(vol_estimates, pd.Series):
@@ -287,4 +287,4 @@ def calculate_vol_surface(
     vol_surface = ewma_volatility(returns_matrix, halflife=vol_halflife)
     vol_surface.columns = tenors
     
-    return vol_surface.fillna(method='ffill')
+    return vol_surface.ffill()

@@ -88,7 +88,7 @@ try:
     from CTAFlow.models.intraday_momentum import DeepIDMomentum
 except Exception:
     try:
-        from intraday_momentum import DeepIDMomentum  # type: ignore
+        from .intraday_momentum import DeepIDMomentum  # type: ignore
     except Exception as e:  # pragma: no cover
         DeepIDMomentum = None  # type: ignore
         _IMPORT_ERR = e

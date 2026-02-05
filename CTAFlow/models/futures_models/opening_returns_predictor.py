@@ -18,7 +18,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from datetime import time, timedelta
-from typing import Dict
 
 import numpy as np
 import pandas as pd

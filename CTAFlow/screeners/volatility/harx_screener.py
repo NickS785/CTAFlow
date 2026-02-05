@@ -210,7 +210,7 @@ class HARXScreener:
         X_ = X.copy()
         X_.index = pd.to_datetime(X_.index).normalize()
         E = e.set_index(pd.to_datetime(e["Date"]).dt.normalize()).drop(columns=["Date"], errors="ignore")
-        X2 = X_.join(E, how="left").fillna(method="ffill")
+        X2 = X_.join(E, how="left").ffill()
         X2 = X2.dropna(axis=1, how="all")  # drop all-NaN exog cols
         return X2
 
