@@ -27,11 +27,11 @@ from typing import List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-# Import CTAFlow deseasonalization utilities
+# Import CTAFlow deseasonalization utilities (aliased to avoid shadowing by params)
 try:
     from CTAFlow.features.cyclical.seasonality.diurnal_seasonality import (
-        deseasonalize_volatility,
-        deseasonalize_volume,
+        deseasonalize_volatility as _deseas_vol_func,
+        deseasonalize_volume as _deseas_volume_func,
     )
     _HAS_DESEAS = True
 except ImportError:
@@ -397,7 +397,7 @@ class ContinuousIntradayPrep:
             valid_mask = volatility.notna() & (volatility > 0)
 
             if valid_mask.sum() > bins_per_day * rolling_days:
-                result = deseasonalize_volatility(
+                result = _deseas_vol_func(
                     volatility[valid_mask],
                     intraday_idx=intraday_idx[valid_mask],
                     bins_per_day=bins_per_day,
@@ -424,7 +424,7 @@ class ContinuousIntradayPrep:
             valid_mask = volume.notna() & (volume > 0)
 
             if valid_mask.sum() > bins_per_day * rolling_days:
-                result = deseasonalize_volume(
+                result = _deseas_volume_func(
                     volume[valid_mask],
                     intraday_idx=intraday_idx[valid_mask],
                     bins_per_day=bins_per_day,
