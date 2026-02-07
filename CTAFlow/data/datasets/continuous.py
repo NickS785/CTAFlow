@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Sequence, Any
 
 
 def _build_sample_mask(
@@ -149,3 +149,340 @@ class ContinuousWindowDataset(Dataset):
         ts = self.df.index[i]
         sess = int(self.df["session_code"].iloc[i]) if "session_code" in self.df.columns else -1
         return x, y, {"timestamp": ts, "session_code": sess}
+
+
+def _normalize_ts_index(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """Normalize index to tz-naive UTC for robust cross-source alignment."""
+    ts = pd.to_datetime(idx)
+    if ts.tz is not None:
+        ts = ts.tz_convert("UTC").tz_localize(None)
+    return pd.DatetimeIndex(ts)
+
+
+def _ffill_bfill_raster(day_raster: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+    """Forward/backward fill missing raster rows inside one day."""
+    out = day_raster.copy()
+    t = out.shape[0]
+    if t == 0:
+        return out
+    if not np.any(valid_mask):
+        return out
+
+    first = int(np.flatnonzero(valid_mask)[0])
+    last = int(np.flatnonzero(valid_mask)[-1])
+
+    # Fill leading gap from first valid
+    for i in range(0, first):
+        out[i] = out[first]
+
+    # Fill trailing gap from last valid
+    for i in range(last + 1, t):
+        out[i] = out[last]
+
+    # Forward-fill interior gaps
+    prev = first
+    for i in range(first + 1, t):
+        if valid_mask[i]:
+            prev = i
+        else:
+            out[i] = out[prev]
+    return out
+
+
+def _build_session_index(
+    day: pd.Timestamp,
+    session_start: str,
+    session_end: str,
+    freq: str,
+) -> pd.DatetimeIndex:
+    """Build per-day expected timestamps for the selected session window."""
+    s = pd.Timestamp(f"{day.date()} {session_start}")
+    e = pd.Timestamp(f"{day.date()} {session_end}")
+    if e <= s:
+        e = e + pd.Timedelta(days=1)
+    return pd.date_range(s, e, freq=freq)
+
+
+def _resample_frame(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """Resample with OHLCV-aware aggregation and last for other numeric columns."""
+    agg = {}
+    for col in df.columns:
+        lc = col.lower()
+        if lc == "open":
+            agg[col] = "first"
+        elif lc == "high":
+            agg[col] = "max"
+        elif lc == "low":
+            agg[col] = "min"
+        elif lc in ("close", "last"):
+            agg[col] = "last"
+        elif lc in ("volume", "vol"):
+            agg[col] = "sum"
+        else:
+            agg[col] = "last"
+    return df.resample(rule).agg(agg).sort_index()
+
+
+class ContinuousRasterAlignedDataset(Dataset):
+    """
+    Continuous dataset for CMDMamba-style long/short streams with raster alignment.
+
+    Produces per-sample:
+      x_short:    [T_short, C, H]
+      t_short:    [T_short, F_time]
+      x_long:     [T_long, F_long]
+      t_long:     [T_long, F_time]
+      short_mask: [T_short]
+      y:          [F_target]
+    """
+
+    DEFAULT_TIME_COLS = (
+        "tod_sin",
+        "tod_cos",
+        "dow_sin",
+        "dow_cos",
+        "doy_sin",
+        "doy_cos",
+        "is_london_session",
+        "is_usa_session",
+        "is_overlap_session",
+    )
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        raster_npz_path: str,
+        feature_cols: List[str],
+        target_cols: List[str],
+        long_lookback: int = 256,
+        short_len_range: Tuple[int, int] = (32, 128),
+        resample_rule: str = "15min",
+        session_start: str = "02:00",
+        session_end: str = "11:00",
+        sample_mode: str = "active",
+        allow_overlap: bool = True,
+        time_feature_cols: Optional[List[str]] = None,
+        max_missing_rows_per_day: int = 6,
+        max_missing_ratio_per_day: float = 0.20,
+        random_short_len: bool = True,
+        return_meta: bool = False,
+    ):
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise TypeError("df must have DatetimeIndex")
+        self.feature_cols = list(feature_cols)
+        self.target_cols = list(target_cols)
+        self.long_lookback = int(long_lookback)
+        self.short_lo = int(short_len_range[0])
+        self.short_hi = int(short_len_range[1])
+        self.random_short_len = bool(random_short_len)
+        self.return_meta = bool(return_meta)
+
+        if self.short_lo <= 0 or self.short_hi < self.short_lo:
+            raise ValueError(f"Invalid short_len_range={short_len_range}")
+        if self.long_lookback <= 0:
+            raise ValueError("long_lookback must be > 0")
+
+        work = df.copy()
+        work.index = _normalize_ts_index(work.index)
+        work = work.sort_index()
+        work = _resample_frame(work, resample_rule)
+
+        # Keep only required columns and make sure they exist
+        missing_feats = [c for c in self.feature_cols if c not in work.columns]
+        missing_tgts = [c for c in self.target_cols if c not in work.columns]
+        if missing_feats:
+            raise KeyError(f"Missing feature columns in df: {missing_feats}")
+        if missing_tgts:
+            raise KeyError(f"Missing target columns in df: {missing_tgts}")
+
+        if time_feature_cols is None:
+            self.time_feature_cols = [c for c in self.DEFAULT_TIME_COLS if c in work.columns]
+        else:
+            self.time_feature_cols = [c for c in time_feature_cols if c in work.columns]
+        if not self.time_feature_cols:
+            # Fallback to a constant channel if time features were not provided.
+            work["_time_const"] = 1.0
+            self.time_feature_cols = ["_time_const"]
+
+        # Raster
+        z = np.load(raster_npz_path, allow_pickle=False)
+        if "data" not in z.files or "idx" not in z.files:
+            raise KeyError(f"{raster_npz_path} must contain keys 'data' and 'idx'")
+        raster = z["data"].astype(np.float32)
+        ridx = pd.DatetimeIndex(pd.to_datetime(z["idx"]))
+        ridx = _normalize_ts_index(ridx)
+
+        if raster.ndim != 3:
+            raise ValueError(f"Expected raster shape (N,C,H), got {raster.shape}")
+        if raster.shape[0] != len(ridx):
+            raise ValueError("Raster length does not match idx length")
+
+        # Sort raster by timestamp (just in case)
+        sort_idx = np.argsort(ridx.values)
+        ridx = ridx[sort_idx]
+        raster = raster[sort_idx]
+        raster_index = pd.DatetimeIndex(ridx)
+
+        # Per-day alignment and filtering
+        common_days = sorted(set(work.index.normalize()) & set(raster_index.normalize()))
+        aligned_frames: List[pd.DataFrame] = []
+        aligned_rasters: List[np.ndarray] = []
+        dropped_days: Dict[str, str] = {}
+
+        for day in common_days:
+            expected = _build_session_index(day, session_start=session_start, session_end=session_end, freq=resample_rule)
+            if len(expected) == 0:
+                continue
+
+            day_raw = work.reindex(expected)
+            feat_missing = day_raw[self.feature_cols].isna().all(axis=1)
+            n_feat_missing = int(feat_missing.sum())
+
+            # Fill features for continuity; keep targets unfilled.
+            day_filled = day_raw.copy()
+            day_filled[self.feature_cols] = day_filled[self.feature_cols].ffill().bfill()
+            day_filled[self.time_feature_cols] = day_filled[self.time_feature_cols].ffill().bfill()
+            for c in self.target_cols:
+                day_filled[c] = day_raw[c]
+
+            ridx_pos = raster_index.get_indexer(expected)
+            valid = ridx_pos >= 0
+            n_raster_missing = int((~valid).sum())
+
+            if not np.any(valid):
+                dropped_days[str(day.date())] = "no_raster_rows"
+                continue
+
+            tlen = len(expected)
+            cdim = raster.shape[1]
+            hdim = raster.shape[2]
+            day_raster = np.zeros((tlen, cdim, hdim), dtype=np.float32)
+            day_raster[valid] = raster[ridx_pos[valid]]
+            day_raster = _ffill_bfill_raster(day_raster, valid_mask=valid)
+
+            miss_limit = max(max_missing_rows_per_day, int(np.floor(max_missing_ratio_per_day * tlen)))
+            if n_feat_missing > miss_limit:
+                dropped_days[str(day.date())] = f"feature_missing={n_feat_missing}"
+                continue
+            if n_raster_missing > miss_limit:
+                dropped_days[str(day.date())] = f"raster_missing={n_raster_missing}"
+                continue
+
+            aligned_frames.append(day_filled)
+            aligned_rasters.append(day_raster)
+
+        if not aligned_frames:
+            raise ValueError("No aligned days left after missing-data filtering.")
+
+        self.df = pd.concat(aligned_frames).sort_index()
+        self.raster = np.concatenate(aligned_rasters, axis=0).astype(np.float32)
+        if len(self.df) != self.raster.shape[0]:
+            raise RuntimeError("Aligned feature/raster lengths do not match after day concat.")
+
+        # Final fill pass for features/time only (targets remain untouched)
+        self.df[self.feature_cols] = self.df[self.feature_cols].ffill().bfill()
+        self.df[self.time_feature_cols] = self.df[self.time_feature_cols].ffill().bfill()
+
+        self.X_long = np.nan_to_num(self.df[self.feature_cols].to_numpy(dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        self.T = np.nan_to_num(self.df[self.time_feature_cols].to_numpy(dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        self.Y = self.df[self.target_cols].to_numpy(dtype=np.float32)
+
+        # Sample positions
+        lookback = max(self.long_lookback, self.short_hi)
+        sample_mask = _build_sample_mask(
+            df=self.df,
+            target_cols=self.target_cols,
+            lookback=lookback,
+            sample_mode=sample_mode,
+            allow_overlap=allow_overlap,
+        )
+        self.sample_pos = np.flatnonzero(sample_mask)
+        if len(self.sample_pos) == 0:
+            raise ValueError("No eligible samples after alignment/masking.")
+
+        self.alignment_stats = {
+            "num_days_in_common": len(common_days),
+            "num_days_kept": len(aligned_frames),
+            "num_days_dropped": len(dropped_days),
+            "dropped_days": dropped_days,
+            "num_samples": int(len(self.sample_pos)),
+            "time_feature_cols": list(self.time_feature_cols),
+        }
+
+    def __len__(self) -> int:
+        return len(self.sample_pos)
+
+    def __getitem__(self, idx: int):
+        i = int(self.sample_pos[idx])
+        if self.random_short_len and self.short_hi > self.short_lo:
+            t_short = int(np.random.randint(self.short_lo, self.short_hi + 1))
+        else:
+            t_short = self.short_hi
+
+        s0 = i - t_short + 1
+        l0 = i - self.long_lookback + 1
+
+        x_short = torch.from_numpy(self.raster[s0:i + 1].copy())  # [T_short,C,H]
+        t_short_feats = torch.from_numpy(self.T[s0:i + 1].copy())  # [T_short,Ft]
+        x_long = torch.from_numpy(self.X_long[l0:i + 1].copy())  # [T_long,F]
+        t_long_feats = torch.from_numpy(self.T[l0:i + 1].copy())  # [T_long,Ft]
+        y = torch.from_numpy(self.Y[i].copy())  # [targets]
+        short_mask = torch.ones((t_short,), dtype=torch.float32)
+
+        if not self.return_meta:
+            return x_short, t_short_feats, x_long, t_long_feats, short_mask, y
+
+        meta = {
+            "timestamp": self.df.index[i],
+            "session_code": int(self.df["session_code"].iloc[i]) if "session_code" in self.df.columns else -1,
+            "sample_pos": i,
+        }
+        return x_short, t_short_feats, x_long, t_long_feats, short_mask, y, meta
+
+
+def collate_continuous_raster(batch: Sequence[Tuple[Any, ...]]):
+    """
+    Collate for ContinuousRasterAlignedDataset with variable short sequence lengths.
+
+    Returns
+    -------
+    tuple
+      x_short_pad: (B, T_short_max, C, H)
+      t_short_pad: (B, T_short_max, F_time)
+      x_long:      (B, T_long, F_long)
+      t_long:      (B, T_long, F_time)
+      short_mask:  (B, T_short_max)
+      y:           (B, F_target) or (B,)
+      meta:        optional tuple of metadata dicts
+    """
+    has_meta = len(batch[0]) == 7
+
+    if has_meta:
+        x_short_list, t_short_list, x_long_list, t_long_list, m_short_list, y_list, meta_list = zip(*batch)
+    else:
+        x_short_list, t_short_list, x_long_list, t_long_list, m_short_list, y_list = zip(*batch)
+        meta_list = None
+
+    bsz = len(x_short_list)
+    t_max = max(int(x.shape[0]) for x in x_short_list)
+    cdim = int(x_short_list[0].shape[1])
+    hdim = int(x_short_list[0].shape[2])
+    ft_dim = int(t_short_list[0].shape[1])
+
+    x_short_pad = torch.zeros((bsz, t_max, cdim, hdim), dtype=torch.float32)
+    t_short_pad = torch.zeros((bsz, t_max, ft_dim), dtype=torch.float32)
+    short_mask = torch.zeros((bsz, t_max), dtype=torch.float32)
+
+    for b in range(bsz):
+        t = int(x_short_list[b].shape[0])
+        x_short_pad[b, :t] = x_short_list[b]
+        t_short_pad[b, :t] = t_short_list[b]
+        short_mask[b, :t] = m_short_list[b]
+
+    x_long = torch.stack(x_long_list, dim=0)
+    t_long = torch.stack(t_long_list, dim=0)
+    y = torch.stack(y_list, dim=0)
+
+    if has_meta:
+        return x_short_pad, t_short_pad, x_long, t_long, short_mask, y, meta_list
+    return x_short_pad, t_short_pad, x_long, t_long, short_mask, y

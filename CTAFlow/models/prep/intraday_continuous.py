@@ -70,6 +70,92 @@ class ContinuousIntradayPrep:
     >>> train_df = df_out.loc[mask]
     """
 
+    @staticmethod
+    def get_feature_cols(
+        steps_60m: int = 12,
+        bar_minutes: int = 5,
+        momentum_lookbacks: Tuple[int, ...] = (5, 10, 20),
+        sma_windows: Tuple[int, ...] = (50, 200),
+        rv_lookbacks: Tuple[int, ...] = (1, 5, 20),
+        add_daily: bool = True,
+        add_overnight: bool = True,
+        add_deseas: bool = True,
+        add_time_features: bool = True,
+        add_resample_precalc: bool = True,
+        resample_rules: Tuple[str, ...] = ("15min", "30min", "60min"),
+    ) -> List[str]:
+        """Generate feature column names based on prepare() parameters.
+
+        Returns the list of feature columns that prepare() will create,
+        excluding OHLCV, targets, and metadata columns.
+        """
+        cols = ["tod_slot", "session_code", "is_active", "is_london", "is_usa", "is_session_overlap"]
+
+        if add_time_features:
+            cols.extend([
+                "tod_sin",
+                "tod_cos",
+                "dow_sin",
+                "dow_cos",
+                "doy_sin",
+                "doy_cos",
+                "is_london_session",
+                "is_usa_session",
+                "is_overlap_session",
+            ])
+
+        # VWAP distance feature
+        vwap_suffix = f"{steps_60m * bar_minutes}m"
+        cols.append(f"vwap_{vwap_suffix}_dist")
+
+        # Overnight return
+        if add_overnight:
+            cols.append("overnight_return")
+
+        # Daily features
+        if add_daily:
+            for lb in momentum_lookbacks:
+                cols.append(f"mom_{lb}d")
+            for w in sma_windows:
+                cols.append(f"dist_sma_{w}d")
+            cols.append("rv_1d")
+            for w in rv_lookbacks:
+                if w != 1:
+                    cols.append(f"rv_{w}d_mean")
+
+        # Deseasonalized features
+        if add_deseas:
+            cols.extend([
+                "log_ret",
+                "vol_scaled_ret",
+                "deseasonalized_vol",
+                "ret_deseasonalized",
+                "deseasonalized_volume",
+            ])
+
+        # Pre-calculated multi-resolution context features
+        if add_resample_precalc:
+            for rule in resample_rules:
+                suffix = (
+                    rule.lower()
+                    .replace("minutes", "min")
+                    .replace("minute", "min")
+                    .replace("hours", "h")
+                    .replace("hour", "h")
+                    .replace(" ", "")
+                )
+                suffix = suffix.replace("min", "m")
+                cols.extend(
+                    [
+                        f"rs_{suffix}_logret",
+                        f"rs_{suffix}_range",
+                        f"rs_{suffix}_vwap_dist",
+                        f"rs_{suffix}_logvol_z",
+                    ]
+                )
+
+        return cols
+
     def __init__(
         self,
         sessions: Optional[Sequence[SessionSpec]] = None,
@@ -157,6 +243,131 @@ class ContinuousIntradayPrep:
             df["session_code"] = is_s1.astype(np.int8)
 
         df["is_active"] = ((is_s1) | (is_s2)).astype(np.int8)
+        # Compatibility aliases for common 2-session setup
+        if len(self.sessions) >= 1:
+            s1_col = f"is_{self.sessions[0].name.lower()}"
+            if s1_col in df.columns:
+                df["is_london"] = df[s1_col].astype(np.int8)
+        else:
+            df["is_london"] = 0
+
+        if len(self.sessions) >= 2:
+            s2_col = f"is_{self.sessions[1].name.lower()}"
+            if s2_col in df.columns:
+                df["is_usa"] = df[s2_col].astype(np.int8)
+        else:
+            df["is_usa"] = 0
+
+        df["is_session_overlap"] = ((df["is_london"] > 0) & (df["is_usa"] > 0)).astype(np.int8)
+        return df
+
+    def add_time_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add cyclical clock/calendar features and session one-hot indicators.
+
+        Designed to stay stable across resampling frequencies.
+        """
+        df = df.copy()
+        idx = df.index
+
+        secs = idx.hour * 3600 + idx.minute * 60 + idx.second
+        tod = secs / (24 * 3600.0)
+        dow = idx.dayofweek / 7.0
+        doy = (idx.dayofyear - 1) / 365.25
+
+        df["tod_sin"] = np.sin(2.0 * np.pi * tod).astype(np.float32)
+        df["tod_cos"] = np.cos(2.0 * np.pi * tod).astype(np.float32)
+        df["dow_sin"] = np.sin(2.0 * np.pi * dow).astype(np.float32)
+        df["dow_cos"] = np.cos(2.0 * np.pi * dow).astype(np.float32)
+        df["doy_sin"] = np.sin(2.0 * np.pi * doy).astype(np.float32)
+        df["doy_cos"] = np.cos(2.0 * np.pi * doy).astype(np.float32)
+
+        df["is_london_session"] = df.get("is_london", pd.Series(0, index=df.index)).astype(np.float32)
+        df["is_usa_session"] = df.get("is_usa", pd.Series(0, index=df.index)).astype(np.float32)
+        df["is_overlap_session"] = df.get("is_session_overlap", pd.Series(0, index=df.index)).astype(np.float32)
+        return df
+
+    def add_resample_precalcs(
+        self,
+        df: pd.DataFrame,
+        rules: Tuple[str, ...] = ("15min", "30min", "60min"),
+        vwap_window_bars: int = 4,
+        vol_z_window: int = 64,
+    ) -> pd.DataFrame:
+        """
+        Pre-calculate multi-resolution features and align them back to base index.
+
+        Uses forward-fill alignment to avoid dropping rows due to sparse coarser bars.
+        """
+        df = df.copy()
+        base_idx = df.index
+
+        for rule in rules:
+            suffix = (
+                rule.lower()
+                .replace("minutes", "min")
+                .replace("minute", "min")
+                .replace("hours", "h")
+                .replace("hour", "h")
+                .replace(" ", "")
+            ).replace("min", "m")
+
+            agg = {}
+            if "Open" in df.columns:
+                agg["Open"] = "first"
+            if "High" in df.columns:
+                agg["High"] = "max"
+            if "Low" in df.columns:
+                agg["Low"] = "min"
+            if "Close" in df.columns:
+                agg["Close"] = "last"
+            if "Volume" in df.columns:
+                agg["Volume"] = "sum"
+
+            if not agg:
+                continue
+
+            rs = df.resample(rule).agg(agg).dropna(how="all")
+            if rs.empty or "Close" not in rs.columns:
+                continue
+
+            rs_close = rs["Close"].astype(float).clip(lower=self.eps)
+            rs_logret = np.log(rs_close).diff()
+            rs_range = ((rs["High"] - rs["Low"]) / (rs_close + self.eps)).astype(float) if {"High", "Low"}.issubset(rs.columns) else pd.Series(np.nan, index=rs.index)
+
+            if "Volume" in rs.columns and "High" in rs.columns and "Low" in rs.columns:
+                tp = (rs["High"] + rs["Low"] + rs_close) / 3.0
+                vol = rs["Volume"].astype(float)
+                pv = (tp * vol).rolling(vwap_window_bars, min_periods=1).sum()
+                vv = vol.rolling(vwap_window_bars, min_periods=1).sum().replace(0.0, np.nan)
+                rs_vwap = pv / vv
+                rs_vwap_dist = (rs_close - rs_vwap) / (rs_vwap + self.eps)
+            else:
+                rs_vwap_dist = pd.Series(np.nan, index=rs.index)
+
+            if "Volume" in rs.columns:
+                rs_logvol = np.log1p(rs["Volume"].astype(float))
+                lv_mu = rs_logvol.rolling(vol_z_window, min_periods=max(8, vol_z_window // 4)).mean()
+                lv_sd = rs_logvol.rolling(vol_z_window, min_periods=max(8, vol_z_window // 4)).std()
+                rs_logvol_z = (rs_logvol - lv_mu) / (lv_sd + self.eps)
+            else:
+                rs_logvol_z = pd.Series(np.nan, index=rs.index)
+
+            rs_feats = pd.DataFrame(
+                {
+                    f"rs_{suffix}_logret": rs_logret,
+                    f"rs_{suffix}_range": rs_range,
+                    f"rs_{suffix}_vwap_dist": rs_vwap_dist,
+                    f"rs_{suffix}_logvol_z": rs_logvol_z,
+                },
+                index=rs.index,
+            )
+            rs_feats = rs_feats.reindex(base_idx, method="ffill")
+            rs_feats = rs_feats.ffill().bfill()
+
+            for c in rs_feats.columns:
+                df[c] = rs_feats[c].astype(np.float32)
+
         return df
 
     # -------------------------
@@ -506,6 +717,153 @@ class ContinuousIntradayPrep:
         return df
 
     # -------------------------
+    # Feature Scaling (similar to DeepIDMomentum)
+    # -------------------------
+    def scale_features(
+        self,
+        df: pd.DataFrame,
+        scale_to_basis_points: bool = True,
+        clip_outliers: bool = True,
+        inplace: bool = False,
+    ) -> pd.DataFrame:
+        """Scale features to comparable ranges for neural network training.
+
+        Applies feature-specific scaling based on column patterns to ensure
+        all features are on comparable scales (~[-5, +5]) without lookahead bias.
+        Uses fixed scaling factors where possible.
+
+        Scaling Rules by Feature Type
+        -----------------------------
+        **Distance features (already fractional):**
+        - vwap_*_dist, dist_sma_*: * 100 (to basis points)
+
+        **Absolute price features:**
+        - sma_*d, vwap_* (no _dist): normalize relative to Close
+
+        **Return features:**
+        - mom_*d: * 100 (to basis points)
+        - overnight_return: * 100 (to basis points)
+        - vol_scaled_ret, ret_deseasonalized: * 100 (to basis points)
+
+        **Volatility features:**
+        - rv_1d, rv_*d_mean: * 100 (convert to percentage), then clip
+        - deseasonalized_vol: clip outliers only (already z-scored)
+
+        **Volume features:**
+        - deseasonalized_volume: clip outliers only (already z-scored)
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            DataFrame with features from prepare()
+        scale_to_basis_points : bool, default True
+            If True, multiply relevant features by 100 to convert to basis points
+        clip_outliers : bool, default True
+            If True, clip features to [-10, 10] to handle extreme values
+        inplace : bool, default False
+            If True, modify DataFrame in place
+
+        Returns
+        -------
+        pd.DataFrame
+            Scaled DataFrame
+
+        Notes
+        -----
+        - All scaled features target approximate range [-5, +5]
+        - Fixed scaling factors avoid lookahead bias entirely
+        - Call this after prepare() but before creating datasets
+
+        Examples
+        --------
+        >>> prep = ContinuousIntradayPrep()
+        >>> df, mask, targets = prep.prepare(raw_df)
+        >>> df_scaled = prep.scale_features(df)
+        """
+        if not inplace:
+            df = df.copy()
+
+        scale_factor = 100.0 if scale_to_basis_points else 1.0
+        scaled_cols = set()
+
+        # --- DISTANCE FEATURES (fractional -> basis points) ---
+        # These are already (value - reference) / reference format
+        dist_patterns = ['_dist', 'dist_']
+        for col in df.columns:
+            if any(p in col.lower() for p in dist_patterns):
+                if clip_outliers:
+                    df[col] = df[col].clip(-0.1, 0.1) * scale_factor
+                else:
+                    df[col] = df[col] * scale_factor
+                scaled_cols.add(col)
+
+        # --- ABSOLUTE PRICE FEATURES (normalize to Close) ---
+        # sma_*d without dist_, vwap_* without _dist
+        close = df["Close"].astype(float) if "Close" in df.columns else None
+        if close is not None:
+            for col in df.columns:
+                # SMA columns (not distance)
+                if col.startswith("sma_") and col.endswith("d") and col not in scaled_cols:
+                    df[col] = ((df[col] - close) / (close + self.eps)) * scale_factor
+                    if clip_outliers:
+                        df[col] = df[col].clip(-10, 10)
+                    scaled_cols.add(col)
+
+                # VWAP columns (not distance)
+                if col.startswith("vwap_") and "_dist" not in col and col not in scaled_cols:
+                    df[col] = ((df[col] - close) / (close + self.eps)) * scale_factor
+                    if clip_outliers:
+                        df[col] = df[col].clip(-10, 10)
+                    scaled_cols.add(col)
+
+        # --- RETURN FEATURES (fractional -> basis points) ---
+        return_cols = ['mom_', 'overnight_return', 'vol_scaled_ret', 'ret_deseasonalized', 'log_ret']
+        for col in df.columns:
+            if any(col.startswith(p) or col == p for p in return_cols) and col not in scaled_cols:
+                if clip_outliers:
+                    # Clip before scaling (returns > 10% are extreme)
+                    df[col] = df[col].clip(-0.1, 0.1) * scale_factor
+                else:
+                    df[col] = df[col] * scale_factor
+                scaled_cols.add(col)
+
+        # --- VOLATILITY FEATURES ---
+        # RV features: small values, scale up
+        for col in df.columns:
+            if (col.startswith("rv_") or "rv_" in col) and col not in scaled_cols:
+                # RV is typically 0.001-0.05, * 100 gives 0.1-5
+                df[col] = df[col] * scale_factor
+                if clip_outliers:
+                    df[col] = df[col].clip(0, 10)
+                scaled_cols.add(col)
+
+        # Deseasonalized vol: already z-scored, just clip
+        if "deseasonalized_vol" in df.columns and "deseasonalized_vol" not in scaled_cols:
+            if clip_outliers:
+                df["deseasonalized_vol"] = df["deseasonalized_vol"].clip(-5, 5)
+            scaled_cols.add("deseasonalized_vol")
+
+        # --- VOLUME FEATURES ---
+        if "deseasonalized_volume" in df.columns and "deseasonalized_volume" not in scaled_cols:
+            # Already z-scored by seasonal, just clip
+            if clip_outliers:
+                df["deseasonalized_volume"] = df["deseasonalized_volume"].clip(-5, 5)
+            scaled_cols.add("deseasonalized_volume")
+
+        # --- FINAL CLIP for any remaining numeric columns ---
+        if clip_outliers:
+            for col in df.columns:
+                if col not in scaled_cols and df[col].dtype in [np.float32, np.float64]:
+                    # Skip target columns and metadata
+                    if col.startswith("y_fwd") or col in ["Open", "High", "Low", "Close", "Volume"]:
+                        continue
+                    if col in ["session_code", "is_active", "tod_slot"]:
+                        continue
+                    df[col] = df[col].clip(-10, 10)
+
+        return df
+
+    # -------------------------
     # Targets: multi-step forward returns
     # -------------------------
     def add_targets_multistep(
@@ -552,9 +910,14 @@ class ContinuousIntradayPrep:
         add_daily: bool = True,
         add_overnight: bool = True,
         add_deseas: bool = True,
+        add_time_features: bool = True,
+        add_resample_precalc: bool = True,
+        resample_rules: Tuple[str, ...] = ("15min", "30min", "60min"),
         rolling_days_deseas: int = 252,
         refit_interval: int = 10,
         use_legacy_deseas: bool = False,
+        apply_scaling: bool = False,
+        scale_to_basis_points: bool = True,
     ) -> Tuple[pd.DataFrame, pd.Series, List[str]]:
         """Prepare full feature set and targets.
 
@@ -572,12 +935,24 @@ class ContinuousIntradayPrep:
             Add overnight return feature
         add_deseas : bool, default True
             Add deseasonalized volatility/volume features
+        add_time_features : bool, default True
+            Add cyclical clock/calendar and session indicator features
+        add_resample_precalc : bool, default True
+            Add aligned multi-resolution pre-calculated features
+        resample_rules : tuple[str], default ("15min","30min","60min")
+            Frequencies used for multi-resolution pre-calculations
         rolling_days_deseas : int, default 252
             Rolling window for deseasonalization
         refit_interval : int, default 10
             Refit deseasonalization model every N days
         use_legacy_deseas : bool, default False
             Use legacy (simple) deseasonalization instead of FFF
+        apply_scaling : bool, default False
+            If True, apply feature scaling for neural network training.
+            Scales features to comparable ranges (~[-5, +5]).
+        scale_to_basis_points : bool, default True
+            If apply_scaling=True, multiply relevant features by 100.
+            Only used when apply_scaling=True.
 
         Returns
         -------
@@ -594,9 +969,17 @@ class ContinuousIntradayPrep:
         # Sessions
         df = self.add_sessions(df)
 
+        # Time features
+        if add_time_features:
+            df = self.add_time_features(df)
+
         # Rolling VWAP
         vwap_bars = steps_60m  # Match target horizon
         df = self.add_vwap(df, window_bars=vwap_bars, suffix=f"{vwap_bars * self.bar_minutes}m")
+
+        # Multi-resolution pre-calculations (aligned via ffill)
+        if add_resample_precalc:
+            df = self.add_resample_precalcs(df, rules=resample_rules)
 
         # Daily features (safe - uses shift(1))
         if add_daily:
@@ -638,6 +1021,15 @@ class ContinuousIntradayPrep:
 
         # Drop rows with missing OHLCV
         df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+
+        # Optional feature scaling for neural network training
+        if apply_scaling:
+            df = self.scale_features(
+                df,
+                scale_to_basis_points=scale_to_basis_points,
+                clip_outliers=True,
+                inplace=False,
+            )
 
         return df, train_mask, target_cols
 

@@ -302,7 +302,16 @@ class SequenceRasterizer:
         >>> data_dict = rasterizer.load_npz('rasterized.npz')
     """
 
-    def __init__(self, bins=64, span_pct=0.01, vol_scale=10.0, price_scale=100.0):
+    def __init__(
+        self,
+        bins=64,
+        span_pct=0.01,
+        vol_scale=10.0,
+        price_scale=100.0,
+        tick_size=None,
+        ticks_per_bin=1,
+        center_on="profile_vwap",
+    ):
         """
         Parameters
         ----------
@@ -319,119 +328,471 @@ class SequenceRasterizer:
         self.span_pct = span_pct
         self.vol_scale = vol_scale
         self.price_scale = price_scale
+        self.tick_size = tick_size
+        self.ticks_per_bin = int(max(1, ticks_per_bin))
+        self.center_on = center_on
 
         # Define grid edges (Scaled space)
         # If span is 1% and scale is 100, edges are -1.0 to 1.0
         limit = span_pct * price_scale
         self.edges = np.linspace(-limit, limit, bins + 1, dtype=np.float32)
 
-    def rasterize(self, df, num_bars=4, interval_mins=None, session_start=None):
+    def _resolve_column(self, df, preferred, aliases):
+        """Resolve a column name from preferred + aliases."""
+        if preferred in df.columns:
+            return preferred
+        for alias in aliases:
+            if alias in df.columns:
+                return alias
+        return None
+
+    def _ensure_timestamp_column(self, df, ts_col="ts_end"):
+        """Ensure a timestamp column exists, using DatetimeIndex if needed."""
+        out = df.copy()
+        resolved_ts_col = ts_col
+        if resolved_ts_col not in out.columns:
+            fallback = self._resolve_column(out, ts_col, ["ts_end", "DateTime", "ts", "datetime", "timestamp"])
+            if fallback is not None:
+                resolved_ts_col = fallback
+            elif isinstance(out.index, pd.DatetimeIndex):
+                out[resolved_ts_col] = out.index
+            else:
+                raise ValueError(f"DataFrame must contain a timestamp column (looked for '{ts_col}')")
+        out[resolved_ts_col] = pd.to_datetime(out[resolved_ts_col], errors="coerce")
+        out = out[out[resolved_ts_col].notna()].copy()
+        return out, resolved_ts_col
+
+    def _normalize_timestamps(self, ts_series: pd.Series) -> pd.Series:
+        """Normalize timestamps to tz-naive local clock time for stable session binning."""
+        ts = pd.to_datetime(ts_series, errors="coerce")
+        if ts.dt.tz is not None:
+            ts = ts.dt.tz_localize(None)
+        return ts
+
+    def _parse_session_time(self, date_value, session_time):
+        """Parse HH:MM strings (or time-like objects) into concrete Timestamps."""
+        if isinstance(session_time, str):
+            hh, mm = map(int, session_time.split(":"))
+            return pd.Timestamp(date_value).replace(hour=hh, minute=mm, second=0, microsecond=0)
+        return pd.Timestamp(date_value).replace(
+            hour=getattr(session_time, "hour", 0),
+            minute=getattr(session_time, "minute", 0),
+            second=getattr(session_time, "second", 0),
+            microsecond=0,
+        )
+
+    def _build_time_edges(self, min_ts, max_ts, num_bars=4, interval_mins=None, session_start=None, session_end=None):
+        """Build monotonic time edges for bar assignment."""
+        if session_start is not None:
+            start_edge = self._parse_session_time(min_ts.date(), session_start)
+        else:
+            start_edge = min_ts
+
+        if num_bars is None:
+            if interval_mins is None or session_end is None:
+                raise ValueError("num_bars=None requires both interval_mins and session_end")
+            end_edge = self._parse_session_time(min_ts.date(), session_end)
+            if end_edge <= start_edge:
+                end_edge = end_edge + pd.Timedelta(days=1)
+            total_mins = (end_edge - start_edge).total_seconds() / 60.0
+            if total_mins <= 0:
+                raise ValueError("Invalid session range: session_end must be after session_start")
+            num_bars = int(np.ceil(total_mins / float(interval_mins)))
+
+        if interval_mins is None:
+            if session_end is not None and session_start is not None:
+                end_edge = self._parse_session_time(min_ts.date(), session_end)
+                if end_edge <= start_edge:
+                    end_edge = end_edge + pd.Timedelta(days=1)
+                total_mins = (end_edge - start_edge).total_seconds() / 60.0
+                interval_mins = total_mins / num_bars if num_bars > 0 else 1.0
+            else:
+                total_mins = (max_ts - min_ts).total_seconds() / 60.0
+                interval_mins = total_mins / num_bars if num_bars > 0 else 1.0
+
+        if interval_mins <= 0:
+            raise ValueError("interval_mins must be > 0")
+        if num_bars <= 0:
+            raise ValueError("num_bars must be > 0")
+
+        edges = [start_edge + pd.Timedelta(minutes=i * interval_mins) for i in range(num_bars + 1)]
+        return edges, num_bars
+
+    def _compute_bucketed_sequence_from_ticks(
+        self,
+        ticks_df: pd.DataFrame,
+        bucket_volume: float,
+        ts_col: str = "ts",
+        price_col: str = "Close",
+        bidvol_col: str = "BidVolume",
+        askvol_col: str = "AskVolume",
+        include_partial_bucket: bool = True,
+    ) -> pd.DataFrame:
         """
-        Converts VPIN DataFrame -> (Num_Bars, Channels, Bins)
-        Channels: [Density, Volume, Imbalance, Returns]
+        Build VPIN-style sequence columns directly from raw ticks.
+
+        Output columns:
+        - ts_end, close, profile_vwap, vol, imb_frac, bucket_return
+        """
+        if bucket_volume is None or bucket_volume <= 0:
+            raise ValueError("bucket_volume must be a positive number")
+
+        ticks, resolved_ts = self._ensure_timestamp_column(ticks_df, ts_col=ts_col)
+
+        resolved_price = self._resolve_column(ticks, price_col, ["Close", "close", "Last", "Price"])
+        resolved_bid = self._resolve_column(ticks, bidvol_col, ["BidVolume", "bid_volume", "bidvol"])
+        resolved_ask = self._resolve_column(ticks, askvol_col, ["AskVolume", "ask_volume", "askvol"])
+
+        if resolved_price is None:
+            raise ValueError("Could not find price column (expected Close/close/Price)")
+        if resolved_bid is None or resolved_ask is None:
+            raise ValueError("Could not find bid/ask volume columns")
+
+        work = ticks[[resolved_ts, resolved_price, resolved_bid, resolved_ask]].copy()
+        work = work.rename(
+            columns={
+                resolved_ts: "ts",
+                resolved_price: "close",
+                resolved_bid: "sell_vol",
+                resolved_ask: "buy_vol",
+            }
+        )
+
+        work["close"] = pd.to_numeric(work["close"], errors="coerce").astype(np.float64)
+        work["buy_vol"] = pd.to_numeric(work["buy_vol"], errors="coerce").astype(np.float64).fillna(0.0).clip(lower=0.0)
+        work["sell_vol"] = pd.to_numeric(work["sell_vol"], errors="coerce").astype(np.float64).fillna(0.0).clip(lower=0.0)
+        work["vol"] = work["buy_vol"] + work["sell_vol"]
+        work = work[(work["vol"] > 0) & work["close"].notna()].copy()
+
+        if work.empty:
+            return pd.DataFrame(columns=["ts_end", "close", "profile_vwap", "vol", "imb_frac", "bucket_return"])
+
+        work = work.sort_values("ts")
+
+        vwap_denom = work["vol"].sum()
+        session_vwap = float((work["close"] * work["vol"]).sum() / vwap_denom) if vwap_denom > 0 else np.nan
+
+        vol = work["vol"].to_numpy(dtype=np.float64)
+        buy = work["buy_vol"].to_numpy(dtype=np.float64)
+        sell = work["sell_vol"].to_numpy(dtype=np.float64)
+        close = work["close"].to_numpy(dtype=np.float64)
+        ts = work["ts"].to_numpy()
+
+        buckets = []
+        cum_vol = 0.0
+        bucket_id = 0
+        bucket_buy = 0.0
+        bucket_sell = 0.0
+        bucket_ts_start = None
+        bucket_ts_end = None
+        bucket_close_first = np.nan
+        bucket_close_last = np.nan
+
+        for i in range(len(vol)):
+            tick_vol = vol[i]
+            if tick_vol <= 0:
+                continue
+
+            tick_buy = buy[i]
+            tick_sell = sell[i]
+
+            buy_ratio = tick_buy / tick_vol if tick_vol > 0 else 0.5
+            sell_ratio = tick_sell / tick_vol if tick_vol > 0 else 0.5
+
+            remaining = tick_vol
+            while remaining > 1e-9:
+                boundary = (bucket_id + 1) * bucket_volume
+                space = boundary - cum_vol
+                assign = min(remaining, space)
+
+                bucket_buy += assign * buy_ratio
+                bucket_sell += assign * sell_ratio
+
+                if bucket_ts_start is None:
+                    bucket_ts_start = ts[i]
+                    bucket_close_first = close[i]
+                bucket_ts_end = ts[i]
+                bucket_close_last = close[i]
+
+                cum_vol += assign
+                remaining -= assign
+
+                if cum_vol >= boundary - 1e-9:
+                    buckets.append(
+                        {
+                            "bucket": bucket_id,
+                            "ts_start": bucket_ts_start,
+                            "ts_end": bucket_ts_end,
+                            "buy": bucket_buy,
+                            "sell": bucket_sell,
+                            "vol": bucket_buy + bucket_sell,
+                            "close_first": bucket_close_first,
+                            "close_last": bucket_close_last,
+                        }
+                    )
+                    bucket_id += 1
+                    bucket_buy = 0.0
+                    bucket_sell = 0.0
+                    bucket_ts_start = None
+                    bucket_ts_end = None
+                    bucket_close_first = np.nan
+                    bucket_close_last = np.nan
+
+        if include_partial_bucket and (bucket_buy + bucket_sell) > 0:
+            buckets.append(
+                {
+                    "bucket": bucket_id,
+                    "ts_start": bucket_ts_start,
+                    "ts_end": bucket_ts_end,
+                    "buy": bucket_buy,
+                    "sell": bucket_sell,
+                    "vol": bucket_buy + bucket_sell,
+                    "close_first": bucket_close_first,
+                    "close_last": bucket_close_last,
+                }
+            )
+
+        if not buckets:
+            return pd.DataFrame(columns=["ts_end", "close", "profile_vwap", "vol", "imb_frac", "bucket_return"])
+
+        seq = pd.DataFrame(buckets)
+        seq["buy"] = seq["buy"].astype(np.float64)
+        seq["sell"] = seq["sell"].astype(np.float64)
+        seq["vol"] = seq["vol"].astype(np.float64)
+        seq["imb_frac"] = (seq["buy"] - seq["sell"]).abs() / seq["vol"].replace(0, np.nan)
+        seq["bucket_return"] = np.log(seq["close_last"] / seq["close_first"].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        seq["close"] = seq["close_last"]
+        seq["profile_vwap"] = session_vwap
+
+        return seq[["ts_end", "close", "profile_vwap", "vol", "imb_frac", "bucket_return"]]
+
+    def _rasterize_sequence(self, df, num_bars=4, interval_mins=None, session_start=None, session_end=None):
+        """Core rasterizer for VPIN-style sequence data."""
+        if df.empty:
+            return torch.zeros((int(num_bars or 0), 4, self.bins), dtype=torch.float32)
+
+        seq, ts_col = self._ensure_timestamp_column(df, ts_col="ts_end")
+        ts_end = self._normalize_timestamps(seq[ts_col])
+        seq["ts_end"] = ts_end
+        seq = seq.sort_values("ts_end")
+        ts_end = seq["ts_end"]
+
+        min_ts = ts_end.min()
+        max_ts = ts_end.max()
+        time_edges, num_bars = self._build_time_edges(
+            min_ts=min_ts,
+            max_ts=max_ts,
+            num_bars=num_bars,
+            interval_mins=interval_mins,
+            session_start=session_start,
+            session_end=session_end,
+        )
+
+        # Time-bin assignment
+        time_edges_np = np.array(time_edges, dtype="datetime64[ns]")
+        t_idx = np.searchsorted(time_edges_np, ts_end.to_numpy(dtype="datetime64[ns]"), side="right") - 1
+
+        # Required channels (with sensible defaults if caller omitted one)
+        if "vol" not in seq.columns:
+            seq["vol"] = 0.0
+        if "imb_frac" not in seq.columns:
+            seq["imb_frac"] = 0.0
+        if "bucket_return" not in seq.columns:
+            seq["bucket_return"] = 0.0
+
+        close = pd.to_numeric(seq["close"], errors="coerce").to_numpy(dtype=np.float64)
+        vol = pd.to_numeric(seq["vol"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+        imb = pd.to_numeric(seq["imb_frac"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+        ret = pd.to_numeric(seq["bucket_return"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+
+        # Center price handling
+        centers = None
+        if self.center_on == "profile_vwap" and "profile_vwap" in seq.columns:
+            centers = pd.to_numeric(seq["profile_vwap"], errors="coerce").to_numpy(dtype=np.float64)
+        elif self.center_on in ("vwap", "bar_vwap", "last", "bar_last"):
+            centers = np.full(len(seq), np.nan, dtype=np.float64)
+            valid_t = (t_idx >= 0) & (t_idx < num_bars)
+            for bar_id in range(num_bars):
+                bar_mask = valid_t & (t_idx == bar_id)
+                if not np.any(bar_mask):
+                    continue
+                if self.center_on in ("last", "bar_last"):
+                    last_idx = np.where(bar_mask)[0][-1]
+                    centers[bar_mask] = close[last_idx]
+                else:
+                    denom = vol[bar_mask].sum()
+                    if denom > 0:
+                        centers[bar_mask] = np.dot(close[bar_mask], vol[bar_mask]) / denom
+                    else:
+                        centers[bar_mask] = np.nanmean(close[bar_mask])
+
+        if centers is None:
+            fallback_center = np.nan
+            denom = vol.sum()
+            if denom > 0:
+                fallback_center = np.dot(close, vol) / denom
+            elif len(close) > 0:
+                fallback_center = np.nanmean(close)
+            centers = np.full(len(close), fallback_center, dtype=np.float64)
+
+        # Vertical bin mapping
+        if self.tick_size is not None and self.tick_size > 0:
+            bin_size = float(self.tick_size) * float(self.ticks_per_bin)
+            half = self.bins // 2
+            b_idx = np.rint((close - centers) / bin_size).astype(np.int32) + half
+        else:
+            p_norm = ((close - centers) / centers) * self.price_scale
+            b_idx = np.searchsorted(self.edges, p_norm, side="right") - 1
+
+        valid = (
+            (t_idx >= 0) &
+            (t_idx < num_bars) &
+            (b_idx >= 0) &
+            (b_idx < self.bins) &
+            np.isfinite(close) &
+            np.isfinite(centers)
+        )
+
+        grid = np.zeros((num_bars, self.bins, 4), dtype=np.float32)
+        if not np.any(valid):
+            return torch.tensor(grid, dtype=torch.float32).permute(0, 2, 1)
+
+        t_v = t_idx[valid]
+        b_v = b_idx[valid]
+
+        np.add.at(grid[..., 0], (t_v, b_v), 1.0)
+        np.add.at(grid[..., 1], (t_v, b_v), vol[valid])
+        np.add.at(grid[..., 2], (t_v, b_v), imb[valid])
+
+        # Last return per (time, price_bin)
+        valid_indices = np.where(valid)[0]
+        sort_idx = np.argsort(ts_end.iloc[valid_indices].to_numpy(dtype="datetime64[ns]"))
+        t_s = t_v[sort_idx]
+        b_s = b_v[sort_idx]
+        vals_s = ret[valid][sort_idx] * self.price_scale
+        grid[t_s, b_s, 3] = vals_s
+
+        counts = np.maximum(grid[..., 0], 1.0)
+        grid[..., 2] /= counts
+        grid[..., 1] = np.log1p(grid[..., 1]) / self.vol_scale
+
+        return torch.tensor(grid, dtype=torch.float32).permute(0, 2, 1)
+
+    def rasterize_from_ticks(
+        self,
+        ticks_df: pd.DataFrame,
+        bucket_volume: float,
+        num_bars=4,
+        interval_mins=None,
+        session_start=None,
+        session_end=None,
+        ts_col="ts",
+        price_col="Close",
+        bidvol_col="BidVolume",
+        askvol_col="AskVolume",
+        include_partial_bucket=True,
+    ):
+        """Rasterize raw ticks by first creating volume buckets from scratch."""
+        seq_df = self._compute_bucketed_sequence_from_ticks(
+            ticks_df=ticks_df,
+            bucket_volume=bucket_volume,
+            ts_col=ts_col,
+            price_col=price_col,
+            bidvol_col=bidvol_col,
+            askvol_col=askvol_col,
+            include_partial_bucket=include_partial_bucket,
+        )
+        return self._rasterize_sequence(
+            seq_df,
+            num_bars=num_bars,
+            interval_mins=interval_mins,
+            session_start=session_start,
+            session_end=session_end,
+        )
+
+    def rasterize(
+        self,
+        df,
+        num_bars=4,
+        interval_mins=None,
+        session_start=None,
+        session_end=None,
+        bucket_volume=None,
+        ts_col="ts_end",
+        price_col="Close",
+        bidvol_col="BidVolume",
+        askvol_col="AskVolume",
+        include_partial_bucket=True,
+    ):
+        """
+        Convert either VPIN-sequence data OR raw tick data into raster tensors.
+
+        Input modes:
+        1) Sequence mode (existing behavior):
+           Requires columns: ts_end, close, vol, imb_frac, bucket_return.
+           Optional: profile_vwap.
+        2) Raw tick mode (new):
+           Requires columns for timestamp, price, BidVolume, AskVolume plus
+           ``bucket_volume`` to construct buckets from scratch.
 
         Parameters
         ----------
         df : pd.DataFrame
-            VPIN data with 'ts_end', 'close', 'profile_vwap', 'vol', 'imb_frac', 'bucket_return'.
-            If ts_end is the index (common from calculate_vpin), it will be extracted.
+            Sequence DataFrame or raw tick DataFrame.
         num_bars : int
-            Number of time bars to split data into
+            Number of time bars.
         interval_mins : float, optional
-            Minutes per bar. If None, auto-computed to evenly split data's time range.
+            Minutes per bar.
         session_start : str or time, optional
-            Session start time (e.g., "08:30"). If provided with interval_mins, builds
-            fixed time edges from session_start instead of data bounds.
+            Session start time (e.g., "08:30").
+        session_end : str or time, optional
+            Session end time. If provided with ``session_start`` it can be used to
+            infer ``interval_mins`` or ``num_bars``.
+        bucket_volume : float, optional
+            Required for raw tick mode.
+        ts_col, price_col, bidvol_col, askvol_col : str
+            Raw tick column names to resolve.
+        include_partial_bucket : bool
+            Whether to include the final partial volume bucket in raw tick mode.
 
         Returns
         -------
         torch.Tensor
-            Shape (num_bars, 4, bins) - channels are [Density, LogVolume, Imbalance, Returns]
+            Shape (num_bars, 4, bins), channels are
+            [Density, LogVolume, Imbalance, Returns].
         """
-        # Handle ts_end as index or column
-        df = df.copy()
-        if 'ts_end' not in df.columns:
-            if isinstance(df.index, pd.DatetimeIndex):
-                df['ts_end'] = df.index
-            else:
-                raise ValueError("DataFrame must have 'ts_end' column or DatetimeIndex")
+        work = df.copy()
+        sequence_cols = {"close", "vol", "imb_frac", "bucket_return"}
+        has_sequence_payload = sequence_cols.issubset(set(work.columns))
 
-        # 1. Get time bounds from data - normalize timezone handling
-        ts_end = pd.to_datetime(df['ts_end'])
+        if has_sequence_payload:
+            return self._rasterize_sequence(
+                work,
+                num_bars=num_bars,
+                interval_mins=interval_mins,
+                session_start=session_start,
+                session_end=session_end,
+            )
 
-        # Normalize to tz-naive UTC for consistent comparisons
-        if ts_end.dt.tz is not None:
-            ts_end = ts_end.dt.tz_convert('UTC').dt.tz_localize(None)
+        if bucket_volume is None:
+            raise ValueError(
+                "Raw tick rasterization requires bucket_volume. "
+                "Either pass sequence columns (close/vol/imb_frac/bucket_return) or set bucket_volume."
+            )
 
-        min_ts = ts_end.min()
-        max_ts = ts_end.max()
-
-        # Build time edges - use session_start if provided, otherwise data bounds
-        if session_start is not None and interval_mins is not None:
-            # Parse session_start if string
-            if isinstance(session_start, str):
-                h, m = map(int, session_start.split(':'))
-                session_start_time = pd.Timestamp(min_ts.date()).replace(hour=h, minute=m)
-            else:
-                session_start_time = pd.Timestamp(min_ts.date()).replace(
-                    hour=session_start.hour, minute=session_start.minute
-                )
-            time_edges = [session_start_time + pd.Timedelta(minutes=i * interval_mins) for i in range(num_bars + 1)]
-        else:
-            # Auto-compute interval if not provided
-            if interval_mins is None:
-                total_mins = (max_ts - min_ts).total_seconds() / 60
-                interval_mins = total_mins / num_bars if num_bars > 0 else 1.0
-
-            # Build time edges from data's start time
-            time_edges = [min_ts + pd.Timedelta(minutes=i * interval_mins) for i in range(num_bars + 1)]
-
-        # 2. Setup Spatial Coordinates
-        # 0.0 = VWAP, Scaled by 100
-        p_norm = ((df['close'] - df['profile_vwap']) / df['profile_vwap']) * self.price_scale
-
-        # 3. Vectorized Binning - use normalized ts_end for comparison
-        t_idx = np.searchsorted(time_edges, ts_end) - 1
-        b_idx = np.searchsorted(self.edges, p_norm) - 1
-
-        # Filter valid
-        valid = (t_idx >= 0) & (t_idx < num_bars) & (b_idx >= 0) & (b_idx < self.bins)
-
-        # 4. Construct Grid (T, Bins, Channels)
-        # We will use 4 Channels: [Count, LogVol, Imbalance, LastReturn]
-        grid = np.zeros((num_bars, self.bins, 4), dtype=np.float32)
-
-        if not np.any(valid):
-            return torch.tensor(grid).permute(0, 2, 1)  # Return empty (T, C, B)
-
-        t_v, b_v = t_idx[valid], b_idx[valid]
-        df_v = df.iloc[valid]
-
-        # Ch 0: Density (Count)
-        np.add.at(grid[..., 0], (t_v, b_v), 1.0)
-
-        # Ch 1: Volume (Sum then Log)
-        np.add.at(grid[..., 1], (t_v, b_v), df_v['vol'].values)
-
-        # Ch 2: Imbalance (Mean)
-        np.add.at(grid[..., 2], (t_v, b_v), df_v['imb_frac'].values)
-
-        # Ch 3: Return (Last) - Using argsort to get time-ordered overwrite
-        # Sort by time to ensure 'last' really means last
-        sort_idx = np.argsort(ts_end.iloc[valid].values)
-        t_s, b_s = t_v[sort_idx], b_v[sort_idx]
-        vals_s = df_v['bucket_return'].values[sort_idx] * self.price_scale
-
-        # Advanced indexing assignment overwrites, leaving the last value effective
-        grid[t_s, b_s, 3] = vals_s
-
-        # Post-process Means & Logs
-        counts = np.maximum(grid[..., 0], 1.0)
-        grid[..., 2] /= counts  # Average Imbalance
-        grid[..., 1] = np.log1p(grid[..., 1]) / self.vol_scale  # Log Volume
-
-        # Output Shape: (Num_Bars, Bins, Channels) -> Permute to (Num_Bars, Channels, Bins) for CNN
-        return torch.tensor(grid, dtype=torch.float32).permute(0, 2, 1)
+        return self.rasterize_from_ticks(
+            ticks_df=work,
+            bucket_volume=bucket_volume,
+            num_bars=num_bars,
+            interval_mins=interval_mins,
+            session_start=session_start,
+            session_end=session_end,
+            ts_col=ts_col,
+            price_col=price_col,
+            bidvol_col=bidvol_col,
+            askvol_col=askvol_col,
+            include_partial_bucket=include_partial_bucket,
+        )
 
     def parquet_to_npz(
         self,
@@ -566,6 +927,11 @@ class SequenceRasterizer:
             'num_dates': len(rasterized_data),
             'skipped': skipped
         }
+
+    def save_npy(self, array, output_path):
+        """Save a raster tensor/array to a .npy feature file."""
+        arr = array.detach().cpu().numpy() if hasattr(array, "detach") else np.asarray(array)
+        np.save(output_path, arr.astype(np.float32))
 
     @staticmethod
     def load_npz(npz_path: str, as_tensor: bool = False) -> dict:
