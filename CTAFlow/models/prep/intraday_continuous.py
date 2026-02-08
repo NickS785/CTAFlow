@@ -698,7 +698,7 @@ class ContinuousIntradayPrep:
             lambda x: x.rolling(rolling_days, min_periods=max(10, rolling_days // 10)).mean()
         )
         seasonal_vol = daily_slot.groupby(level=1)["vol"].transform(
-            lambda x: x.rolling(rolling_days, min_periods=max(10, rolling_days // 10)).mean()
+            lambda x: x.rolling(rolling_days, min_periods=max(10, rollig_days // 10)).mean()
         )
 
         # Map back to original index
