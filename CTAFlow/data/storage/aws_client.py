@@ -362,20 +362,108 @@ class AWSClient:
             logger.error(f"Get metadata failed: {e}")
             raise
 
+    def download_directory(
+        self,
+        s3_prefix: str,
+        local_dir: Union[str, Path],
+        use_cache: bool = True,
+    ) -> Dict[str, Path]:
+        """
+        Recursively download all objects under an S3 prefix.
+
+        Parameters
+        ----------
+        s3_prefix : str
+            S3 prefix to download (e.g., 'workspace/model_data/GC/')
+        local_dir : str or Path
+            Local destination directory
+        use_cache : bool
+            If True, check cache before downloading
+
+        Returns
+        -------
+        Dict[str, Path]
+            Mapping of S3 key -> local file path for all downloaded files
+        """
+        full_prefix = self._add_prefix(s3_prefix)
+        local_dir = Path(local_dir)
+        local_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            paginator = self.s3_client.get_paginator('list_objects_v2')
+            pages = paginator.paginate(
+                Bucket=self.bucket_name, Prefix=full_prefix
+            )
+
+            downloaded = {}
+            for page in pages:
+                if 'Contents' not in page:
+                    continue
+                for obj in page['Contents']:
+                    key = obj['Key']
+                    # Skip "directory" markers (zero-byte keys ending in /)
+                    if key.endswith('/'):
+                        continue
+                    # Compute relative path from the prefix
+                    relative = key[len(full_prefix):].lstrip('/')
+                    if not relative:
+                        continue
+                    local_path = local_dir / relative
+                    local_path.parent.mkdir(parents=True, exist_ok=True)
+
+                    # Download using raw key (already has prefix)
+                    if use_cache:
+                        cache_path = self.cache_dir / key
+                        if cache_path.exists():
+                            logger.info(f"Using cached file: {cache_path}")
+                            import shutil
+                            shutil.copy2(cache_path, local_path)
+                            downloaded[key] = local_path
+                            continue
+
+                    try:
+                        logger.info(
+                            f"Downloading s3://{self.bucket_name}/{key} "
+                            f"-> {local_path}"
+                        )
+                        self.s3_client.download_file(
+                            self.bucket_name, key, str(local_path)
+                        )
+                        downloaded[key] = local_path
+
+                        if use_cache:
+                            cache_path = self.cache_dir / key
+                            cache_path.parent.mkdir(parents=True, exist_ok=True)
+                            import shutil
+                            shutil.copy2(local_path, cache_path)
+
+                    except ClientError as e:
+                        logger.warning(f"Failed to download {key}: {e}")
+
+            logger.info(
+                f"Downloaded {len(downloaded)} files from "
+                f"s3://{self.bucket_name}/{full_prefix}"
+            )
+            return downloaded
+
+        except ClientError as e:
+            logger.error(f"Directory download failed: {e}")
+            raise
+
     def download_ticker_data(
         self,
         ticker: str,
         data_types: Optional[List[str]] = None,
         local_dir: Optional[Union[str, Path]] = None,
-        s3_prefix: str = 'data/',
+        s3_prefix: str = 'workspace/model_data/',
     ) -> Dict[str, Path]:
         """
         Download all data files for a ticker.
 
         Expected S3 structure:
-        s3://bucket/data/{ticker}/features.csv
-        s3://bucket/data/{ticker}/profiles.npz
-        s3://bucket/data/{ticker}/vpin.parquet
+        s3://bucket/workspace/model_data/{ticker}/features.csv
+        s3://bucket/workspace/model_data/{ticker}/profiles.npz
+        s3://bucket/workspace/model_data/{ticker}/vpin.parquet
         etc.
 
         Parameters
@@ -433,7 +521,7 @@ class AWSClient:
         logger.info(f"Downloaded {len(downloaded)} data files for {ticker}")
         return downloaded
 
-    def list_tickers(self, data_prefix: str = 'data/') -> List[str]:
+    def list_tickers(self, data_prefix: str = 'workspace/model_data/') -> List[str]:
         """
         List available tickers in S3.
 

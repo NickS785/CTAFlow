@@ -53,7 +53,7 @@ python-dotenv>=0.19.0  # Environment variable management
 # Optional: Alternative GPU frameworks (uncomment if needed)
 # pycuda>=2021.1  # Lower-level CUDA interface (not used in current implementation)
 
-# Optional: RL stack (for CTAFlow/models/deep_learning/rl/*)
+# Optional: RL stack (for CTAFlow/models/deep_learning/rl
 # gymnasium>=0.29.0
 # stable-baselines3>=2.0.0
 

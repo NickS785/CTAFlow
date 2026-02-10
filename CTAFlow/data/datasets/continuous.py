@@ -266,6 +266,7 @@ class ContinuousRasterAlignedDataset(Dataset):
         max_missing_ratio_per_day: float = 0.20,
         random_short_len: bool = True,
         return_meta: bool = False,
+        sample_stride: int = 1,
     ):
         if not isinstance(df.index, pd.DatetimeIndex):
             raise TypeError("df must have DatetimeIndex")
@@ -399,6 +400,18 @@ class ContinuousRasterAlignedDataset(Dataset):
         self.sample_pos = np.flatnonzero(sample_mask)
         if len(self.sample_pos) == 0:
             raise ValueError("No eligible samples after alignment/masking.")
+
+        # Per-day striding: take every N-th sample within each calendar day
+        # to reduce autocorrelation and cut dataset size.
+        self.sample_stride = int(max(1, sample_stride))
+        if self.sample_stride > 1:
+            sample_dates = self.df.index[self.sample_pos].normalize()
+            thinned = []
+            for day in sample_dates.unique():
+                day_mask = sample_dates == day
+                day_positions = self.sample_pos[day_mask]
+                thinned.append(day_positions[:: self.sample_stride])
+            self.sample_pos = np.concatenate(thinned)
 
         self.alignment_stats = {
             "num_days_in_common": len(common_days),
