@@ -1082,6 +1082,7 @@ class FinancialsIntradayPrep(ContinuousIntradayPrep):
         eps: float = 1e-8,
         macro_df: Optional[pd.DataFrame] = None,
         macro_prep_kwargs: Optional[Dict[str, object]] = None,
+        exclude_tickers: Optional[Sequence[str]] = None,
     ):
         if sessions is None:
             sessions = [SessionSpec("USA", "08:30", "16:00")]
@@ -1092,6 +1093,7 @@ class FinancialsIntradayPrep(ContinuousIntradayPrep):
         self._macro_prep = MacroFeaturePrep(**(macro_prep_kwargs or {}))
         self._macro_features: Optional[pd.DataFrame] = None
         self._macro_feature_cols: List[str] = []
+        self._exclude_tickers: set = set(exclude_tickers or [])
 
         if macro_df is not None:
             self.set_macro_data(macro_df)
@@ -1100,7 +1102,17 @@ class FinancialsIntradayPrep(ContinuousIntradayPrep):
     # Macro data handling
     # ------------------------------------------------------------------
     def set_macro_data(self, macro_df: pd.DataFrame) -> None:
-        """Process raw daily macro context and store engineered features."""
+        """Process raw daily macro context and store engineered features.
+
+        If ``exclude_tickers`` was set at init (e.g. ``["SPX"]`` when
+        training ES), the raw columns are dropped **before**
+        MacroFeaturePrep so that no derived features (returns, relative
+        strength) are generated from the excluded ticker.
+        """
+        if self._exclude_tickers:
+            drop = [c for c in macro_df.columns if c in self._exclude_tickers]
+            if drop:
+                macro_df = macro_df.drop(columns=drop)
         processed = self._macro_prep.process(macro_df)
         self._macro_features = processed
         self._macro_feature_cols = list(processed.columns)
@@ -1116,13 +1128,22 @@ class FinancialsIntradayPrep(ContinuousIntradayPrep):
         return list(self._macro_feature_cols)
 
     def _align_macro_to_intraday(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Forward-fill daily macro features onto the intraday index."""
+        """Align daily macro features onto the intraday index with 1-day lag.
+
+        Yahoo Finance / FRED data for day T represents the close/settlement
+        at 16:00 ET on day T.  Using that data on intraday bars within day T
+        would be forward-looking.  We shift by 1 business day so that bars on
+        day T only see macro features computed from day T-1's closes.
+        """
         if self._macro_features is None or self._macro_features.empty:
             return df
 
         df = df.copy()
         macro = self._macro_features.copy()
         macro.index = pd.to_datetime(macro.index).normalize()
+
+        # Shift by 1 day: day T bars see day T-1 macro features
+        macro = macro.shift(1)
 
         # Map daily values by date then forward-fill within days
         intraday_dates = df.index.normalize()
