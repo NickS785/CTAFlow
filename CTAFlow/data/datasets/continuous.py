@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
-from typing import List, Optional, Tuple, Dict, Sequence, Any
+from typing import List, Optional, Tuple, Dict, Sequence, Any, Union
 
 
 def _build_sample_mask(
@@ -87,6 +87,16 @@ def _contiguous_5m_check(idx: pd.DatetimeIndex, lookback: int, bar_minutes: int 
         bad_in_window = cbad[i] - (cbad[left - 1] if left > 0 else 0)
         ok[i] = (bad_in_window == 0)
     return ok
+
+
+def _to_class_labels(values: np.ndarray, thresholds: Sequence[float]) -> np.ndarray:
+    """Convert continuous values into ordinal classes by threshold cuts."""
+    arr = np.asarray(values, dtype=np.float32)
+    cuts = sorted(float(t) for t in thresholds)
+    labels = np.zeros(arr.shape[0], dtype=np.int64)
+    for i, threshold in enumerate(cuts):
+        labels[arr > threshold] = i + 1
+    return labels
 
 
 class ContinuousWindowDataset(Dataset):
@@ -453,6 +463,172 @@ class ContinuousRasterAlignedDataset(Dataset):
         return x_short, t_short_feats, x_long, t_long_feats, short_mask, y, meta
 
 
+class ContinuousRasterAlignedTaskDataset(ContinuousRasterAlignedDataset):
+    """
+    Task-oriented extension of ContinuousRasterAlignedDataset.
+
+    Adds optional on-the-fly classification targets while preserving the same
+    sample/collate structure expected by collate_continuous_raster.
+    """
+
+    def __init__(
+        self,
+        *args,
+        classification: bool = False,
+        classification_target: Optional[Union[str, int]] = None,
+        classification_thresholds: Sequence[float] = (-0.001, 0.001),
+        classification_target_is_label: bool = False,
+        include_regression_target: bool = False,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.classification = bool(classification)
+        self.classification_target = classification_target
+        self.classification_thresholds = tuple(float(t) for t in classification_thresholds)
+        self.classification_target_is_label = bool(classification_target_is_label)
+        self.include_regression_target = bool(include_regression_target)
+
+        if self.include_regression_target and not self.classification:
+            raise ValueError("include_regression_target=True requires classification=True.")
+
+        self._class_target_index: Optional[int] = None
+        self._class_targets: Optional[np.ndarray] = None
+
+        if self.classification:
+            self._class_target_index = self._resolve_target_index(classification_target)
+            raw = self.Y[:, self._class_target_index]
+            if self.classification_target_is_label:
+                labels = np.rint(raw).astype(np.int64)
+            else:
+                labels = _to_class_labels(raw, self.classification_thresholds)
+            self._class_targets = labels
+
+            self.alignment_stats["classification"] = {
+                "enabled": True,
+                "target_col": self.target_cols[self._class_target_index],
+                "target_index": int(self._class_target_index),
+                "target_is_label": bool(self.classification_target_is_label),
+                "thresholds": list(self.classification_thresholds),
+                "include_regression_target": bool(self.include_regression_target),
+                "num_classes": int(labels.max() + 1) if labels.size else 0,
+            }
+        else:
+            self.alignment_stats["classification"] = {"enabled": False}
+
+    def _resolve_target_index(self, target: Optional[Union[str, int]]) -> int:
+        if target is None:
+            return 0
+        if isinstance(target, int):
+            if target < 0 or target >= len(self.target_cols):
+                raise IndexError(
+                    f"classification_target index {target} out of range for "
+                    f"{len(self.target_cols)} target columns."
+                )
+            return int(target)
+        if isinstance(target, str):
+            if target not in self.target_cols:
+                raise KeyError(f"classification_target '{target}' not in target_cols={self.target_cols}.")
+            return self.target_cols.index(target)
+        raise TypeError("classification_target must be str, int, or None.")
+
+    def _target_from_sample_pos(self, sample_i: int) -> torch.Tensor:
+        if not self.classification:
+            return torch.from_numpy(self.Y[sample_i].copy())
+
+        assert self._class_targets is not None
+        y_class = torch.tensor(int(self._class_targets[sample_i]), dtype=torch.long)
+        if self.include_regression_target:
+            assert self._class_target_index is not None
+            y_reg = torch.tensor(float(self.Y[sample_i, self._class_target_index]), dtype=torch.float32)
+            return torch.stack([y_class.to(torch.float32), y_reg], dim=0)
+        return y_class
+
+    def __getitem__(self, idx: int):
+        base_item = super().__getitem__(idx)
+        if not self.classification:
+            return base_item
+
+        sample_i = int(self.sample_pos[idx])
+        y = self._target_from_sample_pos(sample_i)
+
+        if self.return_meta:
+            x_short, t_short_feats, x_long, t_long_feats, short_mask, _, meta = base_item
+            return x_short, t_short_feats, x_long, t_long_feats, short_mask, y, meta
+
+        x_short, t_short_feats, x_long, t_long_feats, short_mask, _ = base_item
+        return x_short, t_short_feats, x_long, t_long_feats, short_mask, y
+
+
+class FinMambaContinuousDataset(ContinuousRasterAlignedTaskDataset):
+    """
+    FinMamba-ready continuous dataset.
+
+    Returns per-sample in this exact order:
+      x_asset_short, x_asset_long, x_market, t_short, t_long, targets
+    Optional meta payload is appended as the last element when return_meta=True.
+    """
+
+    def __init__(
+        self,
+        *args,
+        market_feature_cols: List[str],
+        market_lookback: Optional[int] = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.market_feature_cols = list(market_feature_cols)
+        if not self.market_feature_cols:
+            raise ValueError("market_feature_cols must be non-empty for FinMambaContinuousDataset.")
+
+        missing_market = [c for c in self.market_feature_cols if c not in self.df.columns]
+        if missing_market:
+            raise KeyError(f"Missing market_feature_cols in df: {missing_market}")
+
+        self.market_lookback = int(market_lookback or self.long_lookback)
+        if self.market_lookback != self.long_lookback:
+            raise ValueError(
+                "FinMambaContinuousDataset currently requires market_lookback == long_lookback "
+                f"(got market_lookback={self.market_lookback}, long_lookback={self.long_lookback})."
+            )
+
+        self.X_market = np.nan_to_num(
+            self.df[self.market_feature_cols].to_numpy(dtype=np.float32),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        self.alignment_stats["market_feature_cols"] = list(self.market_feature_cols)
+        self.alignment_stats["market_lookback"] = int(self.market_lookback)
+
+    def __getitem__(self, idx: int):
+        i = int(self.sample_pos[idx])
+        if self.random_short_len and self.short_hi > self.short_lo:
+            t_short = int(np.random.randint(self.short_lo, self.short_hi + 1))
+        else:
+            t_short = self.short_hi
+
+        s0 = i - t_short + 1
+        l0 = i - self.long_lookback + 1
+        m0 = i - self.market_lookback + 1
+
+        x_asset_short = torch.from_numpy(self.raster[s0:i + 1].copy())  # [T_short,C,H]
+        x_asset_long = torch.from_numpy(self.X_long[l0:i + 1].copy())  # [T_long,F_asset]
+        x_market = torch.from_numpy(self.X_market[m0:i + 1].copy())  # [T_market,F_market]
+        t_short_feats = torch.from_numpy(self.T[s0:i + 1].copy())  # [T_short,F_time]
+        t_long_feats = torch.from_numpy(self.T[l0:i + 1].copy())  # [T_long,F_time]
+        y = self._target_from_sample_pos(i)
+
+        if not self.return_meta:
+            return x_asset_short, x_asset_long, x_market, t_short_feats, t_long_feats, y
+
+        meta = {
+            "timestamp": self.df.index[i],
+            "session_code": int(self.df["session_code"].iloc[i]) if "session_code" in self.df.columns else -1,
+            "sample_pos": i,
+        }
+        return x_asset_short, x_asset_long, x_market, t_short_feats, t_long_feats, y, meta
+
+
 def collate_continuous_raster(batch: Sequence[Tuple[Any, ...]]):
     """
     Collate for ContinuousRasterAlignedDataset with variable short sequence lengths.
@@ -499,3 +675,42 @@ def collate_continuous_raster(batch: Sequence[Tuple[Any, ...]]):
     if has_meta:
         return x_short_pad, t_short_pad, x_long, t_long, short_mask, y, meta_list
     return x_short_pad, t_short_pad, x_long, t_long, short_mask, y
+
+
+def collate_finmamba_continuous(batch: Sequence[Tuple[Any, ...]]):
+    """
+    Collate for FinMambaContinuousDataset.
+
+    Returns in this exact order:
+      x_asset_short, x_asset_long, x_market, t_short, t_long, targets
+      (+ meta_list when dataset was built with return_meta=True)
+    """
+    has_meta = len(batch[0]) == 7
+
+    if has_meta:
+        x_short_list, x_long_list, x_market_list, t_short_list, t_long_list, y_list, meta_list = zip(*batch)
+    else:
+        x_short_list, x_long_list, x_market_list, t_short_list, t_long_list, y_list = zip(*batch)
+        meta_list = None
+
+    bsz = len(x_short_list)
+    t_max = max(int(x.shape[0]) for x in x_short_list)
+    cdim = int(x_short_list[0].shape[1])
+    hdim = int(x_short_list[0].shape[2])
+    ft_dim = int(t_short_list[0].shape[1])
+
+    x_asset_short = torch.zeros((bsz, t_max, cdim, hdim), dtype=torch.float32)
+    t_short = torch.zeros((bsz, t_max, ft_dim), dtype=torch.float32)
+    for b in range(bsz):
+        t = int(x_short_list[b].shape[0])
+        x_asset_short[b, :t] = x_short_list[b]
+        t_short[b, :t] = t_short_list[b]
+
+    x_asset_long = torch.stack(x_long_list, dim=0)
+    x_market = torch.stack(x_market_list, dim=0)
+    t_long = torch.stack(t_long_list, dim=0)
+    targets = torch.stack(y_list, dim=0)
+
+    if has_meta:
+        return x_asset_short, x_asset_long, x_market, t_short, t_long, targets, meta_list
+    return x_asset_short, x_asset_long, x_market, t_short, t_long, targets

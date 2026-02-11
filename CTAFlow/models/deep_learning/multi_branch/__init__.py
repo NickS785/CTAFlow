@@ -14,4 +14,8 @@ from .cmd_mamba import (
     CMDMambaConfig,
     CMDMamba,
 )
+from .fin_mamba import (
+    MarketGatingUnit,
+    FinMambaCMD,
+)
 from .tri_modal import TriModalModel, TriModalLSTM, RecurrentTriModal, TriModalClassifier

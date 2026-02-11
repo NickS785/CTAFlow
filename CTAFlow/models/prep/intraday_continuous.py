@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import time, timedelta
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -1038,31 +1038,409 @@ class ContinuousIntradayPrep:
 ContinuousIntradayPrepShort = ContinuousIntradayPrep
 
 
-# -------------------------
-# Usage example
-# -------------------------
-if __name__ == "__main__":
-    # df = your 5-min OHLCV dataframe with DatetimeIndex
-    prep = ContinuousIntradayPrep(
-        sessions=[
-            SessionSpec("LONDON", "02:00", "11:00"),
-            SessionSpec("USA", "08:30", "16:00"),
-        ],
-        bar_minutes=5,
-    )
+class FinancialsIntradayPrep(ContinuousIntradayPrep):
+    """
+    Financials-focused continuous intraday prep with macro market-state features.
 
-    # Example with dummy data
-    print("ContinuousIntradayPrep initialized")
-    print(f"Sessions: {[s.name for s in prep.sessions]}")
-    print(f"Bar minutes: {prep.bar_minutes}")
+    Extends ContinuousIntradayPrep for FinMambaCMD training by:
+    - Defaulting to USA session (08:30-16:00)
+    - Accepting a daily macro context DataFrame (rates, indices, sectors)
+    - Processing macro data through MacroFeaturePrep into engineered features
+    - Forward-filling daily macro features onto the intraday bar index
+    - Providing get_loaders() to build FinMambaContinuousDataset DataLoaders
 
-    # To use:
-    # df_out, mask, target_cols = prep.prepare(
-    #     df,
-    #     steps_60m=12,
-    #     keep_only_active=False,
-    #     add_daily=True,
-    #     add_overnight=True,
-    #     add_deseas=True,
-    # )
-    # train_df = df_out.loc[mask]
+    Parameters
+    ----------
+    sessions : Sequence[SessionSpec], optional
+        Session definitions. Default: USA only (08:30-16:00).
+    bar_minutes : int, default 5
+        Bar frequency in minutes.
+    eps : float, default 1e-8
+        Small constant for numerical stability.
+    macro_df : pd.DataFrame, optional
+        Raw daily macro context (e.g. from MacroClient.get_macro_context()).
+        Columns like SPX, VIX, YIELD_10Y, sector ETFs, etc.
+    macro_prep_kwargs : dict, optional
+        Keyword arguments forwarded to MacroFeaturePrep constructor.
+
+    Examples
+    --------
+    >>> from CTAFlow.data.ext.macro_client import MacroClient
+    >>> macro_df = MacroClient().get_macro_context(start_date="2015-01-01")
+    >>> prep = FinancialsIntradayPrep(macro_df=macro_df)
+    >>> df_out, mask, target_cols = prep.prepare(raw_ohlcv_df, steps_60m=12)
+    >>> train_loader, val_loader = prep.get_loaders(
+    ...     df=raw_ohlcv_df, raster_npz_path="GC_rasterized.npz",
+    ...     val_split=True, batch_size=32,
+    ... )
+    """
+
+    def __init__(
+        self,
+        sessions: Optional[Sequence[SessionSpec]] = None,
+        bar_minutes: int = 5,
+        eps: float = 1e-8,
+        macro_df: Optional[pd.DataFrame] = None,
+        macro_prep_kwargs: Optional[Dict[str, object]] = None,
+    ):
+        if sessions is None:
+            sessions = [SessionSpec("USA", "08:30", "16:00")]
+        super().__init__(sessions=sessions, bar_minutes=bar_minutes, eps=eps)
+
+        from CTAFlow.features.macro_prep import MacroFeaturePrep
+
+        self._macro_prep = MacroFeaturePrep(**(macro_prep_kwargs or {}))
+        self._macro_features: Optional[pd.DataFrame] = None
+        self._macro_feature_cols: List[str] = []
+
+        if macro_df is not None:
+            self.set_macro_data(macro_df)
+
+    # ------------------------------------------------------------------
+    # Macro data handling
+    # ------------------------------------------------------------------
+    def set_macro_data(self, macro_df: pd.DataFrame) -> None:
+        """Process raw daily macro context and store engineered features."""
+        processed = self._macro_prep.process(macro_df)
+        self._macro_features = processed
+        self._macro_feature_cols = list(processed.columns)
+
+    @property
+    def macro_features(self) -> Optional[pd.DataFrame]:
+        """Engineered macro feature DataFrame (daily frequency)."""
+        return self._macro_features
+
+    @property
+    def macro_feature_cols(self) -> List[str]:
+        """Column names of the macro feature set."""
+        return list(self._macro_feature_cols)
+
+    def _align_macro_to_intraday(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Forward-fill daily macro features onto the intraday index."""
+        if self._macro_features is None or self._macro_features.empty:
+            return df
+
+        df = df.copy()
+        macro = self._macro_features.copy()
+        macro.index = pd.to_datetime(macro.index).normalize()
+
+        # Map daily values by date then forward-fill within days
+        intraday_dates = df.index.normalize()
+        macro_aligned = macro.reindex(intraday_dates)
+        macro_aligned.index = df.index
+        macro_aligned = macro_aligned.ffill().bfill()
+
+        for col in macro_aligned.columns:
+            df[col] = macro_aligned[col].astype(np.float32)
+
+        return df
+
+    @staticmethod
+    def _scale_macro_features(
+        df: pd.DataFrame,
+        macro_cols: List[str],
+        clip_range: float = 10.0,
+    ) -> pd.DataFrame:
+        """Scale macro features to ~[-5, +5] range matching asset feature scale.
+
+        Scaling rules by pattern:
+        - Rate changes (*_chg_*): already small (bp), * 10 for visibility
+        - TERM_SPREAD: keep as-is (~0.5-3.0), clip
+        - Return features (*_ret_*): * 100 (to basis points), clip
+        - Relative strength (*_rel_*): * 100 (to basis points), clip
+        - VIX level: / 10 (normalise from ~10-80 to ~1-8), clip
+        - VIX change (VIX_chg): keep as-is (~-5 to 5), clip
+        """
+        df = df.copy()
+        for col in macro_cols:
+            if col not in df.columns:
+                continue
+            cl = col.lower()
+            if "_chg_" in cl:
+                # Rate changes: ~0.01-0.2 -> * 10 -> ~0.1-2
+                df[col] = (df[col] * 10.0).clip(-clip_range, clip_range)
+            elif "_ret_" in cl or "_rel_" in cl:
+                # Returns / relative strength: ~-0.05 to 0.05 -> * 100 -> ~-5 to 5
+                df[col] = (df[col] * 100.0).clip(-clip_range, clip_range)
+            elif cl == "vix":
+                # VIX level: ~10-80 -> / 10 -> ~1-8
+                df[col] = (df[col] / 10.0).clip(0, clip_range)
+            elif cl == "term_spread":
+                # Term spread: ~-1 to 3, already good range
+                df[col] = df[col].clip(-clip_range, clip_range)
+            else:
+                # Fallback: just clip
+                df[col] = df[col].clip(-clip_range, clip_range)
+        return df
+
+    # ------------------------------------------------------------------
+    # Override prepare to inject macro features
+    # ------------------------------------------------------------------
+    def prepare(
+        self,
+        df: pd.DataFrame,
+        **kwargs,
+    ) -> Tuple[pd.DataFrame, pd.Series, List[str]]:
+        """Prepare asset features then align and scale macro features.
+
+        Accepts all keyword arguments of ContinuousIntradayPrep.prepare().
+        Macro features are scaled when ``apply_scaling=True``.
+        """
+        apply_scaling = kwargs.get("apply_scaling", False)
+        df_out, train_mask, target_cols = super().prepare(df, **kwargs)
+        df_out = self._align_macro_to_intraday(df_out)
+        if apply_scaling and self._macro_feature_cols:
+            df_out = self._scale_macro_features(df_out, self._macro_feature_cols)
+        return df_out, train_mask, target_cols
+
+    # ------------------------------------------------------------------
+    # get_loaders – build FinMambaContinuousDataset DataLoaders
+    # ------------------------------------------------------------------
+    def get_loaders(
+        self,
+        df: pd.DataFrame,
+        raster_npz_path: str,
+        *,
+        # Feature columns (auto-detected if None)
+        feature_cols: Optional[List[str]] = None,
+        market_feature_cols: Optional[List[str]] = None,
+        target_cols: Optional[List[str]] = None,
+        # Dataset geometry
+        long_lookback: int = 256,
+        short_len_range: Tuple[int, int] = (32, 128),
+        resample_rule: str = "15min",
+        session_start: Optional[str] = None,
+        session_end: Optional[str] = None,
+        sample_mode: str = "usa",
+        sample_stride: int = 1,
+        # Classification
+        classification: bool = False,
+        classification_target: Optional[Union[str, int]] = None,
+        classification_thresholds: Sequence[float] = (-0.001, 0.001),
+        # Train / val split
+        val_split: bool = True,
+        val_ratio: float = 0.2,
+        val_cutoff_date: Optional[Union[str, pd.Timestamp]] = None,
+        # DataLoader
+        batch_size: int = 32,
+        shuffle_train: bool = True,
+        num_workers: int = 0,
+        # prepare() passthrough — target horizon
+        target_steps: Optional[int] = None,
+        target_horizon_minutes: Optional[int] = None,
+        # prepare() passthrough — feature toggles
+        add_daily: bool = True,
+        add_overnight: bool = True,
+        add_deseas: bool = True,
+        add_time_features: bool = True,
+        add_resample_precalc: bool = True,
+        resample_rules: Tuple[str, ...] = ("15min", "30min", "60min"),
+        apply_scaling: bool = True,
+        verbose: bool = False,
+    ):
+        """Build train (and optionally val) DataLoaders for FinMambaCMD.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Raw OHLCV data with DatetimeIndex.
+        raster_npz_path : str
+            Path to rasterized .npz file (keys: 'data', 'idx').
+        feature_cols : list[str], optional
+            Asset feature columns. Auto-detected from get_feature_cols() if None.
+        market_feature_cols : list[str], optional
+            Macro/market feature columns. Uses self.macro_feature_cols if None.
+        target_cols : list[str], optional
+            Target columns. Uses prepare() output if None.
+        long_lookback : int, default 256
+            Lookback window for the long (asset feature) stream.
+        short_len_range : tuple[int, int], default (32, 128)
+            Min/max raster sequence length per sample.
+        resample_rule : str, default "15min"
+            Resampling frequency for dataset alignment.
+        session_start, session_end : str, optional
+            Session window for raster alignment. Defaults to first session's
+            start and last session's end.
+        sample_mode : str, default "usa"
+            Session filter for eligible samples.
+        sample_stride : int, default 1
+            Take every N-th sample per day to reduce autocorrelation.
+        classification : bool, default False
+            Build classification targets via dataset (discretises the
+            selected target column using ``classification_thresholds``).
+        classification_target : str or int, optional
+            Which target column to discretize for classification.
+        classification_thresholds : sequence of float
+            Threshold cuts for classification labels.
+        val_split : bool, default True
+            Whether to return separate train and val loaders.
+        val_ratio : float, default 0.2
+            Fraction of calendar days for validation (ignored if
+            val_cutoff_date is set).
+        val_cutoff_date : str or Timestamp, optional
+            Explicit date cutoff. Dates < cutoff = train, >= cutoff = val.
+        batch_size : int, default 32
+        shuffle_train : bool, default True
+        num_workers : int, default 0
+        target_steps : int, optional
+            Number of forward bars for multi-step return targets.
+            For 15-min bars: 4 steps = 60 min horizon.
+            Exactly one of ``target_steps`` or ``target_horizon_minutes``
+            must be provided.
+        target_horizon_minutes : int, optional
+            Forward horizon in minutes. Converted to steps via
+            ``target_horizon_minutes // bar_minutes``.
+        apply_scaling : bool, default True
+            Scale asset and macro features to comparable ranges.
+        verbose : bool, default False
+            Print alignment statistics.
+
+        Returns
+        -------
+        DataLoader or Tuple[DataLoader, DataLoader]
+            Single loader when val_split=False, else (train_loader, val_loader).
+        """
+        from CTAFlow.data.datasets.continuous import (
+            FinMambaContinuousDataset,
+            collate_finmamba_continuous,
+        )
+        from torch.utils.data import DataLoader
+
+        if self._macro_features is None:
+            raise ValueError(
+                "No macro data set. Call set_macro_data(macro_df) or pass "
+                "macro_df= to the constructor before get_loaders()."
+            )
+
+        # --- Resolve target horizon ---
+        if target_steps is not None and target_horizon_minutes is not None:
+            raise ValueError("Specify only one of target_steps or target_horizon_minutes.")
+        if target_horizon_minutes is not None:
+            steps = int(target_horizon_minutes) // self.bar_minutes
+            if steps < 1:
+                raise ValueError(
+                    f"target_horizon_minutes={target_horizon_minutes} is less "
+                    f"than one bar ({self.bar_minutes} min)."
+                )
+        elif target_steps is not None:
+            steps = int(target_steps)
+        else:
+            # Default: 60 minutes worth of bars
+            steps = 60 // self.bar_minutes
+
+        # --- 1. Prepare asset + macro features ---
+        df_out, train_mask, tgt_cols = self.prepare(
+            df,
+            steps_60m=steps,
+            add_daily=add_daily,
+            add_overnight=add_overnight,
+            add_deseas=add_deseas,
+            add_time_features=add_time_features,
+            add_resample_precalc=add_resample_precalc,
+            resample_rules=resample_rules,
+            apply_scaling=apply_scaling,
+        )
+
+        if target_cols is None:
+            target_cols = tgt_cols
+
+        # --- 2. Resolve feature columns ---
+        if feature_cols is None:
+            feature_cols = self.get_feature_cols(
+                steps_60m=steps,
+                bar_minutes=self.bar_minutes,
+                add_daily=add_daily,
+                add_overnight=add_overnight,
+                add_deseas=add_deseas,
+                add_time_features=add_time_features,
+                add_resample_precalc=add_resample_precalc,
+                resample_rules=resample_rules,
+            )
+            feature_cols = [c for c in feature_cols if c in df_out.columns]
+
+        if market_feature_cols is None:
+            market_feature_cols = self.macro_feature_cols
+        missing = [c for c in market_feature_cols if c not in df_out.columns]
+        if missing:
+            raise KeyError(
+                f"market_feature_cols not found in prepared DataFrame: {missing}. "
+                f"Ensure macro_df covers the date range of df."
+            )
+
+        # --- 3. Session window defaults ---
+        if session_start is None:
+            session_start = self.sessions[0].start
+        if session_end is None:
+            session_end = self.sessions[-1].end
+
+        # --- 4. Date-based train / val split ---
+        if val_split:
+            if val_cutoff_date is not None:
+                cutoff = pd.Timestamp(val_cutoff_date)
+            else:
+                dates = sorted(df_out.index.normalize().unique())
+                n_val = max(1, int(len(dates) * val_ratio))
+                cutoff = dates[-n_val]
+            train_df = df_out[df_out.index < cutoff]
+            val_df = df_out[df_out.index >= cutoff]
+            if verbose:
+                print(f"Split: cutoff={cutoff.date()}, "
+                      f"train_days={train_df.index.normalize().nunique()}, "
+                      f"val_days={val_df.index.normalize().nunique()}")
+        else:
+            train_df = df_out
+            val_df = None
+
+        # --- 5. Shared dataset kwargs ---
+        ds_kwargs: Dict[str, object] = dict(
+            raster_npz_path=raster_npz_path,
+            feature_cols=feature_cols,
+            target_cols=target_cols,
+            market_feature_cols=market_feature_cols,
+            long_lookback=long_lookback,
+            short_len_range=short_len_range,
+            resample_rule=resample_rule,
+            session_start=session_start,
+            session_end=session_end,
+            sample_mode=sample_mode,
+            sample_stride=sample_stride,
+            classification=classification,
+            classification_target=classification_target,
+            classification_thresholds=classification_thresholds,
+        )
+
+        # --- 6. Build datasets and loaders ---
+        train_ds = FinMambaContinuousDataset(train_df, **ds_kwargs)
+        if verbose:
+            s = train_ds.alignment_stats
+            print(f"Train: {len(train_ds)} samples, "
+                  f"{s['num_days_kept']}/{s['num_days_in_common']} days, "
+                  f"{len(feature_cols)} asset feats, "
+                  f"{len(market_feature_cols)} market feats")
+
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=shuffle_train,
+            collate_fn=collate_finmamba_continuous,
+            num_workers=num_workers,
+        )
+
+        if not val_split:
+            return train_loader
+
+        val_ds = FinMambaContinuousDataset(val_df, **ds_kwargs)
+        if verbose:
+            s = val_ds.alignment_stats
+            print(f"Val:   {len(val_ds)} samples, "
+                  f"{s['num_days_kept']}/{s['num_days_in_common']} days")
+
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=collate_finmamba_continuous,
+            num_workers=num_workers,
+        )
+
+        return train_loader, val_loader
