@@ -48,8 +48,14 @@ class VolRegimeMoEConfig:
     # Sparse routing (set top_k < num_experts to activate)
     top_k: int = 0                        # 0 = soft (all experts)
 
-    # Aux loss coefficient for vol-prediction loss
+    # Aux loss coefficients
     aux_loss_coeff: float = 0.01
+    load_balance_coeff: float = 0.01
+
+    # Two-phase optimization (DeepVol first, then higher MoE LR)
+    deepvol_warmup_epochs: int = 5
+    post_warmup_moe_lr_mult: float = 2.0
+    freeze_router_after_warmup: bool = False
 
     # Unified head
     head_hidden_dim: int = 0              # 0 → inherit d_model
@@ -160,6 +166,7 @@ class VolRegimeAwareMoE(nn.Module):
         self.moe_cfg = moe_cfg
         self.num_experts = moe_cfg.num_experts
         self.aux_loss_coeff = moe_cfg.aux_loss_coeff
+        self.load_balance_coeff = moe_cfg.load_balance_coeff
         d_model = cfg.d_model
 
         # ---- DeepVol router (processes 1D returns ONLY) ----
@@ -199,6 +206,108 @@ class VolRegimeAwareMoE(nn.Module):
         # ---- diagnostics ----
         self.last_tracker: Dict[str, object] = {}
 
+    @staticmethod
+    def _set_module_requires_grad(module: nn.Module, enabled: bool) -> None:
+        for param in module.parameters():
+            param.requires_grad = enabled
+
+    def _load_balance_loss(self, weights: torch.Tensor) -> torch.Tensor:
+        """
+        Encourage uniform expert usage over the current batch.
+        Returns 0 when routing is perfectly uniform.
+        """
+        usage = weights.mean(dim=0)
+        uniform = torch.full_like(usage, 1.0 / float(self.num_experts))
+        return self.num_experts * torch.mean((usage - uniform) ** 2)
+
+    def build_optimizer(
+        self,
+        base_lr: float = 2e-4,
+        weight_decay: float = 1e-2,
+        router_lr_mult: float = 1.0,
+        moe_lr_mult: float = 1.0,
+        betas: Tuple[float, float] = (0.9, 0.999),
+    ) -> torch.optim.Optimizer:
+        """
+        Build AdamW with named param groups so epoch-wise LR control can be
+        applied to router vs MoE (experts/head) independently.
+        """
+        router_params = [p for p in self.router.parameters() if p.requires_grad]
+        expert_params = [p for p in self.experts.parameters() if p.requires_grad]
+        head_params = [p for p in self.head.parameters() if p.requires_grad]
+
+        param_groups = []
+        if router_params:
+            router_lr = float(base_lr) * float(router_lr_mult)
+            param_groups.append(
+                {
+                    "name": "router",
+                    "params": router_params,
+                    "lr": router_lr,
+                    "base_lr": router_lr,
+                }
+            )
+        if expert_params:
+            expert_lr = float(base_lr) * float(moe_lr_mult)
+            param_groups.append(
+                {
+                    "name": "experts",
+                    "params": expert_params,
+                    "lr": expert_lr,
+                    "base_lr": expert_lr,
+                }
+            )
+        if head_params:
+            head_lr = float(base_lr) * float(moe_lr_mult)
+            param_groups.append(
+                {
+                    "name": "head",
+                    "params": head_params,
+                    "lr": head_lr,
+                    "base_lr": head_lr,
+                }
+            )
+
+        if not param_groups:
+            raise ValueError("No trainable parameters found for optimizer construction.")
+
+        return torch.optim.AdamW(
+            param_groups,
+            betas=betas,
+            weight_decay=weight_decay,
+        )
+
+    def apply_epoch_schedule(
+        self,
+        optimizer: torch.optim.Optimizer,
+        epoch: int,
+    ) -> None:
+        """
+        Call once per epoch (typically at epoch start):
+        - Epochs 1..deepvol_warmup_epochs: base LR for experts/head
+        - Epoch > deepvol_warmup_epochs: experts/head LR is boosted
+        """
+        if epoch < 1:
+            raise ValueError("epoch must be >= 1")
+
+        warmup_epochs = int(self.moe_cfg.deepvol_warmup_epochs)
+        boosted = epoch > warmup_epochs
+        moe_mult = float(self.moe_cfg.post_warmup_moe_lr_mult) if boosted else 1.0
+
+        if self.moe_cfg.freeze_router_after_warmup:
+            self._set_module_requires_grad(self.router, not boosted)
+
+        for group in optimizer.param_groups:
+            group_name = str(group.get("name", ""))
+            if group_name not in {"experts", "head"}:
+                if self.moe_cfg.freeze_router_after_warmup and group_name == "router" and boosted:
+                    group["lr"] = 0.0
+                continue
+
+            base_lr = float(group.get("base_lr", group["lr"]))
+            group["base_lr"] = base_lr
+            group["lr"] = base_lr * moe_mult
+
     # ------------------------------------------------------------------
     def forward(
         self,
@@ -228,10 +337,13 @@ class VolRegimeAwareMoE(nn.Module):
 
         # 2. APPLY TOP-K SPARSITY (optional)
         if self.moe_cfg.top_k > 0 and self.moe_cfg.top_k < self.num_experts:
-            topk_vals, topk_idx = weights.topk(self.moe_cfg.top_k, dim=-1)
+            _, topk_idx = weights.topk(self.moe_cfg.top_k, dim=-1)
             mask = torch.zeros_like(weights).scatter_(1, topk_idx, 1.0)
             weights = weights * mask
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
+
+        # 2.1 LOAD BALANCING LOSS FOR EXPERT UTILISATION
+        load_balance_loss = self._load_balance_loss(weights)
 
         # 3. RUN EXPERTS
         expert_embeddings: List[torch.Tensor] = []
@@ -263,14 +375,19 @@ class VolRegimeAwareMoE(nn.Module):
         if self.cfg.task == "classification" and return_probs:
             prediction = torch.softmax(prediction, dim=-1)
 
+        weights_mean = weights.mean(dim=0)
+        route_entropy = -torch.sum(weights_mean * torch.log(weights_mean + 1e-8))
+
         # ---- diagnostics ----
         self.last_tracker = {
-            "router_weights_mean": weights.mean(dim=0).detach().cpu(),
+            "router_weights_mean": weights_mean.detach().cpu(),
             "router_weights_std": weights.std(dim=0).detach().cpu(),
             "vol_loss": float(vol_loss.detach().cpu()),
+            "load_balance_loss": float(load_balance_loss.detach().cpu()),
             "pred_vol_mean": float(pred_vol.mean().detach().cpu()),
             "pred_vol_std": float(pred_vol.std().detach().cpu()),
-            "dominant_expert": int(weights.mean(dim=0).argmax()),
+            "route_entropy": float(route_entropy.detach().cpu()),
+            "dominant_expert": int(weights_mean.argmax()),
         }
 
         if not return_features:
@@ -281,6 +398,8 @@ class VolRegimeAwareMoE(nn.Module):
             "expert_embeddings": stacked,
             "z_fused": z_fused,
             "aux_loss": vol_loss,
+            "vol_loss": vol_loss,
+            "load_balance_loss": load_balance_loss,
             "pred_vol": pred_vol,
             "tracker": self.get_last_tracker(),
         }
@@ -290,5 +409,15 @@ class VolRegimeAwareMoE(nn.Module):
         return dict(self.last_tracker)
 
     def aux_loss(self, features_dict: Dict) -> torch.Tensor:
-        """Convenience: extract scaled aux loss for adding to task loss."""
-        return self.aux_loss_coeff * features_dict["aux_loss"]
+        """
+        Combined auxiliary objective:
+        - volatility prediction loss (DeepVol target)
+        - routing load-balancing loss (prevents expert collapse)
+        """
+        vol_loss = features_dict["aux_loss"]
+        load_balance_loss = features_dict.get("load_balance_loss")
+
+        total = self.aux_loss_coeff * vol_loss
+        if load_balance_loss is not None:
+            total = total + self.load_balance_coeff * load_balance_loss
+        return total
