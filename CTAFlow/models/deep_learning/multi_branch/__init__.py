@@ -23,4 +23,8 @@ from .regime_moe import (
     RegimeAwareMoE,
     RegimeMoEConfig,
 )
+from .vol_regime_moe import (
+    VolRegimeAwareMoE,
+    VolRegimeMoEConfig,
+)
 from .tri_modal import TriModalModel, TriModalLSTM, RecurrentTriModal, TriModalClassifier

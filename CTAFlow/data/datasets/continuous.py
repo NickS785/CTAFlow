@@ -714,3 +714,142 @@ def collate_finmamba_continuous(batch: Sequence[Tuple[Any, ...]]):
     if has_meta:
         return x_asset_short, x_asset_long, x_market, t_short, t_long, targets, meta_list
     return x_asset_short, x_asset_long, x_market, t_short, t_long, targets
+
+
+class VolMoEContinuousDataset(ContinuousRasterAlignedTaskDataset):
+    """
+    Dataset for VolRegimeAwareMoE training.
+
+    Extends ContinuousRasterAlignedTaskDataset with:
+    - ``x_vol``: a 1D return series (extracted from ``return_col``) that the
+      DeepVol router consumes directly.
+    - ``vol_target``: 1-day ahead realized volatility for the router's aux loss.
+
+    No market features — the vol router only needs 1D returns, and the experts
+    process asset features + raster directly.
+
+    Returns per-sample:
+      x_short, x_long, x_vol, t_short, t_long, y, vol_target
+    With ``return_meta=True``, meta dict is appended as the last element.
+
+    Parameters
+    ----------
+    return_col : str
+        Column name in *feature_cols* that contains bar-level log returns.
+        Used both as the router's 1D input (``x_vol``) and to compute the
+        1-day ahead realized vol target.
+    """
+
+    def __init__(
+        self,
+        *args,
+        return_col: str = "log_ret",
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+
+        if return_col not in self.feature_cols:
+            raise KeyError(
+                f"return_col='{return_col}' not found in feature_cols. "
+                f"Available: {self.feature_cols[:10]}..."
+            )
+        self.return_col = return_col
+        self.return_col_idx = self.feature_cols.index(return_col)
+
+        # Pre-extract the 1D return series for x_vol
+        self.X_vol = np.nan_to_num(
+            self.df[return_col].to_numpy(dtype=np.float32), nan=0.0,
+        )
+
+        # ---- compute 1-day ahead realized volatility ----
+        ret_series = self.df[return_col]
+        daily_rv = ret_series.groupby(ret_series.index.date).std()
+        daily_rv.index = pd.to_datetime(daily_rv.index)
+        fwd_rv = daily_rv.shift(-1)  # today → tomorrow's realized vol
+        fwd_vol = self.df.index.normalize().map(fwd_rv).to_numpy(dtype=np.float32)
+        # NaN on last day (no tomorrow) → fill with previous day's vol
+        nan_mask = np.isnan(fwd_vol)
+        if nan_mask.any() and not nan_mask.all():
+            last_valid = fwd_vol[~nan_mask][-1]
+            fwd_vol[nan_mask] = last_valid
+        self.fwd_vol = np.nan_to_num(fwd_vol, nan=0.0)
+
+        self.alignment_stats["vol_target"] = {
+            "return_col": return_col,
+            "return_col_idx": int(self.return_col_idx),
+            "fwd_vol_mean": float(np.nanmean(self.fwd_vol)),
+            "fwd_vol_std": float(np.nanstd(self.fwd_vol)),
+        }
+
+    def __getitem__(self, idx: int):
+        i = int(self.sample_pos[idx])
+        if self.random_short_len and self.short_hi > self.short_lo:
+            t_short = int(np.random.randint(self.short_lo, self.short_hi + 1))
+        else:
+            t_short = self.short_hi
+
+        s0 = i - t_short + 1
+        l0 = i - self.long_lookback + 1
+
+        x_short = torch.from_numpy(self.raster[s0:i + 1].copy())       # [T_short, C, H]
+        x_long = torch.from_numpy(self.X_long[l0:i + 1].copy())        # [T_long, F]
+        x_vol = torch.from_numpy(self.X_vol[l0:i + 1].copy())          # [T_long]
+        t_short_feats = torch.from_numpy(self.T[s0:i + 1].copy())      # [T_short, Ft]
+        t_long_feats = torch.from_numpy(self.T[l0:i + 1].copy())       # [T_long, Ft]
+        y = self._target_from_sample_pos(i)
+        vol_target = torch.tensor([self.fwd_vol[i]], dtype=torch.float32)  # [1]
+
+        if not self.return_meta:
+            return x_short, x_long, x_vol, t_short_feats, t_long_feats, y, vol_target
+
+        meta = {
+            "timestamp": self.df.index[i],
+            "session_code": int(self.df["session_code"].iloc[i]) if "session_code" in self.df.columns else -1,
+            "sample_pos": i,
+        }
+        return x_short, x_long, x_vol, t_short_feats, t_long_feats, y, vol_target, meta
+
+
+def collate_vol_moe_continuous(batch: Sequence[Tuple[Any, ...]]):
+    """
+    Collate for VolMoEContinuousDataset.
+
+    Returns in this exact order:
+      x_short, x_long, x_vol, t_short, t_long, targets, vol_target
+      (+ meta_list when dataset was built with return_meta=True)
+
+    - ``x_vol``    is ``[B, T_long]``  — 1D return series for the DeepVol router.
+    - ``vol_target`` is ``[B, 1]``     — 1-day ahead realized vol for aux loss.
+    """
+    has_meta = len(batch[0]) == 8
+
+    if has_meta:
+        (x_short_list, x_long_list, x_vol_list,
+         t_short_list, t_long_list, y_list, vol_list, meta_list) = zip(*batch)
+    else:
+        (x_short_list, x_long_list, x_vol_list,
+         t_short_list, t_long_list, y_list, vol_list) = zip(*batch)
+        meta_list = None
+
+    bsz = len(x_short_list)
+    t_max = max(int(x.shape[0]) for x in x_short_list)
+    cdim = int(x_short_list[0].shape[1])
+    hdim = int(x_short_list[0].shape[2])
+    ft_dim = int(t_short_list[0].shape[1])
+
+    x_short_pad = torch.zeros((bsz, t_max, cdim, hdim), dtype=torch.float32)
+    t_short_pad = torch.zeros((bsz, t_max, ft_dim), dtype=torch.float32)
+    for b in range(bsz):
+        t = int(x_short_list[b].shape[0])
+        x_short_pad[b, :t] = x_short_list[b]
+        t_short_pad[b, :t] = t_short_list[b]
+
+    x_long = torch.stack(x_long_list, dim=0)
+    x_vol = torch.stack(x_vol_list, dim=0)      # [B, T_long]
+    t_long = torch.stack(t_long_list, dim=0)
+    targets = torch.stack(y_list, dim=0)
+    vol_target = torch.stack(vol_list, dim=0)    # [B, 1]
+
+    if has_meta:
+        return x_short_pad, x_long, x_vol, t_short_pad, t_long, targets, vol_target, meta_list
+    return x_short_pad, x_long, x_vol, t_short_pad, t_long, targets, vol_target
