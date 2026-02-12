@@ -54,7 +54,8 @@ class VolRegimeMoEConfig:
 
     # Two-phase optimization (DeepVol first, then higher MoE LR)
     deepvol_warmup_epochs: int = 5
-    post_warmup_moe_lr_mult: float = 2.0
+    post_warmup_moe_lr_mult: float = 1.5
+    moe_lr_ramp_epochs: int = 3
     freeze_router_after_warmup: bool = False
 
     # Unified head
@@ -292,7 +293,15 @@ class VolRegimeAwareMoE(nn.Module):
 
         warmup_epochs = int(self.moe_cfg.deepvol_warmup_epochs)
         boosted = epoch > warmup_epochs
-        moe_mult = float(self.moe_cfg.post_warmup_moe_lr_mult) if boosted else 1.0
+
+        # Smoothly ramp MoE LR after warmup to avoid abrupt instability.
+        target_mult = float(self.moe_cfg.post_warmup_moe_lr_mult)
+        ramp_epochs = max(1, int(self.moe_cfg.moe_lr_ramp_epochs))
+        if not boosted:
+            moe_mult = 1.0
+        else:
+            progress = min(1.0, float(epoch - warmup_epochs) / float(ramp_epochs))
+            moe_mult = 1.0 + (target_mult - 1.0) * progress
 
         if self.moe_cfg.freeze_router_after_warmup:
             self._set_module_requires_grad(self.router, not boosted)
