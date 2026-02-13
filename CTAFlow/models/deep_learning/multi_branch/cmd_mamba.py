@@ -7,6 +7,7 @@ import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from CTAFlow.models.deep_learning.deep_vol import DeepVolEncoder
 
 try:
     from mamba_ssm import Mamba  # type: ignore
@@ -285,6 +286,14 @@ class CMDMambaConfig:
     task: str = "regression"  # "regression" or "classification"
     out_dim: int = 1
 
+    # Optional DeepVol branch for long-stream conditioning
+    use_deepvol: bool = False
+    deepvol_hidden_dim: int = 32
+    deepvol_layers: int = 4
+    deepvol_feature_idx: Optional[int] = None  # fallback index from x_long when x_vol is not provided
+    deepvol_separate_return_from_long: bool = True
+    deepvol_aux_loss_coeff: float = 0.0
+
 
 class CMDMamba(nn.Module):
     """
@@ -295,6 +304,7 @@ class CMDMamba(nn.Module):
     x_short : [B, T_short, 4, 32]
     t_short : [B, T_short, F_time] (optional)
     x_long  : [B, T_long, F_long]
+    x_vol   : [B, T_long] (optional; 1D returns for DeepVol branch)
     t_long  : [B, T_long, F_time] (optional)
     short_mask : [B, T_short] (optional; 1 for valid positions)
     """
@@ -311,6 +321,8 @@ class CMDMamba(nn.Module):
         self.cfg = cfg
         d_model = cfg.d_model
         self.time_feat_dim = int(time_feat_dim)
+        self.long_input_dim = int(long_input_dim)
+        self.deepvol_aux_loss_coeff = float(cfg.deepvol_aux_loss_coeff)
 
         self.raster_pre = RasterPreprocessor(
             means=raster_norm_means,
@@ -332,6 +344,36 @@ class CMDMamba(nn.Module):
             stride=cfg.long_stride,
             dropout=cfg.dropout,
         )
+
+        self.use_deepvol = bool(cfg.use_deepvol)
+        if self.use_deepvol:
+            self.deepvol_feature_idx = cfg.deepvol_feature_idx
+            self.deepvol_separate_return_from_long = bool(cfg.deepvol_separate_return_from_long)
+            self.deepvol_encoder = DeepVolEncoder(
+                input_dim=1,
+                hidden_dim=int(cfg.deepvol_hidden_dim),
+                layers=int(cfg.deepvol_layers),
+            )
+            # Map raw-step DeepVol features back to long feature space [B,T,F_long].
+            self.deepvol_to_long = nn.Sequential(
+                nn.Linear(int(cfg.deepvol_hidden_dim), self.long_input_dim),
+                nn.LayerNorm(self.long_input_dim),
+                nn.Dropout(cfg.dropout),
+            )
+            self.deepvol_long_gate = nn.Sequential(
+                nn.Linear(self.long_input_dim * 2, self.long_input_dim),
+                nn.GELU(),
+                nn.Dropout(cfg.dropout),
+                nn.Linear(self.long_input_dim, self.long_input_dim),
+                nn.Sigmoid(),
+            )
+            self.deepvol_aux_head = nn.Sequential(
+                nn.Linear(int(cfg.deepvol_hidden_dim), int(cfg.deepvol_hidden_dim)),
+                nn.GELU(),
+                nn.Dropout(cfg.dropout),
+                nn.Linear(int(cfg.deepvol_hidden_dim), 1),
+                nn.Softplus(),
+            )
 
         self.use_time = self.time_feat_dim > 0
         if self.use_time:
@@ -398,6 +440,59 @@ class CMDMamba(nn.Module):
         idx = (lengths - 1).view(tokens.size(0), 1, 1).expand(tokens.size(0), 1, tokens.size(2))
         return tokens.gather(dim=1, index=idx).squeeze(1)
 
+    def _resolve_x_vol(self, x_long: torch.Tensor, x_vol: Optional[torch.Tensor]) -> torch.Tensor:
+        if x_vol is not None:
+            if x_vol.dim() == 3 and x_vol.shape[-1] == 1:
+                resolved = x_vol.squeeze(-1)
+            elif x_vol.dim() == 2:
+                resolved = x_vol
+            else:
+                raise ValueError(f"x_vol must be [B,T] or [B,T,1], got {tuple(x_vol.shape)}")
+
+            if resolved.shape[0] != x_long.shape[0] or resolved.shape[1] != x_long.shape[1]:
+                raise ValueError(
+                    f"x_vol shape {tuple(resolved.shape)} must match x_long [B,T,*]={tuple(x_long.shape[:2])}"
+                )
+            return resolved
+
+        if self.deepvol_feature_idx is None:
+            raise ValueError(
+                "use_deepvol=True requires x_vol input or deepvol_feature_idx in CMDMambaConfig."
+            )
+        f_idx = int(self.deepvol_feature_idx)
+        if f_idx < 0 or f_idx >= x_long.shape[-1]:
+            raise ValueError(
+                f"deepvol_feature_idx={f_idx} is out of range for x_long with F={x_long.shape[-1]}"
+            )
+        return x_long[:, :, f_idx]
+
+    def _fuse_deepvol_into_long(
+        self,
+        x_long: torch.Tensor,
+        x_vol: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        DeepVol runs on raw single-candle returns (no stride).
+        Its output is fused into the raw long feature tensor before patching/Mamba.
+        Returns:
+          x_long_fused : [B,T,F_long]
+          z_vol_tokens : [B,T,H_vol]  (raw-step DeepVol embeddings)
+        """
+        vol_series = self._resolve_x_vol(x_long=x_long, x_vol=x_vol)  # [B,T]
+
+        x_long_main = x_long
+        if self.deepvol_feature_idx is not None and self.deepvol_separate_return_from_long:
+            # Separate return from the long feature stream so DeepVol owns return processing.
+            x_long_main = x_long.clone()
+            x_long_main[:, :, int(self.deepvol_feature_idx)] = 0.0
+
+        # DeepVol encoder: dilated causal convolutions over raw bar returns.
+        z_vol_tokens = self.deepvol_encoder(vol_series.unsqueeze(1)).transpose(1, 2).contiguous()  # [B,T,H]
+        z_vol_long = self.deepvol_to_long(z_vol_tokens)  # [B,T,F_long]
+        gate = self.deepvol_long_gate(torch.cat([x_long_main, z_vol_long], dim=-1))
+        x_long_fused = x_long_main + gate * z_vol_long
+        return x_long_fused, z_vol_tokens
+
     def forward(
         self,
         x_short: torch.Tensor,
@@ -407,6 +502,8 @@ class CMDMamba(nn.Module):
         short_mask: Optional[torch.Tensor] = None,
         return_probs: bool = False,
         return_features: bool = False,
+        x_vol: Optional[torch.Tensor] = None,
+        vol_target: Optional[torch.Tensor] = None,
     ):
         # Short branch
         z_short = self.raster_pre(x_short)
@@ -422,13 +519,34 @@ class CMDMamba(nn.Module):
         z_short_last = self._last_valid(z_short, short_mask)
 
         # Long branch
-        z_long = self.long_patcher(x_long)  # [B,Tl',D]
+        x_long_fused = x_long
+        z_vol_tokens = None
+        if self.use_deepvol:
+            x_long_fused, z_vol_tokens = self._fuse_deepvol_into_long(
+                x_long=x_long,
+                x_vol=x_vol,
+            )
+
+        z_long = self.long_patcher(x_long_fused)  # [B,Tl',D]
         if self.use_time and t_long is not None:
             z_long = z_long + self.time_long_patcher(t_long)
         for blk in self.long_blocks:
             z_long = blk(z_long)
         z_long = self.long_norm(z_long)
         z_long_last = z_long[:, -1, :]
+
+        vol_aux_loss = torch.tensor(0.0, device=x_long.device, dtype=x_long.dtype)
+        pred_vol_aux = None
+        if self.use_deepvol and z_vol_tokens is not None:
+            pred_vol_aux = self.deepvol_aux_head(z_vol_tokens[:, -1, :])  # [B,1]
+            if vol_target is not None:
+                if vol_target.dim() == 1:
+                    vol_target = vol_target.unsqueeze(-1)
+                if vol_target.shape != pred_vol_aux.shape:
+                    raise ValueError(
+                        f"vol_target shape {tuple(vol_target.shape)} must match predicted vol shape {tuple(pred_vol_aux.shape)}"
+                    )
+                vol_aux_loss = F.mse_loss(pred_vol_aux, vol_target.to(pred_vol_aux.dtype))
 
         # Router + head
         z_fused, w = self.router(z_long_last, z_short_last)
@@ -442,7 +560,20 @@ class CMDMamba(nn.Module):
             "long_tokens": int(z_long.shape[1]),
             "short_tokens": int(z_short.shape[1]),
             "base_bar_minutes": int(self.cfg.base_bar_minutes),
+            "use_deepvol": bool(self.use_deepvol),
         }
+        if z_vol_tokens is not None:
+            self.last_tracker["deepvol_raw_steps"] = int(z_vol_tokens.shape[1])
+            self.last_tracker["deepvol_token_norm"] = float(
+                z_vol_tokens.norm(dim=-1).mean().detach().cpu()
+            )
+            self.last_tracker["deepvol_fused_delta"] = float(
+                (x_long_fused - x_long).abs().mean().detach().cpu()
+            )
+            self.last_tracker["deepvol_aux_loss"] = float(vol_aux_loss.detach().cpu())
+            if pred_vol_aux is not None:
+                self.last_tracker["pred_vol_aux_mean"] = float(pred_vol_aux.mean().detach().cpu())
+                self.last_tracker["pred_vol_aux_std"] = float(pred_vol_aux.std().detach().cpu())
 
         if not return_features:
             return out
@@ -451,4 +582,26 @@ class CMDMamba(nn.Module):
             "z_short_last": z_short_last,
             "z_fused": z_fused,
             "router_w": w,
+            "z_vol_tokens": z_vol_tokens,
+            "x_long_fused": x_long_fused,
+            "vol_aux_loss": vol_aux_loss,
+            "pred_vol_aux": pred_vol_aux,
         }
+
+    def deepvol_aux_loss(self, features_dict: Dict) -> torch.Tensor:
+        """
+        Scaled auxiliary loss for the DeepVol branch.
+        Add this to your task loss during training when using vol targets.
+        """
+        if not self.use_deepvol:
+            probe = features_dict.get("z_fused")
+            if isinstance(probe, torch.Tensor):
+                return probe.new_zeros(())
+            return torch.tensor(0.0)
+        base = features_dict.get("vol_aux_loss")
+        if base is None:
+            probe = features_dict.get("z_fused")
+            if isinstance(probe, torch.Tensor):
+                return probe.new_zeros(())
+            return torch.tensor(0.0)
+        return float(self.deepvol_aux_loss_coeff) * base

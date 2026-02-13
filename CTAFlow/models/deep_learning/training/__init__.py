@@ -25,6 +25,7 @@ from .loss import (
     SharpePenaltyLoss,
     TradingPnLLoss,
 )
+from .optimization import AccuracyWeightedPnL
 
 __all__ = [
     # Training utilities
@@ -55,4 +56,6 @@ __all__ = [
     # Regression losses
     "SharpePenaltyLoss",
     "TradingPnLLoss",
+    # Optimization objectives
+    "AccuracyWeightedPnL",
 ]

@@ -716,27 +716,24 @@ def collate_finmamba_continuous(batch: Sequence[Tuple[Any, ...]]):
     return x_asset_short, x_asset_long, x_market, t_short, t_long, targets
 
 
-class VolMoEContinuousDataset(ContinuousRasterAlignedTaskDataset):
+class VolMSContinuousDataset(ContinuousRasterAlignedTaskDataset):
     """
-    Dataset for VolRegimeAwareMoE training.
+    Volatility MultiScale continuous dataset for CMDMamba + DeepVol training.
 
     Extends ContinuousRasterAlignedTaskDataset with:
-    - ``x_vol``: a 1D return series (extracted from ``return_col``) that the
-      DeepVol router consumes directly.
-    - ``vol_target``: 1-day ahead realized volatility for the router's aux loss.
-
-    No market features — the vol router only needs 1D returns, and the experts
-    process asset features + raster directly.
+    - ``x_vol``: a 1D return series (extracted from ``return_col``) consumed by
+      the DeepVol branch.
+    - ``vol_target``: 1-day ahead realized volatility for optional aux loss.
 
     Returns per-sample:
-      x_short, x_long, x_vol, t_short, t_long, y, vol_target
+      x_short, x_long, x_vol, t_short, t_long, short_mask, y, vol_target
     With ``return_meta=True``, meta dict is appended as the last element.
 
     Parameters
     ----------
     return_col : str
         Column name in *feature_cols* that contains bar-level log returns.
-        Used both as the router's 1D input (``x_vol``) and to compute the
+        Used both as the DeepVol 1D input (``x_vol``) and to compute the
         1-day ahead realized vol target.
     """
 
@@ -765,9 +762,9 @@ class VolMoEContinuousDataset(ContinuousRasterAlignedTaskDataset):
         ret_series = self.df[return_col]
         daily_rv = ret_series.groupby(ret_series.index.date).std()
         daily_rv.index = pd.to_datetime(daily_rv.index)
-        fwd_rv = daily_rv.shift(-1)  # today → tomorrow's realized vol
+        fwd_rv = daily_rv.shift(-1)  # today -> tomorrow's realized vol
         fwd_vol = self.df.index.normalize().map(fwd_rv).to_numpy(dtype=np.float32)
-        # NaN on last day (no tomorrow) → fill with previous day's vol
+        # NaN on last day (no tomorrow) -> fill with previous day's vol
         nan_mask = np.isnan(fwd_vol)
         if nan_mask.any() and not nan_mask.all():
             last_valid = fwd_vol[~nan_mask][-1]
@@ -796,39 +793,49 @@ class VolMoEContinuousDataset(ContinuousRasterAlignedTaskDataset):
         x_vol = torch.from_numpy(self.X_vol[l0:i + 1].copy())          # [T_long]
         t_short_feats = torch.from_numpy(self.T[s0:i + 1].copy())      # [T_short, Ft]
         t_long_feats = torch.from_numpy(self.T[l0:i + 1].copy())       # [T_long, Ft]
+        short_mask = torch.ones((t_short,), dtype=torch.float32)       # [T_short]
         y = self._target_from_sample_pos(i)
         vol_target = torch.tensor([self.fwd_vol[i]], dtype=torch.float32)  # [1]
 
         if not self.return_meta:
-            return x_short, x_long, x_vol, t_short_feats, t_long_feats, y, vol_target
+            return x_short, x_long, x_vol, t_short_feats, t_long_feats, short_mask, y, vol_target
 
         meta = {
             "timestamp": self.df.index[i],
             "session_code": int(self.df["session_code"].iloc[i]) if "session_code" in self.df.columns else -1,
             "sample_pos": i,
         }
-        return x_short, x_long, x_vol, t_short_feats, t_long_feats, y, vol_target, meta
+        return x_short, x_long, x_vol, t_short_feats, t_long_feats, short_mask, y, vol_target, meta
 
 
-def collate_vol_moe_continuous(batch: Sequence[Tuple[Any, ...]]):
+class VolMoEContinuousDataset(VolMSContinuousDataset):
     """
-    Collate for VolMoEContinuousDataset.
+    Backward-compatible alias for VolMSContinuousDataset.
+
+    NOTE: New code should prefer VolMSContinuousDataset.
+    """
+
+
+
+def collate_vol_ms_continuous(batch: Sequence[Tuple[Any, ...]]):
+    """
+    Collate for VolMSContinuousDataset.
 
     Returns in this exact order:
-      x_short, x_long, x_vol, t_short, t_long, targets, vol_target
+      x_short, x_long, x_vol, t_short, t_long, short_mask, targets, vol_target
       (+ meta_list when dataset was built with return_meta=True)
 
-    - ``x_vol``    is ``[B, T_long]``  — 1D return series for the DeepVol router.
-    - ``vol_target`` is ``[B, 1]``     — 1-day ahead realized vol for aux loss.
+    - ``x_vol`` is ``[B, T_long]``  - 1D return series for DeepVol.
+    - ``vol_target`` is ``[B, 1]``  - 1-day ahead realized vol for aux loss.
     """
-    has_meta = len(batch[0]) == 8
+    has_meta = len(batch[0]) == 9
 
     if has_meta:
         (x_short_list, x_long_list, x_vol_list,
-         t_short_list, t_long_list, y_list, vol_list, meta_list) = zip(*batch)
+         t_short_list, t_long_list, m_short_list, y_list, vol_list, meta_list) = zip(*batch)
     else:
         (x_short_list, x_long_list, x_vol_list,
-         t_short_list, t_long_list, y_list, vol_list) = zip(*batch)
+         t_short_list, t_long_list, m_short_list, y_list, vol_list) = zip(*batch)
         meta_list = None
 
     bsz = len(x_short_list)
@@ -839,10 +846,12 @@ def collate_vol_moe_continuous(batch: Sequence[Tuple[Any, ...]]):
 
     x_short_pad = torch.zeros((bsz, t_max, cdim, hdim), dtype=torch.float32)
     t_short_pad = torch.zeros((bsz, t_max, ft_dim), dtype=torch.float32)
+    short_mask = torch.zeros((bsz, t_max), dtype=torch.float32)
     for b in range(bsz):
         t = int(x_short_list[b].shape[0])
         x_short_pad[b, :t] = x_short_list[b]
         t_short_pad[b, :t] = t_short_list[b]
+        short_mask[b, :t] = m_short_list[b]
 
     x_long = torch.stack(x_long_list, dim=0)
     x_vol = torch.stack(x_vol_list, dim=0)      # [B, T_long]
@@ -851,5 +860,21 @@ def collate_vol_moe_continuous(batch: Sequence[Tuple[Any, ...]]):
     vol_target = torch.stack(vol_list, dim=0)    # [B, 1]
 
     if has_meta:
-        return x_short_pad, x_long, x_vol, t_short_pad, t_long, targets, vol_target, meta_list
-    return x_short_pad, x_long, x_vol, t_short_pad, t_long, targets, vol_target
+        return x_short_pad, x_long, x_vol, t_short_pad, t_long, short_mask, targets, vol_target, meta_list
+    return x_short_pad, x_long, x_vol, t_short_pad, t_long, short_mask, targets, vol_target
+
+
+
+def collate_vol_moe_continuous(batch: Sequence[Tuple[Any, ...]]):
+    """
+    Backward-compatible collate for VolMoEContinuousDataset.
+
+    Preserves legacy output ordering without ``short_mask``:
+      x_short, x_long, x_vol, t_short, t_long, targets, vol_target, [meta]
+    """
+    packed = collate_vol_ms_continuous(batch)
+    if len(packed) == 9:
+        x_short, x_long, x_vol, t_short, t_long, _short_mask, targets, vol_target, meta = packed
+        return x_short, x_long, x_vol, t_short, t_long, targets, vol_target, meta
+    x_short, x_long, x_vol, t_short, t_long, _short_mask, targets, vol_target = packed
+    return x_short, x_long, x_vol, t_short, t_long, targets, vol_target
