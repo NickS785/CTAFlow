@@ -37,10 +37,56 @@ def _safe_cache_name(symbol: str) -> str:
     )
 
 
-def _standardize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_col_label(label: Any) -> str:
+    return str(label).strip().lower().replace("_", " ")
+
+
+def _select_ohlcv_columns_from_multiindex(
+    frame: pd.DataFrame,
+    preferred_symbol: Optional[str] = None,
+) -> pd.DataFrame:
+    if not isinstance(frame.columns, pd.MultiIndex):
+        return frame
+
+    # 1) If symbol level exists, try selecting that symbol first.
+    if preferred_symbol is not None:
+        for lvl in range(frame.columns.nlevels):
+            vals = [str(v) for v in frame.columns.get_level_values(lvl)]
+            if preferred_symbol in vals:
+                try:
+                    picked = frame.xs(preferred_symbol, axis=1, level=lvl, drop_level=True)
+                    if isinstance(picked, pd.Series):
+                        picked = picked.to_frame()
+                    if not isinstance(picked.columns, pd.MultiIndex):
+                        return picked
+                    frame = picked
+                except Exception:
+                    pass
+
+    # 2) Identify which level contains OHLCV labels and use that level as columns.
+    ohlcv_keys = {"open", "high", "low", "close", "adj close", "volume"}
+    best_level = None
+    best_hits = -1
+    for lvl in range(frame.columns.nlevels):
+        vals = [_normalize_col_label(v) for v in frame.columns.get_level_values(lvl)]
+        hits = sum(v in ohlcv_keys for v in vals)
+        if hits > best_hits:
+            best_hits = hits
+            best_level = lvl
+
+    if best_level is not None and best_hits > 0:
+        out = frame.copy()
+        out.columns = out.columns.get_level_values(best_level)
+        return out
+
+    # 3) Fallback: drop the last level.
+    return frame.droplevel(-1, axis=1)
+
+
+def _standardize_ohlcv(df: pd.DataFrame, preferred_symbol: Optional[str] = None) -> pd.DataFrame:
     frame = df.copy()
     if isinstance(frame.columns, pd.MultiIndex):
-        frame.columns = frame.columns.get_level_values(-1)
+        frame = _select_ohlcv_columns_from_multiindex(frame, preferred_symbol=preferred_symbol)
     frame.columns = [str(c).strip() for c in frame.columns]
 
     col_map: Dict[str, str] = {}
@@ -60,9 +106,14 @@ def _standardize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
             col_map[col] = "volume"
     frame = frame.rename(columns=col_map)
 
-    for needed in ("open", "high", "low", "close"):
-        if needed not in frame.columns:
-            raise ValueError(f"missing required price column '{needed}'")
+    if "close" not in frame.columns:
+        raise ValueError("missing required price column 'close'")
+    if "open" not in frame.columns:
+        frame["open"] = frame["close"]
+    if "high" not in frame.columns:
+        frame["high"] = frame["close"]
+    if "low" not in frame.columns:
+        frame["low"] = frame["close"]
     if "adj_close" not in frame.columns:
         frame["adj_close"] = frame["close"]
     if "volume" not in frame.columns:
@@ -177,7 +228,7 @@ def download_tickers(
 
             if frame is None or frame.empty:
                 continue
-            frame = _standardize_ohlcv(frame)
+            frame = _standardize_ohlcv(frame, preferred_symbol=symbol)
             frame.to_pickle(cache_file)
 
         if frame is None or frame.empty:
