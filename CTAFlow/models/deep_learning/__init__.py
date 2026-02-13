@@ -37,6 +37,7 @@ from .multi_branch.mamba_model import (
     MambaWeightTracker,
 )
 from .multi_branch.tri_modal import TriModalModel, RecurrentTriModal
+from .multi_asset_qlstm import QLSTMConfig, QLSTMModel
 
 __all__ = [
     # Regressors
@@ -83,5 +84,7 @@ __all__ = [
     "MambaWeightTracker",
     "RecurrentTriModal",
     "TriModalModel",
+    "QLSTMConfig",
+    "QLSTMModel",
     "loss",
 ]
