@@ -16,6 +16,12 @@ from .qlstm_multi_asset import (
     collate_variable_seq,
     compute_group_ewma_volatilities,
 )
+from .density_quantile import (
+    DensityQuantileDataset,
+    DensityQuantilePipelineConfig,
+    build_density_quantile_pipeline,
+    collate_density_quantile,
+)
 from ..model_datasets import RasterizedModalDataset, OnTheFlyRasterizedDataset, WSPRWindowDataset
 __all__ = [
     "ContinuousWindowDataset",
@@ -32,6 +38,10 @@ __all__ = [
     "compute_group_ewma_volatilities",
     "collate_variable_seq",
     "build_full_pipeline",
+    "DensityQuantileDataset",
+    "DensityQuantilePipelineConfig",
+    "collate_density_quantile",
+    "build_density_quantile_pipeline",
     "RasterizedModalDataset",
     "OnTheFlyRasterizedDataset",
     "WSPRWindowDataset",

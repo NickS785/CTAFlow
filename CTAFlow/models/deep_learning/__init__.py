@@ -38,6 +38,15 @@ from .multi_branch.mamba_model import (
 )
 from .multi_branch.tri_modal import TriModalModel, RecurrentTriModal
 from .multi_asset_qlstm import QLSTMConfig, QLSTMModel
+from .density_quantile import (
+    DEFAULT_DQ_QUANTILES,
+    DenseQuantileConfig,
+    DenseQuantileModel,
+    QuantileLSTMConfig,
+    QuantileLSTMModel,
+    TemporalAttentionPool,
+    pinball_loss,
+)
 
 __all__ = [
     # Regressors
@@ -86,5 +95,12 @@ __all__ = [
     "TriModalModel",
     "QLSTMConfig",
     "QLSTMModel",
+    "DEFAULT_DQ_QUANTILES",
+    "DenseQuantileConfig",
+    "DenseQuantileModel",
+    "QuantileLSTMConfig",
+    "QuantileLSTMModel",
+    "TemporalAttentionPool",
+    "pinball_loss",
     "loss",
 ]
