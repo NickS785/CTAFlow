@@ -187,29 +187,39 @@ class QLSTMModel(nn.Module):
         quantiles = torch.cat([base, q_rest], dim=-1)
         return quantiles
 
-    def _pinball_loss(self, quantiles: torch.Tensor, returns: torch.Tensor) -> torch.Tensor:
-        if returns.dim() == 1:
-            returns = returns.unsqueeze(-1)
-        elif returns.dim() > 2:
-            returns = returns.view(returns.shape[0], -1)
+    def _pinball_loss(self, quantiles: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Quantile (pinball) loss for scalar targets.
 
-        y = returns.unsqueeze(-1)  # [B, N, 1]
-        q = quantiles.unsqueeze(1)  # [B, 1, Q]
-        tau = self.taus.view(1, 1, -1).to(quantiles.dtype)
-        err = y - q
+        Args:
+            quantiles: [B, Q] predicted quantile values.
+            target: [B] scalar target returns.
+        """
+        if target.dim() == 1:
+            target = target.unsqueeze(-1)  # [B, 1]
+
+        # target: [B, 1], quantiles: [B, Q]
+        tau = self.taus.unsqueeze(0).to(quantiles.dtype)  # [1, Q]
+        err = target - quantiles  # [B, Q]
         loss = torch.maximum(tau * err, (tau - 1.0) * err)
         return loss.mean()
 
     def compute_loss(
         self,
         quantiles: torch.Tensor,
-        raw_returns: torch.Tensor,
-        norm_returns: Optional[torch.Tensor] = None,
+        target_return: torch.Tensor,
+        target_norm: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        raw_loss = self._pinball_loss(quantiles, raw_returns)
+        """Compute combined pinball loss for the next-day return prediction.
 
-        if norm_returns is not None and self.config.norm_loss_weight > 0.0:
-            norm_loss = self._pinball_loss(quantiles, norm_returns)
+        Args:
+            quantiles: [B, Q] predicted quantile values.
+            target_return: [B] scalar next-day raw log return r_{t+1}.
+            target_norm: [B] optional vol-normalised return r_{t+1} / σ̄_t.
+        """
+        raw_loss = self._pinball_loss(quantiles, target_return)
+
+        if target_norm is not None and self.config.norm_loss_weight > 0.0:
+            norm_loss = self._pinball_loss(quantiles, target_norm)
         else:
             norm_loss = quantiles.new_zeros(())
 

@@ -52,12 +52,18 @@ class MultiAssetDistributionDataset(Dataset):
     """
     Variable-length sequence dataset for qLSTM distribution modeling.
 
+    The model predicts the conditional PDF of the **next single-day return**
+    r_{t+1}, following the paper methodology.  Each sample therefore produces
+    scalar target values rather than a multi-step horizon vector.
+
     Output keys:
       - asset_features   : [seq_len, F_asset]
       - market_features  : [seq_len, F_market]
       - asset_class_id   : scalar long
-      - raw_returns      : [horizon]
-      - norm_returns     : [horizon]
+      - target_return    : scalar float — r_{t+1} (next-day raw log return)
+      - target_norm      : scalar float — r_{t+1} / σ̄_t (normalised by today's
+                           group EWMA vol, known at prediction time)
+      - group_vol        : scalar float — σ̄_t (for denormalising predictions)
       - lookback_returns : [seq_len]
       - seq_length       : scalar long
     """
@@ -71,11 +77,9 @@ class MultiAssetDistributionDataset(Dataset):
         asset_class_map: Dict[str, int],
         date_range: Tuple[str, str],
         seq_range: Tuple[int, int] = (15, 30),
-        forecast_horizon: int = 22,
     ):
         self.asset_class_map = dict(asset_class_map)
         self.seq_range = (int(seq_range[0]), int(seq_range[1]))
-        self.forecast_horizon = int(forecast_horizon)
 
         self.date_start = pd.Timestamp(date_range[0])
         self.date_end = pd.Timestamp(date_range[1])
@@ -89,9 +93,9 @@ class MultiAssetDistributionDataset(Dataset):
         self.samples: List[Tuple[str, int]] = []
 
         max_seq = self.seq_range[1]
-        fh = self.forecast_horizon
         t_total = len(self.split_dates)
-        if t_total < (max_seq + fh + 1):
+        # Need at least max_seq days for lookback + 1 day for the target
+        if t_total < (max_seq + 2):
             return
 
         for ticker, feat_df in asset_features.items():
@@ -110,7 +114,10 @@ class MultiAssetDistributionDataset(Dataset):
                 "group_vol": vol_aligned.values.astype(np.float32),
             }
 
-            for t in range(max_seq, t_total - fh):
+            # t is the prediction point: we observe data up to t and predict
+            # the return at t (i.e. r_{t+1} in calendar terms).  We need at
+            # least one future return, so t can go up to t_total - 1.
+            for t in range(max_seq, t_total - 1):
                 self.samples.append((ticker, t))
 
     def __len__(self) -> int:
@@ -126,9 +133,11 @@ class MultiAssetDistributionDataset(Dataset):
         market_feat = self.market_np[start:t]
         lookback_ret = data["returns"][start:t]
 
-        fh = self.forecast_horizon
-        raw_ret = data["returns"][t : t + fh]
-        gvol = data["group_vol"][t : t + fh]
+        # Scalar target: next-day return r_{t+1}
+        raw_ret = data["returns"][t]
+        # Normalise by TODAY's group EWMA vol (known at prediction time, no
+        # look-ahead bias).
+        gvol = data["group_vol"][t]
         norm_ret = raw_ret / (gvol + 1e-10)
 
         class_id = int(self.asset_class_map.get(ticker, 0))
@@ -136,8 +145,9 @@ class MultiAssetDistributionDataset(Dataset):
             "asset_features": torch.from_numpy(asset_feat),
             "market_features": torch.from_numpy(market_feat),
             "asset_class_id": torch.tensor(class_id, dtype=torch.long),
-            "raw_returns": torch.from_numpy(raw_ret),
-            "norm_returns": torch.from_numpy(norm_ret),
+            "target_return": torch.tensor(raw_ret, dtype=torch.float32),
+            "target_norm": torch.tensor(norm_ret, dtype=torch.float32),
+            "group_vol": torch.tensor(gvol, dtype=torch.float32),
             "lookback_returns": torch.from_numpy(lookback_ret),
             "seq_length": torch.tensor(seq_len, dtype=torch.long),
         }
@@ -146,15 +156,15 @@ class MultiAssetDistributionDataset(Dataset):
 def collate_variable_seq(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     batch_size = len(batch)
     max_seq = max(int(item["seq_length"].item()) for item in batch)
-    horizon = int(batch[0]["raw_returns"].shape[0])
     f_asset = int(batch[0]["asset_features"].shape[-1])
     f_market = int(batch[0]["market_features"].shape[-1])
 
     asset_features = torch.zeros(batch_size, max_seq, f_asset)
     market_features = torch.zeros(batch_size, max_seq, f_market)
     lookback_returns = torch.zeros(batch_size, max_seq)
-    raw_returns = torch.zeros(batch_size, horizon)
-    norm_returns = torch.zeros(batch_size, horizon)
+    target_return = torch.zeros(batch_size)
+    target_norm = torch.zeros(batch_size)
+    group_vol = torch.zeros(batch_size)
     asset_class_ids = torch.zeros(batch_size, dtype=torch.long)
     seq_lengths = torch.zeros(batch_size, dtype=torch.long)
 
@@ -163,8 +173,9 @@ def collate_variable_seq(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torc
         asset_features[i, :sl] = item["asset_features"]
         market_features[i, :sl] = item["market_features"]
         lookback_returns[i, :sl] = item["lookback_returns"]
-        raw_returns[i] = item["raw_returns"]
-        norm_returns[i] = item["norm_returns"]
+        target_return[i] = item["target_return"]
+        target_norm[i] = item["target_norm"]
+        group_vol[i] = item["group_vol"]
         asset_class_ids[i] = item["asset_class_id"]
         seq_lengths[i] = item["seq_length"]
 
@@ -172,8 +183,9 @@ def collate_variable_seq(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torc
         "asset_features": asset_features,
         "market_features": market_features,
         "asset_class_ids": asset_class_ids,
-        "raw_returns": raw_returns,
-        "norm_returns": norm_returns,
+        "target_return": target_return,
+        "target_norm": target_norm,
+        "group_vol": group_vol,
         "lookback_returns": lookback_returns,
         "seq_lengths": seq_lengths,
     }
@@ -185,7 +197,6 @@ def build_full_pipeline(
     zscore_window: int = 219,
     ewma_lambda: float = 0.94,
     seq_range: Tuple[int, int] = (15, 30),
-    forecast_horizon: int = 22,
     batch_size: int = 64,
     num_workers: int = 0,
     cache_dir: str = "./data_cache",
@@ -249,7 +260,6 @@ def build_full_pipeline(
             asset_class_map=asset_class_map,
             date_range=date_range,
             seq_range=seq_range,
-            forecast_horizon=forecast_horizon,
         )
         for split, date_range in splits.items()
     }
