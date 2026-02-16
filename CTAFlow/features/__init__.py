@@ -38,6 +38,14 @@ from .daily_engine import (
     default_asset_tickers,
     download_tickers,
 )
+from .distribution import (
+    DistributionFeatureConfig,
+    DistributionFeatureExtractor,
+    extract_distribution_features,
+    prob_up_from_quantiles,
+    quantile_moment_features,
+    quantile_tail_features,
+)
 from .volume import *
 SpreadFeatures = SpreadData
 
@@ -76,6 +84,13 @@ __all__ = [
     'build_asset_universe',
     'default_asset_tickers',
     'download_tickers',
+    # Distribution features
+    'DistributionFeatureConfig',
+    'DistributionFeatureExtractor',
+    'extract_distribution_features',
+    'prob_up_from_quantiles',
+    'quantile_moment_features',
+    'quantile_tail_features',
     # Volume
     "MarketProfileExtractor",
 ]
