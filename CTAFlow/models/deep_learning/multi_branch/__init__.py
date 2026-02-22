@@ -30,3 +30,4 @@ from .regime_moe import (
 )
 
 from .tri_modal import TriModalModel, TriModalLSTM, RecurrentTriModal, TriModalClassifier
+from .tft import TFTAlignedWSPR, TFTAlignedMamba
