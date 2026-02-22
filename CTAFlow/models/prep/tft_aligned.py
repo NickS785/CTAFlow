@@ -40,7 +40,7 @@ from __future__ import annotations
 import warnings
 from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -66,6 +66,51 @@ from CTAFlow.data.datasets.tft import (
     macro_from_dataframe,
     tft_aligned_collate_fn,
 )
+
+
+# ============================================================================
+# Target Transforms
+# ============================================================================
+
+def quantile_classify(
+    n_classes: int = 3,
+    expanding_min: int = 60,
+) -> Callable[[pd.Series], pd.Series]:
+    """Return a target transform that bins returns into classes via expanding quantiles.
+
+    Uses expanding (non-forward-looking) quantile boundaries so that each
+    day's thresholds are computed from *past data only*.
+
+    Parameters
+    ----------
+    n_classes : int
+        Number of output classes (2 or 3 typical).
+    expanding_min : int
+        Minimum observations before quantile boundaries stabilise.
+
+    Returns
+    -------
+    callable
+        ``f(series) -> series`` mapping continuous returns to int labels.
+    """
+    def _transform(s: pd.Series) -> pd.Series:
+        labels = pd.Series(np.full(len(s), -1, dtype=np.int64), index=s.index)
+        boundaries = np.linspace(0, 1, n_classes + 1)[1:-1]  # e.g. [0.333, 0.667]
+
+        for i in range(expanding_min, len(s)):
+            window = s.iloc[:i]
+            thresholds = [window.quantile(q) for q in boundaries]
+            val = s.iloc[i]
+            cls = 0
+            for t in thresholds:
+                if val > t:
+                    cls += 1
+            labels.iloc[i] = cls
+
+        # Drop the warm-up period
+        return labels[labels >= 0]
+
+    return _transform
 
 
 # ============================================================================
@@ -221,6 +266,7 @@ class TFTAlignedPrepLayer:
         anticipation_horizon: int = 5,
         custom_ticker_table: Optional[Dict[str, Dict[str, str]]] = None,
         summary_config: Optional[SummarySelectionConfig] = None,
+        target_transform: Optional[Callable[[pd.Series], pd.Series]] = None,
     ):
         self.window_size = window_size
         self.f_macro = f_macro
@@ -247,6 +293,7 @@ class TFTAlignedPrepLayer:
         )
 
         self.summary_config = summary_config
+        self.target_transform = target_transform
 
         # Per-ticker loaded data
         self._summary: Dict[str, Dict[date, np.ndarray]] = {}
@@ -621,6 +668,11 @@ class TFTAlignedPrepLayer:
 
         # 5. Targets (CSV)
         target_series = _read_target(root / target_file, target_col=target_col)
+
+        # Apply target transform (e.g. quantile discretization for classification)
+        if self.target_transform is not None:
+            target_series = self.target_transform(target_series)
+
         target_dict: Dict[date, Union[int, float]] = {}
         for idx, val in target_series.items():
             d = idx.date() if isinstance(idx, (datetime, pd.Timestamp)) else idx
@@ -1355,6 +1407,7 @@ class TFTAlignedPrepLayer:
         exclude_macro_tickers: Optional[Sequence[str]] = None,
         custom_ticker_table: Optional[Dict[str, Dict[str, str]]] = None,
         summary_config: Optional[SummarySelectionConfig] = None,
+        target_transform: Optional[Callable[[pd.Series], pd.Series]] = None,
         **kwargs,
     ) -> "TFTAlignedPrepLayer":
         """Convenience constructor that loads all tickers from a root directory.
@@ -1407,6 +1460,9 @@ class TFTAlignedPrepLayer:
             Columns to drop from macro_raw_df before processing.
         custom_ticker_table : dict, optional
             Override default ticker metadata.
+        target_transform : callable, optional
+            ``f(series) -> series`` applied to raw targets before storing.
+            Use ``quantile_classify(n_classes=3)`` for classification tasks.
 
         Returns
         -------
@@ -1426,6 +1482,7 @@ class TFTAlignedPrepLayer:
             f_macro=f_macro,
             custom_ticker_table=custom_ticker_table,
             summary_config=summary_config,
+            target_transform=target_transform,
             **kwargs,
         )
 
