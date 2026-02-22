@@ -14,7 +14,7 @@ import pandas as pd
 from .raw_formatting.dly_contract_manager import DLYContractManager, DLYFolderUpdater
 from .raw_formatting.intraday_manager import IntradayFileManager
 from .update_management import (
-    WEEKLY_MARKET_DATA_UPDATE_EVENT,
+    WEEKLY_MARKET_UPDATE_EVENT,
     get_update_metadata_store,
     prepare_dataframe_for_append,
     summarize_update_summary,

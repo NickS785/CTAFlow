@@ -7,7 +7,7 @@ using technical indicators, COT (Commitment of Traders) data, and machine learni
 
 Core Components:
 - data: Data processing, retrieval, and analysis modules
-- forecaster: Machine learning models for CTA positioning prediction  
+- models: Machine learning models for CTA positioning prediction
 - strategy: Trading strategy implementation using forecasting framework
 - config: Configuration and data paths
 
@@ -35,7 +35,7 @@ __email__ = "research@example.com"
 # Import main classes for easy access
 try:
     # Core forecasting classes
-    from .forecaster.forecast import CTAForecast, CTALinear, CTALight, CTAXGBoost, CTARForest
+    from .models.base_models import CTAForecast, CTALinear, CTALight, CTAXGBoost, CTARForest
 
     # Primary data processing classes
     from .data.data_processor import DataProcessor

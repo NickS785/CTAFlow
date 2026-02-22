@@ -218,9 +218,11 @@ class TFTAlignedPrepLayer:
 
         # Per-ticker loaded data
         self._summary: Dict[str, Dict[date, np.ndarray]] = {}
+        self._summary_cols: Dict[str, List[str]] = {}
         self._profile: Dict[str, Dict[date, np.ndarray]] = {}
         self._raster: Dict[str, Dict[date, np.ndarray]] = {}
         self._seq: Dict[str, Dict[date, np.ndarray]] = {}
+        self._seq_cols: Dict[str, List[str]] = {}
         self._seq_lens: Dict[str, Dict[date, int]] = {}
         self._targets: Dict[str, Dict[date, Union[int, float]]] = {}
         self._available_dates: Dict[str, List[date]] = {}
@@ -285,6 +287,7 @@ class TFTAlignedPrepLayer:
         summary_df = summary_df.select_dtypes(include="number").astype(np.float32)
         summary_df = summary_df.fillna(0.0)
 
+        summary_col_names = list(summary_df.columns)
         summary_dates = [d.date() if isinstance(d, (datetime, pd.Timestamp)) else d
                          for d in summary_df.index]
         summary_dict: Dict[date, np.ndarray] = {}
@@ -323,6 +326,7 @@ class TFTAlignedPrepLayer:
         seq_df = _read_tabular(root / seq_file)
         seq_numeric = seq_df.select_dtypes(include="number").astype(np.float32)
         seq_numeric = seq_numeric.fillna(0.0)
+        seq_col_names = list(seq_numeric.columns)
 
         seq_dict: Dict[date, np.ndarray] = {}
         seq_lens_dict: Dict[date, int] = {}
@@ -353,9 +357,11 @@ class TFTAlignedPrepLayer:
         common_dates = sorted(set.intersection(*all_date_sets))
 
         self._summary[ticker] = summary_dict
+        self._summary_cols[ticker] = summary_col_names
         self._profile[ticker] = profile_dict
         self._raster[ticker] = raster_dict
         self._seq[ticker] = seq_dict
+        self._seq_cols[ticker] = seq_col_names
         self._seq_lens[ticker] = seq_lens_dict
         self._targets[ticker] = target_dict
         self._available_dates[ticker] = common_dates
@@ -367,11 +373,450 @@ class TFTAlignedPrepLayer:
         self.events_by_date = events_from_dataframe(df, **kwargs)
 
     def load_macro_from_dataframe(self, df: pd.DataFrame, **kwargs):
-        """Load macro features from a DataFrame."""
+        """Load pre-computed macro features from a DataFrame.
+
+        For raw daily close data that needs feature engineering, use
+        :meth:`build_macro_from_daily` instead.
+        """
         self.macro_features = macro_from_dataframe(df, **kwargs)
         if self.macro_features:
             sample = next(iter(self.macro_features.values()))
             self.f_macro = len(sample)
+
+    def build_macro_from_daily(
+        self,
+        daily_df: pd.DataFrame,
+        *,
+        macro_prep_kwargs: Optional[Dict] = None,
+        scale: bool = True,
+        clip_range: float = 10.0,
+        exclude_tickers: Optional[Sequence[str]] = None,
+    ) -> pd.DataFrame:
+        """Compute macro features from raw daily close data via MacroFeaturePrep.
+
+        The output is shifted by 1 day so that prediction-day T only sees
+        features derived from day T-1's closes (avoids lookahead).
+
+        Parameters
+        ----------
+        daily_df : DataFrame
+            Raw daily data with columns like VIX, YIELD_10Y, YIELD_2Y,
+            SPX, etc.  DatetimeIndex or parseable date index.
+        macro_prep_kwargs : dict, optional
+            Override kwargs for :class:`MacroFeaturePrep` (rate_cols,
+            vix_col, return_windows, etc.).
+        scale : bool
+            If True, scale features to ~[-5, +5] range (matching the
+            spatial data normalisation convention).
+        clip_range : float
+            Absolute clipping bound applied when *scale* is True.
+        exclude_tickers : sequence of str, optional
+            Columns to drop from *daily_df* before processing (e.g.
+            ``["SPX"]`` when training ES to avoid target leakage).
+
+        Returns
+        -------
+        DataFrame
+            Processed & shifted macro features (for inspection).
+            The features are also stored into ``self.macro_features``
+            ready for sample building.
+        """
+        from CTAFlow.features.macro_prep import MacroFeaturePrep
+
+        df = daily_df.copy()
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+        df.index = df.index.normalize()
+
+        # Drop excluded tickers before feature engineering
+        if exclude_tickers:
+            drop = [c for c in df.columns if c in set(exclude_tickers)]
+            if drop:
+                df = df.drop(columns=drop)
+
+        prep = MacroFeaturePrep(**(macro_prep_kwargs or {}))
+        processed = prep.process(df)
+
+        # Keep raw yield levels alongside the derived changes/spread
+        for col in prep.rate_cols:
+            if col in df.columns:
+                processed[col] = df[col]
+
+        # Shift by 1 day: day T sees day T-1 close-derived features
+        processed = processed.shift(1)
+        processed = processed.ffill().bfill().fillna(0.0)
+
+        if scale:
+            processed = self._scale_macro_features(processed, clip_range=clip_range)
+
+        # Store as {date -> np.array} dict
+        self.macro_features = {}
+        for idx, row in processed.iterrows():
+            d = idx.date() if isinstance(idx, (datetime, pd.Timestamp)) else idx
+            self.macro_features[d] = row.values.astype(np.float32)
+
+        if self.macro_features:
+            self.f_macro = len(next(iter(self.macro_features.values())))
+
+        return processed
+
+    def build_macro_from_engine(
+        self,
+        market_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Use a pre-built MarketFeatureEngine output as macro context.
+
+        ``MarketFeatureEngine.build_features()`` already produces
+        z-score-normalised, clipped features.  This method only applies
+        the 1-day shift for lookahead prevention and stores the result.
+
+        Parameters
+        ----------
+        market_df : DataFrame
+            Output of ``MarketFeatureEngine.build_features()`` (daily
+            z-scored features clipped to [-5, 5]).
+
+        Returns
+        -------
+        DataFrame
+            Shifted macro features.
+        """
+        df = market_df.copy()
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+        df.index = df.index.normalize()
+
+        # Shift by 1 day: day T sees day T-1 close-derived features
+        df = df.shift(1).ffill().bfill().fillna(0.0)
+
+        self.macro_features = {}
+        for idx, row in df.iterrows():
+            d = idx.date() if isinstance(idx, (datetime, pd.Timestamp)) else idx
+            self.macro_features[d] = row.values.astype(np.float32)
+
+        if self.macro_features:
+            self.f_macro = len(next(iter(self.macro_features.values())))
+
+        return df
+
+    @staticmethod
+    def _scale_macro_features(
+        df: pd.DataFrame,
+        clip_range: float = 10.0,
+    ) -> pd.DataFrame:
+        """Scale macro features to ~[-5, +5] matching spatial data scale.
+
+        Scaling rules by column pattern:
+        - Raw yield levels (YIELD_*): keep as-is (~0-5%), clip
+        - Rate changes (*_chg_*): * 10
+        - TERM_SPREAD: keep as-is, clip
+        - Returns (*_ret_*) / relative strength (*_rel_*): * 100 (to bps)
+        - VIX level: / 10
+        - VIX_chg: keep as-is, clip
+        - Fallback: clip only
+        """
+        df = df.copy()
+        for col in df.columns:
+            cl = col.lower()
+            if cl.startswith("yield_") and "_chg_" not in cl:
+                # Raw yield levels: ~0-5%, already in a reasonable range
+                df[col] = df[col].clip(-clip_range, clip_range)
+            elif "_chg_" in cl:
+                df[col] = (df[col] * 10.0).clip(-clip_range, clip_range)
+            elif "_ret_" in cl or "_rel_" in cl:
+                df[col] = (df[col] * 100.0).clip(-clip_range, clip_range)
+            elif cl == "vix":
+                df[col] = (df[col] / 10.0).clip(0, clip_range)
+            elif cl == "term_spread":
+                df[col] = df[col].clip(-clip_range, clip_range)
+            else:
+                df[col] = df[col].clip(-clip_range, clip_range)
+        return df
+
+    # ----- Feature Scaling -----
+
+    def scale_features(
+        self,
+        tickers: Optional[List[str]] = None,
+        *,
+        scale_summary: bool = True,
+        scale_sequential: bool = True,
+        scale_profiles: bool = True,
+        rolling_window: int = 252,
+        price_scale: float = 100.0,
+        profile_log_vol_div: float = 15.0,
+        clip_range: float = 5.0,
+    ) -> None:
+        """Scale all loaded modalities in place (no lookahead).
+
+        Follows the same conventions as ``DeepIDMomentum``:
+
+        **Summary** — pattern-based fixed multipliers for known feature
+        types, rolling z-score for unbounded / drifting features.
+
+        **Sequential** — price-like columns normalised as
+        ``(value - close) / close * 100`` (basis points); orderflow
+        columns scaled with fixed multipliers.
+
+        **Profiles** — channel-wise scaling matching ``ProfileScaler``:
+        vol-density as-is, imbalance clipped, log-volume ÷ divisor,
+        price channel × ``price_scale``.
+
+        Parameters
+        ----------
+        tickers : list of str, optional
+            Which tickers to scale. ``None`` = all loaded.
+        scale_summary : bool
+            Scale summary feature vectors.
+        scale_sequential : bool
+            Scale sequential (VPIN) feature vectors.
+        scale_profiles : bool
+            Scale profile arrays channel-wise.
+        rolling_window : int
+            Window for rolling z-score on unbounded features.
+        price_scale : float
+            Multiplier for price channels (profiles).
+        profile_log_vol_div : float
+            Divisor for log-volume channel in profiles.
+        clip_range : float
+            Final clip bound for scaled features.
+        """
+        if tickers is None:
+            tickers = list(self._available_dates.keys())
+
+        for ticker in tickers:
+            if scale_summary and ticker in self._summary:
+                self._scale_summary_inplace(
+                    ticker, rolling_window=rolling_window, clip_range=clip_range,
+                )
+            if scale_sequential and ticker in self._seq:
+                self._scale_sequential_inplace(
+                    ticker, clip_range=clip_range,
+                )
+            if scale_profiles and ticker in self._profile:
+                self._scale_profiles_inplace(
+                    ticker,
+                    price_scale=price_scale,
+                    log_vol_div=profile_log_vol_div,
+                )
+
+    # ---- summary ----
+
+    def _scale_summary_inplace(
+        self,
+        ticker: str,
+        rolling_window: int = 252,
+        clip_range: float = 5.0,
+    ) -> None:
+        """Scale summary features using fixed multipliers or rolling z-score.
+
+        Pattern-based rules (matches ``DeepIDMomentum.scale_summary_data``):
+
+        Fixed multipliers (no lookahead):
+        - ``*dist_prior*``, ``*session_dist_vwap*``: × 100 (to bps)
+        - ``rsv_*``: × 500
+        - ``*impact_coeff*``: × 500
+        - ``*impact_vol*``: log1p(x) − 5
+        - ``*norm_range_hist*``: (clip(0,3) − 1) × 5
+        - ``*intraday_curve_slope_change*``: × 10
+        - ``*intraday_rel_basis_change*``: × 5
+        - ``*scaled_returns*``: clip(−10,10) / 2
+        - ``*_ret_*``, ``*_rel_*``: × 100 (to bps)
+        - ``*_chg_*``: × 10
+
+        Rolling z-score (non-forward-looking):
+        - Calendar / unbounded features not caught by the fixed rules
+
+        Already scaled (clip only):
+        - ``*deseasonalized*``, ``is_*``, ``*curve_slope*``, ``*rel_basis*``
+        """
+        cols = self._summary_cols.get(ticker, [])
+        if not cols:
+            return
+
+        dates = sorted(self._summary[ticker].keys())
+        if not dates:
+            return
+
+        # Reconstruct DataFrame for rolling operations
+        arr = np.stack([self._summary[ticker][d] for d in dates])
+        df = pd.DataFrame(arr, columns=cols, index=dates)
+
+        scaled_cols: set = set()
+
+        # --- FIXED MULTIPLIERS ---
+        for col in df.columns:
+            cl = col.lower()
+
+            if any(p in cl for p in ("dist_prior", "session_dist_vwap")):
+                df[col] = df[col].clip(-0.05, 0.05) * 100.0
+                scaled_cols.add(col)
+            elif cl.startswith("rsv_"):
+                df[col] = df[col].clip(0, 0.01) * 500.0
+                scaled_cols.add(col)
+            elif "impact_coeff" in cl:
+                df[col] = df[col].clip(0, 0.01) * 500.0
+                scaled_cols.add(col)
+            elif "impact_vol" in cl:
+                df[col] = np.log1p(df[col]) - 5.0
+                scaled_cols.add(col)
+            elif "norm_range_hist" in cl:
+                df[col] = (df[col].clip(0, 3) - 1.0) * 5.0
+                scaled_cols.add(col)
+            elif "intraday_curve_slope_change" in cl:
+                df[col] = df[col].clip(-0.5, 0.5) * 10.0
+                scaled_cols.add(col)
+            elif "intraday_rel_basis_change" in cl:
+                df[col] = df[col].clip(-1, 1) * 5.0
+                scaled_cols.add(col)
+            elif "scaled_returns" in cl:
+                df[col] = df[col].clip(-10, 10) / 2.0
+                scaled_cols.add(col)
+            elif "_ret_" in cl or "_rel_" in cl:
+                df[col] = (df[col] * 100.0).clip(-clip_range, clip_range)
+                scaled_cols.add(col)
+            elif "_chg_" in cl:
+                df[col] = (df[col] * 10.0).clip(-clip_range, clip_range)
+                scaled_cols.add(col)
+
+        # --- ALREADY SCALED (clip only) ---
+        for col in df.columns:
+            if col in scaled_cols:
+                continue
+            cl = col.lower()
+            if (
+                "deseasonalized" in cl
+                or cl.startswith("is_")
+                or ("curve_slope" in cl and "intraday" not in cl)
+                or ("rel_basis" in cl and "intraday" not in cl)
+            ):
+                df[col] = df[col].clip(-clip_range, clip_range)
+                scaled_cols.add(col)
+
+        # --- ROLLING Z-SCORE for remaining unbounded features ---
+        remaining = [c for c in df.columns if c not in scaled_cols]
+        if remaining:
+            for col in remaining:
+                r_mean = df[col].expanding(min_periods=20).mean()
+                r_std = df[col].expanding(min_periods=20).std().replace(0, 1)
+                if len(df) > rolling_window:
+                    r_mean = df[col].rolling(
+                        window=rolling_window, min_periods=20,
+                    ).mean()
+                    r_std = df[col].rolling(
+                        window=rolling_window, min_periods=20,
+                    ).std().replace(0, 1)
+                df[col] = ((df[col] - r_mean) / r_std).clip(
+                    -clip_range, clip_range,
+                )
+            df[remaining] = df[remaining].fillna(0.0)
+
+        # Write back
+        values = df.values.astype(np.float32)
+        for i, d in enumerate(dates):
+            self._summary[ticker][d] = values[i]
+
+    # ---- sequential ----
+
+    def _scale_sequential_inplace(
+        self,
+        ticker: str,
+        clip_range: float = 5.0,
+    ) -> None:
+        """Scale sequential VPIN data with fixed multipliers (no lookahead).
+
+        Matches ``DeepIDMomentum.normalize_sequential_features``:
+
+        Price-like columns (vah, val, poc, profile_vwap, ib_high, ib_low):
+            ``(value − close) / close × 100``   (basis points)
+
+        Orderflow columns:
+        - ``vpin``: ``(x − 0.5) × 10``          → ~[−5, 5]
+        - ``signed_imbalance``: ``× 5``          → [−5, 5]
+        - ``imb_frac``: ``(x − 0.5) × 10``      → ~[−5, 5]
+        - ``vol``: ``log1p(x) − 2.5``            → ~[−2, 2]
+        - ``bucket_return``: ``× 100``           → bps
+        - ``log_duration``: ``÷ 2``              → ~[−3.5, 4.5]
+        """
+        cols = self._seq_cols.get(ticker, [])
+        if not cols:
+            return
+
+        col_idx = {c: i for i, c in enumerate(cols)}
+
+        price_like = {"vah", "val", "poc", "profile_vwap", "ib_high", "ib_low"}
+        price_like_idx = [col_idx[c] for c in price_like if c in col_idx]
+        close_idx = col_idx.get("close")
+
+        for d, arr in self._seq[ticker].items():
+            if arr.ndim != 2 or arr.shape[0] == 0:
+                continue
+            arr = arr.copy()
+
+            # Price-like → basis points relative to close
+            if close_idx is not None and price_like_idx:
+                close_vals = arr[:, close_idx : close_idx + 1]
+                safe_close = np.where(
+                    np.abs(close_vals) < 1e-8, 1.0, close_vals,
+                )
+                for ci in price_like_idx:
+                    arr[:, ci] = (
+                        (arr[:, ci : ci + 1] - close_vals) / safe_close * 100.0
+                    ).squeeze(-1)
+
+            # Orderflow fixed multipliers
+            if "vpin" in col_idx:
+                i = col_idx["vpin"]
+                arr[:, i] = (arr[:, i] - 0.5) * 10.0
+            if "signed_imbalance" in col_idx:
+                i = col_idx["signed_imbalance"]
+                arr[:, i] = arr[:, i] * 5.0
+            if "imb_frac" in col_idx:
+                i = col_idx["imb_frac"]
+                arr[:, i] = (arr[:, i] - 0.5) * 10.0
+            if "vol" in col_idx:
+                i = col_idx["vol"]
+                arr[:, i] = np.log1p(arr[:, i]) - 2.5
+            if "bucket_return" in col_idx:
+                i = col_idx["bucket_return"]
+                arr[:, i] = arr[:, i] * 100.0
+            if "log_duration" in col_idx:
+                i = col_idx["log_duration"]
+                arr[:, i] = arr[:, i] / 2.0
+
+            self._seq[ticker][d] = arr.astype(np.float32)
+
+    # ---- profiles ----
+
+    def _scale_profiles_inplace(
+        self,
+        ticker: str,
+        price_scale: float = 100.0,
+        log_vol_div: float = 15.0,
+    ) -> None:
+        """Scale profile channels matching ``ProfileScaler``.
+
+        Channel layout  (N, C, Bins):
+        - 0: Volume density (0-1) — keep as-is
+        - 1: Imbalance (−1 to 1) — clip
+        - 2: Log volume (0-14) — ÷ ``log_vol_div``
+        - 3: Relative price (~−0.02 to 0.02) — × ``price_scale``
+        """
+        for d, arr in self._profile[ticker].items():
+            if arr.ndim < 2:
+                continue
+            arr = arr.copy()
+            n_ch = arr.shape[0]
+            # Ch 1: imbalance clip
+            if n_ch > 1:
+                arr[1] = np.clip(arr[1], -1.0, 1.0)
+            # Ch 2: log volume normalise
+            if n_ch > 2:
+                arr[2] = arr[2] / log_vol_div
+            # Ch 3: price → basis points
+            if n_ch > 3:
+                arr[3] = arr[3] * price_scale
+            self._profile[ticker][d] = arr.astype(np.float32)
 
     # ----- Macro Window -----
 
@@ -627,6 +1072,10 @@ class TFTAlignedPrepLayer:
         f_macro: int = 10,
         events_df: Optional[pd.DataFrame] = None,
         macro_df: Optional[pd.DataFrame] = None,
+        macro_raw_df: Optional[pd.DataFrame] = None,
+        market_engine_df: Optional[pd.DataFrame] = None,
+        macro_prep_kwargs: Optional[Dict] = None,
+        exclude_macro_tickers: Optional[Sequence[str]] = None,
         custom_ticker_table: Optional[Dict[str, Dict[str, str]]] = None,
         **kwargs,
     ) -> "TFTAlignedPrepLayer":
@@ -644,6 +1093,16 @@ class TFTAlignedPrepLayer:
                 ES/
                     ...
 
+        Macro context can be supplied in three ways (first match wins):
+
+        1. ``macro_raw_df`` — raw daily closes (VIX, YIELD_10Y, SPX, …).
+           Processed via :class:`MacroFeaturePrep`, shifted by 1 day.
+        2. ``market_engine_df`` — output of
+           ``MarketFeatureEngine.build_features()``. Already z-scored;
+           only the 1-day shift is applied.
+        3. ``macro_df`` — pre-computed feature DataFrame loaded as-is
+           (no shifting applied — caller is responsible).
+
         Parameters
         ----------
         root_dir : str or Path
@@ -657,7 +1116,17 @@ class TFTAlignedPrepLayer:
         events_df : DataFrame, optional
             Event calendar DataFrame.
         macro_df : DataFrame, optional
-            Daily macro features DataFrame.
+            Pre-computed daily macro features DataFrame (no shifting).
+        macro_raw_df : DataFrame, optional
+            Raw daily close data to run through MacroFeaturePrep
+            (shifted + scaled automatically).
+        market_engine_df : DataFrame, optional
+            Output of ``MarketFeatureEngine.build_features()``
+            (shifted automatically).
+        macro_prep_kwargs : dict, optional
+            Override kwargs for MacroFeaturePrep when using macro_raw_df.
+        exclude_macro_tickers : sequence of str, optional
+            Columns to drop from macro_raw_df before processing.
         custom_ticker_table : dict, optional
             Override default ticker metadata.
 
@@ -672,19 +1141,31 @@ class TFTAlignedPrepLayer:
         if events_df is not None:
             events_by_date = events_from_dataframe(events_df)
 
-        macro_features = None
-        if macro_df is not None:
-            macro_features = macro_from_dataframe(macro_df)
-
         prep = cls(
             tickers=tickers,
             window_size=window_size,
             events_by_date=events_by_date,
-            macro_features=macro_features,
             f_macro=f_macro,
             custom_ticker_table=custom_ticker_table,
             **kwargs,
         )
+
+        # Macro context — priority: raw daily > engine output > pre-computed
+        if macro_raw_df is not None:
+            result = prep.build_macro_from_daily(
+                macro_raw_df,
+                macro_prep_kwargs=macro_prep_kwargs,
+                exclude_tickers=exclude_macro_tickers,
+            )
+            print(f"  [Macro] Built {result.shape[1]} features from raw daily data (shifted 1d)")
+        elif market_engine_df is not None:
+            result = prep.build_macro_from_engine(market_engine_df)
+            print(f"  [Macro] Loaded {result.shape[1]} MarketFeatureEngine features (shifted 1d)")
+        elif macro_df is not None:
+            prep.macro_features = macro_from_dataframe(macro_df)
+            if prep.macro_features:
+                prep.f_macro = len(next(iter(prep.macro_features.values())))
+            print(f"  [Macro] Loaded {prep.f_macro} pre-computed macro features")
 
         for ticker in tickers:
             ticker_dir = root / ticker
