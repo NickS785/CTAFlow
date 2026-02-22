@@ -46,6 +46,12 @@ import numpy as np
 import pandas as pd
 from torch.utils.data import DataLoader
 
+from CTAFlow.models.multi_asset import (
+    SummarySelectionConfig,
+    feature_signature,
+    _filter_by_substrings,
+)
+
 from CTAFlow.data.datasets.tft import (
     COMMODITY_EVENT_TYPES,
     EVENTS_BY_TICKER_TYPE,
@@ -127,6 +133,29 @@ def _load_npz_arrays(
     return arr, dates
 
 
+def _load_npz_date_keyed(
+    path: Union[str, Path],
+) -> Dict[date, np.ndarray]:
+    """Load date-string-keyed NPZ (e.g. from SequenceRasterizer.parquet_to_npz).
+
+    These files store one array per date: keys like '2011-01-03' -> (T, C, B).
+    Returns a dict mapping python date -> float32 array.
+    """
+    npz = np.load(str(path), allow_pickle=True)
+    out: Dict[date, np.ndarray] = {}
+    for key in npz.files:
+        try:
+            d = pd.Timestamp(key).date()
+        except (ValueError, TypeError):
+            continue
+        out[d] = np.asarray(npz[key], dtype=np.float32)
+    if not out:
+        raise ValueError(
+            f"No date-string keys found in {path}. Available keys: {npz.files[:10]}"
+        )
+    return out
+
+
 def _dates_to_python(dates: np.ndarray) -> List[date]:
     """Convert numpy date array to list of python date objects."""
     out = []
@@ -191,6 +220,7 @@ class TFTAlignedPrepLayer:
         surprise_threshold: float = 1.0,
         anticipation_horizon: int = 5,
         custom_ticker_table: Optional[Dict[str, Dict[str, str]]] = None,
+        summary_config: Optional[SummarySelectionConfig] = None,
     ):
         self.window_size = window_size
         self.f_macro = f_macro
@@ -216,6 +246,8 @@ class TFTAlignedPrepLayer:
             anticipation_horizon=anticipation_horizon,
         )
 
+        self.summary_config = summary_config
+
         # Per-ticker loaded data
         self._summary: Dict[str, Dict[date, np.ndarray]] = {}
         self._summary_cols: Dict[str, List[str]] = {}
@@ -240,6 +272,248 @@ class TFTAlignedPrepLayer:
     @property
     def n_asset_subclasses(self) -> int:
         return max(m.asset_subclass_id for m in self.ticker_registry.values()) + 1
+
+    # ----- Summary Alignment -----
+
+    def align_summaries(
+        self,
+        config: Optional[SummarySelectionConfig] = None,
+    ) -> None:
+        """Align summary feature schemas across all loaded tickers.
+
+        After calling ``load_ticker_from_files`` for multiple tickers, their
+        ``_summary`` dicts may have different column counts.  This method
+        rewrites every ticker's summary arrays to a shared schema.
+
+        Parameters
+        ----------
+        config : SummarySelectionConfig, optional
+            Alignment strategy.  Falls back to ``self.summary_config`` or
+            the default ``SummarySelectionConfig(strategy="exact")``.
+        """
+        cfg = config or self.summary_config or SummarySelectionConfig(strategy="exact")
+        tickers = [t for t in self._summary if self._summary[t]]
+        if len(tickers) <= 1:
+            return  # nothing to align
+
+        if cfg.strategy == "recompute":
+            self._recompute_all_summaries(cfg)
+            return
+
+        # Reconstruct per-ticker DataFrames
+        per_ticker_dfs: Dict[str, pd.DataFrame] = {}
+        for t in tickers:
+            cols = self._summary_cols[t]
+            dates = sorted(self._summary[t].keys())
+            arr = np.stack([self._summary[t][d] for d in dates])
+            per_ticker_dfs[t] = pd.DataFrame(arr, columns=cols, index=dates)
+
+        if cfg.strategy == "exact":
+            aligned_cols = self._align_exact(per_ticker_dfs, cfg)
+        elif cfg.strategy == "signature":
+            aligned_cols = self._align_signature(per_ticker_dfs, cfg)
+        else:
+            raise ValueError(f"Unknown strategy: {cfg.strategy!r}")
+
+        if not aligned_cols:
+            warnings.warn(
+                "Summary alignment produced 0 common columns. "
+                "Consider strategy='recompute'."
+            )
+            return
+
+        # Rewrite _summary arrays to aligned shape
+        for t in tickers:
+            df = per_ticker_dfs[t]
+            # Keep only aligned columns, fill missing with 0
+            aligned_df = df.reindex(columns=aligned_cols, fill_value=0.0)
+            self._summary_cols[t] = list(aligned_cols)
+            for d, row in zip(aligned_df.index, aligned_df.values):
+                self._summary[t][d] = row.astype(np.float32)
+
+    def _align_exact(
+        self,
+        dfs: Dict[str, pd.DataFrame],
+        cfg: SummarySelectionConfig,
+    ) -> List[str]:
+        """Intersect column names across all tickers."""
+        col_sets = [set(df.columns) for df in dfs.values()]
+        common = sorted(set.intersection(*col_sets)) if col_sets else []
+        if cfg.always_include:
+            for c in cfg.always_include:
+                if c not in common and all(c in df.columns for df in dfs.values()):
+                    common.append(c)
+        return common
+
+    def _align_signature(
+        self,
+        dfs: Dict[str, pd.DataFrame],
+        cfg: SummarySelectionConfig,
+    ) -> List[str]:
+        """Match features by (window, remainder) signatures, pick best window.
+
+        Returns the list of *original* column names from the first ticker
+        that matched, renamed to canonical ``window__remainder`` form so all
+        tickers share identical column names.
+        """
+        # Build per-ticker: {(window, remainder): [col, ...]}
+        sig_maps: Dict[str, Dict[tuple, List[str]]] = {}
+        for t, df in dfs.items():
+            m: Dict[tuple, List[str]] = {}
+            for c in df.columns:
+                sig = feature_signature(c)
+                if sig is None:
+                    continue
+                window, remainder = sig
+                if cfg.require_substrings and not _filter_by_substrings(
+                    remainder, cfg.require_substrings,
+                ):
+                    continue
+                m.setdefault((window, remainder), []).append(c)
+            sig_maps[t] = m
+
+        # Try preferred windows in order
+        best_sigs: List[tuple] = []
+        for w in cfg.prefer_windows:
+            per_sets = []
+            for t in dfs:
+                keys = {k for k in sig_maps[t] if k[0] == w}
+                per_sets.append(keys)
+            if not per_sets:
+                continue
+            inter = set.intersection(*per_sets)
+            if len(inter) >= cfg.min_common:
+                best_sigs = sorted(inter)
+                break
+            if len(inter) > len(best_sigs):
+                best_sigs = sorted(inter)
+
+        if not best_sigs:
+            if cfg.strict:
+                raise ValueError("No shared signature features found.")
+            return []
+
+        # Build canonical column names and rewrite DataFrames
+        canonical_cols: List[str] = []
+        # Add always-include columns first
+        if cfg.always_include:
+            for c in cfg.always_include:
+                if all(c in df.columns for df in dfs.values()):
+                    canonical_cols.append(c)
+
+        for window, remainder in best_sigs:
+            canonical_cols.append(f"{window}__{remainder}")
+
+        # Rename columns in each ticker's DataFrame
+        for t, df in dfs.items():
+            rename_map: Dict[str, str] = {}
+            for window, remainder in best_sigs:
+                candidates = sig_maps[t].get((window, remainder), [])
+                if candidates:
+                    rename_map[sorted(candidates)[0]] = f"{window}__{remainder}"
+
+            # Keep always_include as-is, add renamed signature cols
+            keep_cols: List[str] = []
+            if cfg.always_include:
+                for c in cfg.always_include:
+                    if c in df.columns:
+                        keep_cols.append(c)
+
+            for orig, canon in rename_map.items():
+                if orig in df.columns:
+                    keep_cols.append(orig)
+
+            new_df = df[keep_cols].rename(columns=rename_map)
+            new_df = new_df.reindex(columns=canonical_cols, fill_value=0.0)
+            dfs[t] = new_df
+
+        return canonical_cols
+
+    def _recompute_all_summaries(self, cfg: SummarySelectionConfig) -> None:
+        """Recompute universal summary features from sequential close prices."""
+        periods = list(cfg.recompute_periods) if cfg.recompute_periods else [1, 5, 10]
+        canonical_cols = (
+            [f"session_return_{p}" for p in periods]
+            + [f"session_volatility_{p}" for p in periods]
+        )
+
+        tickers = [t for t in self._seq if self._seq[t]]
+        for t in tickers:
+            recomputed = self._recompute_summary_from_seq(t, periods=periods)
+            self._summary_cols[t] = list(canonical_cols)
+            # Overwrite summary dict with recomputed values
+            new_summary: Dict[date, np.ndarray] = {}
+            for d in sorted(recomputed.index):
+                py_d = d.date() if isinstance(d, (datetime, pd.Timestamp)) else d
+                new_summary[py_d] = recomputed.loc[d].values.astype(np.float32)
+            self._summary[t] = new_summary
+
+            # Update available dates to intersection with new summary
+            if t in self._available_dates:
+                old = set(self._available_dates[t])
+                new = set(new_summary.keys())
+                self._available_dates[t] = sorted(old & new)
+
+    def _recompute_summary_from_seq(
+        self,
+        ticker: str,
+        periods: Sequence[int] = (1, 5, 10),
+    ) -> pd.DataFrame:
+        """Build session return/volatility features from sequential close prices.
+
+        Uses the already-loaded ``_seq`` data so no separate intraday file
+        is needed.
+        """
+        seq_dict = self._seq.get(ticker, {})
+        cols = self._seq_cols.get(ticker, [])
+        if not seq_dict or not cols:
+            raise ValueError(f"No sequential data loaded for {ticker}")
+
+        # Find close column index
+        close_idx = None
+        for name in ("close", "Close", "last", "Last"):
+            if name in cols:
+                close_idx = cols.index(name)
+                break
+
+        if close_idx is None:
+            raise ValueError(
+                f"No close/price column in sequential data for {ticker}. "
+                f"Available: {cols}"
+            )
+
+        # Extract daily session close (last bar's close per day)
+        daily_close: Dict[date, float] = {}
+        for d in sorted(seq_dict.keys()):
+            arr = seq_dict[d]
+            if arr.ndim == 2 and arr.shape[0] > 0:
+                daily_close[d] = float(arr[-1, close_idx])
+
+        if not daily_close:
+            return pd.DataFrame(columns=[f"session_return_{p}" for p in periods]
+                                + [f"session_volatility_{p}" for p in periods])
+
+        dates = sorted(daily_close.keys())
+        closes = pd.Series(
+            [daily_close[d] for d in dates],
+            index=pd.DatetimeIndex(dates),
+            dtype=np.float64,
+        )
+
+        # Daily returns
+        rets = closes.pct_change()
+
+        # Build features: rolling cumulative return and rolling mean volatility
+        features: Dict[str, pd.Series] = {}
+        log_rets = np.log1p(rets)
+        for p in periods:
+            cum = log_rets.rolling(p).sum().shift(1)
+            features[f"session_return_{p}"] = np.expm1(cum)
+            features[f"session_volatility_{p}"] = rets.abs().rolling(p).mean().shift(1)
+
+        df = pd.DataFrame(features, index=closes.index)
+        df = df.fillna(0.0).astype(np.float32)
+        return df
 
     # ----- File Loading -----
 
@@ -308,19 +582,23 @@ class TFTAlignedPrepLayer:
         for d, arr in zip(profile_dates, profile_arr):
             profile_dict[d] = arr
 
-        # 3. Rasterized VPIN (NPZ)
-        raster_arr, raster_dates_raw = _load_npz_arrays(
-            root / raster_file,
-            array_keys=("data", "rasterized", "tensor", "arr_0"),
-        )
-        if raster_dates_raw is not None:
-            raster_dates = _dates_to_python(raster_dates_raw)
-        else:
-            raster_dates = summary_dates[:len(raster_arr)]
-
+        # 3. Rasterized VPIN (NPZ) — try stacked format first, fall back to date-keyed
         raster_dict: Dict[date, np.ndarray] = {}
-        for d, arr in zip(raster_dates, raster_arr):
-            raster_dict[d] = arr
+        raster_path = root / raster_file
+        try:
+            raster_arr, raster_dates_raw = _load_npz_arrays(
+                raster_path,
+                array_keys=("data", "rasterized", "tensor", "arr_0"),
+            )
+            if raster_dates_raw is not None:
+                raster_dates = _dates_to_python(raster_dates_raw)
+            else:
+                raster_dates = summary_dates[:len(raster_arr)]
+            for d, arr in zip(raster_dates, raster_arr):
+                raster_dict[d] = arr
+        except ValueError:
+            # Date-string-keyed format (e.g. from SequenceRasterizer.parquet_to_npz)
+            raster_dict = _load_npz_date_keyed(raster_path)
 
         # 4. Sequential VPIN (Parquet)
         seq_df = _read_tabular(root / seq_file)
@@ -1077,6 +1355,7 @@ class TFTAlignedPrepLayer:
         macro_prep_kwargs: Optional[Dict] = None,
         exclude_macro_tickers: Optional[Sequence[str]] = None,
         custom_ticker_table: Optional[Dict[str, Dict[str, str]]] = None,
+        summary_config: Optional[SummarySelectionConfig] = None,
         **kwargs,
     ) -> "TFTAlignedPrepLayer":
         """Convenience constructor that loads all tickers from a root directory.
@@ -1147,6 +1426,7 @@ class TFTAlignedPrepLayer:
             events_by_date=events_by_date,
             f_macro=f_macro,
             custom_ticker_table=custom_ticker_table,
+            summary_config=summary_config,
             **kwargs,
         )
 
@@ -1174,6 +1454,16 @@ class TFTAlignedPrepLayer:
                 continue
             n = prep.load_ticker_from_files(ticker, ticker_dir)
             print(f"  [{ticker}] Loaded {n} valid dates")
+
+        # Align summary schemas across tickers if config provided
+        if summary_config is not None and len(prep._summary) > 1:
+            prep.align_summaries(summary_config)
+            sample_cols = next(
+                (prep._summary_cols[t] for t in prep._summary_cols if prep._summary_cols[t]),
+                [],
+            )
+            print(f"  [Summary] Aligned to {len(sample_cols)} features "
+                  f"(strategy={summary_config.strategy!r})")
 
         return prep
 
