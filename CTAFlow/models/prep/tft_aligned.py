@@ -626,10 +626,12 @@ class TFTAlignedPrepLayer:
             d = idx.date() if isinstance(idx, (datetime, pd.Timestamp)) else idx
             target_dict[d] = val
 
-        # Compute available dates (intersection of all modalities)
+        # Compute available dates (intersection of ALL modalities)
         all_date_sets = [
             set(summary_dict.keys()),
             set(profile_dict.keys()),
+            set(raster_dict.keys()),
+            set(seq_dict.keys()),
             set(target_dict.keys()),
         ]
         common_dates = sorted(set.intersection(*all_date_sets))
@@ -1224,6 +1226,10 @@ class TFTAlignedPrepLayer:
                 if not all(d in profile_dict for d in window_dates):
                     continue
 
+                # Skip if raster or sequential data missing for prediction date
+                if pred_date not in raster_dict or pred_date not in seq_dict:
+                    continue
+
                 summary_stack = np.stack(
                     [summary_dict[d] for d in window_dates]
                 )
@@ -1231,15 +1237,8 @@ class TFTAlignedPrepLayer:
                     [profile_dict[d] for d in window_dates]
                 )
 
-                # Raster and seq: use prediction date's data
-                raster = raster_dict.get(
-                    pred_date,
-                    np.zeros((1, 1, 1), dtype=np.float32),
-                )
-                seq = seq_dict.get(
-                    pred_date,
-                    np.zeros((1, 1), dtype=np.float32),
-                )
+                raster = raster_dict[pred_date]
+                seq = seq_dict[pred_date]
                 seq_len = seq_lens_dict.get(pred_date, seq.shape[0])
 
                 target = target_dict.get(pred_date)
