@@ -81,7 +81,7 @@ Dashboard will be available at `http://localhost:8050`
 The dashboard automatically syncs with AWS S3 when enabled:
 
 ```python
-from app.utils import DataLoader
+from CTAFlow.data.utils import DataLoader
 
 # Initialize with S3
 loader = DataLoader(use_s3=True)
@@ -95,7 +95,7 @@ model_path = loader.load_model_checkpoint('wspr_HE_LE')  # Downloads model
 
 ```python
 import pandas as pd
-from app.utils import DataLoader
+from CTAFlow.data.utils import DataLoader
 
 loader = DataLoader(use_s3=True, results_dir='app/results')
 
@@ -114,7 +114,7 @@ loader.save_predictions(predictions, model_name='wspr_HE_LE', ticker='HE')
 
 # Save and upload to S3
 loader.save_predictions(predictions, model_name='wspr_HE_LE',
-                       ticker='HE', upload_to_s3=True)
+                        ticker='HE', upload_to_s3=True)
 ```
 
 ### Reading Predictions

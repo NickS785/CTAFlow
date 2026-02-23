@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+Ok#!/usr/bin/env bash
 set -euo pipefail
 
 if [ $# -lt 1 ]; then

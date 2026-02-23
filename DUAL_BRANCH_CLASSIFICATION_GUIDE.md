@@ -66,6 +66,7 @@ The `_make_clf_targets()` method divides continuous returns into 3 classes:
 | **2** | Large positive returns (Strong Up) | `returns > 0` AND high magnitude |
 
 ### Default Usage
+
 ```python
 from CTAFlow.models.intraday_momentum import DeepIDMomentum
 
@@ -79,8 +80,8 @@ model = DeepIDMomentum.from_files(
 
 # Convert to classification targets
 model._make_clf_targets(
-    upper_threshold=0.6,   # Top 40% of absolute returns → class 2 (if positive)
-    lower_threshold=0.3,   # Not used in current implementation
+    upper_threshold=0.6,  # Top 40% of absolute returns → class 2 (if positive)
+    lower_threshold=0.3,  # Not used in current implementation
     inplace=True
 )
 
@@ -190,6 +191,7 @@ loaders = model.get_loaders(
 ## 4. Complete Classification Training Example
 
 ### Preparing Data
+
 ```python
 from CTAFlow.models.intraday_momentum import DeepIDMomentum
 from CTAFlow.models.deep_learning.multi_branch.dual_model import DualBranchModel

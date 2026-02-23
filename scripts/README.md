@@ -171,4 +171,4 @@ gcloud auth configure-docker us-east4-docker.pkg.dev
 
 - [VERTEX_AI_TRAINING_GUIDE.md](../VERTEX_AI_TRAINING_GUIDE.md) - Complete setup guide
 - [Dockerfile](../Dockerfile) - Container definition
-- [CTAFlow/models/deep_learning/loss/](../CTAFlow/models/deep_learning/loss/) - Loss function implementations
+- [CTAFlow/models/deep_learning/loss/](../CTAFlow/models/deep_learning/training/loss/) - Loss function implementations

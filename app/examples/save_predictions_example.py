@@ -7,9 +7,8 @@ MultiAssetWSPR model in the format expected by the dashboard.
 
 import torch
 import pandas as pd
-import numpy as np
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # Add CTAFlow to path
 import sys
@@ -17,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from CTAFlow.models.multi_asset import MultiAssetMomentum
 from CTAFlow.models.deep_learning.multi_branch.dual_model import MultiAssetWSPR
-from app.utils import DataLoader
+from CTAFlow.data.utils import DataLoader
 
 
 def load_trained_model(checkpoint_path: str, device: str = 'cuda'):
