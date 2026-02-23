@@ -840,20 +840,23 @@ class TFTAlignedPrepLayer:
 
         Scaling rules by column pattern:
         - Raw yield levels (YIELD_*): keep as-is (~0-5%), clip
-        - Rate changes (*_chg_*): * 10
+        - Change columns (*_chg*): * 10  (rate diffs & release-day changes)
         - TERM_SPREAD: keep as-is, clip
         - Returns (*_ret_*) / relative strength (*_rel_*): * 100 (to bps)
         - VIX level: / 10
-        - VIX_chg: keep as-is, clip
+        - YoY econ (*_YOY, not _chg): / 2  (~0-10% → ~0-5)
+        - UMCSENT level: / 20  (~50-120 → ~2.5-6)
+        - FEDFUNDS level: / 4  (~0-20 → ~0-5)
+        - UNRATE level: / 2  (~3-15 → ~1.5-7.5)
+        - Derived composites (REAL_RATE, FF_SPREAD): clip (already ~[-5,5])
         - Fallback: clip only
         """
         df = df.copy()
         for col in df.columns:
             cl = col.lower()
-            if cl.startswith("yield_") and "_chg_" not in cl:
-                # Raw yield levels: ~0-5%, already in a reasonable range
+            if cl.startswith("yield_") and "_chg" not in cl:
                 df[col] = df[col].clip(-clip_range, clip_range)
-            elif "_chg_" in cl:
+            elif "_chg" in cl:
                 df[col] = (df[col] * 10.0).clip(-clip_range, clip_range)
             elif "_ret_" in cl or "_rel_" in cl:
                 df[col] = (df[col] * 100.0).clip(-clip_range, clip_range)
@@ -861,6 +864,14 @@ class TFTAlignedPrepLayer:
                 df[col] = (df[col] / 10.0).clip(0, clip_range)
             elif cl == "term_spread":
                 df[col] = df[col].clip(-clip_range, clip_range)
+            elif cl == "umcsent":
+                df[col] = (df[col] / 20.0).clip(0, clip_range)
+            elif cl == "fedfunds":
+                df[col] = (df[col] / 4.0).clip(0, clip_range)
+            elif cl == "unrate":
+                df[col] = (df[col] / 2.0).clip(0, clip_range)
+            elif cl.endswith("_yoy"):
+                df[col] = (df[col] / 2.0).clip(-clip_range, clip_range)
             else:
                 df[col] = df[col].clip(-clip_range, clip_range)
         return df
