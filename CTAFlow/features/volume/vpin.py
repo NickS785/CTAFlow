@@ -360,6 +360,9 @@ class SequenceRasterizer:
                 raise ValueError(f"DataFrame must contain a timestamp column (looked for '{ts_col}')")
         out[resolved_ts_col] = pd.to_datetime(out[resolved_ts_col], errors="coerce")
         out = out[out[resolved_ts_col].notna()].copy()
+        # Avoid ambiguity when timestamp exists both as an index level and a column.
+        # Rasterization paths sort/filter by column name, so normalize to a plain RangeIndex.
+        out = out.reset_index(drop=True)
         return out, resolved_ts_col
 
     def _normalize_timestamps(self, ts_series: pd.Series) -> pd.Series:

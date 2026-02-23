@@ -403,6 +403,9 @@ class MMTFCore(nn.Module):
         doy_cos: torch.Tensor,
         event_type_ids: Optional[torch.Tensor] = None,
         days_until_event: Optional[torch.Tensor] = None,
+        macro_days: Optional[torch.Tensor] = None,
+        event_outcomes: Optional[torch.Tensor] = None,
+        event_mask: Optional[torch.Tensor] = None,
         return_probs: bool = False,
         return_tracker: bool = False,
     ):
@@ -419,6 +422,12 @@ class MMTFCore(nn.Module):
         month, dow, doy_sin, doy_cos : Tensor (B, W)
         event_type_ids : Tensor (B, W, max_events), optional
         days_until_event : Tensor (B, W, max_events), optional
+        macro_days : Tensor (B, W, f_macro), optional
+            Macro context (ignored by MMTFCore; accepted for batch-dict compatibility).
+        event_outcomes : Tensor, optional
+            Event outcomes (ignored by MMTFCore; accepted for batch-dict compatibility).
+        event_mask : Tensor, optional
+            Event mask (ignored by MMTFCore; accepted for batch-dict compatibility).
         return_probs : bool
         return_tracker : bool
 
