@@ -373,26 +373,30 @@ class TFTAlignedMamba(nn.Module):
         task: str = "classification",
         num_classes: int = 3,
         dropout: float = 0.2,
+        grn_dropout: float | None = None,
     ):
         super().__init__()
         self.task = task
         self.d_model = d_model
 
+        # GRN/BVS dropout defaults to main dropout if not specified
+        _grn_drop = grn_dropout if grn_dropout is not None else dropout
+
         from ..mamba_model import SpatioTemporalMambaFusion
 
-        # Static Encoder
+        # Static Encoder (uses GRNs internally)
         self.static_encoder = StaticCovariateEncoder(
             d_model=d_model,
             n_tickers=n_tickers,
             n_asset_classes=n_asset_classes,
             n_asset_subclasses=n_asset_subclasses,
             d_emb=d_static_emb,
-            dropout=dropout,
+            dropout=_grn_drop,
         )
 
         self.static_daily_proj = GatedResidualNetwork(
             d_model=d_model,
-            dropout=dropout,
+            dropout=_grn_drop,
         )
 
         # Known Future Encoder
@@ -440,18 +444,18 @@ class TFTAlignedMamba(nn.Module):
             dropout=dropout,
         )
 
-        # Fusion
+        # Fusion (GRN/BVS components use grn_dropout)
         self.branch_selector = BranchVariableSelection(
             n_branches=4,
             d_branch=d_model,
             d_context=d_model,
-            dropout=dropout,
+            dropout=_grn_drop,
         )
 
         self.enrichment_ctx_fuse = GatedResidualNetwork(
             d_model=d_model,
             d_input=d_model * 2,
-            dropout=dropout,
+            dropout=_grn_drop,
         )
 
         self.temporal_attn = MacroEnrichedTemporalAttention(
