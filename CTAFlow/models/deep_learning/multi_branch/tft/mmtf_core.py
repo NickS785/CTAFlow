@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..encoders import (
+from ...encoders import (
     IntradayRNN,
     MarketProfileResNet,
     RasterResNet,
@@ -38,7 +38,7 @@ from .tft_encoders import (
     StaticCovariateEncoder,
     TemporalKnownInputEncoder,
 )
-from ..market_context_models import (
+from ...market_context_models import (
     BranchVariableSelection,
     GatedResidualNetwork,
 )
@@ -94,7 +94,7 @@ class TransformerFusionBackbone(TemporalFusionBackbone):
         self.d_model = d_model
 
         # Positional encoding
-        self.pos_dropout = nn.Dropout(dropout)
+        self.pos_dropout = nn.Dropout(dropout)2
 
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
