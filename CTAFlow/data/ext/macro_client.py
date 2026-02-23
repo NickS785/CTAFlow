@@ -69,9 +69,15 @@ class MacroClient:
         "XLC": "XLC",
     }
 
-    def __init__(self, fred_api_key: Optional[str] = None, auto_adjust: bool = True):
+    def __init__(
+        self,
+        fred_api_key: Optional[str] = None,
+        auto_adjust: bool = True,
+        include_sectors: bool = False,
+    ):
         self.fred_api_key = fred_api_key
         self.auto_adjust = bool(auto_adjust)
+        self.include_sectors = bool(include_sectors)
 
     def fetch_fred_data(
         self,
@@ -157,9 +163,11 @@ class MacroClient:
         start_date: datetime,
         end_date: Optional[datetime] = None,
     ) -> pd.DataFrame:
-        """Fetch market indices and sector ETFs as one aligned frame."""
-        all_tickers = {**self.MARKET_TICKERS, **self.SECTOR_TICKERS}
-        return self._fetch_yahoo_close(all_tickers, start_date=start_date, end_date=end_date)
+        """Fetch market indices (and optionally sector ETFs) as one aligned frame."""
+        tickers = dict(self.MARKET_TICKERS)
+        if self.include_sectors:
+            tickers.update(self.SECTOR_TICKERS)
+        return self._fetch_yahoo_close(tickers, start_date=start_date, end_date=end_date)
 
     def fetch_econ_data(
         self,
