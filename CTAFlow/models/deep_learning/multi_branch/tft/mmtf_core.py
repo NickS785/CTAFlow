@@ -94,7 +94,7 @@ class TransformerFusionBackbone(TemporalFusionBackbone):
         self.d_model = d_model
 
         # Positional encoding
-        self.pos_dropout = nn.Dropout(dropout)2
+        self.pos_dropout = nn.Dropout(dropout)
 
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
