@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Dict, Optional
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 try:
     import yfinance as yf
@@ -11,9 +14,9 @@ except Exception:  # pragma: no cover - optional dependency
     yf = None  # type: ignore
 
 try:
-    import pandas_datareader.data as web
+    from fredapi import Fred
 except Exception:  # pragma: no cover - optional dependency
-    web = None  # type: ignore
+    Fred = None  # type: ignore
 
 
 class MacroClient:
@@ -79,28 +82,47 @@ class MacroClient:
         self.auto_adjust = bool(auto_adjust)
         self.include_sectors = bool(include_sectors)
 
+    def _get_fred(self) -> Optional["Fred"]:
+        """Return a Fred client or None if unavailable."""
+        if Fred is None:
+            logger.warning("fredapi not installed — pip install fredapi")
+            return None
+        if not self.fred_api_key:
+            import os
+            self.fred_api_key = os.getenv("FRED_API_KEY")
+        if not self.fred_api_key:
+            logger.warning("FRED_API_KEY not set — skipping FRED data")
+            return None
+        return Fred(api_key=self.fred_api_key)
+
     def fetch_fred_data(
         self,
         start_date: datetime,
         end_date: Optional[datetime] = None,
     ) -> pd.DataFrame:
         """Fetch FRED macro series. Returns empty frame if dependency/source is unavailable."""
-        if web is None:
+        fred = self._get_fred()
+        if fred is None:
             return pd.DataFrame()
 
         try:
             end = end_date or datetime.utcnow()
-            raw = web.DataReader(
-                list(self.FRED_SERIES.values()),
-                "fred",
-                start_date,
-                end,
-                api_key=self.fred_api_key,
-            )
-            out = raw.rename(columns={v: k for k, v in self.FRED_SERIES.items()})
+            frames = {}
+            for alias, series_id in self.FRED_SERIES.items():
+                s = fred.get_series(
+                    series_id,
+                    observation_start=start_date,
+                    observation_end=end,
+                )
+                if s is not None and not s.empty:
+                    frames[alias] = s
+            if not frames:
+                return pd.DataFrame()
+            out = pd.DataFrame(frames)
             out.index = pd.to_datetime(out.index)
             return out.sort_index()
-        except Exception:
+        except Exception as e:
+            logger.warning("FRED yield fetch failed: %s", e)
             return pd.DataFrame()
 
     @staticmethod
@@ -184,26 +206,32 @@ class MacroClient:
         The resulting frame is at *native* frequency (monthly / quarterly)
         — forward-filling to daily happens in ``get_macro_context()``.
         """
-        if web is None:
+        fred = self._get_fred()
+        if fred is None:
             return pd.DataFrame()
 
         end = end_date or datetime.utcnow()
         # Request extra history so YoY calculation doesn't clip early rows
         lookback_start = pd.Timestamp(start_date) - pd.DateOffset(months=15)
 
-        series_ids = [v["series_id"] for v in self.ECON_SERIES.values()]
-        try:
-            raw = web.DataReader(
-                series_ids, "fred", lookback_start, end,
-                api_key=self.fred_api_key,
-            )
-        except Exception:
+        raw_frames = {}
+        for name, spec in self.ECON_SERIES.items():
+            try:
+                s = fred.get_series(
+                    spec["series_id"],
+                    observation_start=lookback_start,
+                    observation_end=end,
+                )
+                if s is not None and not s.empty:
+                    raw_frames[name] = s
+            except Exception as e:
+                logger.warning("FRED series %s (%s) failed: %s", name, spec["series_id"], e)
+
+        if not raw_frames:
+            logger.warning("No FRED econ series retrieved")
             return pd.DataFrame()
 
-        # Map FRED codes back to friendly names
-        id_to_name = {v["series_id"]: k for k, v in self.ECON_SERIES.items()}
-        raw = raw.rename(columns=id_to_name)
-
+        raw = pd.DataFrame(raw_frames)
         out = pd.DataFrame(index=raw.index)
         for name, spec in self.ECON_SERIES.items():
             if name not in raw.columns:

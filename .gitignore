@@ -73,3 +73,5 @@ CONSTANT_M1_IMPLEMENTATION.md
 
 # Backtest outputs
 calendar_patterns_backtest.csv
+/CTAFlow/auth/
+/credentials
