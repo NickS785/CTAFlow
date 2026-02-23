@@ -38,7 +38,7 @@ from .tft_encoders import (
     StaticCovariateEncoder,
     TemporalKnownInputEncoder,
 )
-from ...market_context_models import (
+from ..market_context_models import (
     BranchVariableSelection,
     GatedResidualNetwork,
 )
