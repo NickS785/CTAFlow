@@ -4,6 +4,9 @@ from .tft_encoders import (
     MacroPastObservedEncoder,
 )
 from .tft_models import TFTAlignedWSPR, TFTAlignedMamba
+from .tft_simple import TFTAlignedMambaSimple
+from .mmtf_core import MMTFCore
+from .mmtf_models import MMTFTransformer, MMTFMamba
 
 __all__ = [
     "StaticCovariateEncoder",
@@ -11,4 +14,8 @@ __all__ = [
     "MacroPastObservedEncoder",
     "TFTAlignedWSPR",
     "TFTAlignedMamba",
+    "TFTAlignedMambaSimple",
+    "MMTFCore",
+    "MMTFTransformer",
+    "MMTFMamba",
 ]
