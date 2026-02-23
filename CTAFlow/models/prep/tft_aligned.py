@@ -838,41 +838,36 @@ class TFTAlignedPrepLayer:
     ) -> pd.DataFrame:
         """Scale macro features to ~[-5, +5] matching spatial data scale.
 
-        Scaling rules by column pattern:
-        - Raw yield levels (YIELD_*): keep as-is (~0-5%), clip
-        - Change columns (*_chg*): * 10  (rate diffs & release-day changes)
-        - TERM_SPREAD: keep as-is, clip
-        - Returns (*_ret_*) / relative strength (*_rel_*): * 100 (to bps)
-        - VIX level: / 10
-        - YoY econ (*_YOY, not _chg): / 2  (~0-10% → ~0-5)
-        - UMCSENT level: / 20  (~50-120 → ~2.5-6)
-        - FEDFUNDS level: / 4  (~0-20 → ~0-5)
-        - UNRATE level: / 2  (~3-15 → ~1.5-7.5)
-        - Derived composites (REAL_RATE, FF_SPREAD): clip (already ~[-5,5])
-        - Fallback: clip only
+        Lean feature set from MacroFeaturePrep (14 cols):
+          REAL_RATE_10Y, REAL_RATE_10Y_chg  — already ~[-5,5], chg ×10
+          TERM_SPREAD, TERM_SPREAD_chg      — already ~[-3,3], chg ×10
+          FF_SPREAD_10Y                     — ~[-5,5], clip only
+          REAL_FF_RATE                      — ~[-5,5], clip only
+          CORE_INFLATION, CORE_INFLATION_chg — /2, chg ×10
+          RGDP_YOY, RGDP_YOY_chg           — /2, chg ×10
+          UNRATE, UNRATE_chg                — /2, chg ×10
+          UMCSENT, UMCSENT_chg              — /20, chg ×10
+
+        Also handles MarketFeatureEngine columns (returns, VIX) when present.
         """
         df = df.copy()
         for col in df.columns:
             cl = col.lower()
-            if cl.startswith("yield_") and "_chg" not in cl:
-                df[col] = df[col].clip(-clip_range, clip_range)
-            elif "_chg" in cl:
+            if "_chg" in cl:
+                # Release-day changes are tiny diffs — amplify
                 df[col] = (df[col] * 10.0).clip(-clip_range, clip_range)
             elif "_ret_" in cl or "_rel_" in cl:
+                # Market returns → basis points
                 df[col] = (df[col] * 100.0).clip(-clip_range, clip_range)
             elif cl == "vix":
                 df[col] = (df[col] / 10.0).clip(0, clip_range)
-            elif cl == "term_spread":
-                df[col] = df[col].clip(-clip_range, clip_range)
             elif cl == "umcsent":
                 df[col] = (df[col] / 20.0).clip(0, clip_range)
-            elif cl == "fedfunds":
-                df[col] = (df[col] / 4.0).clip(0, clip_range)
-            elif cl == "unrate":
-                df[col] = (df[col] / 2.0).clip(0, clip_range)
-            elif cl.endswith("_yoy"):
+            elif cl in ("unrate", "core_inflation", "rgdp_yoy"):
                 df[col] = (df[col] / 2.0).clip(-clip_range, clip_range)
             else:
+                # REAL_RATE_10Y, TERM_SPREAD, FF_SPREAD_10Y, REAL_FF_RATE
+                # already in ~[-5, +5] range
                 df[col] = df[col].clip(-clip_range, clip_range)
         return df
 

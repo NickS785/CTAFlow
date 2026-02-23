@@ -23,8 +23,8 @@ DEFAULT_MARKET_TICKERS: Dict[str, Dict[str, Any]] = {
     "^VIX": {"name": "vix", "category": "volatility", "use_level": True},
     "DX-Y.NYB": {"name": "us_dollar_index", "category": "currency_index", "use_level": True},
     "AGG": {"name": "corp_bond_index", "category": "bond", "use_level": False},
-    "^TNX": {"name": "10y_treasury", "category": "treasury", "use_level": True},
-    "^IRX": {"name": "3m_treasury", "category": "treasury", "use_level": True},
+    "^TNX": {"name": "10y_treasury", "category": "treasury", "use_level": True, "emit": False},
+    "^IRX": {"name": "3m_treasury", "category": "treasury", "use_level": True, "emit": False},
 }
 
 
@@ -411,6 +411,8 @@ class MarketFeatureEngine:
             if len(prices) < 50:
                 continue
 
+            if not meta.get("emit", True):
+                continue
             name = str(meta.get("name", ticker)).lower().replace(" ", "_")
             if bool(meta.get("use_level", False)):
                 feature_series[name] = prices
@@ -422,7 +424,10 @@ class MarketFeatureEngine:
             irx = self.raw_data["^IRX"]["adj_close"].astype(np.float64)
             idx = tnx.index.intersection(irx.index)
             if len(idx) > 50:
-                feature_series["yield_curve_slope"] = tnx.reindex(idx) - irx.reindex(idx)
+                slope = tnx.reindex(idx) - irx.reindex(idx)
+                feature_series["yield_curve_slope"] = slope
+                feature_series["yield_curve_slope_chg_1d"] = slope.diff(1)
+                feature_series["yield_curve_slope_chg_28d"] = slope.diff(28)
 
         if not feature_series:
             raise RuntimeError("No market features could be computed from current inputs.")

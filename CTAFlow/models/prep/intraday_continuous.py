@@ -1164,33 +1164,25 @@ class FinancialsIntradayPrep(ContinuousIntradayPrep):
     ) -> pd.DataFrame:
         """Scale macro features to ~[-5, +5] range matching asset feature scale.
 
-        Scaling rules by pattern:
-        - Rate changes (*_chg_*): already small (bp), * 10 for visibility
-        - TERM_SPREAD: keep as-is (~0.5-3.0), clip
-        - Return features (*_ret_*): * 100 (to basis points), clip
-        - Relative strength (*_rel_*): * 100 (to basis points), clip
-        - VIX level: / 10 (normalise from ~10-80 to ~1-8), clip
-        - VIX change (VIX_chg): keep as-is (~-5 to 5), clip
+        Handles both MarketFeatureEngine columns (returns, VIX) and
+        MacroFeaturePrep lean columns (real rates, spreads, econ levels).
         """
         df = df.copy()
         for col in macro_cols:
             if col not in df.columns:
                 continue
             cl = col.lower()
-            if "_chg_" in cl:
-                # Rate changes: ~0.01-0.2 -> * 10 -> ~0.1-2
+            if "_chg" in cl:
                 df[col] = (df[col] * 10.0).clip(-clip_range, clip_range)
             elif "_ret_" in cl or "_rel_" in cl:
-                # Returns / relative strength: ~-0.05 to 0.05 -> * 100 -> ~-5 to 5
                 df[col] = (df[col] * 100.0).clip(-clip_range, clip_range)
             elif cl == "vix":
-                # VIX level: ~10-80 -> / 10 -> ~1-8
                 df[col] = (df[col] / 10.0).clip(0, clip_range)
-            elif cl == "term_spread":
-                # Term spread: ~-1 to 3, already good range
-                df[col] = df[col].clip(-clip_range, clip_range)
+            elif cl == "umcsent":
+                df[col] = (df[col] / 20.0).clip(0, clip_range)
+            elif cl in ("unrate", "core_inflation", "rgdp_yoy"):
+                df[col] = (df[col] / 2.0).clip(-clip_range, clip_range)
             else:
-                # Fallback: just clip
                 df[col] = df[col].clip(-clip_range, clip_range)
         return df
 
