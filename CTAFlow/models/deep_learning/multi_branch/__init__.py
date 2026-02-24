@@ -14,11 +14,6 @@ from .cmd_mamba import (
     CMDMambaConfig,
     CMDMamba,
 )
-from .cmd_mamba_visual_proto import (
-    TimePreservingRasterResNet,
-    CMDMambaVisualConfig,
-    CMDMambaVisualProto,
-)
 from .fin_mamba import (
     MarketGatingUnit,
     FinMambaCMD,

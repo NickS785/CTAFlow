@@ -7,6 +7,12 @@ from .tft_models import TFTAlignedWSPR, TFTAlignedMamba
 from .tft_simple import TFTAlignedMambaSimple
 from .mmtf_core import MMTFCore
 from .mmtf_models import MMTFTransformer, MMTFMamba
+from .mmtf_v2_models import (
+    BranchVariableSelectionV2,
+    MMTFv2Core,
+    MMTFv2Transformer,
+    MMTFv2Mamba,
+)
 
 __all__ = [
     "StaticCovariateEncoder",
@@ -18,4 +24,8 @@ __all__ = [
     "MMTFCore",
     "MMTFTransformer",
     "MMTFMamba",
+    "BranchVariableSelectionV2",
+    "MMTFv2Core",
+    "MMTFv2Transformer",
+    "MMTFv2Mamba",
 ]
