@@ -517,7 +517,38 @@ class NumberBarEncoder(nn.Module):
         self.out_norm = nn.LayerNorm(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, bins, C) → (B, C, T, bins)
+        """Encode number bars with robust shape handling."""
+        in_channels = self.conv[0].in_channels
+
+        if x.dim() == 3:
+            # Missing temporal axis; promote to T=1.
+            if x.shape[-1] == in_channels:          # (B, bins, C)
+                x = x.unsqueeze(1)                  # (B, 1, bins, C)
+            elif x.shape[1] == in_channels:         # (B, C, bins)
+                x = x.transpose(1, 2).unsqueeze(1)  # (B, 1, bins, C)
+            else:
+                raise ValueError(
+                    f"NumberBarEncoder expected channels={in_channels} in dim 1 or -1 for 3D input, "
+                    f"got shape={tuple(x.shape)}"
+                )
+        elif x.dim() == 4:
+            if x.shape[-1] == in_channels:          # (B, T, bins, C)
+                pass
+            elif x.shape[2] == in_channels:         # (B, T, C, bins)
+                x = x.permute(0, 1, 3, 2)
+            elif x.shape[1] == in_channels:         # (B, C, T, bins)
+                x = x.permute(0, 2, 3, 1)
+            else:
+                raise ValueError(
+                    f"NumberBarEncoder expected channels={in_channels} in one axis for 4D input, "
+                    f"got shape={tuple(x.shape)}"
+                )
+        else:
+            raise ValueError(
+                f"NumberBarEncoder expected 3D or 4D input, got shape={tuple(x.shape)}"
+            )
+
+        # Canonical: (B, T, bins, C) -> (B, C, T, bins)
         x = x.permute(0, 3, 1, 2)
         x = self.conv(x)
         x = self.pool(x).flatten(1)
