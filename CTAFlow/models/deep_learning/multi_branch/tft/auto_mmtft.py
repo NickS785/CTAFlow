@@ -871,6 +871,7 @@ class MMTFAutoEncoderCore(nn.Module):
         d_latent: int = 64,
         d_ae_hidden: int = 128,
         ae_n_layers: int = 2,
+        ae_n_heads: int = 4,
         n_codes: int = 16,
         kl_weight: float = 0.01,
         recon_weight: float = 0.1,
@@ -936,7 +937,7 @@ class MMTFAutoEncoderCore(nn.Module):
                 d_hidden=d_ae_hidden,
                 d_latent=d_latent,
                 n_layers=ae_n_layers,
-                n_heads=n_heads,
+                n_heads=ae_n_heads,
                 kl_weight=kl_weight,
                 dropout=dropout,
             )

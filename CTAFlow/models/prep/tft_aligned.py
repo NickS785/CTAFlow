@@ -650,6 +650,21 @@ class TFTAlignedPrepLayer:
             returns_dict[d] = row.values
 
         self._daily_returns[ticker] = returns_dict
+
+        # Narrow available_dates to intersection with daily returns so
+        # ae_input is always aligned with the other modalities.
+        if ticker in self._available_dates and returns_dict:
+            old_dates = set(self._available_dates[ticker])
+            ret_dates = set(returns_dict.keys())
+            aligned = sorted(old_dates & ret_dates)
+            n_dropped = len(old_dates) - len(aligned)
+            if n_dropped > 0:
+                warnings.warn(
+                    f"[{ticker}] Dropped {n_dropped} dates missing from "
+                    f"intraday returns ({len(aligned)} remain)"
+                )
+            self._available_dates[ticker] = aligned
+
         return len(returns_dict)
 
     # ----- File Loading -----
@@ -1400,14 +1415,14 @@ class TFTAlignedPrepLayer:
                 # Build ae_input from daily returns (if available)
                 ae_input = None
                 if has_returns:
-                    # Determine feature dim from first available entry
-                    f_ae = next(iter(returns_dict.values())).shape[0]
-                    ae_rows = []
-                    for d in window_dates:
-                        ae_rows.append(
-                            returns_dict.get(d, np.zeros(f_ae, dtype=np.float32))
-                        )
-                    ae_input = np.stack(ae_rows)  # (W, f_ae)
+                    # All window_dates should be in returns_dict because
+                    # _available_dates was intersected with daily returns.
+                    # Skip sample if any date is somehow missing.
+                    if not all(d in returns_dict for d in window_dates):
+                        continue
+                    ae_input = np.stack(
+                        [returns_dict[d] for d in window_dates]
+                    )  # (W, f_ae)
 
                 sample = self.prepare_sample(
                     ticker=ticker,
