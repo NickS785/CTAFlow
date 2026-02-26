@@ -54,12 +54,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from CTAFlow.models.deep_learning.multi_branch.market_context_models import (
-    BranchVariableSelection,
     GatedResidualNetwork,
     GLU,
 )
+from CTAFlow.models.deep_learning.multi_branch.tft.mmtf_v2_models import (
+    BranchVariableSelectionV2,
+)
 from CTAFlow.models.deep_learning.multi_branch.tft.tft_encoders import (
     TemporalKnownInputEncoder,
+)
+from CTAFlow.models.deep_learning.multi_branch.tft.mmtf_core import (
+    TransformerFusionBackbone,
+    MambaFusionBackbone,
 )
 from CTAFlow.models.deep_learning.encoders import (
     IntradayRNN,
@@ -359,6 +365,144 @@ class VariationalRegimeAE(nn.Module):
         # KL(q(z|x) || N(0,I)) = -0.5 * sum(1 + logvar - mu^2 - exp(logvar))
         kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
+        total = recon_loss + self.kl_weight * kl_loss
+
+        return z, x_recon, {
+            "recon_loss": recon_loss,
+            "kl_loss": kl_loss,
+            "total_ae_loss": total,
+        }
+
+
+class TransformerVariationalRegimeAE(nn.Module):
+    """Transformer-based variational autoencoder for regime representation.
+
+    Replaces the GRU encoder/decoder with transformer blocks, which can
+    capture non-local temporal dependencies in the return window more
+    effectively. Uses learned positional encoding and mean-pooling over
+    time to produce the latent distribution parameters.
+
+    Parameters
+    ----------
+    f_input : int
+        Features per timestep (e.g., 3 for [return, abs_return, cum_return]).
+    d_hidden : int
+        Transformer model dimension.
+    d_latent : int
+        Latent dimension (both mean and logvar are this size).
+    n_layers : int
+        Number of transformer encoder/decoder layers.
+    n_heads : int
+        Number of attention heads.
+    kl_weight : float
+        Weight for KL divergence term.
+    max_seq_len : int
+        Maximum window length (for positional encoding).
+    dropout : float
+        Dropout rate.
+    """
+
+    def __init__(
+        self,
+        f_input: int = 3,
+        d_hidden: int = 128,
+        d_latent: int = 64,
+        n_layers: int = 2,
+        n_heads: int = 4,
+        kl_weight: float = 0.01,
+        max_seq_len: int = 20,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.d_latent = d_latent
+        self.d_hidden = d_hidden
+        self.kl_weight = kl_weight
+
+        # --- Encoder ---
+        self.enc_input_proj = nn.Linear(f_input, d_hidden)
+        self.enc_pos = nn.Parameter(torch.randn(1, max_seq_len, d_hidden) * 0.02)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_hidden,
+            nhead=n_heads,
+            dim_feedforward=d_hidden * 2,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.enc_norm = nn.LayerNorm(d_hidden)
+        self.fc_mu = nn.Linear(d_hidden, d_latent)
+        self.fc_logvar = nn.Linear(d_hidden, d_latent)
+
+        # --- Decoder ---
+        self.dec_latent_proj = nn.Linear(d_latent, d_hidden)
+        self.dec_pos = nn.Parameter(torch.randn(1, max_seq_len, d_hidden) * 0.02)
+        decoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_hidden,
+            nhead=n_heads,
+            dim_feedforward=d_hidden * 2,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=n_layers)
+        self.dec_norm = nn.LayerNorm(d_hidden)
+        self.dec_output_proj = nn.Linear(d_hidden, f_input)
+
+    def _encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode to (mu, logvar)."""
+        W = x.size(1)
+        h = self.enc_input_proj(x) + self.enc_pos[:, :W, :]
+        h = self.encoder(h)
+        h = self.enc_norm(h)
+        # Mean-pool over time dimension
+        h_pooled = h.mean(dim=1)  # (B, d_hidden)
+        mu = self.fc_mu(h_pooled)
+        logvar = self.fc_logvar(h_pooled).clamp(-10, 2)
+        return mu, logvar
+
+    def _reparameterize(
+        self, mu: torch.Tensor, logvar: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.training:
+            std = torch.exp(0.5 * logvar)
+            eps = torch.randn_like(std)
+            return mu + eps * std
+        return mu
+
+    def _decode(self, z: torch.Tensor, seq_len: int) -> torch.Tensor:
+        """Decode latent to reconstructed sequence."""
+        z_proj = self.dec_latent_proj(z)  # (B, d_hidden)
+        # Broadcast to (B, W, d_hidden) and add positional encoding
+        z_seq = z_proj.unsqueeze(1).expand(-1, seq_len, -1)
+        z_seq = z_seq + self.dec_pos[:, :seq_len, :]
+        h = self.decoder(z_seq)
+        h = self.dec_norm(h)
+        return self.dec_output_proj(h)  # (B, W, f_input)
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode to mean (no sampling). Use for conditioning at inference."""
+        mu, _ = self._encode(x)
+        return mu
+
+    def forward(
+        self, x: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """
+        x : (B, W, f_input)
+
+        Returns
+        -------
+        z : (B, d_latent) — sampled regime latent
+        x_recon : (B, W, f_input) — reconstruction
+        ae_losses : dict with 'recon_loss', 'kl_loss', 'total_ae_loss'
+        """
+        mu, logvar = self._encode(x)
+        z = self._reparameterize(mu, logvar)
+        x_recon = self._decode(z, seq_len=x.size(1))
+
+        recon_loss = F.mse_loss(x_recon, x)
+        kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
         total = recon_loss + self.kl_weight * kl_loss
 
         return z, x_recon, {
@@ -723,7 +867,7 @@ class MMTFAutoEncoderCore(nn.Module):
         f_raster: int,
         f_seq: int,
         f_ae: int = 6,
-        ae_type: Literal["deterministic", "vae", "vqvae"] = "vae",
+        ae_type: Literal["deterministic", "vae", "transformer_vae", "vqvae"] = "vae",
         d_latent: int = 64,
         d_ae_hidden: int = 128,
         ae_n_layers: int = 2,
@@ -750,6 +894,11 @@ class MMTFAutoEncoderCore(nn.Module):
         num_classes: int = 3,
         dropout: float = 0.2,
         grn_dropout: float | None = None,
+        # --- Anti-collapse BVS + windowed branch params ---
+        sum_lstm_hidden: int = 64,
+        bvs_temperature: float = 1.5,
+        bvs_entropy_weight: float = 0.1,
+        bvs_min_weight: float = 0.05,
     ):
         super().__init__()
         self.task = task
@@ -757,6 +906,7 @@ class MMTFAutoEncoderCore(nn.Module):
         self.backbone_type = backbone
         self.ae_type = ae_type
         self.recon_weight = recon_weight
+        self.sum_lstm_hidden = sum_lstm_hidden
 
         _grn_drop = grn_dropout if grn_dropout is not None else dropout
 
@@ -777,6 +927,16 @@ class MMTFAutoEncoderCore(nn.Module):
                 d_hidden=d_ae_hidden,
                 d_latent=d_latent,
                 n_layers=ae_n_layers,
+                kl_weight=kl_weight,
+                dropout=dropout,
+            )
+        elif ae_type == "transformer_vae":
+            self.autoencoder = TransformerVariationalRegimeAE(
+                f_input=f_ae,
+                d_hidden=d_ae_hidden,
+                d_latent=d_latent,
+                n_layers=ae_n_layers,
+                n_heads=n_heads,
                 kl_weight=kl_weight,
                 dropout=dropout,
             )
@@ -837,13 +997,37 @@ class MMTFAutoEncoderCore(nn.Module):
         self.spatial_fuse = SpatialFuse(d_spatial=d_model, mode="gated")
 
         # ================================================================
-        # TEMPORAL FUSION BACKBONE
+        # WINDOWED SUMMARY LSTM (Branch 2 — dedicated temporal summary)
         # ================================================================
-        from CTAFlow.models.deep_learning.multi_branch.tft.mmtf_core import (
-            TransformerFusionBackbone,
-            MambaFusionBackbone,
+        self.summary_lstm = nn.LSTM(
+            input_size=d_model,
+            hidden_size=sum_lstm_hidden,
+            num_layers=1,
+            batch_first=True,
+        )
+        self.cc_to_sum_lstm = nn.Linear(d_model, sum_lstm_hidden)
+        self.ch_to_sum_lstm = nn.Linear(d_model, sum_lstm_hidden)
+        self.sum_lstm_proj = nn.Linear(sum_lstm_hidden, d_model)
+
+        # ================================================================
+        # WINDOWED SPATIAL ATTENTION (Branch 5 — spatial evolution)
+        # ================================================================
+        self.spatial_wind_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.spatial_wind_norm = nn.LayerNorm(d_model)
+        self.spatial_wind_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
         )
 
+        # ================================================================
+        # TEMPORAL FUSION BACKBONE
+        # ================================================================
         if backbone == "transformer":
             self.fusion_backbone = TransformerFusionBackbone(
                 d_model=d_model,
@@ -865,13 +1049,16 @@ class MMTFAutoEncoderCore(nn.Module):
             raise ValueError(f"Unknown backbone: {backbone}")
 
         # ================================================================
-        # FUSION
+        # ANTI-COLLAPSE BRANCH SELECTION (5 branches)
         # ================================================================
-        self.branch_selector = BranchVariableSelection(
-            n_branches=3,
+        self.branch_selector = BranchVariableSelectionV2(
+            n_branches=5,
             d_branch=d_model,
             d_context=d_model,
             dropout=_grn_drop,
+            temperature=bvs_temperature,
+            entropy_weight=bvs_entropy_weight,
+            min_weight=bvs_min_weight,
         )
 
         self.enrichment_fuse = GatedResidualNetwork(
@@ -999,15 +1186,46 @@ class MMTFAutoEncoderCore(nn.Module):
             z_profile_seq, temporal_seq,
         )
 
+        # ============================================================
+        # PHASE 5: DEDICATED WINDOWED + RECENT BRANCHES
+        # ============================================================
+
+        # Branch 2: summary_wind — LSTM over windowed summary features
+        h0_sum = self.ch_to_sum_lstm(c_h).unsqueeze(0)
+        c0_sum = self.cc_to_sum_lstm(c_c).unsqueeze(0)
+        _, (h_sum, _) = self.summary_lstm(z_summary_seq, (h0_sum, c0_sum))
+        z_summary_wind = self.sum_lstm_proj(h_sum[-1])
+
+        # Branch 3: spatial — fused profile + raster (most recent)
         z_raster = self.raster_net(raster_recent)
-        z_seq = self.seq_net(seq_recent, lengths=seq_lens_recent)
         z_prof_recent = z_profile_seq[:, -1, :]
         z_spatial = self.spatial_fuse(z_prof_recent, z_raster)
 
+        # Branch 4: sequential — intraday sequence
+        z_seq = self.seq_net(seq_recent, lengths=seq_lens_recent)
+
+        # Branch 5: spatial_wind — attention over daily profile evolution
+        query = z_prof_recent.unsqueeze(1)
+        attn_out_sw, _ = self.spatial_wind_attn(
+            query=query,
+            key=z_profile_seq,
+            value=z_profile_seq,
+        )
+        z_spatial_wind = self.spatial_wind_norm(
+            attn_out_sw.squeeze(1) + z_prof_recent
+        )
+        z_spatial_wind = self.spatial_wind_proj(z_spatial_wind)
+
         # ============================================================
-        # PHASE 5: BRANCH SELECTION + ATTENTION
+        # PHASE 6: ANTI-COLLAPSE BRANCH SELECTION
         # ============================================================
-        branch_outputs = [fused_daily_token, z_spatial, z_seq]
+        branch_outputs = [
+            fused_daily_token,   # Branch 1: backbone-fused daily
+            z_summary_wind,      # Branch 2: windowed summary temporal
+            z_spatial,           # Branch 3: most-recent spatial
+            z_seq,               # Branch 4: intraday sequential
+            z_spatial_wind,      # Branch 5: windowed spatial evolution
+        ]
         z_selected, branch_weights = self.branch_selector(
             branch_outputs=branch_outputs,
             context=c_s,
@@ -1039,11 +1257,20 @@ class MMTFAutoEncoderCore(nn.Module):
         # ============================================================
         # TRACKING
         # ============================================================
+        branch_names = [
+            "daily_fused", "summary_wind", "spatial",
+            "sequential", "spatial_wind",
+        ]
         self._last_tracker = {
             "branch_weights": {
                 name: branch_weights[:, i].mean().item()
-                for i, name in enumerate(["daily", "spatial", "sequential"])
+                for i, name in enumerate(branch_names)
             },
+            "branch_entropy": (
+                self.branch_selector.last_entropy.item()
+                if self.branch_selector.last_entropy is not None
+                else None
+            ),
             "regime_var_weights": {
                 name: self.regime_encoder.last_var_weights[:, i].mean().item()
                 for i, name in enumerate(self.regime_encoder.var_names)
@@ -1073,6 +1300,14 @@ class MMTFAutoEncoderCore(nn.Module):
         Useful for regime analysis, clustering, and visualization.
         """
         return self.autoencoder.encode(ae_input)
+
+    def get_entropy_loss(self) -> torch.Tensor:
+        """Get BVS entropy regularization loss.
+
+        Add this to your training loss:
+            total_loss = task_loss + recon_loss + model.get_entropy_loss()
+        """
+        return self.branch_selector.get_entropy_loss()
 
 
 # ============================================================================
@@ -1140,7 +1375,10 @@ def train_step_with_ae(
     rw = recon_weight if recon_weight is not None else model.recon_weight
     ae_loss = ae_losses["total_ae_loss"]
 
-    total_loss = task_loss + rw * ae_loss
+    # BVS entropy regularization
+    entropy_loss = model.get_entropy_loss()
+
+    total_loss = task_loss + rw * ae_loss + entropy_loss
     total_loss.backward()
 
     if clip_grad > 0:
@@ -1150,6 +1388,7 @@ def train_step_with_ae(
     metrics = {
         "task_loss": task_loss.item(),
         "recon_loss": ae_losses["recon_loss"].item(),
+        "entropy_loss": entropy_loss.item() if torch.is_tensor(entropy_loss) else entropy_loss,
         "total_loss": total_loss.item(),
     }
     if "kl_loss" in ae_losses:

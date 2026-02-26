@@ -332,6 +332,7 @@ class TFTAlignedSample:
     days_until_event: np.ndarray    # (W, max_events)
     event_mask: np.ndarray          # (W,)
     target: Union[int, float, np.ndarray]
+    ae_input: Optional[np.ndarray] = None  # (W, f_ae) daily returns window for VAE
     ticker: str = ""
     prediction_date: Optional[date] = None
 
@@ -385,6 +386,9 @@ class TFTAlignedDataset(Dataset):
             ),
         }
 
+        if s.ae_input is not None:
+            item["ae_input"] = torch.from_numpy(s.ae_input).float()
+
         if self.return_metadata:
             item["_ticker"] = s.ticker
             item["_prediction_date"] = str(s.prediction_date) if s.prediction_date else ""
@@ -415,6 +419,10 @@ def tft_aligned_collate_fn(
     collated: Dict[str, torch.Tensor] = {}
     for key in fixed_keys:
         collated[key] = torch.stack([b[key] for b in batch])
+
+    # Stack ae_input if present (from daily returns VAE dataset)
+    if "ae_input" in batch[0]:
+        collated["ae_input"] = torch.stack([b["ae_input"] for b in batch])
 
     collated["seq_lens_recent"] = torch.stack(
         [b["seq_lens_recent"] for b in batch]
@@ -467,6 +475,8 @@ def unpack_batch_for_model(
         "month", "dow", "doy_sin", "doy_cos",
         "event_type_ids", "event_outcomes", "days_until_event", "event_mask",
     ]
+    # Include ae_input when present (daily returns for VAE conditioning)
+    OPTIONAL_KEYS = ["ae_input"]
 
     model_inputs = {}
     for key in MODEL_KEYS:
@@ -474,6 +484,13 @@ def unpack_batch_for_model(
         if device is not None:
             t = t.to(device)
         model_inputs[key] = t
+
+    for key in OPTIONAL_KEYS:
+        if key in batch:
+            t = batch[key]
+            if device is not None:
+                t = t.to(device)
+            model_inputs[key] = t
 
     targets = batch["target"]
     if device is not None:

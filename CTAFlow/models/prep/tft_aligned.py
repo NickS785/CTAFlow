@@ -304,6 +304,7 @@ class TFTAlignedPrepLayer:
         self._seq_cols: Dict[str, List[str]] = {}
         self._seq_lens: Dict[str, Dict[date, int]] = {}
         self._targets: Dict[str, Dict[date, Union[int, float]]] = {}
+        self._daily_returns: Dict[str, Dict[date, np.ndarray]] = {}  # (f_ae,) per day
         self._available_dates: Dict[str, List[date]] = {}
 
     # ----- Properties -----
@@ -561,6 +562,95 @@ class TFTAlignedPrepLayer:
         df = pd.DataFrame(features, index=closes.index)
         df = df.fillna(0.0).astype(np.float32)
         return df
+
+    # ----- Daily Returns from Intraday -----
+
+    def compute_daily_returns_from_intraday(
+        self,
+        ticker: str,
+        intraday_path: Union[str, Path],
+        target_time: str = "10:00",
+    ) -> int:
+        """Compute daily return features from 5min intraday OHLCV data.
+
+        Extracts the close price at ``target_time`` each day, computes
+        10AM-to-10AM returns, and builds a 3-feature vector per day:
+        ``[return_1d, abs_return_1d, cumulative_5d_return]``.
+
+        No shift is applied because the prediction target is for returns
+        from 10AM forward — the 10AM(T-1)->10AM(T) return is fully known
+        at prediction time.
+
+        Parameters
+        ----------
+        ticker : str
+            Ticker symbol (must already be in registry).
+        intraday_path : str or Path
+            Path to the intraday CSV file (Sierra Chart 5min export).
+        target_time : str
+            Time of day to anchor the daily close (HH:MM format).
+
+        Returns
+        -------
+        int
+            Number of valid daily return dates produced.
+        """
+        from CTAFlow.data.raw_formatting.intraday_manager import read_exported_df
+
+        intraday_path = Path(intraday_path)
+        if not intraday_path.exists():
+            warnings.warn(
+                f"Intraday file not found for {ticker}: {intraday_path}. "
+                f"ae_input will be unavailable."
+            )
+            return 0
+
+        df = read_exported_df(str(intraday_path))
+
+        # Filter to bars at the target time (e.g. "10:00")
+        hour, minute = (int(x) for x in target_time.split(":"))
+        mask = (df.index.hour == hour) & (df.index.minute == minute)
+        daily_at_target = df.loc[mask, "Close"].copy()
+
+        if daily_at_target.empty:
+            warnings.warn(
+                f"No bars at {target_time} found for {ticker}. "
+                f"ae_input will be unavailable."
+            )
+            return 0
+
+        # One price per day — take the first if duplicates exist
+        daily_at_target.index = daily_at_target.index.date
+        daily_at_target = daily_at_target.groupby(level=0).first()
+        daily_at_target = daily_at_target.sort_index()
+
+        # 10AM(T-1) -> 10AM(T) return — no shift needed for 10AM-forward prediction
+        ret_1d = daily_at_target.pct_change()
+        abs_ret_1d = ret_1d.abs()
+        log_rets = np.log1p(ret_1d)
+        cum_5d = log_rets.rolling(5).sum().apply(np.expm1)
+
+        features = pd.DataFrame({
+            "return_1d": ret_1d,
+            "abs_return_1d": abs_ret_1d,
+            "cumulative_5d_return": cum_5d,
+        }, index=daily_at_target.index)
+
+        # Scale returns to basis points for numerical stability
+        features["return_1d"] = (features["return_1d"] * 100.0).clip(-20, 20)
+        features["abs_return_1d"] = (features["abs_return_1d"] * 100.0).clip(0, 20)
+        features["cumulative_5d_return"] = (
+            features["cumulative_5d_return"] * 100.0
+        ).clip(-50, 50)
+
+        features = features.fillna(0.0).astype(np.float32)
+
+        returns_dict: Dict[date, np.ndarray] = {}
+        for d, row in features.iterrows():
+            returns_dict[d] = row.values
+
+        self._daily_returns[ticker] = returns_dict
+        return len(returns_dict)
 
     # ----- File Loading -----
 
@@ -1189,6 +1279,7 @@ class TFTAlignedPrepLayer:
         seq_len: int,
         target: Union[int, float, np.ndarray],
         prediction_date: Optional[date] = None,
+        ae_input: Optional[np.ndarray] = None,
     ) -> TFTAlignedSample:
         """Build a single TFTAlignedSample from pre-computed market data."""
         if ticker not in self.ticker_registry:
@@ -1231,6 +1322,7 @@ class TFTAlignedPrepLayer:
             days_until_event=evt["days_until_event"],
             event_mask=evt["event_mask"],
             target=target,
+            ae_input=ae_input,
             ticker=ticker,
             prediction_date=ref_date,
         )
@@ -1270,6 +1362,8 @@ class TFTAlignedPrepLayer:
             seq_dict = self._seq[ticker]
             seq_lens_dict = self._seq_lens[ticker]
             target_dict = self._targets[ticker]
+            returns_dict = self._daily_returns.get(ticker, {})
+            has_returns = bool(returns_dict)
 
             for idx in range(W - 1, len(avail_dates)):
                 pred_date = avail_dates[idx]
@@ -1303,6 +1397,18 @@ class TFTAlignedPrepLayer:
                 if target is None:
                     continue
 
+                # Build ae_input from daily returns (if available)
+                ae_input = None
+                if has_returns:
+                    # Determine feature dim from first available entry
+                    f_ae = next(iter(returns_dict.values())).shape[0]
+                    ae_rows = []
+                    for d in window_dates:
+                        ae_rows.append(
+                            returns_dict.get(d, np.zeros(f_ae, dtype=np.float32))
+                        )
+                    ae_input = np.stack(ae_rows)  # (W, f_ae)
+
                 sample = self.prepare_sample(
                     ticker=ticker,
                     window_dates=window_dates,
@@ -1313,6 +1419,7 @@ class TFTAlignedPrepLayer:
                     seq_len=seq_len,
                     target=target,
                     prediction_date=pred_date,
+                    ae_input=ae_input,
                 )
                 samples.append(sample)
 
@@ -1414,6 +1521,8 @@ class TFTAlignedPrepLayer:
         custom_ticker_table: Optional[Dict[str, Dict[str, str]]] = None,
         summary_config: Optional[SummarySelectionConfig] = None,
         target_transform: Optional[Callable[[pd.Series], pd.Series]] = None,
+        intraday_file: Optional[str] = None,
+        intraday_target_time: str = "10:00",
         **kwargs,
     ) -> "TFTAlignedPrepLayer":
         """Convenience constructor that loads all tickers from a root directory.
@@ -1427,6 +1536,7 @@ class TFTAlignedPrepLayer:
                     rasterized.npz
                     vpin.parquet
                     target.csv
+                    intraday.csv  (optional, for VAE daily returns)
                 ES/
                     ...
 
@@ -1516,6 +1626,16 @@ class TFTAlignedPrepLayer:
                 continue
             n = prep.load_ticker_from_files(ticker, ticker_dir)
             print(f"  [{ticker}] Loaded {n} valid dates")
+
+            # Load intraday data for VAE daily returns (if requested)
+            if intraday_file is not None:
+                intraday_path = ticker_dir / intraday_file
+                n_ret = prep.compute_daily_returns_from_intraday(
+                    ticker, intraday_path, target_time=intraday_target_time,
+                )
+                if n_ret > 0:
+                    print(f"  [{ticker}] Computed {n_ret} daily returns "
+                          f"(target_time={intraday_target_time})")
 
         # Align summary schemas across tickers if config provided
         if summary_config is not None and len(prep._summary) > 1:
