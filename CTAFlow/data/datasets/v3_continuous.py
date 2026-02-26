@@ -458,19 +458,24 @@ class V3ContinuousPrep:
             print(f"  Spatial shapes: profile={obj._profile_shape}, raster={obj._raster_shape}")
         return obj
 
-    def get_dims(self) -> Dict[str, int]:
+    def get_dims(self) -> Dict:
         """Return feature dimensions for model construction."""
         f_seq = 0
         for vpin_df in self._seq_vpin.values():
             if len(vpin_df.columns) > 0:
                 f_seq = len(vpin_df.columns)
                 break
+        p = self.profile_shape   # e.g. (4, 96)
+        r = self.raster_shape    # e.g. (12, 4, 128)
         return {
             "f_tech": len(self._tech_feature_cols),
             "f_seq": f_seq,
-            "f_ae": 4,  # [ret_1d, ret_5d, ret_21d, rv_1d]
-            "profile_shape": self.profile_shape,
-            "raster_shape": self.raster_shape,
+            "f_ae": 4,
+            # Spatial — unpacked for direct use in model constructor
+            "numbars_channels": p[0] if len(p) == 2 else 4,
+            "vpin_time": r[0],
+            "vpin_channels": r[1],
+            "vpin_bins": r[2],
         }
 
     def build_samples(
