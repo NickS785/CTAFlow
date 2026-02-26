@@ -27,6 +27,7 @@ from CTAFlow.models.prep.intraday_continuous import (
     SessionSpec,
 )
 from CTAFlow.data.datasets.tft import build_ticker_registry
+from CTAFlow.data.raw_formatting.intraday_manager import read_exported_df
 
 # ---------------------------------------------------------------------------
 # NPZ helpers (mirror tft_aligned.py pattern)
@@ -225,9 +226,7 @@ class V3ContinuousPrep:
 
         # 1. Intraday tech features
         intra_path = root / intraday_file
-        raw_df = pd.read_csv(str(intra_path), parse_dates=True, index_col=0)
-        if not isinstance(raw_df.index, pd.DatetimeIndex):
-            raw_df.index = pd.to_datetime(raw_df.index)
+        raw_df = read_exported_df(str(intra_path))
 
         df_out, train_mask, target_cols = self.prep.prepare(
             raw_df,
