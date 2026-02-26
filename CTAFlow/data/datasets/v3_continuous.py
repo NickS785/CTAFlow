@@ -770,24 +770,15 @@ class V3ContinuousDataset(Dataset):
         tech = torch.tensor(s["tech_features"], dtype=torch.float32)
         tech_len = torch.tensor(s["tech_len"], dtype=torch.long)
 
-        # --- Profile (NumberBars) ---
-        # NumberBarEncoder expects (T, bins, C).
-        # Stored as (C, bins) → transpose to (bins, C), unsqueeze T=1.
+        # Spatial — use zeros if missing for a given day
         if s["numbars_recent"] is not None:
-            raw_nb = np.asarray(s["numbars_recent"], dtype=np.float32)
-            if raw_nb.ndim == 2:
-                # (C, bins) → (1, bins, C)
-                raw_nb = raw_nb.T[np.newaxis, ...]
-            nb = torch.tensor(raw_nb, dtype=torch.float32)
-        else:
-            # Zero-fill: (1, bins, C)
-            nb = torch.zeros(
-                (1, self.profile_shape[1], self.profile_shape[0]),
+            nb = torch.tensor(
+                np.asarray(s["numbars_recent"], dtype=np.float32),
                 dtype=torch.float32,
             )
+        else:
+            nb = torch.zeros(self.profile_shape, dtype=torch.float32)
 
-        # --- Rasterized VPIN ---
-        # VPINRasterEncoder expects (T, C, bins) — matches stored format.
         if s["vpin_raster_recent"] is not None:
             vr = torch.tensor(
                 np.asarray(s["vpin_raster_recent"], dtype=np.float32),

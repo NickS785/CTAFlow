@@ -520,8 +520,152 @@ class MMTFv3MambaVQVAE(MMTFv3Core):
 
 
 # ============================================================================
+# Stateful Position Layer
+# ============================================================================
+
+class TickerPositionStateLayer(nn.Module):
+    """Online ticker-level position state and fusion layer."""
+
+    def __init__(
+        self,
+        n_tickers: int,
+        hidden_dim: int = 16,
+        momentum: float = 0.9,
+    ):
+        super().__init__()
+        if n_tickers <= 0:
+            raise ValueError(f"n_tickers must be > 0, got {n_tickers}")
+        if not (0.0 <= momentum < 1.0):
+            raise ValueError(f"momentum must be in [0, 1), got {momentum}")
+
+        self.n_tickers = n_tickers
+        self.momentum = momentum
+        self.fuser = nn.Sequential(
+            nn.Linear(2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.register_buffer("position_state", torch.zeros(n_tickers, 1))
+
+    @torch.no_grad()
+    def reset(self, value: float = 0.0) -> None:
+        self.position_state.fill_(value)
+
+    @torch.no_grad()
+    def _update_state(
+        self,
+        ticker_id: torch.Tensor,
+        next_position: torch.Tensor,
+    ) -> None:
+        ticker_flat = ticker_id.view(-1).long()
+        next_pos = next_position.detach().view(-1, 1)
+
+        for tid in ticker_flat.unique(sorted=False):
+            mask = ticker_flat == tid
+            mean_pos = next_pos[mask].mean(dim=0)
+            idx = int(tid.item())
+            prev = self.position_state[idx]
+            self.position_state[idx] = self.momentum * prev + (1.0 - self.momentum) * mean_pos
+
+    def forward(
+        self,
+        base_position: torch.Tensor,
+        ticker_id: torch.Tensor,
+        update_state: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ticker_flat = ticker_id.view(-1).long()
+        prev_state = self.position_state.index_select(0, ticker_flat).to(base_position.dtype)
+
+        fused = torch.cat([base_position, prev_state], dim=-1)
+        state_delta = self.fuser(fused)
+        position = torch.tanh(base_position + state_delta)
+
+        if update_state:
+            self._update_state(ticker_flat, position)
+
+        return position, prev_state, state_delta
+
+
+class StatefulMMTFv3Core(nn.Module):
+    """MMTFv3Core wrapped with a ticker-aware online position state layer."""
+
+    def __init__(
+        self,
+        base_model: MMTFv3Core,
+        n_tickers: int,
+        state_hidden_dim: int = 16,
+        state_momentum: float = 0.9,
+        update_on_eval: bool = True,
+    ):
+        super().__init__()
+        self.base_model = base_model
+        self.recon_weight = base_model.recon_weight
+        self.update_on_eval = update_on_eval
+        self.state_layer = TickerPositionStateLayer(
+            n_tickers=n_tickers,
+            hidden_dim=state_hidden_dim,
+            momentum=state_momentum,
+        )
+        self._last_tracker: Dict[str, object] = {}
+
+    @torch.no_grad()
+    def reset_position_state(self, value: float = 0.0) -> None:
+        self.state_layer.reset(value=value)
+
+    def forward(
+        self,
+        return_tracker: bool = False,
+        return_ae_losses: bool = True,
+        **inputs,
+    ):
+        base_out = self.base_model(
+            **inputs,
+            return_tracker=return_tracker,
+            return_ae_losses=True,
+        )
+
+        if return_tracker:
+            base_position, ae_losses, tracker = base_out
+        else:
+            base_position, ae_losses = base_out
+            tracker = {}
+
+        should_update_state = self.training or self.update_on_eval
+        position, prev_state, state_delta = self.state_layer(
+            base_position=base_position,
+            ticker_id=inputs["ticker_id"],
+            update_state=should_update_state,
+        )
+
+        tracker = dict(tracker)
+        tracker.update(
+            {
+                "avg_prev_state": prev_state.detach().mean().item(),
+                "avg_state_delta": state_delta.detach().mean().item(),
+                "avg_stateful_position": position.detach().mean().item(),
+                "avg_abs_stateful_position": position.detach().abs().mean().item(),
+            }
+        )
+        self._last_tracker = tracker
+
+        outputs = [position]
+        if return_ae_losses:
+            outputs.append(ae_losses)
+        if return_tracker:
+            outputs.append(tracker)
+        return outputs[0] if len(outputs) == 1 else tuple(outputs)
+
+    def get_last_tracker(self) -> Dict[str, object]:
+        return dict(self._last_tracker)
+
+
+# ============================================================================
 # Training Helpers
 # ============================================================================
+
+def _maybe_reset_position_state(model) -> None:
+    if hasattr(model, "reset_position_state") and callable(model.reset_position_state):
+        model.reset_position_state()
 
 def train_epoch_v3(
     model: MMTFv3Core,
@@ -534,6 +678,53 @@ def train_epoch_v3(
 ) -> Tuple[float, Dict[str, float]]:
     """Train one epoch with continuous trading loss + AE reconstruction."""
     model.train()
+    total_loss = 0.0
+    metric_accum: Dict[str, float] = {}
+    n_batches = 0
+
+    for batch in loader:
+        inputs, targets = unpack_fn(batch, device=device)
+        targets = targets.float()
+
+        optimizer.zero_grad()
+        position, ae_losses = model(**inputs, return_ae_losses=True)
+
+        trading_loss, metrics = loss_fn(position, targets)
+        ae_loss = model.recon_weight * ae_losses["total_ae_loss"]
+        loss = trading_loss + ae_loss
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            continue
+
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+        optimizer.step()
+
+        total_loss += loss.item()
+        for k, v in metrics.items():
+            metric_accum[k] = metric_accum.get(k, 0.0) + v
+        metric_accum["ae_recon"] = metric_accum.get("ae_recon", 0.0) + ae_losses["recon_loss"].item()
+        if "kl_loss" in ae_losses:
+            metric_accum["ae_kl"] = metric_accum.get("ae_kl", 0.0) + ae_losses["kl_loss"].item()
+        n_batches += 1
+
+    n = max(n_batches, 1)
+    return total_loss / n, {k: v / n for k, v in metric_accum.items()}
+
+
+def train_epoch_v3_stateful(
+    model: nn.Module,
+    loader,
+    loss_fn: ContinuousTradingLoss,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    max_norm: float = 1.0,
+    unpack_fn=None,
+) -> Tuple[float, Dict[str, float]]:
+    """Train one epoch with online ticker state updates."""
+    model.train()
+    _maybe_reset_position_state(model)
+
     total_loss = 0.0
     metric_accum: Dict[str, float] = {}
     n_batches = 0
@@ -623,6 +814,62 @@ def evaluate_v3(
     }
 
 
+@torch.no_grad()
+def evaluate_v3_stateful(
+    model: nn.Module,
+    loader,
+    loss_fn: ContinuousTradingLoss,
+    device: torch.device,
+    unpack_fn=None,
+) -> Dict[str, float]:
+    """Evaluate with state reset and online stateful inference."""
+    model.eval()
+    _maybe_reset_position_state(model)
+    all_positions, all_returns = [], []
+    total_loss = 0.0
+    n_batches = 0
+
+    for batch in loader:
+        inputs, targets = unpack_fn(batch, device=device)
+        targets = targets.float()
+        position, ae_losses = model(**inputs, return_ae_losses=True)
+        trading_loss, _ = loss_fn(position, targets)
+        total_loss += (trading_loss + model.recon_weight * ae_losses["total_ae_loss"]).item()
+        n_batches += 1
+        all_positions.append(position.detach().view(-1).cpu())
+        all_returns.append(targets.detach().view(-1).cpu())
+
+    positions = torch.cat(all_positions)
+    returns = torch.cat(all_returns)
+    strategy_ret = positions * returns
+
+    n = max(n_batches, 1)
+    mean_ret = strategy_ret.mean().item()
+    std_ret = strategy_ret.std().item() + 1e-8
+
+    gross_profit = strategy_ret[strategy_ret > 0].sum().item()
+    gross_loss = strategy_ret[strategy_ret < 0].abs().sum().item() + 1e-8
+    cum_ret = strategy_ret.cumsum(dim=0)
+
+    correct_dir = ((positions > 0) & (returns > 0)) | ((positions < 0) & (returns < 0))
+    non_flat = positions.abs() > 0.05
+    dir_acc = (correct_dir & non_flat).float().sum().item() / max(non_flat.float().sum().item(), 1)
+
+    return {
+        "loss": total_loss / n,
+        "sharpe": mean_ret / std_ret,
+        "sortino": mean_ret / (strategy_ret.clamp(max=0.0).pow(2).mean().sqrt().item() + 1e-8),
+        "mean_strategy_ret": mean_ret,
+        "win_rate": (strategy_ret > 0).float().mean().item() * 100.0,
+        "dir_accuracy": dir_acc * 100.0,
+        "profit_factor": gross_profit / gross_loss,
+        "max_drawdown": (cum_ret.cummax(dim=0)[0] - cum_ret).max().item(),
+        "avg_exposure": positions.abs().mean().item(),
+        "avg_position": positions.mean().item(),
+        "n_samples": len(positions),
+    }
+
+
 def print_v3_diagnostics(tracker: dict, eval_metrics: dict, epoch: int = 0) -> None:
     """Pretty-print backbone, branch, spatial, regime, and trading diagnostics."""
     print(f"\n{'='*60}")
@@ -668,6 +915,5 @@ def print_v3_diagnostics(tracker: dict, eval_metrics: dict, epoch: int = 0) -> N
             fmt = f"{val:.4f}" if abs(val) < 10 else f"{val:.1f}"
             print(f"    {key:<22s}: {fmt}")
     print()
-
 
 
