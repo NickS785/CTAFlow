@@ -24,6 +24,12 @@ from ..market_context_models import (
 )
 from ..macro_event_encoding import MacroEventEncoder, N_EVENT_TYPES
 
+try:
+    from mamba_ssm import Mamba as MambaBlock
+    _HAS_MAMBA = True
+except ImportError:
+    _HAS_MAMBA = False
+
 
 # ============================================================================
 # Static Covariate Encoder (TFT Section 4.3)
@@ -381,3 +387,183 @@ class MacroPastObservedEncoder(nn.Module):
         z_macro_context = (z_macro_days * weights).sum(dim=1)
 
         return z_macro_days, z_macro_context
+
+
+# ============================================================================
+# MMTF v3 Backbones + Spatial Encoders
+# ============================================================================
+
+class TransformerTemporalBackbone(nn.Module):
+    """Pre-norm Transformer encoder for temporal fusion."""
+
+    def __init__(
+        self,
+        d_model: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        d_ff: int = 512,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_ff,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.out_norm = nn.LayerNorm(d_model)
+        self.pool_gate = nn.Linear(d_model, 1)
+        self.last_tracker: Dict[str, object] = {}
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        fused_seq = self.out_norm(self.encoder(x))
+        gate_logits = self.pool_gate(fused_seq).squeeze(-1)
+        gate_weights = F.softmax(gate_logits, dim=-1)
+        fused_token = torch.einsum("bl,bld->bd", gate_weights, fused_seq)
+        self.last_tracker = {
+            "pool_weights_entropy": (
+                -(gate_weights * (gate_weights + 1e-8).log()).sum(dim=-1).mean().item()
+            ),
+        }
+        return fused_seq, fused_token
+
+
+class MambaTemporalBackbone(nn.Module):
+    """Mamba SSM backbone with GRU fallback."""
+
+    def __init__(
+        self,
+        d_model: int = 128,
+        n_layers: int = 2,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.use_mamba = _HAS_MAMBA
+        if self.use_mamba:
+            self.layers = nn.ModuleList()
+            self.norms = nn.ModuleList()
+            self.dropouts = nn.ModuleList()
+            for _ in range(n_layers):
+                self.layers.append(
+                    MambaBlock(
+                        d_model=d_model,
+                        d_state=d_state,
+                        d_conv=d_conv,
+                        expand=expand,
+                    )
+                )
+                self.norms.append(nn.LayerNorm(d_model))
+                self.dropouts.append(nn.Dropout(dropout))
+        else:
+            self.gru = nn.GRU(
+                input_size=d_model,
+                hidden_size=d_model,
+                num_layers=n_layers,
+                batch_first=True,
+                dropout=dropout if n_layers > 1 else 0.0,
+            )
+            self.out_proj = nn.Linear(d_model, d_model)
+
+        self.out_norm = nn.LayerNorm(d_model)
+        self.last_tracker: Dict[str, object] = {}
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.use_mamba:
+            out = x
+            for layer, norm, drop in zip(self.layers, self.norms, self.dropouts):
+                residual = out
+                out = norm(out)
+                out = layer(out)
+                out = drop(out) + residual
+            fused_seq = self.out_norm(out)
+        else:
+            gru_out, _ = self.gru(x)
+            fused_seq = self.out_norm(self.out_proj(gru_out))
+
+        fused_token = fused_seq[:, -1, :]
+        self.last_tracker = {"backbone_type": "mamba" if self.use_mamba else "gru_fallback"}
+        return fused_seq, fused_token
+
+
+class NumberBarEncoder(nn.Module):
+    """Encode number bars (B, T, bins, C) to (B, d_model).
+
+    Works with any T >= 1.  When profile data has no time dimension
+    (single day), pass T=1 by unsqueezing.  Padding on the T axis
+    ensures Conv2d kernels never exceed the spatial extent.
+    """
+
+    def __init__(self, in_channels: int = 4, d_model: int = 128):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=(2, 5), padding=(1, 2)),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.Conv2d(32, 64, kernel_size=(2, 5), padding=(1, 2)),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+            nn.Conv2d(64, d_model, kernel_size=(1, 3), padding=(0, 1)),
+            nn.BatchNorm2d(d_model),
+            nn.GELU(),
+        )
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.out_norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, bins, C) → (B, C, T, bins)
+        x = x.permute(0, 3, 1, 2)
+        x = self.conv(x)
+        x = self.pool(x).flatten(1)
+        return self.out_norm(self.out_proj(x))
+
+
+class VPINRasterEncoder(nn.Module):
+    """Encode single-day VPIN raster (B, T, C, bins) to (B, d_model)."""
+
+    def __init__(
+        self,
+        in_channels: int = 4,
+        n_bins: int = 64,
+        n_time: int = 24,
+        d_model: int = 128,
+        n_heads: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        d_spatial = 64
+        self.spatial_conv = nn.Sequential(
+            nn.Conv1d(in_channels, 32, kernel_size=5, padding=2),
+            nn.BatchNorm1d(32),
+            nn.GELU(),
+            nn.Conv1d(32, d_spatial, kernel_size=3, padding=1),
+            nn.BatchNorm1d(d_spatial),
+            nn.GELU(),
+            nn.AdaptiveAvgPool1d(1),
+        )
+        self.time_proj = nn.Linear(d_spatial, d_model)
+        self.time_pos = nn.Parameter(torch.randn(1, n_time, d_model) * 0.02)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_model * 2,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.temporal_encoder = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        self.out_norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bsz, n_time, n_channels, n_bins = x.shape
+        flat = x.reshape(bsz * n_time, n_channels, n_bins)
+        z_sp = self.spatial_conv(flat).squeeze(-1).view(bsz, n_time, -1)
+        z = self.time_proj(z_sp) + self.time_pos[:, :n_time]
+        z = self.temporal_encoder(z)
+        return self.out_norm(z.mean(dim=1))

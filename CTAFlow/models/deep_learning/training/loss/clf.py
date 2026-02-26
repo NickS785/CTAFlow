@@ -10,11 +10,15 @@ These losses extend standard cross-entropy with:
 
 Classes are typically ordinal: 0=down/short, 1=flat/neutral, 2=up/long
 """
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Literal, List
+from typing import Optional, Literal, List, Tuple, Dict
+
+from torch import nn as nn
+from torch.nn import functional as F
 
 
 class DistanceWeightedCE(nn.Module):
@@ -787,3 +791,114 @@ __all__ = [
     'SharpeInspiredCE',
     'HierarchicalDirectionalLoss',
 ]
+
+
+class ContinuousTradingLoss(nn.Module):
+    """Loss for continuous position sizing with Sharpe-like optimization.
+
+    Components:
+      1. Differentiable Sharpe/Sortino (batch-level risk-adjusted return)
+      2. Directional accuracy (per-sample, stable early gradients)
+      3. Transaction cost / turnover penalty
+      4. Position regularization (selectivity toward target exposure)
+    """
+
+    def __init__(
+        self,
+        tc_cost: float = 0.001,
+        direction_weight: float = 0.5,
+        reg_weight: float = 0.1,
+        target_exposure: float = 0.3,
+        use_sortino: bool = False,
+        sharpe_eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.tc_cost = tc_cost
+        self.direction_weight = direction_weight
+        self.reg_weight = reg_weight
+        self.target_exposure = target_exposure
+        self.use_sortino = use_sortino
+        self.sharpe_eps = sharpe_eps
+
+    def forward(
+        self,
+        position: torch.Tensor,
+        forward_return: torch.Tensor,
+        prev_position: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        pos = position.squeeze()
+        ret = forward_return.squeeze()
+        strategy_ret = pos * ret
+
+        # 1. Risk-adjusted return
+        mean_r = strategy_ret.mean()
+        if self.use_sortino:
+            risk = strategy_ret.clamp(max=0.0).pow(2).mean().sqrt() + self.sharpe_eps
+        else:
+            risk = strategy_ret.std() + self.sharpe_eps
+        loss_sharpe = -mean_r / risk
+
+        # 2. Directional accuracy
+        pos_sign = torch.tanh(pos * 10.0)
+        ret_sign = torch.tanh(ret * 100.0)
+        loss_direction = F.smooth_l1_loss(pos_sign, ret_sign)
+
+        # 3. Transaction cost
+        if prev_position is not None:
+            turnover = (pos - prev_position.squeeze()).abs().mean()
+        else:
+            turnover = pos.abs().mean()
+        loss_tc = self.tc_cost * turnover
+
+        # 4. Position regularization
+        avg_exposure = pos.abs().mean()
+        loss_reg = self.reg_weight * (avg_exposure - self.target_exposure).pow(2)
+
+        total = loss_sharpe + self.direction_weight * loss_direction + loss_tc + loss_reg
+        metrics = {
+            "loss_sharpe": loss_sharpe.item(),
+            "loss_direction": loss_direction.item(),
+            "loss_tc": loss_tc.item(),
+            "loss_reg": loss_reg.item(),
+            "mean_strategy_ret": mean_r.item(),
+            "avg_exposure": avg_exposure.item(),
+            "sharpe_batch": (-loss_sharpe).item(),
+        }
+        return total, metrics
+
+
+class SharpeScheduler:
+    """Gradually shift emphasis from direction → Sharpe during training."""
+
+    def __init__(
+        self,
+        warmup_epochs: int = 5,
+        total_epochs: int = 30,
+        initial_direction_weight: float = 1.0,
+        final_direction_weight: float = 0.1,
+        initial_reg_weight: float = 0.5,
+        final_reg_weight: float = 0.05,
+        initial_target_exposure: float = 0.2,
+        final_target_exposure: float = 0.5,
+    ):
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.initial_dw = initial_direction_weight
+        self.final_dw = final_direction_weight
+        self.initial_rw = initial_reg_weight
+        self.final_rw = final_reg_weight
+        self.initial_te = initial_target_exposure
+        self.final_te = final_target_exposure
+
+    def step(self, epoch: int, loss_fn: ContinuousTradingLoss) -> None:
+        if epoch < self.warmup_epochs:
+            t = 0.0
+        else:
+            t = min(
+                (epoch - self.warmup_epochs)
+                / max(self.total_epochs - self.warmup_epochs, 1),
+                1.0,
+            )
+        loss_fn.direction_weight = self.initial_dw + t * (self.final_dw - self.initial_dw)
+        loss_fn.reg_weight = self.initial_rw + t * (self.final_rw - self.initial_rw)
+        loss_fn.target_exposure = self.initial_te + t * (self.final_te - self.initial_te)
