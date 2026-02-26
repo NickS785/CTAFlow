@@ -50,8 +50,14 @@ Example Usage (Multi-Ticker with Meta Modality):
     ... )
 """
 
-from .env import EndOfDayTradingEnv, MultiModalTradingEnv, MultiTickerTradingEnv
-from .features_extractor import WSPRExtractor, WSPRExtractorV2, FiLMLayer
+from .env import (
+    EndOfDayTradingEnv,
+    MultiModalTradingEnv,
+    MultiTickerTradingEnv,
+    V3ContinuousPPOEnv,
+    build_v3_rl_envs,
+)
+from .features_extractor import WSPRExtractor, WSPRExtractorV2, V3ContinuousExtractor, FiLMLayer
 from .policy import (
     CnnLstmExtractor,
     MultiInputLstmExtractor,
@@ -68,9 +74,12 @@ __all__ = [
     'EndOfDayTradingEnv',
     'MultiModalTradingEnv',
     'MultiTickerTradingEnv',
+    'V3ContinuousPPOEnv',
+    'build_v3_rl_envs',
     # Feature Extractors
     'WSPRExtractor',
     'WSPRExtractorV2',
+    'V3ContinuousExtractor',
     'FiLMLayer',
     'CnnLstmExtractor',
     'MultiInputLstmExtractor',

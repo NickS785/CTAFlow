@@ -11,6 +11,7 @@ from ..encoders import (
     SpatialFuse,
     MetaModalityEncoder,
 )
+from ..multi_branch.tft.tft_encoders import NumberBarEncoder, VPINRasterEncoder
 
 
 class WSPRExtractor(BaseFeaturesExtractor):
@@ -464,3 +465,151 @@ class WSPRExtractorV2(BaseFeaturesExtractor):
         }
         _, z_meta_window = self.meta_enc(meta_dict, W=W)
         return z_meta_window
+
+
+class V3ContinuousExtractor(BaseFeaturesExtractor):
+    """SB3 extractor for V3ContinuousPPOEnv observations."""
+
+    def __init__(
+        self,
+        observation_space: gym.spaces.Dict,
+        d_model: int = 128,
+        tech_hidden: int = 128,
+        id_emb_dim: int = 16,
+        n_heads: int = 4,
+        dropout: float = 0.1,
+    ):
+        tech_shape = observation_space["tech_window"].shape       # (L_tech, f_tech)
+        nb_shape = observation_space["numbars_recent"].shape      # (T_nb, bins, C)
+        vr_shape = observation_space["vpin_raster_recent"].shape  # (T_vpin, C, bins)
+        seq_shape = observation_space["seq_vpin"].shape           # (max_seq_len, f_seq)
+        ae_shape = observation_space["ae_input"].shape            # (ae_window, f_ae)
+
+        f_tech = int(tech_shape[-1])
+        nb_channels = int(nb_shape[-1])
+        vr_time = int(vr_shape[0])
+        vr_channels = int(vr_shape[1])
+        vr_bins = int(vr_shape[2])
+        f_seq = int(seq_shape[-1])
+        f_ae = int(ae_shape[-1])
+
+        # tech + numbars + raster + spatial + seq + ae + id embeddings
+        features_dim = tech_hidden + (d_model * 5) + (id_emb_dim * 3)
+        super().__init__(observation_space, features_dim)
+
+        self.tech_proj = nn.Sequential(
+            nn.Linear(f_tech, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+        )
+        self.tech_gru = nn.GRU(
+            input_size=d_model,
+            hidden_size=tech_hidden,
+            batch_first=True,
+        )
+
+        self.numbars_enc = NumberBarEncoder(
+            in_channels=nb_channels,
+            d_model=d_model,
+        )
+        self.raster_enc = VPINRasterEncoder(
+            in_channels=vr_channels,
+            n_bins=vr_bins,
+            n_time=vr_time,
+            d_model=d_model,
+            n_heads=n_heads,
+            dropout=dropout,
+        )
+        self.spatial_fuse = SpatialFuse(
+            d_spatial=d_model,
+            mode="gated",
+        )
+
+        self.seq_enc = IntradayRNN(
+            input_dim=f_seq,
+            d_model=d_model,
+            num_layers=1,
+            dropout=dropout,
+        )
+
+        self.ae_gru = nn.GRU(
+            input_size=f_ae,
+            hidden_size=d_model,
+            batch_first=True,
+        )
+
+        self.ticker_emb = nn.Embedding(max(observation_space["ticker_id"].n, 1), id_emb_dim)
+        self.class_emb = nn.Embedding(max(observation_space["asset_class_id"].n, 1), id_emb_dim)
+        self.subclass_emb = nn.Embedding(max(observation_space["asset_subclass_id"].n, 1), id_emb_dim)
+
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(features_dim)
+
+    def forward(self, observations):
+        tech = observations["tech_window"].float()        # (B, L_tech, f_tech)
+        nb = observations["numbars_recent"].float()       # (B, T_nb, bins, C)
+        vr = observations["vpin_raster_recent"].float()   # (B, T_vpin, C, bins)
+        seq = observations["seq_vpin"].float()            # (B, max_seq_len, f_seq)
+        ae = observations["ae_input"].float()             # (B, ae_window, f_ae)
+
+        seq_lens = observations.get("seq_vpin_len")
+        if seq_lens is None:
+            seq_lens = torch.full(
+                (seq.shape[0],),
+                seq.shape[1],
+                dtype=torch.long,
+                device=seq.device,
+            )
+        else:
+            if seq_lens.dim() == 2:
+                seq_lens = seq_lens.squeeze(-1)
+            seq_lens = seq_lens.long().clamp(min=1, max=seq.shape[1])
+
+        bsz, l_tech = tech.shape[0], tech.shape[1]
+        tech_flat = tech.reshape(bsz * l_tech, -1)
+        z_tech_all = self.tech_proj(tech_flat).view(bsz, l_tech, -1)
+        _, h_tech = self.tech_gru(z_tech_all)
+        z_tech = h_tech[-1]
+
+        z_nb = self.numbars_enc(nb)
+        z_vr = self.raster_enc(vr)
+        z_spatial = self.spatial_fuse(z_nb, z_vr)
+        z_seq = self.seq_enc(seq, lengths=seq_lens)
+
+        _, h_ae = self.ae_gru(ae)
+        z_ae = h_ae[-1]
+
+        def _obs_to_index(x: torch.Tensor) -> torch.Tensor:
+            # SB3 may pass Discrete observations as one-hot vectors.
+            if x.dim() == 1:
+                return x.long().view(-1)
+            if x.dim() > 2:
+                x = x.view(x.shape[0], -1)
+            if x.shape[1] == 1:
+                return x[:, 0].long()
+            return torch.argmax(x, dim=1).long()
+
+        ticker_id = _obs_to_index(observations["ticker_id"])
+        class_id = _obs_to_index(observations["asset_class_id"])
+        subclass_id = _obs_to_index(observations["asset_subclass_id"])
+        z_tid = self.ticker_emb(ticker_id)
+        z_cls = self.class_emb(class_id)
+        z_sub = self.subclass_emb(subclass_id)
+
+        features = torch.cat(
+            [
+                z_tech,
+                z_nb,
+                z_vr,
+                z_spatial,
+                z_seq,
+                z_ae,
+                z_tid,
+                z_cls,
+                z_sub,
+            ],
+            dim=1,
+        )
+        features = self.layer_norm(features)
+        features = self.dropout(features)
+        return features

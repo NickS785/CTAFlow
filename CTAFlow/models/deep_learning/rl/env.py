@@ -2,6 +2,7 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import pandas as pd
+from typing import Dict, List, Optional, Tuple
 
 
 class EndOfDayTradingEnv(gym.Env):
@@ -680,3 +681,317 @@ class MultiTickerTradingEnv(gym.Env):
                 'std_return': float(data['returns'].std()),
             }
         return stats
+
+
+class V3ContinuousPPOEnv(gym.Env):
+    """Gymnasium environment sourced from V3ContinuousPrep samples.
+
+    Observations are the V3 multi-modal payload at each bar:
+      - tech_window:        (L_tech, f_tech)
+      - numbars_recent:     (T_nb, nb_bins, nb_channels)
+      - vpin_raster_recent: (T_vpin, vpin_channels, vpin_bins)
+      - seq_vpin:           (max_seq_len, f_seq)
+      - seq_vpin_len:       (1,)
+      - ae_input:           (ae_window, f_ae)
+      - ticker_id / asset ids (discrete scalars)
+
+    Action space:
+      - Discrete(3): 0=Short (-1), 1=Flat (0), 2=Long (+1)
+
+    Reward:
+      reward_t = (prev_position_ticker * forward_return_t - tc_cost * |delta_position_ticker|) * reward_scale
+
+    Position state is tracked independently per ticker.
+    """
+
+    def __init__(
+        self,
+        samples: List[Dict],
+        max_seq_len: int = 24,
+        transaction_cost_bps: float = 1.0,
+        reward_scale: float = 100.0,
+        numbars_channels: int = 4,
+        vpin_channels: int = 4,
+        max_episode_steps: Optional[int] = None,
+        random_start: bool = False,
+    ):
+        super().__init__()
+        if not samples:
+            raise ValueError("V3ContinuousPPOEnv requires non-empty samples.")
+
+        self.samples = samples
+        self.max_seq_len = int(max_seq_len)
+        self.transaction_cost = float(transaction_cost_bps) / 10000.0
+        self.reward_scale = float(reward_scale)
+        self.numbars_channels = int(max(1, numbars_channels))
+        self.vpin_channels = int(max(1, vpin_channels))
+        self.max_episode_steps = max_episode_steps
+        self.random_start = random_start
+
+        self._processed = [self._process_sample(s) for s in self.samples]
+        self._n_steps = len(self._processed)
+
+        # Infer dimensions from first sample
+        first = self._processed[0]
+        self._tech_shape = first["tech_window"].shape
+        self._nb_shape = first["numbars_recent"].shape
+        self._vr_shape = first["vpin_raster_recent"].shape
+        self._seq_shape = first["seq_vpin"].shape
+        self._ae_shape = first["ae_input"].shape
+
+        self.max_ticker_id = max(int(p["ticker_id"]) for p in self._processed) + 1
+        self.max_class_id = max(int(p["asset_class_id"]) for p in self._processed) + 1
+        self.max_subclass_id = max(int(p["asset_subclass_id"]) for p in self._processed) + 1
+
+        self.observation_space = spaces.Dict({
+            "tech_window": spaces.Box(-np.inf, np.inf, shape=self._tech_shape, dtype=np.float32),
+            "numbars_recent": spaces.Box(-np.inf, np.inf, shape=self._nb_shape, dtype=np.float32),
+            "vpin_raster_recent": spaces.Box(-np.inf, np.inf, shape=self._vr_shape, dtype=np.float32),
+            "seq_vpin": spaces.Box(-np.inf, np.inf, shape=self._seq_shape, dtype=np.float32),
+            "seq_vpin_len": spaces.Box(0, self.max_seq_len, shape=(1,), dtype=np.int32),
+            "ae_input": spaces.Box(-np.inf, np.inf, shape=self._ae_shape, dtype=np.float32),
+            "ticker_id": spaces.Discrete(max(self.max_ticker_id, 1)),
+            "asset_class_id": spaces.Discrete(max(self.max_class_id, 1)),
+            "asset_subclass_id": spaces.Discrete(max(self.max_subclass_id, 1)),
+        })
+
+        self.action_space = spaces.Discrete(3)
+
+        self._idx = 0
+        self._episode_steps = 0
+        self._position_by_ticker = np.zeros(self.max_ticker_id, dtype=np.float32)
+
+    def _normalize_numbars(self, arr: np.ndarray) -> np.ndarray:
+        x = np.asarray(arr, dtype=np.float32)
+        c = self.numbars_channels
+
+        if x.ndim == 2:
+            if x.shape[-1] == c:       # (bins, C)
+                x = x[None, :, :]      # (1, bins, C)
+            elif x.shape[0] == c:      # (C, bins)
+                x = x.T[None, :, :]    # (1, bins, C)
+            else:
+                raise ValueError(f"Unsupported numbars 2D shape={x.shape} with channels={c}")
+        elif x.ndim == 3:
+            if x.shape[-1] == c:       # (T, bins, C)
+                pass
+            elif x.shape[1] == c:      # (T, C, bins)
+                x = np.transpose(x, (0, 2, 1))
+            elif x.shape[0] == c:      # (C, T, bins)
+                x = np.transpose(x, (1, 2, 0))
+            else:
+                raise ValueError(f"Unsupported numbars 3D shape={x.shape} with channels={c}")
+        else:
+            raise ValueError(f"numbars_recent must be 2D/3D, got shape={x.shape}")
+
+        return x.astype(np.float32, copy=False)
+
+    def _normalize_raster(self, arr: np.ndarray) -> np.ndarray:
+        x = np.asarray(arr, dtype=np.float32)
+        c = self.vpin_channels
+
+        if x.ndim == 2:
+            if x.shape[0] == c:          # (C, bins)
+                x = x[None, :, :]        # (1, C, bins)
+            elif x.shape[-1] == c:       # (bins, C)
+                x = np.transpose(x, (1, 0))[None, :, :]  # (1, C, bins)
+            else:
+                raise ValueError(f"Unsupported raster 2D shape={x.shape} with channels={c}")
+        elif x.ndim == 3:
+            if x.shape[1] == c:          # (T, C, bins)
+                pass
+            elif x.shape[-1] == c:       # (T, bins, C)
+                x = np.transpose(x, (0, 2, 1))
+            elif x.shape[0] == c:        # (C, T, bins)
+                x = np.transpose(x, (1, 0, 2))
+            else:
+                raise ValueError(f"Unsupported raster 3D shape={x.shape} with channels={c}")
+        else:
+            raise ValueError(f"vpin_raster_recent must be 2D/3D, got shape={x.shape}")
+
+        return x.astype(np.float32, copy=False)
+
+    def _process_sample(self, sample: Dict) -> Dict:
+        tech = np.asarray(sample["tech_features"], dtype=np.float32)
+        nb = self._normalize_numbars(np.asarray(sample["numbars_recent"], dtype=np.float32))
+        vr = self._normalize_raster(np.asarray(sample["vpin_raster_recent"], dtype=np.float32))
+        ae = np.asarray(sample["ae_input"], dtype=np.float32)
+
+        seq_raw = np.asarray(sample["seq_vpin"], dtype=np.float32)
+        if seq_raw.ndim == 1:
+            seq_raw = seq_raw[:, None]
+
+        f_seq = int(seq_raw.shape[1]) if seq_raw.size > 0 else 1
+        seq = np.zeros((self.max_seq_len, f_seq), dtype=np.float32)
+        seq_len = int(min(len(seq_raw), self.max_seq_len))
+        if seq_len > 0:
+            seq[:seq_len, :] = seq_raw[:seq_len, :]
+
+        return {
+            "tech_window": tech,
+            "numbars_recent": nb,
+            "vpin_raster_recent": vr,
+            "seq_vpin": seq,
+            "seq_vpin_len": np.array([seq_len], dtype=np.int32),
+            "ae_input": ae,
+            "ticker_id": np.array(int(sample["ticker_id"]), dtype=np.int64),
+            "asset_class_id": np.array(int(sample["asset_class_id"]), dtype=np.int64),
+            "asset_subclass_id": np.array(int(sample["asset_subclass_id"]), dtype=np.int64),
+            "target": float(sample["target"]),
+            "ticker": sample.get("ticker"),
+            "date": sample.get("date"),
+        }
+
+    def _get_obs(self, idx: int) -> Dict[str, np.ndarray]:
+        x = self._processed[idx]
+        return {
+            "tech_window": x["tech_window"],
+            "numbars_recent": x["numbars_recent"],
+            "vpin_raster_recent": x["vpin_raster_recent"],
+            "seq_vpin": x["seq_vpin"],
+            "seq_vpin_len": x["seq_vpin_len"],
+            "ae_input": x["ae_input"],
+            "ticker_id": x["ticker_id"],
+            "asset_class_id": x["asset_class_id"],
+            "asset_subclass_id": x["asset_subclass_id"],
+        }
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+
+        if self.random_start and self._n_steps > 2:
+            self._idx = int(self.np_random.integers(0, self._n_steps - 2))
+        else:
+            self._idx = 0
+
+        self._episode_steps = 0
+        self._position_by_ticker.fill(0.0)
+
+        obs = self._get_obs(self._idx)
+        info = {"idx": self._idx, "date": self._processed[self._idx].get("date")}
+        return obs, info
+
+    def step(self, action: int):
+        action = int(action)
+        target_pos = float(action - 1)  # 0->-1, 1->0, 2->+1
+
+        cur = self._processed[self._idx]
+        tid = int(cur["ticker_id"])
+        prev_pos = float(self._position_by_ticker[tid])
+        step_return = float(cur["target"])
+
+        gross_pnl = prev_pos * step_return
+        delta = abs(target_pos - prev_pos)
+        cost = delta * self.transaction_cost
+        reward = (gross_pnl - cost) * self.reward_scale
+
+        # Update ticker-specific position state after reward realization.
+        self._position_by_ticker[tid] = target_pos
+
+        self._idx += 1
+        self._episode_steps += 1
+
+        terminated = self._idx >= self._n_steps - 1
+        truncated = False
+        if self.max_episode_steps is not None and self._episode_steps >= self.max_episode_steps:
+            truncated = True
+
+        next_idx = min(self._idx, self._n_steps - 1)
+        obs = self._get_obs(next_idx)
+
+        info = {
+            "idx": next_idx,
+            "ticker": cur.get("ticker"),
+            "ticker_id": tid,
+            "date": cur.get("date"),
+            "position_prev": prev_pos,
+            "position_target": target_pos,
+            "gross_pnl": gross_pnl,
+            "cost": cost,
+            "step_return": step_return,
+            "reward_unscaled": gross_pnl - cost,
+        }
+
+        return obs, float(reward), terminated, truncated, info
+
+
+def build_v3_rl_envs(
+    prep,
+    tech_lookback: int = 64,
+    seq_lookback_bars: int = 12,
+    val_ratio: float = 0.2,
+    val_cutoff_date: Optional[str] = None,
+    sample_session: Optional[str] = None,
+    sample_session_start: Optional[str] = None,
+    sample_session_end: Optional[str] = None,
+    stride: int = 1,
+    transaction_cost_bps: float = 1.0,
+    reward_scale: float = 100.0,
+    max_episode_steps: Optional[int] = None,
+) -> Tuple[V3ContinuousPPOEnv, V3ContinuousPPOEnv, Dict[str, object]]:
+    """Build train/val V3 RL environments from V3ContinuousPrep."""
+    all_samples = prep.build_samples(
+        tech_lookback=tech_lookback,
+        seq_lookback_bars=seq_lookback_bars,
+        session_only=True,
+        sample_session=sample_session,
+        sample_session_start=sample_session_start,
+        sample_session_end=sample_session_end,
+        stride=stride,
+    )
+
+    if not all_samples:
+        raise ValueError("No V3 samples produced for RL env construction.")
+
+    all_dates = sorted(set(s["date"] for s in all_samples))
+    if val_cutoff_date is not None:
+        cutoff = pd.Timestamp(val_cutoff_date).date()
+    else:
+        n_val = max(1, int(len(all_dates) * val_ratio))
+        cutoff = all_dates[-n_val]
+
+    train_samples = [s for s in all_samples if s["date"] < cutoff]
+    val_samples = [s for s in all_samples if s["date"] >= cutoff]
+
+    if not train_samples or not val_samples:
+        raise ValueError(
+            f"Invalid split for RL envs: train={len(train_samples)}, val={len(val_samples)}, cutoff={cutoff}"
+        )
+
+    dims = prep.get_dims()
+    env_kwargs = dict(
+        max_seq_len=seq_lookback_bars,
+        transaction_cost_bps=transaction_cost_bps,
+        reward_scale=reward_scale,
+        numbars_channels=dims.get("numbars_channels", 4),
+        vpin_channels=dims.get("vpin_channels", 4),
+        max_episode_steps=max_episode_steps,
+    )
+
+    train_env = V3ContinuousPPOEnv(
+        samples=train_samples,
+        random_start=True,
+        **env_kwargs,
+    )
+    val_env = V3ContinuousPPOEnv(
+        samples=val_samples,
+        random_start=False,
+        **env_kwargs,
+    )
+
+    info = {
+        "train_samples": len(train_samples),
+        "val_samples": len(val_samples),
+        "cutoff_date": cutoff,
+        "n_unique_dates": len(all_dates),
+        "train_obs_shapes": {
+            k: tuple(v.shape) for k, v in train_env.observation_space.spaces.items()
+            if hasattr(v, "shape")
+        },
+        "n_tickers": train_env.max_ticker_id,
+        "n_asset_classes": train_env.max_class_id,
+        "n_asset_subclasses": train_env.max_subclass_id,
+        "env_kwargs": env_kwargs,
+    }
+
+    return train_env, val_env, info
