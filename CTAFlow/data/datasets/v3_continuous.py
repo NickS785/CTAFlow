@@ -73,18 +73,106 @@ def _dates_to_python(raw: np.ndarray) -> List[date]:
 
 
 # ---------------------------------------------------------------------------
+# VPIN sequential feature scaling
+# ---------------------------------------------------------------------------
+
+# Fixed scaling rules matching normalize_sequential_features pattern.
+# Target range: ~[-5, +5] for all features.
+_VPIN_SCALE_RULES: Dict[str, Tuple[str, ...]] = {
+    # (method, *args)
+    "vpin":              ("center_scale", 0.5, 10.0),    # (x - 0.5) * 10
+    "imb_frac":          ("center_scale", 0.5, 10.0),
+    "signed_imbalance":  ("multiply", 5.0),              # x * 5
+    "bucket_return":     ("multiply", 100.0),             # x * 100
+    "log_duration":      ("divide", 2.0),                 # x / 2
+    "vol":               ("log_shift", 2.5),              # log1p(x) - 2.5
+    "buy":               ("log_shift", 2.0),              # log1p(x) - 2.0
+    "sell":              ("log_shift", 2.0),
+    "imbalance":         ("log_shift", 2.0),
+    "vol_ratio":         ("center_scale", 1.0, 10.0),    # (x - 1.0) * 10
+    "buy_dom":           ("center_scale", 0.5, 10.0),
+    "sell_dom":          ("center_scale", 0.5, 10.0),
+    "max_buy_run":       ("divide", 4.0),
+    "max_sell_run":      ("divide", 4.0),
+    "bucket":            ("skip",),                        # ordinal, not useful
+}
+# Price-like columns get rolling z-score
+_VPIN_PRICE_COLS = {"close", "poc", "val", "vah", "ib_high", "ib_low", "profile_vwap"}
+
+
+def scale_vpin_features(
+    df: pd.DataFrame,
+    zscore_window: int = 252,
+    clip_val: float = 5.0,
+) -> pd.DataFrame:
+    """Scale VPIN sequential features to ~[-5, +5] range.
+
+    - Known columns get fixed transformations (matching normalize_sequential_features).
+    - Price-like columns get rolling z-score relative to close.
+    - Unknown columns get rolling z-score.
+    """
+    out = df.copy()
+
+    # Price-like columns: normalize relative to close
+    if "close" in out.columns:
+        close = out["close"].copy()
+        close_safe = close.replace(0, np.nan).ffill()
+        for col in _VPIN_PRICE_COLS:
+            if col == "close" or col not in out.columns:
+                continue
+            # (value - close) / close * 100  →  basis points
+            out[col] = ((out[col] - close_safe) / close_safe * 100.0).clip(-clip_val, clip_val)
+        # Close itself: rolling z-score of log returns
+        log_ret = np.log(close_safe).diff()
+        rm = log_ret.rolling(zscore_window, min_periods=20).mean()
+        rs = log_ret.rolling(zscore_window, min_periods=20).std().clip(lower=1e-8)
+        out["close"] = ((log_ret - rm) / rs * 2.0).clip(-clip_val, clip_val)
+
+    # Apply fixed scaling rules
+    for col, rule in _VPIN_SCALE_RULES.items():
+        if col not in out.columns:
+            continue
+        method = rule[0]
+        if method == "skip":
+            out.drop(columns=[col], inplace=True, errors="ignore")
+        elif method == "center_scale":
+            center, scale = rule[1], rule[2]
+            out[col] = ((out[col] - center) * scale).clip(-clip_val, clip_val)
+        elif method == "multiply":
+            out[col] = (out[col] * rule[1]).clip(-clip_val, clip_val)
+        elif method == "divide":
+            out[col] = (out[col] / rule[1]).clip(-clip_val, clip_val)
+        elif method == "log_shift":
+            out[col] = (np.log1p(out[col].clip(lower=0)) - rule[1]).clip(-clip_val, clip_val)
+
+    # Remaining unknown columns: rolling z-score
+    handled = set(_VPIN_SCALE_RULES.keys()) | _VPIN_PRICE_COLS
+    for col in out.columns:
+        if col in handled:
+            continue
+        rm = out[col].rolling(zscore_window, min_periods=20).mean()
+        rs = out[col].rolling(zscore_window, min_periods=20).std().clip(lower=1e-8)
+        out[col] = ((out[col] - rm) / rs * 2.0).clip(-clip_val, clip_val)
+
+    out = out.ffill().bfill().fillna(0.0)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # AE daily feature computation
 # ---------------------------------------------------------------------------
 
 def compute_ae_daily_features(
     intraday_df: pd.DataFrame,
     target_time: str = "10:00",
+    zscore_window: int = 63,
+    clip_val: float = 5.0,
     eps: float = 1e-8,
 ) -> Dict[date, np.ndarray]:
     """Compute daily AE features from intraday close prices.
 
     Returns dict[date -> np.array([ret_1d, ret_5d, ret_21d, rv_1d])].
-    All values scaled to basis points and clipped.
+    Features are rolling z-scored and clipped to [-clip_val, clip_val].
     """
     df = intraday_df.copy()
     if not isinstance(df.index, pd.DatetimeIndex):
@@ -107,7 +195,6 @@ def compute_ae_daily_features(
     mask = df.index.time == tgt
     daily = close[mask].copy()
     daily.index = daily.index.normalize()
-    # Deduplicate (keep last)
     daily = daily[~daily.index.duplicated(keep="last")]
 
     if len(daily) < 22:
@@ -126,22 +213,29 @@ def compute_ae_daily_features(
     ret_5d = daily.pct_change(5)
     ret_21d = daily.pct_change(21)
 
+    # Build DataFrame for rolling z-score
+    feat_df = pd.DataFrame({
+        "ret_1d": ret_1d,
+        "ret_5d": ret_5d,
+        "ret_21d": ret_21d,
+    }, index=daily.index)
+    feat_df["rv_1d"] = daily_rv.reindex(feat_df.index)
+
+    # Rolling z-score per feature
+    for col in feat_df.columns:
+        rm = feat_df[col].rolling(zscore_window, min_periods=10).mean()
+        rs = feat_df[col].rolling(zscore_window, min_periods=10).std().clip(lower=eps)
+        feat_df[col] = ((feat_df[col] - rm) / rs).clip(-clip_val, clip_val)
+
+    feat_df = feat_df.ffill().bfill()
+
     out: Dict[date, np.ndarray] = {}
-    for dt in daily.index:
-        d = dt.date() if hasattr(dt, "date") else pd.Timestamp(dt).date()
-        r1 = ret_1d.get(dt, np.nan)
-        r5 = ret_5d.get(dt, np.nan)
-        r21 = ret_21d.get(dt, np.nan)
-        rv = daily_rv.get(dt, np.nan)
-        if any(np.isnan(x) for x in [r1, r5, r21, rv]):
+    for dt in feat_df.index:
+        row = feat_df.loc[dt]
+        if row.isna().any():
             continue
-        feat = np.array([
-            np.clip(r1 * 100.0, -20, 20),
-            np.clip(r5 * 100.0, -50, 50),
-            np.clip(r21 * 100.0, -100, 100),
-            np.clip(rv * 100.0, 0, 20),
-        ], dtype=np.float32)
-        out[d] = feat
+        d = dt.date() if hasattr(dt, "date") else pd.Timestamp(dt).date()
+        out[d] = row.values.astype(np.float32)
 
     return out
 
@@ -193,6 +287,10 @@ class V3ContinuousPrep:
         self._seq_vpin: Dict[str, pd.DataFrame] = {}
         self._ae_features: Dict[str, Dict[date, np.ndarray]] = {}
 
+        # Auto-detected spatial shapes (set after first load)
+        self._profile_shape: Optional[Tuple[int, ...]] = None
+        self._raster_shape: Optional[Tuple[int, ...]] = None
+
     @property
     def n_tickers(self) -> int:
         return len(self.tickers)
@@ -208,6 +306,14 @@ class V3ContinuousPrep:
     @property
     def f_tech(self) -> int:
         return len(self._tech_feature_cols)
+
+    @property
+    def profile_shape(self) -> Tuple[int, ...]:
+        return self._profile_shape or (4, 96)
+
+    @property
+    def raster_shape(self) -> Tuple[int, ...]:
+        return self._raster_shape or (12, 4, 128)
 
     def load_ticker(
         self,
@@ -258,6 +364,10 @@ class V3ContinuousPrep:
         prof_path = root / profile_file
         if prof_path.exists():
             self._profiles[ticker] = self._load_spatial_npz(prof_path)
+            # Auto-detect shape from first entry
+            if self._profile_shape is None and self._profiles[ticker]:
+                sample = next(iter(self._profiles[ticker].values()))
+                self._profile_shape = sample.shape
         else:
             self._profiles[ticker] = {}
 
@@ -265,22 +375,28 @@ class V3ContinuousPrep:
         rast_path = root / raster_file
         if rast_path.exists():
             self._rasters[ticker] = self._load_spatial_npz(rast_path)
+            if self._raster_shape is None and self._rasters[ticker]:
+                sample = next(iter(self._rasters[ticker].values()))
+                self._raster_shape = sample.shape
         else:
             self._rasters[ticker] = {}
 
-        # 4. Sequential VPIN
+        # 4. Sequential VPIN — load, scale, store
         vpin_path = root / vpin_file
         if vpin_path.exists():
             vpin_df = pd.read_parquet(str(vpin_path))
             if not isinstance(vpin_df.index, pd.DatetimeIndex):
                 vpin_df.index = pd.to_datetime(vpin_df.index)
+            # Strip timezone for consistent date lookups
+            if vpin_df.index.tz is not None:
+                vpin_df.index = vpin_df.index.tz_localize(None)
             vpin_df = vpin_df.select_dtypes(include="number").astype(np.float32)
-            vpin_df = vpin_df.ffill().bfill().fillna(0.0)
+            vpin_df = scale_vpin_features(vpin_df)
             self._seq_vpin[ticker] = vpin_df
         else:
             self._seq_vpin[ticker] = pd.DataFrame()
 
-        # 5. AE daily features
+        # 5. AE daily features (rolling z-scored)
         self._ae_features[ticker] = compute_ae_daily_features(
             raw_df, target_time=self.ae_target_time,
         )
@@ -336,7 +452,10 @@ class V3ContinuousPrep:
             print(f"  [{ticker}] {n} valid bars, "
                   f"profiles={len(obj._profiles.get(ticker, {}))}, "
                   f"rasters={len(obj._rasters.get(ticker, {}))}, "
-                  f"ae_dates={len(obj._ae_features.get(ticker, {}))}")
+                  f"ae_dates={len(obj._ae_features.get(ticker, {}))}, "
+                  f"vpin_cols={len(obj._seq_vpin.get(ticker, pd.DataFrame()).columns)}")
+        if obj._profile_shape:
+            print(f"  Spatial shapes: profile={obj._profile_shape}, raster={obj._raster_shape}")
         return obj
 
     def get_dims(self) -> Dict[str, int]:
@@ -350,6 +469,8 @@ class V3ContinuousPrep:
             "f_tech": len(self._tech_feature_cols),
             "f_seq": f_seq,
             "f_ae": 4,  # [ret_1d, ret_5d, ret_21d, rv_1d]
+            "profile_shape": self.profile_shape,
+            "raster_shape": self.raster_shape,
         }
 
     def build_samples(
@@ -415,7 +536,6 @@ class V3ContinuousPrep:
 
             # --- Session mask ---
             if sample_session_start is not None and sample_session_end is not None:
-                # Custom time window
                 t_start = time(
                     int(sample_session_start.split(":")[0]),
                     int(sample_session_start.split(":")[1]),
@@ -442,6 +562,11 @@ class V3ContinuousPrep:
                         f"sample_session_start/end for custom windows."
                     )
                 session_mask = df[col].values.astype(bool)
+                # ContinuousIntradayPrep maps session 1 → is_london internally.
+                # If the named column is all-zero, fall back to is_active.
+                if not session_mask.any() and "is_active" in df.columns:
+                    session_mask = df["is_active"].values.astype(bool)
+                    print(f"    [WARN] '{col}' all-zero, falling back to is_active")
             elif session_only:
                 session_mask = (
                     df["is_active"].values.astype(bool)
@@ -461,13 +586,21 @@ class V3ContinuousPrep:
             unique_dates = sorted(set(dates))
             date_to_idx = {d: i for i, d in enumerate(unique_dates)}
 
+            # Build sorted list of AE dates for nearest-fill lookup
+            ae_date_set = set(ae_feats.keys())
+            ae_sorted = sorted(ae_date_set)
+
             # Collect eligible bar indices per day then apply stride
             day_bars: Dict[date, List[int]] = {}
+            n_in_session = 0
+            n_with_target = 0
             for bar_idx in range(tech_lookback, len(df)):
                 if not session_mask[bar_idx]:
                     continue
+                n_in_session += 1
                 if np.isnan(target_arr[bar_idx]):
                     continue
+                n_with_target += 1
                 d = dates[bar_idx]
                 day_bars.setdefault(d, []).append(bar_idx)
 
@@ -476,23 +609,54 @@ class V3ContinuousPrep:
                 for d in day_bars:
                     day_bars[d] = day_bars[d][::stride]
 
+            n_bars_after_stride = sum(len(v) for v in day_bars.values())
+
+            # Diagnostics counters
+            _skip_no_prev = 0
+            _skip_no_spatial = 0
+            _skip_ae_short = 0
+            _skip_ae_missing = 0
+            _days_used = 0
+
             for current_date, bar_indices in day_bars.items():
                 date_ord = date_to_idx.get(current_date, -1)
                 prev_date = unique_dates[date_ord - 1] if date_ord > 0 else None
                 if prev_date is None:
+                    _skip_no_prev += 1
                     continue
                 if prev_date not in profiles and prev_date not in rasters:
+                    _skip_no_spatial += 1
                     continue
 
                 # AE window: ae_window consecutive days ending at prev_date
                 ae_end_idx = date_ord
                 ae_start_idx = ae_end_idx - self.ae_window
                 if ae_start_idx < 0:
+                    _skip_ae_short += 1
                     continue
-                ae_dates = unique_dates[ae_start_idx:ae_end_idx]
-                if not all(d in ae_feats for d in ae_dates):
+                ae_dates_window = unique_dates[ae_start_idx:ae_end_idx]
+
+                # Lenient AE fill: use nearest available for missing dates
+                ae_vec_list = []
+                for ad in ae_dates_window:
+                    if ad in ae_feats:
+                        ae_vec_list.append(ae_feats[ad])
+                    else:
+                        # Forward-fill from most recent available date
+                        filled = None
+                        for prev_ad in reversed(ae_sorted):
+                            if prev_ad <= ad:
+                                filled = ae_feats[prev_ad]
+                                break
+                        if filled is None:
+                            break
+                        ae_vec_list.append(filled)
+
+                if len(ae_vec_list) < len(ae_dates_window):
+                    _skip_ae_missing += 1
                     continue
-                ae_input = np.stack([ae_feats[d] for d in ae_dates])
+                ae_input = np.stack(ae_vec_list)
+                _days_used += 1
 
                 profile = profiles.get(prev_date)
                 raster = rasters.get(prev_date)
@@ -533,6 +697,45 @@ class V3ContinuousPrep:
                         "date": current_date,
                     })
 
+            # Per-ticker diagnostics
+            print(
+                f"  [{ticker}] build_samples: "
+                f"total_bars={len(df)}, "
+                f"in_session={n_in_session}, "
+                f"with_target={n_with_target}, "
+                f"days_with_bars={len(day_bars)}, "
+                f"bars_after_stride={n_bars_after_stride}"
+            )
+            print(
+                f"    date_filters: "
+                f"no_prev={_skip_no_prev}, "
+                f"no_spatial={_skip_no_spatial}, "
+                f"ae_short={_skip_ae_short}, "
+                f"ae_missing={_skip_ae_missing}, "
+                f"days_used={_days_used}, "
+                f"samples_so_far={len(samples)}"
+            )
+            if _days_used == 0 and len(day_bars) > 0:
+                # Debug: inspect a sample date to identify the exact filter
+                sample_date = list(day_bars.keys())[min(50, len(day_bars) - 1)]
+                d_ord = date_to_idx.get(sample_date, -1)
+                prev_d = unique_dates[d_ord - 1] if d_ord > 0 else None
+                print(
+                    f"    DEBUG sample_date={sample_date}, date_ord={d_ord}, "
+                    f"prev_date={prev_d}, "
+                    f"prev_in_profiles={prev_d in profiles if prev_d else 'N/A'}, "
+                    f"prev_in_rasters={prev_d in rasters if prev_d else 'N/A'}"
+                )
+                if prev_d is not None and d_ord >= self.ae_window:
+                    ae_slice = unique_dates[d_ord - self.ae_window:d_ord]
+                    ae_hits = sum(1 for d in ae_slice if d in ae_feats)
+                    print(
+                        f"    DEBUG ae_window: need={len(ae_slice)}, "
+                        f"have={ae_hits}, "
+                        f"ae_feats_type={type(list(ae_feats.keys())[0]) if ae_feats else 'empty'}, "
+                        f"unique_dates_type={type(unique_dates[0])}"
+                    )
+
         return samples
 
 
@@ -540,23 +743,18 @@ class V3ContinuousPrep:
 # PyTorch Dataset
 # ---------------------------------------------------------------------------
 
-# Default spatial shapes (used as zero-fill when data missing for a day)
-_DEFAULT_PROFILE_SHAPE = (4, 129, 4)   # (T_max, bins, channels)
-_DEFAULT_RASTER_SHAPE = (24, 4, 64)    # (time, channels, bins)
-
-
 class V3ContinuousDataset(Dataset):
     """PyTorch dataset producing bar-level samples for MMTFv3Core."""
 
     def __init__(
         self,
         samples: List[Dict],
-        default_profile_shape: Tuple[int, ...] = _DEFAULT_PROFILE_SHAPE,
-        default_raster_shape: Tuple[int, ...] = _DEFAULT_RASTER_SHAPE,
+        profile_shape: Tuple[int, ...] = (4, 96),
+        raster_shape: Tuple[int, ...] = (12, 4, 128),
     ):
         self.samples = samples
-        self.default_profile_shape = default_profile_shape
-        self.default_raster_shape = default_raster_shape
+        self.profile_shape = profile_shape
+        self.raster_shape = raster_shape
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -567,16 +765,22 @@ class V3ContinuousDataset(Dataset):
         tech = torch.tensor(s["tech_features"], dtype=torch.float32)
         tech_len = torch.tensor(s["tech_len"], dtype=torch.long)
 
-        # Spatial — use zeros if missing
+        # Spatial — use zeros if missing for a given day
         if s["numbars_recent"] is not None:
-            nb = torch.tensor(s["numbars_recent"], dtype=torch.float32)
+            nb = torch.tensor(
+                np.asarray(s["numbars_recent"], dtype=np.float32),
+                dtype=torch.float32,
+            )
         else:
-            nb = torch.zeros(self.default_profile_shape, dtype=torch.float32)
+            nb = torch.zeros(self.profile_shape, dtype=torch.float32)
 
         if s["vpin_raster_recent"] is not None:
-            vr = torch.tensor(s["vpin_raster_recent"], dtype=torch.float32)
+            vr = torch.tensor(
+                np.asarray(s["vpin_raster_recent"], dtype=np.float32),
+                dtype=torch.float32,
+            )
         else:
-            vr = torch.zeros(self.default_raster_shape, dtype=torch.float32)
+            vr = torch.zeros(self.raster_shape, dtype=torch.float32)
 
         seq = torch.tensor(s["seq_vpin"], dtype=torch.float32)
         seq_len = torch.tensor(s["seq_vpin_len"], dtype=torch.long)
@@ -696,7 +900,7 @@ def build_v3_loaders(
         stride=stride,
     )
     if not all_samples:
-        raise ValueError("No valid samples produced. Check data availability.")
+        raise ValueError("No valid samples produced. Check diagnostics above.")
 
     # Date-based split
     all_dates = sorted(set(s["date"] for s in all_samples))
@@ -712,8 +916,11 @@ def build_v3_loaders(
     print(f"Samples: {len(train_samples)} train, {len(val_samples)} val "
           f"(cutoff={cutoff}, {len(all_dates)} total days)")
 
-    train_ds = V3ContinuousDataset(train_samples)
-    val_ds = V3ContinuousDataset(val_samples)
+    p_shape = prep.profile_shape
+    r_shape = prep.raster_shape
+
+    train_ds = V3ContinuousDataset(train_samples, profile_shape=p_shape, raster_shape=r_shape)
+    val_ds = V3ContinuousDataset(val_samples, profile_shape=p_shape, raster_shape=r_shape)
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=shuffle_train,
