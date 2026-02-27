@@ -305,6 +305,11 @@ class EarlyStoppingCallback(BaseCallback):
         Don't check exposure until this fraction of training (default 0.2).
     max_drawdown_threshold : float or None
         Absolute max drawdown that triggers a stop.  ``None`` = disabled.
+    total_timesteps : int or None
+        Legacy compatibility argument. If provided, overrides the SB3-derived
+        total timestep count used for progress-based checks.
+    max_drawdown : float or None
+        Legacy alias for ``max_drawdown_threshold``.
     custom_rule : callable or None
         ``fn(metrics_cb, num_timesteps, total_timesteps) -> str | None``.
         Return a reason string to stop, or ``None`` to continue.
@@ -320,6 +325,8 @@ class EarlyStoppingCallback(BaseCallback):
         min_exposure: float = 0.1,
         exposure_warmup_fraction: float = 0.2,
         max_drawdown_threshold: Optional[float] = None,
+        total_timesteps: Optional[int] = None,
+        max_drawdown: Optional[float] = None,
         custom_rule: Optional[Callable] = None,
         verbose: int = 1,
     ):
@@ -329,13 +336,16 @@ class EarlyStoppingCallback(BaseCallback):
         self.pnl_check_fraction = pnl_check_fraction
         self.min_exposure = min_exposure
         self.exposure_warmup_fraction = exposure_warmup_fraction
+        if max_drawdown_threshold is None:
+            max_drawdown_threshold = max_drawdown
         self.max_drawdown_threshold = max_drawdown_threshold
         self.custom_rule = custom_rule
         self._last_check_step = 0
-        self._total_timesteps: int = 0
+        self._total_timesteps: int = int(total_timesteps or 0)
 
     def _on_training_start(self) -> None:
-        self._total_timesteps = self.locals.get("total_timesteps", 0)
+        if self._total_timesteps <= 0:
+            self._total_timesteps = self.locals.get("total_timesteps", 0)
 
     def _on_step(self) -> bool:
         if self.num_timesteps - self._last_check_step < self.check_interval:

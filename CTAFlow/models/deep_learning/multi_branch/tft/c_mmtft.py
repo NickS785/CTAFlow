@@ -39,7 +39,8 @@ Data shapes:
 
 from __future__ import annotations
 
-from typing import Dict, Literal, Tuple
+import math
+from typing import Dict, Iterable, Literal, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -193,6 +194,7 @@ class MMTFv3Core(nn.Module):
         self.ae_type = ae_type
         self.recon_weight = recon_weight
         self.backbone_type = backbone
+        self.dropout = dropout
 
         _grn_drop = grn_dropout if grn_dropout is not None else dropout
 
@@ -448,10 +450,13 @@ class MMTFv3Core(nn.Module):
         # PHASE 6: PREDICTION
         # ==========================================================
         z_final = torch.cat([z_temporal, z_selected], dim=-1)       # (B, 2*d_model)
+        ptp_context = torch.cat([c_h, z_temporal], dim=-1)          # (B, 2*d_model)
 
         logits = None
         if isinstance(self.head, QuantilePositionHead):
-            position, logits = self.head(z_final)                   # (B,1), (B,5)
+            position, logits = self.head(
+                z_final, context=ptp_context,
+            )                                                       # (B,1), (B,5)
         else:
             position = self.head(z_final)                           # (B, 1)
 
@@ -478,7 +483,10 @@ class MMTFv3Core(nn.Module):
             },
             "avg_position": position.detach().mean().item(),
             "avg_abs_position": position.detach().abs().mean().item(),
+            "ptp_context_norm": ptp_context.detach().norm(dim=-1).mean().item(),
         }
+        if logits is not None and hasattr(self.head, "get_last_stats"):
+            self._last_tracker["ptp"] = self.head.get_last_stats()
 
         # Build return
         results = [position]
@@ -572,14 +580,45 @@ class PredictionToPosition(nn.Module):
     where anchors are learnable, initialized to [-1.0, -0.5, 0.0, +0.5, +1.0].
     """
 
-    def __init__(self, temperature: float = 1.5):
+    def __init__(
+        self,
+        temperature: float = 1.5,
+        context_dim: int = 0,
+        max_anchor_shift: float = 0.35,
+        max_temp_scale: float = 0.30,
+    ):
         super().__init__()
         self.temperature = temperature
+        self.context_dim = context_dim
+        self.max_anchor_shift = max_anchor_shift
+        self.max_temp_scale = max_temp_scale
         self.anchors = nn.Parameter(
             torch.tensor([-1.0, -0.5, 0.0, 0.5, 1.0]),
         )
+        if context_dim > 0:
+            ctx_hidden = max(16, min(128, context_dim))
+            self.context_to_anchor = nn.Sequential(
+                nn.Linear(context_dim, ctx_hidden),
+                nn.LayerNorm(ctx_hidden),
+                nn.GELU(),
+                nn.Linear(ctx_hidden, 5),
+            )
+            self.context_to_temp = nn.Sequential(
+                nn.Linear(context_dim, ctx_hidden),
+                nn.GELU(),
+                nn.Linear(ctx_hidden, 1),
+                nn.Tanh(),
+            )
+        else:
+            self.context_to_anchor = None
+            self.context_to_temp = None
+        self._last_stats: Dict[str, float] = {}
 
-    def forward(self, logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        logits: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Parameters
         ----------
@@ -590,10 +629,37 @@ class PredictionToPosition(nn.Module):
         position : Tensor (B, 1)
         logits : Tensor (B, 5) — passed through for multi-loss
         """
-        probs = torch.softmax(logits / self.temperature, dim=-1)    # (B, 5)
-        weighted = (probs * self.anchors.unsqueeze(0)).sum(dim=-1)   # (B,)
+        batch_size = logits.size(0)
+        anchors = self.anchors.unsqueeze(0).expand(batch_size, -1)
+        temperature = torch.full(
+            (batch_size, 1),
+            fill_value=self.temperature,
+            dtype=logits.dtype,
+            device=logits.device,
+        )
+        anchor_shift = torch.zeros_like(anchors)
+
+        if context is not None and self.context_to_anchor is not None:
+            anchor_shift = self.max_anchor_shift * torch.tanh(
+                self.context_to_anchor(context),
+            )
+            anchors = anchors + anchor_shift
+            temperature = temperature * (
+                1.0 + self.max_temp_scale * self.context_to_temp(context)
+            ).clamp(min=0.5, max=1.5)
+
+        probs = torch.softmax(logits / temperature, dim=-1)         # (B, 5)
+        weighted = (probs * anchors).sum(dim=-1)                    # (B,)
         position = torch.tanh(weighted).unsqueeze(-1)                # (B, 1)
+        self._last_stats = {
+            "anchor_shift_mean": anchor_shift.detach().abs().mean().item(),
+            "temperature_mean": temperature.detach().mean().item(),
+            "anchor_mean": anchors.detach().mean().item(),
+        }
         return position, logits
+
+    def get_last_stats(self) -> Dict[str, float]:
+        return dict(self._last_stats)
 
 
 class QuantilePositionHead(nn.Module):
@@ -602,20 +668,43 @@ class QuantilePositionHead(nn.Module):
     Replaces the standard Tanh head in MMTFv3Core when quantile_head=True.
     """
 
-    def __init__(self, d_input: int, d_model: int, dropout: float = 0.2, temperature: float = 1.5):
+    def __init__(
+        self,
+        d_input: int,
+        d_model: int,
+        dropout: float = 0.2,
+        temperature: float = 1.5,
+        context_dim: int = 0,
+    ):
         super().__init__()
-        self.mlp = nn.Sequential(
+        self.feature_proj = nn.Sequential(
             nn.Linear(d_input, d_model),
             nn.LayerNorm(d_model),
             nn.GELU(),
             nn.Dropout(dropout),
+        )
+        self.context_proj = None
+        if context_dim > 0:
+            self.context_proj = nn.Sequential(
+                nn.Linear(context_dim, d_model),
+                nn.LayerNorm(d_model),
+                nn.GELU(),
+            )
+        self.hidden_to_logits = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.GELU(),
             nn.Linear(d_model // 2, 5),
         )
-        self.ptp = PredictionToPosition(temperature=temperature)
+        self.ptp = PredictionToPosition(
+            temperature=temperature,
+            context_dim=context_dim,
+        )
 
-    def forward(self, z_final: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        z_final: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Parameters
         ----------
@@ -626,9 +715,24 @@ class QuantilePositionHead(nn.Module):
         position : Tensor (B, 1)
         logits : Tensor (B, 5)
         """
-        logits = self.mlp(z_final)           # (B, 5)
-        position, logits = self.ptp(logits)  # (B, 1), (B, 5)
+        hidden = self.feature_proj(z_final)
+        if context is not None and self.context_proj is not None:
+            hidden = hidden + self.context_proj(context)
+        logits = self.hidden_to_logits(hidden)                       # (B, 5)
+        position, logits = self.ptp(logits, context=context)        # (B, 1), (B, 5)
         return position, logits
+
+    def quantile_parameters(self) -> Iterable[nn.Parameter]:
+        yield from self.feature_proj.parameters()
+        if self.context_proj is not None:
+            yield from self.context_proj.parameters()
+        yield from self.hidden_to_logits.parameters()
+
+    def ptp_parameters(self) -> Iterable[nn.Parameter]:
+        yield from self.ptp.parameters()
+
+    def get_last_stats(self) -> Dict[str, float]:
+        return self.ptp.get_last_stats()
 
 
 # ============================================================================
@@ -741,8 +845,9 @@ class StatefulMMTFv3Core(nn.Module):
             base_model.head = QuantilePositionHead(
                 d_input=base_model.d_model * 2,
                 d_model=base_model.d_model,
-                dropout=0.2,
+                dropout=base_model.dropout,
                 temperature=ptp_temperature,
+                context_dim=base_model.d_model * 2,
             )
 
         self.state_layer = TickerPositionStateLayer(
@@ -1275,6 +1380,7 @@ def evaluate_v3_ptp(
     _maybe_reset_position_state(model)
 
     all_positions, all_returns, all_logits = [], [], []
+    metric_accum: Dict[str, float] = {}
     total_loss = 0.0
     n_batches = 0
 
@@ -1284,10 +1390,12 @@ def evaluate_v3_ptp(
 
         position, ae_losses, logits = model(**inputs, return_ae_losses=True)
 
-        ptp_total, _ = ptp_loss(position, logits, targets)
+        ptp_total, ptp_metrics = ptp_loss(position, logits, targets)
         ae_loss = model.recon_weight * ae_losses["total_ae_loss"]
         total_loss += (ptp_total + ae_loss).item()
         n_batches += 1
+        for k, v in ptp_metrics.items():
+            metric_accum[k] = metric_accum.get(k, 0.0) + v
 
         all_positions.append(position.detach().view(-1).cpu())
         all_returns.append(targets.detach().view(-1).cpu())
@@ -1327,7 +1435,7 @@ def evaluate_v3_ptp(
             per_class[f"cls_{c}_acc"] = (pred_cls[mask] == c).float().mean().item() * 100.0
             per_class[f"cls_{c}_count"] = int(mask.sum().item())
 
-    return {
+    metrics = {
         "loss": total_loss / n,
         "sharpe": mean_ret / std_ret,
         "sortino": mean_ret / (strategy_ret.clamp(max=0.0).pow(2).mean().sqrt().item() + 1e-8),
@@ -1342,5 +1450,206 @@ def evaluate_v3_ptp(
         **per_class,
         "n_samples": len(positions),
     }
+    metrics.update({k: v / n for k, v in metric_accum.items()})
+    return metrics
+
+
+def build_ptp_optimizer_param_groups(
+    model: nn.Module,
+    base_lr: float,
+    weight_decay: float = 0.0,
+    quantile_lr_scale: float = 1.0,
+    ptp_lr_scale: float = 1.0,
+) -> list[dict]:
+    """Build optimizer groups for trunk, quantile logits head, and PTP mapper."""
+    core_model = getattr(model, "base_model", model)
+    head = getattr(core_model, "head", None)
+
+    if not isinstance(head, QuantilePositionHead):
+        return [{
+            "params": [p for p in model.parameters() if p.requires_grad],
+            "lr": base_lr,
+            "weight_decay": weight_decay,
+            "group_name": "trunk",
+        }]
+
+    quantile_params = list(head.quantile_parameters())
+    ptp_params = list(head.ptp_parameters())
+    tracked = {id(p) for p in quantile_params + ptp_params}
+    trunk_params = [
+        p for p in model.parameters()
+        if p.requires_grad and id(p) not in tracked
+    ]
+
+    param_groups = []
+    if trunk_params:
+        param_groups.append({
+            "params": trunk_params,
+            "lr": base_lr,
+            "weight_decay": weight_decay,
+            "group_name": "trunk",
+        })
+    if quantile_params:
+        param_groups.append({
+            "params": quantile_params,
+            "lr": base_lr * quantile_lr_scale,
+            "weight_decay": weight_decay,
+            "group_name": "quantile_head",
+        })
+    if ptp_params:
+        param_groups.append({
+            "params": ptp_params,
+            "lr": base_lr * ptp_lr_scale,
+            "weight_decay": weight_decay,
+            "group_name": "ptp_head",
+        })
+    return param_groups
+
+
+class HeadAwarePTPScheduler:
+    """Adaptive LR control for trunk, quantile logits head, and PTP mapper.
+
+    The trunk follows a cosine decay. The quantile and PTP groups are reduced
+    independently when their validation objective plateaus or starts to overfit,
+    and they can recover gradually after fresh improvement.
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        total_epochs: int,
+        trunk_group: str = "trunk",
+        quantile_group: str = "quantile_head",
+        ptp_group: str = "ptp_head",
+        trunk_min_scale: float = 0.2,
+        head_decay: float = 0.6,
+        head_recovery: float = 1.05,
+        min_head_scale: float = 0.1,
+        quantile_patience: int = 2,
+        ptp_patience: int = 2,
+        improvement_delta: float = 1e-4,
+        overfit_tolerance: float = 0.03,
+        ptp_downside_weight: float = 1.0,
+    ):
+        self.optimizer = optimizer
+        self.total_epochs = max(total_epochs, 1)
+        self.trunk_group = trunk_group
+        self.quantile_group = quantile_group
+        self.ptp_group = ptp_group
+        self.trunk_min_scale = trunk_min_scale
+        self.head_decay = head_decay
+        self.head_recovery = head_recovery
+        self.min_head_scale = min_head_scale
+        self.improvement_delta = improvement_delta
+        self.overfit_tolerance = overfit_tolerance
+        self.ptp_downside_weight = ptp_downside_weight
+
+        self.group_map = {
+            group.get("group_name", f"group_{idx}"): group
+            for idx, group in enumerate(self.optimizer.param_groups)
+        }
+        self.initial_lrs = {
+            name: group["lr"] for name, group in self.group_map.items()
+        }
+        self.head_state = {
+            self.quantile_group: {
+                "best_train": float("inf"),
+                "best_val": float("inf"),
+                "bad_epochs": 0,
+                "patience": quantile_patience,
+            },
+            self.ptp_group: {
+                "best_train": float("inf"),
+                "best_val": float("inf"),
+                "bad_epochs": 0,
+                "patience": ptp_patience,
+            },
+        }
+        self.last_actions: Dict[str, str] = {}
+
+    def _set_group_lr(self, group_name: str, new_lr: float) -> None:
+        group = self.group_map.get(group_name)
+        if group is None:
+            return
+        min_lr = self.initial_lrs[group_name] * self.min_head_scale
+        max_lr = self.initial_lrs[group_name]
+        group["lr"] = min(max(new_lr, min_lr), max_lr)
+
+    def _apply_trunk_lr(self, epoch: int) -> None:
+        group = self.group_map.get(self.trunk_group)
+        if group is None:
+            return
+        cosine = 0.5 * (
+            1.0 + math.cos(math.pi * min(epoch, self.total_epochs - 1) / self.total_epochs)
+        )
+        scale = self.trunk_min_scale + (1.0 - self.trunk_min_scale) * cosine
+        group["lr"] = self.initial_lrs[self.trunk_group] * scale
+
+    def _update_head(
+        self,
+        group_name: str,
+        train_value: Optional[float],
+        val_value: Optional[float],
+    ) -> str:
+        if group_name not in self.group_map or train_value is None or val_value is None:
+            return "missing"
+
+        state = self.head_state[group_name]
+        improved = val_value < (state["best_val"] - self.improvement_delta)
+        overfit = (
+            train_value < (state["best_train"] - self.improvement_delta)
+            and val_value > state["best_val"] * (1.0 + self.overfit_tolerance)
+        )
+
+        if improved:
+            state["best_val"] = val_value
+            state["best_train"] = min(state["best_train"], train_value)
+            state["bad_epochs"] = 0
+            current_lr = self.group_map[group_name]["lr"]
+            self._set_group_lr(group_name, current_lr * self.head_recovery)
+            return "improved"
+
+        state["best_train"] = min(state["best_train"], train_value)
+        state["bad_epochs"] += 2 if overfit else 1
+        if state["bad_epochs"] >= state["patience"]:
+            current_lr = self.group_map[group_name]["lr"]
+            self._set_group_lr(group_name, current_lr * self.head_decay)
+            state["bad_epochs"] = 0
+            return "reduced_overfit" if overfit else "reduced_plateau"
+        return "overfit_watch" if overfit else "plateau_watch"
+
+    def step(self, epoch: int, metrics: Dict[str, float]) -> Dict[str, float]:
+        self._apply_trunk_lr(epoch)
+
+        quantile_action = self._update_head(
+            self.quantile_group,
+            metrics.get("train_ce_loss"),
+            metrics.get("val_ce_loss"),
+        )
+        ptp_train = None
+        ptp_val = None
+        if "train_trading_loss" in metrics:
+            ptp_train = metrics["train_trading_loss"] + self.ptp_downside_weight * metrics.get(
+                "train_downside_vol",
+                0.0,
+            )
+        if "val_trading_loss" in metrics:
+            ptp_val = metrics["val_trading_loss"] + self.ptp_downside_weight * metrics.get(
+                "val_downside_vol",
+                0.0,
+            )
+        ptp_action = self._update_head(self.ptp_group, ptp_train, ptp_val)
+
+        self.last_actions = {
+            self.quantile_group: quantile_action,
+            self.ptp_group: ptp_action,
+        }
+        return self.get_lrs()
+
+    def get_lrs(self) -> Dict[str, float]:
+        return {
+            name: group["lr"]
+            for name, group in self.group_map.items()
+        }
 
 

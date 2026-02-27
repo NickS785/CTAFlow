@@ -810,6 +810,7 @@ class ContinuousTradingLoss(nn.Module):
         reg_weight: float = 0.1,
         target_exposure: float = 0.3,
         use_sortino: bool = False,
+        downside_vol_weight: float = 0.0,
         sharpe_eps: float = 1e-6,
     ):
         super().__init__()
@@ -818,6 +819,7 @@ class ContinuousTradingLoss(nn.Module):
         self.reg_weight = reg_weight
         self.target_exposure = target_exposure
         self.use_sortino = use_sortino
+        self.downside_vol_weight = downside_vol_weight
         self.sharpe_eps = sharpe_eps
 
     def forward(
@@ -837,6 +839,8 @@ class ContinuousTradingLoss(nn.Module):
         else:
             risk = strategy_ret.std() + self.sharpe_eps
         loss_sharpe = -mean_r / risk
+        downside_vol = strategy_ret.clamp(max=0.0).pow(2).mean().sqrt()
+        loss_downside_vol = self.downside_vol_weight * downside_vol
 
         # 2. Directional accuracy
         pos_sign = torch.tanh(pos * 10.0)
@@ -854,15 +858,23 @@ class ContinuousTradingLoss(nn.Module):
         avg_exposure = pos.abs().mean()
         loss_reg = self.reg_weight * (avg_exposure - self.target_exposure).pow(2)
 
-        total = loss_sharpe + self.direction_weight * loss_direction + loss_tc + loss_reg
+        total = (
+            loss_sharpe
+            + self.direction_weight * loss_direction
+            + loss_tc
+            + loss_reg
+            + loss_downside_vol
+        )
         metrics = {
             "loss_sharpe": loss_sharpe.item(),
             "loss_direction": loss_direction.item(),
             "loss_tc": loss_tc.item(),
             "loss_reg": loss_reg.item(),
+            "loss_downside_vol": loss_downside_vol.item(),
             "mean_strategy_ret": mean_r.item(),
             "avg_exposure": avg_exposure.item(),
             "sharpe_batch": (-loss_sharpe).item(),
+            "downside_vol": downside_vol.item(),
         }
         return total, metrics
 
