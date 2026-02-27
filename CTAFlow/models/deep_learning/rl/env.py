@@ -732,7 +732,9 @@ class V3ContinuousPPOEnv(gym.Env):
         self._processed = [self._process_sample(s) for s in self.samples]
         self._n_steps = len(self._processed)
 
-        # Infer dimensions from first sample
+        # Infer shapes from first non-None sample, then fill None entries with zeros
+        self._finalize_shapes()
+
         first = self._processed[0]
         self._tech_shape = first["tech_features"].shape
         self._nb_shape = first["numbars_recent"].shape
@@ -762,6 +764,30 @@ class V3ContinuousPPOEnv(gym.Env):
         self._idx = 0
         self._episode_steps = 0
         self._position_by_ticker = np.zeros(self.max_ticker_id, dtype=np.float32)
+
+    def _finalize_shapes(self):
+        """Find reference shapes from first non-None spatial data, fill None with zeros."""
+        nb_shape = None
+        vr_shape = None
+        for p in self._processed:
+            if nb_shape is None and p["numbars_recent"] is not None:
+                nb_shape = p["numbars_recent"].shape
+            if vr_shape is None and p["vpin_raster_recent"] is not None:
+                vr_shape = p["vpin_raster_recent"].shape
+            if nb_shape is not None and vr_shape is not None:
+                break
+
+        # Fallback shapes if ALL samples are None
+        if nb_shape is None:
+            nb_shape = (1, 96, self.numbars_channels)
+        if vr_shape is None:
+            vr_shape = (12, self.vpin_channels, 128)
+
+        for p in self._processed:
+            if p["numbars_recent"] is None:
+                p["numbars_recent"] = np.zeros(nb_shape, dtype=np.float32)
+            if p["vpin_raster_recent"] is None:
+                p["vpin_raster_recent"] = np.zeros(vr_shape, dtype=np.float32)
 
     def _normalize_numbars(self, arr: np.ndarray) -> np.ndarray:
         x = np.asarray(arr, dtype=np.float32)
@@ -815,9 +841,20 @@ class V3ContinuousPPOEnv(gym.Env):
 
     def _process_sample(self, sample: Dict) -> Dict:
         tech = np.asarray(sample["tech_features"], dtype=np.float32)
-        nb = self._normalize_numbars(np.asarray(sample["numbars_recent"], dtype=np.float32))
-        vr = self._normalize_raster(np.asarray(sample["vpin_raster_recent"], dtype=np.float32))
         ae = np.asarray(sample["ae_input"], dtype=np.float32)
+
+        # Handle None spatial data (missing dates in build_samples)
+        raw_nb = sample["numbars_recent"]
+        if raw_nb is None:
+            nb = None  # placeholder; resolved in _finalize_shapes
+        else:
+            nb = self._normalize_numbars(np.asarray(raw_nb, dtype=np.float32))
+
+        raw_vr = sample["vpin_raster_recent"]
+        if raw_vr is None:
+            vr = None  # placeholder; resolved in _finalize_shapes
+        else:
+            vr = self._normalize_raster(np.asarray(raw_vr, dtype=np.float32))
 
         seq_raw = np.asarray(sample["seq_vpin"], dtype=np.float32)
         if seq_raw.ndim == 1:
