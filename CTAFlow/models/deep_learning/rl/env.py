@@ -687,11 +687,12 @@ class V3ContinuousPPOEnv(gym.Env):
     """Gymnasium environment sourced from V3ContinuousPrep samples.
 
     Observations are the V3 multi-modal payload at each bar:
-      - tech_window:        (L_tech, f_tech)
+      - tech_features:      (L_tech, f_tech)
+      - tech_lens:          (1,)
       - numbars_recent:     (T_nb, nb_bins, nb_channels)
       - vpin_raster_recent: (T_vpin, vpin_channels, vpin_bins)
       - seq_vpin:           (max_seq_len, f_seq)
-      - seq_vpin_len:       (1,)
+      - seq_vpin_lens:      (1,)
       - ae_input:           (ae_window, f_ae)
       - ticker_id / asset ids (discrete scalars)
 
@@ -733,7 +734,7 @@ class V3ContinuousPPOEnv(gym.Env):
 
         # Infer dimensions from first sample
         first = self._processed[0]
-        self._tech_shape = first["tech_window"].shape
+        self._tech_shape = first["tech_features"].shape
         self._nb_shape = first["numbars_recent"].shape
         self._vr_shape = first["vpin_raster_recent"].shape
         self._seq_shape = first["seq_vpin"].shape
@@ -744,11 +745,12 @@ class V3ContinuousPPOEnv(gym.Env):
         self.max_subclass_id = max(int(p["asset_subclass_id"]) for p in self._processed) + 1
 
         self.observation_space = spaces.Dict({
-            "tech_window": spaces.Box(-np.inf, np.inf, shape=self._tech_shape, dtype=np.float32),
+            "tech_features": spaces.Box(-np.inf, np.inf, shape=self._tech_shape, dtype=np.float32),
+            "tech_lens": spaces.Box(0, self._tech_shape[0], shape=(1,), dtype=np.int32),
             "numbars_recent": spaces.Box(-np.inf, np.inf, shape=self._nb_shape, dtype=np.float32),
             "vpin_raster_recent": spaces.Box(-np.inf, np.inf, shape=self._vr_shape, dtype=np.float32),
             "seq_vpin": spaces.Box(-np.inf, np.inf, shape=self._seq_shape, dtype=np.float32),
-            "seq_vpin_len": spaces.Box(0, self.max_seq_len, shape=(1,), dtype=np.int32),
+            "seq_vpin_lens": spaces.Box(0, self.max_seq_len, shape=(1,), dtype=np.int32),
             "ae_input": spaces.Box(-np.inf, np.inf, shape=self._ae_shape, dtype=np.float32),
             "ticker_id": spaces.Discrete(max(self.max_ticker_id, 1)),
             "asset_class_id": spaces.Discrete(max(self.max_class_id, 1)),
@@ -828,11 +830,12 @@ class V3ContinuousPPOEnv(gym.Env):
             seq[:seq_len, :] = seq_raw[:seq_len, :]
 
         return {
-            "tech_window": tech,
+            "tech_features": tech,
+            "tech_lens": np.array([int(sample.get("tech_len", tech.shape[0]))], dtype=np.int32),
             "numbars_recent": nb,
             "vpin_raster_recent": vr,
             "seq_vpin": seq,
-            "seq_vpin_len": np.array([seq_len], dtype=np.int32),
+            "seq_vpin_lens": np.array([seq_len], dtype=np.int32),
             "ae_input": ae,
             "ticker_id": np.array(int(sample["ticker_id"]), dtype=np.int64),
             "asset_class_id": np.array(int(sample["asset_class_id"]), dtype=np.int64),
@@ -845,11 +848,12 @@ class V3ContinuousPPOEnv(gym.Env):
     def _get_obs(self, idx: int) -> Dict[str, np.ndarray]:
         x = self._processed[idx]
         return {
-            "tech_window": x["tech_window"],
+            "tech_features": x["tech_features"],
+            "tech_lens": x["tech_lens"],
             "numbars_recent": x["numbars_recent"],
             "vpin_raster_recent": x["vpin_raster_recent"],
             "seq_vpin": x["seq_vpin"],
-            "seq_vpin_len": x["seq_vpin_len"],
+            "seq_vpin_lens": x["seq_vpin_lens"],
             "ae_input": x["ae_input"],
             "ticker_id": x["ticker_id"],
             "asset_class_id": x["asset_class_id"],

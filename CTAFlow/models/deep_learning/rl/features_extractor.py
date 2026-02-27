@@ -3,7 +3,7 @@ import torch.nn as nn
 import gymnasium as gym
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
-# Assuming these are importable from your project structure
+# Existing CTAFlow encoder components
 from ..encoders import (
     MarketProfileResNet,
     RasterResNet,
@@ -11,7 +11,22 @@ from ..encoders import (
     SpatialFuse,
     MetaModalityEncoder,
 )
-from ..multi_branch.tft.tft_encoders import NumberBarEncoder, VPINRasterEncoder
+from ..multi_branch.tft.tft_encoders import (
+    NumberBarEncoder,
+    VPINRasterEncoder,
+    TransformerTemporalBackbone,
+    MambaTemporalBackbone,
+)
+from ..multi_branch.market_context_models import (
+    BranchVariableSelection,
+    GatedResidualNetwork,
+)
+from ..multi_branch.tft.auto_mmtft import (
+    DeterministicRegimeAE,
+    VariationalRegimeAE,
+    VQRegimeAE,
+    AutoencoderConditionedEncoder,
+)
 
 
 class WSPRExtractor(BaseFeaturesExtractor):
@@ -468,18 +483,85 @@ class WSPRExtractorV2(BaseFeaturesExtractor):
 
 
 class V3ContinuousExtractor(BaseFeaturesExtractor):
-    """SB3 extractor for V3ContinuousPPOEnv observations."""
+    """SB3 extractor mirroring MMTFv3Core architecture.
+
+    Follows the full MMTFv3 pipeline:
+      Phase 0: VAE on ae_input → z_regime
+      Phase 1: AutoencoderConditionedEncoder(identity + z_regime) → c_s, c_e, c_c, c_h
+      Phase 2: Tech features → projection + regime enrichment → Mamba/Transformer backbone
+               → (fused_seq, fused_token)
+      Phase 3: Spatial (NumberBars + VPIN raster) → SpatialFuse → z_spatial
+               Sequential (tabular VPIN) → IntradayRNN → z_seq
+      Phase 4: BranchVariableSelection([fused_token, z_spatial, z_seq], context=c_s) → z_selected
+      Phase 5: Enrichment + Temporal Attention
+               enrichment_ctx = GRN(c_e), temporal_attn(query=ctx, K/V=fused_seq) → z_temporal
+      Output:  cat[z_temporal, z_selected] → (B, 2*d_model)
+
+    Parameters
+    ----------
+    observation_space : gym.spaces.Dict
+        From V3ContinuousPPOEnv.
+    d_model : int
+        Main model dimension (matches MMTFv3Core).
+    d_static_emb : int
+        Identity embedding dimension.
+    d_latent : int
+        AE bottleneck dimension.
+    d_ae_hidden : int
+        AE GRU hidden size.
+    ae_type : str
+        'deterministic', 'vae', or 'vqvae'.
+    ae_n_layers : int
+        AE GRU layers.
+    kl_weight : float
+        VAE KL weight.
+    backbone : str
+        'transformer' or 'mamba'.
+    n_heads : int
+        Attention heads.
+    n_layers : int
+        Backbone layers.
+    d_ff : int
+        Transformer FFN dimension.
+    d_state, d_conv, expand : int
+        Mamba configuration.
+    spatial_fuse_mode : str
+        'gated' or 'mean'.
+    dropout : float
+        Dropout rate.
+    """
 
     def __init__(
         self,
         observation_space: gym.spaces.Dict,
         d_model: int = 128,
-        tech_hidden: int = 128,
-        id_emb_dim: int = 16,
+        d_static_emb: int = 64,
+        d_latent: int = 64,
+        d_ae_hidden: int = 128,
+        ae_type: str = "vae",
+        ae_n_layers: int = 2,
+        kl_weight: float = 0.01,
+        n_codes: int = 16,
+        backbone: str = "mamba",
         n_heads: int = 4,
-        dropout: float = 0.1,
+        n_layers: int = 2,
+        d_ff: int = 512,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        spatial_fuse_mode: str = "gated",
+        spatial_fuse_temp: float = 2.0,
+        dropout: float = 0.2,
+        grn_dropout: float | None = None,
     ):
-        tech_shape = observation_space["tech_window"].shape       # (L_tech, f_tech)
+        # Output is cat[z_temporal, z_selected] = 2 * d_model
+        features_dim = d_model * 2
+        super().__init__(observation_space, features_dim)
+
+        self.d_model = d_model
+
+        # Infer dimensions from observation space
+        tech_shape = observation_space["tech_features"].shape     # (L_tech, f_tech)
         nb_shape = observation_space["numbars_recent"].shape      # (T_nb, bins, C)
         vr_shape = observation_space["vpin_raster_recent"].shape  # (T_vpin, C, bins)
         seq_shape = observation_space["seq_vpin"].shape           # (max_seq_len, f_seq)
@@ -493,123 +575,238 @@ class V3ContinuousExtractor(BaseFeaturesExtractor):
         f_seq = int(seq_shape[-1])
         f_ae = int(ae_shape[-1])
 
-        # tech + numbars + raster + spatial + seq + ae + id embeddings
-        features_dim = tech_hidden + (d_model * 5) + (id_emb_dim * 3)
-        super().__init__(observation_space, features_dim)
+        _grn_drop = grn_dropout if grn_dropout is not None else dropout
 
+        # ==============================================================
+        # PHASE 0: AUTOENCODER (long-term → regime latent)
+        # ==============================================================
+        if ae_type == "deterministic":
+            self.autoencoder = DeterministicRegimeAE(
+                f_input=f_ae, d_hidden=d_ae_hidden,
+                d_latent=d_latent, n_layers=ae_n_layers,
+                dropout=dropout,
+            )
+        elif ae_type == "vae":
+            self.autoencoder = VariationalRegimeAE(
+                f_input=f_ae, d_hidden=d_ae_hidden,
+                d_latent=d_latent, n_layers=ae_n_layers,
+                kl_weight=kl_weight, dropout=dropout,
+            )
+        elif ae_type == "vqvae":
+            self.autoencoder = VQRegimeAE(
+                f_input=f_ae, d_hidden=d_ae_hidden,
+                d_latent=d_latent, n_codes=n_codes,
+                n_layers=ae_n_layers, dropout=dropout,
+            )
+        else:
+            raise ValueError(f"Unknown ae_type: {ae_type}")
+
+        # ==============================================================
+        # PHASE 1: REGIME-CONDITIONED STATIC ENCODER
+        # identity + z_regime → c_s, c_e, c_c, c_h
+        # ==============================================================
+        n_tickers = max(observation_space["ticker_id"].n, 1)
+        n_asset_classes = max(observation_space["asset_class_id"].n, 1)
+        n_asset_subclasses = max(observation_space["asset_subclass_id"].n, 1)
+
+        self.regime_encoder = AutoencoderConditionedEncoder(
+            d_model=d_model,
+            d_latent=d_latent,
+            n_tickers=n_tickers,
+            n_asset_classes=n_asset_classes,
+            n_asset_subclasses=n_asset_subclasses,
+            d_emb=d_static_emb,
+            dropout=_grn_drop,
+        )
+        self.regime_bar_proj = GatedResidualNetwork(
+            d_model=d_model, dropout=_grn_drop,
+        )
+
+        # ==============================================================
+        # PHASE 2: TECHNICAL FEATURE PROJECTION + BACKBONE
+        # ==============================================================
         self.tech_proj = nn.Sequential(
+            nn.LayerNorm(f_tech),
             nn.Linear(f_tech, d_model),
-            nn.LayerNorm(d_model),
             nn.GELU(),
-        )
-        self.tech_gru = nn.GRU(
-            input_size=d_model,
-            hidden_size=tech_hidden,
-            batch_first=True,
+            nn.Dropout(dropout),
         )
 
-        self.numbars_enc = NumberBarEncoder(
-            in_channels=nb_channels,
-            d_model=d_model,
+        if backbone == "transformer":
+            self.fusion_backbone = TransformerTemporalBackbone(
+                d_model=d_model, n_heads=n_heads,
+                n_layers=n_layers, d_ff=d_ff, dropout=dropout,
+            )
+        elif backbone == "mamba":
+            self.fusion_backbone = MambaTemporalBackbone(
+                d_model=d_model, n_layers=n_layers,
+                d_state=d_state, d_conv=d_conv,
+                expand=expand, dropout=dropout,
+            )
+        else:
+            raise ValueError(f"Unknown backbone: {backbone}")
+
+        # ==============================================================
+        # PHASE 3: SPATIAL + SEQUENTIAL BRANCHES
+        # ==============================================================
+        self.numbar_encoder = NumberBarEncoder(
+            in_channels=nb_channels, d_model=d_model,
         )
-        self.raster_enc = VPINRasterEncoder(
-            in_channels=vr_channels,
-            n_bins=vr_bins,
-            n_time=vr_time,
-            d_model=d_model,
-            n_heads=n_heads,
-            dropout=dropout,
+        self.vpin_encoder = VPINRasterEncoder(
+            in_channels=vr_channels, n_bins=vr_bins,
+            n_time=vr_time, d_model=d_model,
+            n_heads=n_heads, dropout=dropout,
         )
         self.spatial_fuse = SpatialFuse(
-            d_spatial=d_model,
-            mode="gated",
+            d_spatial=d_model, mode=spatial_fuse_mode,
+            temperature=spatial_fuse_temp,
+        )
+        self.seq_net = IntradayRNN(
+            input_dim=f_seq, d_model=d_model,
+            num_layers=1, dropout=dropout,
         )
 
-        self.seq_enc = IntradayRNN(
-            input_dim=f_seq,
-            d_model=d_model,
-            num_layers=1,
-            dropout=dropout,
+        # ==============================================================
+        # PHASE 4: BRANCH VARIABLE SELECTION (regime-conditioned)
+        # ==============================================================
+        self.branch_selector = BranchVariableSelection(
+            n_branches=3,
+            d_branch=d_model,
+            d_context=d_model,
+            dropout=_grn_drop,
         )
 
-        self.ae_gru = nn.GRU(
-            input_size=f_ae,
-            hidden_size=d_model,
-            batch_first=True,
+        # ==============================================================
+        # PHASE 5: ENRICHMENT + TEMPORAL ATTENTION
+        # ==============================================================
+        self.enrichment_grn = GatedResidualNetwork(
+            d_model=d_model, dropout=_grn_drop,
         )
+        self.temporal_attn = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=n_heads,
+            dropout=dropout, batch_first=True,
+        )
+        self.temporal_ln = nn.LayerNorm(d_model)
 
-        self.ticker_emb = nn.Embedding(max(observation_space["ticker_id"].n, 1), id_emb_dim)
-        self.class_emb = nn.Embedding(max(observation_space["asset_class_id"].n, 1), id_emb_dim)
-        self.subclass_emb = nn.Embedding(max(observation_space["asset_subclass_id"].n, 1), id_emb_dim)
+        # Tracking for diagnostics
+        self._last_branch_weights = None
+        self._last_regime_var_weights = None
 
-        self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(features_dim)
+    @staticmethod
+    def _obs_to_index(x: torch.Tensor) -> torch.Tensor:
+        """Convert SB3 Discrete observation (may be one-hot) to long index."""
+        if x.dim() == 1:
+            return x.long().view(-1)
+        if x.dim() > 2:
+            x = x.view(x.shape[0], -1)
+        if x.shape[1] == 1:
+            return x[:, 0].long()
+        return torch.argmax(x, dim=1).long()
 
     def forward(self, observations):
-        tech = observations["tech_window"].float()        # (B, L_tech, f_tech)
-        nb = observations["numbars_recent"].float()       # (B, T_nb, bins, C)
-        vr = observations["vpin_raster_recent"].float()   # (B, T_vpin, C, bins)
-        seq = observations["seq_vpin"].float()            # (B, max_seq_len, f_seq)
-        ae = observations["ae_input"].float()             # (B, ae_window, f_ae)
+        tech = observations["tech_features"].float()       # (B, L, f_tech)
+        nb = observations["numbars_recent"].float()        # (B, T_nb, bins, C)
+        vr = observations["vpin_raster_recent"].float()    # (B, T_vpin, C, bins)
+        seq = observations["seq_vpin"].float()             # (B, max_seq_len, f_seq)
+        ae = observations["ae_input"].float()              # (B, ae_window, f_ae)
 
-        seq_lens = observations.get("seq_vpin_len")
+        # Sequence lengths
+        seq_lens = observations.get("seq_vpin_lens")
         if seq_lens is None:
             seq_lens = torch.full(
-                (seq.shape[0],),
-                seq.shape[1],
-                dtype=torch.long,
-                device=seq.device,
+                (seq.shape[0],), seq.shape[1],
+                dtype=torch.long, device=seq.device,
             )
         else:
             if seq_lens.dim() == 2:
                 seq_lens = seq_lens.squeeze(-1)
             seq_lens = seq_lens.long().clamp(min=1, max=seq.shape[1])
 
-        bsz, l_tech = tech.shape[0], tech.shape[1]
-        tech_flat = tech.reshape(bsz * l_tech, -1)
-        z_tech_all = self.tech_proj(tech_flat).view(bsz, l_tech, -1)
-        _, h_tech = self.tech_gru(z_tech_all)
-        z_tech = h_tech[-1]
+        # Identity indices
+        ticker_id = self._obs_to_index(observations["ticker_id"])
+        class_id = self._obs_to_index(observations["asset_class_id"])
+        subclass_id = self._obs_to_index(observations["asset_subclass_id"])
 
-        z_nb = self.numbars_enc(nb)
-        z_vr = self.raster_enc(vr)
-        z_spatial = self.spatial_fuse(z_nb, z_vr)
-        z_seq = self.seq_enc(seq, lengths=seq_lens)
+        B, L, _ = tech.shape
 
-        _, h_ae = self.ae_gru(ae)
-        z_ae = h_ae[-1]
+        # ==============================================================
+        # PHASE 0: AUTOENCODER → REGIME LATENT
+        # ==============================================================
+        z_regime, _x_recon, _ae_losses = self.autoencoder(ae)
 
-        def _obs_to_index(x: torch.Tensor) -> torch.Tensor:
-            # SB3 may pass Discrete observations as one-hot vectors.
-            if x.dim() == 1:
-                return x.long().view(-1)
-            if x.dim() > 2:
-                x = x.view(x.shape[0], -1)
-            if x.shape[1] == 1:
-                return x[:, 0].long()
-            return torch.argmax(x, dim=1).long()
-
-        ticker_id = _obs_to_index(observations["ticker_id"])
-        class_id = _obs_to_index(observations["asset_class_id"])
-        subclass_id = _obs_to_index(observations["asset_subclass_id"])
-        z_tid = self.ticker_emb(ticker_id)
-        z_cls = self.class_emb(class_id)
-        z_sub = self.subclass_emb(subclass_id)
-
-        features = torch.cat(
-            [
-                z_tech,
-                z_nb,
-                z_vr,
-                z_spatial,
-                z_seq,
-                z_ae,
-                z_tid,
-                z_cls,
-                z_sub,
-            ],
-            dim=1,
+        # ==============================================================
+        # PHASE 1: REGIME-CONDITIONED CONTEXT
+        # ==============================================================
+        c_s, c_e, c_c, c_h = self.regime_encoder(
+            ticker_id=ticker_id,
+            asset_class_id=class_id,
+            asset_subclass_id=subclass_id,
+            z_regime=z_regime,
         )
-        features = self.layer_norm(features)
-        features = self.dropout(features)
+        self._last_regime_var_weights = self.regime_encoder.last_var_weights
+
+        # ==============================================================
+        # PHASE 2: BACKBONE — TEMPORAL FUSION OVER TECH STREAM
+        # ==============================================================
+        z_tech = self.tech_proj(tech)                          # (B, L, d_model)
+        z_regime_bar = self.regime_bar_proj(c_h)               # (B, d_model)
+        z_tech_enriched = z_tech + z_regime_bar.unsqueeze(1)   # (B, L, d_model)
+
+        fused_seq, fused_token = self.fusion_backbone(z_tech_enriched)
+        # fused_seq:   (B, L, d_model)
+        # fused_token: (B, d_model)
+
+        # ==============================================================
+        # PHASE 3: CROSS-MODAL BRANCH ENCODING
+        # ==============================================================
+        z_numbars = self.numbar_encoder(nb)
+        z_vpin = self.vpin_encoder(vr)
+        z_spatial = self.spatial_fuse(z_numbars, z_vpin)
+        z_seq = self.seq_net(seq, lengths=seq_lens)
+
+        # ==============================================================
+        # PHASE 4: REGIME-CONDITIONED BRANCH SELECTION
+        # ==============================================================
+        branch_outputs = [fused_token, z_spatial, z_seq]
+        z_selected, branch_weights = self.branch_selector(
+            branch_outputs=branch_outputs,
+            context=c_s,
+        )
+        self._last_branch_weights = branch_weights.detach()
+
+        # ==============================================================
+        # PHASE 5: ENRICHMENT + TEMPORAL ATTENTION
+        # ==============================================================
+        enrichment_ctx = self.enrichment_grn(c_e)              # (B, d_model)
+        query = enrichment_ctx.unsqueeze(1)                    # (B, 1, d_model)
+        attn_out, _attn_weights = self.temporal_attn(
+            query=query, key=fused_seq, value=fused_seq,
+            need_weights=False,
+        )
+        z_temporal = self.temporal_ln(
+            attn_out.squeeze(1) + enrichment_ctx
+        )                                                      # (B, d_model)
+
+        # ==============================================================
+        # OUTPUT: cat[z_temporal, z_selected] → (B, 2*d_model)
+        # ==============================================================
+        features = torch.cat([z_temporal, z_selected], dim=-1)
         return features
+
+    def get_diagnostics(self) -> dict:
+        """Return last-step diagnostic info for logging."""
+        diag = {}
+        if self._last_branch_weights is not None:
+            names = ["backbone_fused", "spatial", "sequential"]
+            diag["branch_weights"] = {
+                name: self._last_branch_weights[:, i].mean().item()
+                for i, name in enumerate(names)
+            }
+        if self._last_regime_var_weights is not None:
+            names = self.regime_encoder.var_names
+            diag["regime_var_weights"] = {
+                name: self._last_regime_var_weights[:, i].mean().item()
+                for i, name in enumerate(names)
+            }
+        diag["spatial_fuse"] = self.spatial_fuse.get_importance_stats()
+        return diag
