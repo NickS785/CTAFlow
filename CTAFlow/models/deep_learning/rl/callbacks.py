@@ -3,13 +3,16 @@
 Provides ``TradingMetricsCallback`` which accumulates step-level PnL, drawdown,
 exposure, and action statistics from V3ContinuousPPOEnv info dicts, then logs
 a formatted summary every ``log_interval`` steps.
+
+``EarlyStoppingCallback`` wraps TradingMetricsCallback and stops training when
+PnL is still negative past a configurable checkpoint (default: halfway).
 """
 
 from __future__ import annotations
 
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
@@ -41,6 +44,8 @@ class TradingMetricsCallback(BaseCallback):
     def __init__(self, log_interval: int = 10_000, verbose: int = 2):
         super().__init__(verbose=verbose)
         self.log_interval = log_interval
+        self.stopped_early = False
+        self._stop_reason: Optional[str] = None
 
         # Window accumulators (reset each log interval)
         self._w_rewards: List[float] = []
@@ -55,6 +60,7 @@ class TradingMetricsCallback(BaseCallback):
         self._cum_pnl: float = 0.0
         self._cum_peak: float = 0.0
         self._max_dd_lifetime: float = 0.0
+        self._all_net_pnl: List[float] = []  # every step's net PnL
 
         # Episode tracking
         self._ep_rewards: List[float] = []  # current episode
@@ -63,9 +69,11 @@ class TradingMetricsCallback(BaseCallback):
 
         self._last_log_step = 0
         self._start_time = None
+        self._total_timesteps_planned: int = 0
 
     def _on_training_start(self) -> None:
         self._start_time = time.time()
+        self._total_timesteps_planned = self.locals.get("total_timesteps", 0)
 
     def _on_step(self) -> bool:
         infos = self.locals.get("infos", [])
@@ -99,6 +107,7 @@ class TradingMetricsCallback(BaseCallback):
             ticker = info.get("ticker", "?")
             net_pnl = float(gross) - float(cost)
             self._w_ticker_pnl[ticker].append(net_pnl)
+            self._all_net_pnl.append(net_pnl)
 
             # Lifetime cumulative PnL + drawdown
             self._cum_pnl += net_pnl
@@ -237,6 +246,22 @@ class TradingMetricsCallback(BaseCallback):
         self._w_ticker_pnl.clear()
         self._ep_total_rewards.clear()
 
+    @property
+    def progress(self) -> float:
+        """Fraction of total planned timesteps completed (0.0 to 1.0)."""
+        if self._total_timesteps_planned > 0:
+            return self.num_timesteps / self._total_timesteps_planned
+        return 0.0
+
+    @property
+    def recent_sharpe(self) -> float:
+        """Sharpe ratio of the current (un-flushed) window rewards."""
+        if len(self._w_rewards) < 2:
+            return 0.0
+        r = np.array(self._w_rewards)
+        std = float(np.std(r)) + 1e-8
+        return float(np.mean(r)) / std
+
     def get_lifetime_summary(self) -> Dict[str, float]:
         """Return lifetime stats (useful after training completes)."""
         return {
@@ -244,4 +269,122 @@ class TradingMetricsCallback(BaseCallback):
             "max_drawdown": self._max_dd_lifetime,
             "episodes_completed": self._ep_completed,
             "total_timesteps": self.num_timesteps,
+            "stopped_early": self.stopped_early,
+            "stop_reason": self._stop_reason,
         }
+
+
+class EarlyStoppingCallback(BaseCallback):
+    """Stops training when trading metrics indicate a hopeless trial.
+
+    Wraps a ``TradingMetricsCallback`` and evaluates stop conditions at
+    configurable checkpoints.  When a condition triggers, it sets
+    ``metrics_cb.stopped_early = True`` and returns ``False`` from
+    ``_on_step`` which tells SB3 to halt ``model.learn()``.
+
+    Default rules (all configurable):
+      1. **Negative PnL at halfway** — if cumulative net PnL < 0 after 50%
+         of total_timesteps, the config is unlikely to recover.
+      2. **Flat exposure** — if avg exposure < ``min_exposure`` after the
+         warmup fraction, the agent is doing nothing.
+      3. **Drawdown blowup** — if lifetime max drawdown exceeds
+         ``max_drawdown_threshold``, cut losses.
+
+    Parameters
+    ----------
+    metrics_cb : TradingMetricsCallback
+        The metrics callback to read stats from (must be in the same
+        callback list passed to ``model.learn``).
+    check_interval : int
+        Evaluate stop conditions every this many steps (default 10_000).
+    pnl_check_fraction : float
+        Fraction of training at which cumPnL must be >= 0 (default 0.5).
+    min_exposure : float
+        Minimum avg exposure required after warmup (default 0.1).
+    exposure_warmup_fraction : float
+        Don't check exposure until this fraction of training (default 0.2).
+    max_drawdown_threshold : float or None
+        Absolute max drawdown that triggers a stop.  ``None`` = disabled.
+    custom_rule : callable or None
+        ``fn(metrics_cb, num_timesteps, total_timesteps) -> str | None``.
+        Return a reason string to stop, or ``None`` to continue.
+    verbose : int
+        0 = silent, 1 = print stop reason.
+    """
+
+    def __init__(
+        self,
+        metrics_cb: TradingMetricsCallback,
+        check_interval: int = 10_000,
+        pnl_check_fraction: float = 0.5,
+        min_exposure: float = 0.1,
+        exposure_warmup_fraction: float = 0.2,
+        max_drawdown_threshold: Optional[float] = None,
+        custom_rule: Optional[Callable] = None,
+        verbose: int = 1,
+    ):
+        super().__init__(verbose=verbose)
+        self.metrics_cb = metrics_cb
+        self.check_interval = check_interval
+        self.pnl_check_fraction = pnl_check_fraction
+        self.min_exposure = min_exposure
+        self.exposure_warmup_fraction = exposure_warmup_fraction
+        self.max_drawdown_threshold = max_drawdown_threshold
+        self.custom_rule = custom_rule
+        self._last_check_step = 0
+        self._total_timesteps: int = 0
+
+    def _on_training_start(self) -> None:
+        self._total_timesteps = self.locals.get("total_timesteps", 0)
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps - self._last_check_step < self.check_interval:
+            return True
+        self._last_check_step = self.num_timesteps
+
+        if self._total_timesteps <= 0:
+            return True
+
+        progress = self.num_timesteps / self._total_timesteps
+        mcb = self.metrics_cb
+
+        # Rule 1: negative PnL at checkpoint
+        if progress >= self.pnl_check_fraction and mcb._cum_pnl < 0:
+            return self._stop(
+                f"cumPnL={mcb._cum_pnl:+.4f} still negative at "
+                f"{progress:.0%} progress ({self.num_timesteps:,} steps)"
+            )
+
+        # Rule 2: flat exposure (agent just sitting)
+        if progress >= self.exposure_warmup_fraction and len(mcb._all_net_pnl) > 0:
+            # Use recent window if available, else lifetime
+            exposures = mcb._w_exposures if mcb._w_exposures else [0.0]
+            avg_exp = float(np.mean(exposures))
+            if avg_exp < self.min_exposure:
+                return self._stop(
+                    f"avg_exposure={avg_exp:.3f} < {self.min_exposure} at "
+                    f"{progress:.0%} — agent is flat"
+                )
+
+        # Rule 3: drawdown blowup
+        if self.max_drawdown_threshold is not None:
+            if mcb._max_dd_lifetime > self.max_drawdown_threshold:
+                return self._stop(
+                    f"maxDD={mcb._max_dd_lifetime:.4f} > "
+                    f"threshold={self.max_drawdown_threshold:.4f}"
+                )
+
+        # Rule 4: custom
+        if self.custom_rule is not None:
+            reason = self.custom_rule(mcb, self.num_timesteps, self._total_timesteps)
+            if reason:
+                return self._stop(reason)
+
+        return True
+
+    def _stop(self, reason: str) -> bool:
+        self.metrics_cb.stopped_early = True
+        self.metrics_cb._stop_reason = reason
+        if self.verbose >= 1:
+            print(f"  [EarlyStop] {reason}")
+        return False

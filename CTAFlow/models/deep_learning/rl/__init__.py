@@ -57,7 +57,7 @@ from .env import (
     V3ContinuousPPOEnv,
     build_v3_rl_envs,
 )
-from .callbacks import TradingMetricsCallback
+from .callbacks import TradingMetricsCallback, EarlyStoppingCallback
 from .features_extractor import WSPRExtractor, WSPRExtractorV2, V3ContinuousExtractor, FiLMLayer
 from .policy import (
     CnnLstmExtractor,
@@ -83,6 +83,7 @@ __all__ = [
     'V3ContinuousExtractor',
     'FiLMLayer',
     'TradingMetricsCallback',
+    'EarlyStoppingCallback',
     'CnnLstmExtractor',
     'MultiInputLstmExtractor',
     # Policies
