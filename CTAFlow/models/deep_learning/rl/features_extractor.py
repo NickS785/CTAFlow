@@ -404,10 +404,14 @@ class WSPRExtractorV2(BaseFeaturesExtractor):
             seq_lens = seq_lens.squeeze(-1)
 
         # --- 6. Process Meta Modality First (for conditioning) ---
+        # Identity fields are Box-encoded floats; convert to clamped long indices
+        n_t = self.meta_enc.ticker_emb.num_embeddings
+        n_c = self.meta_enc.class_emb.num_embeddings
+        n_sc = self.meta_enc.subclass_emb.num_embeddings
         meta_dict = {
-            'ticker_id': observations['ticker_id'],
-            'asset_class_id': observations['asset_class_id'],
-            'asset_subclass_id': observations['asset_subclass_id'],
+            'ticker_id': observations['ticker_id'].reshape(B, -1)[:, 0].long().clamp(0, n_t - 1),
+            'asset_class_id': observations['asset_class_id'].reshape(B, -1)[:, 0].long().clamp(0, n_c - 1),
+            'asset_subclass_id': observations['asset_subclass_id'].reshape(B, -1)[:, 0].long().clamp(0, n_sc - 1),
             'month': observations.get('month'),
             'dow': observations.get('dow'),
             'doy_sin': observations.get('doy_sin'),
@@ -465,12 +469,15 @@ class WSPRExtractorV2(BaseFeaturesExtractor):
 
     def get_meta_embedding(self, observations) -> torch.Tensor:
         """Extract just the meta embedding for analysis/visualization."""
-        B = observations['ticker_id'].shape[0]
+        B = observations['summary_window'].shape[0]
         W = observations['summary_window'].shape[1]
+        n_t = self.meta_enc.ticker_emb.num_embeddings
+        n_c = self.meta_enc.class_emb.num_embeddings
+        n_sc = self.meta_enc.subclass_emb.num_embeddings
         meta_dict = {
-            'ticker_id': observations['ticker_id'],
-            'asset_class_id': observations['asset_class_id'],
-            'asset_subclass_id': observations['asset_subclass_id'],
+            'ticker_id': observations['ticker_id'].reshape(B, -1)[:, 0].long().clamp(0, n_t - 1),
+            'asset_class_id': observations['asset_class_id'].reshape(B, -1)[:, 0].long().clamp(0, n_c - 1),
+            'asset_subclass_id': observations['asset_subclass_id'].reshape(B, -1)[:, 0].long().clamp(0, n_sc - 1),
             'month': observations.get('month'),
             'dow': observations.get('dow'),
             'doy_sin': observations.get('doy_sin'),
@@ -603,9 +610,17 @@ class V3ContinuousExtractor(BaseFeaturesExtractor):
         # PHASE 1: REGIME-CONDITIONED STATIC ENCODER
         # identity + z_regime → c_s, c_e, c_c, c_h
         # ==============================================================
-        n_tickers = max(observation_space["ticker_id"].n, 1)
-        n_asset_classes = max(observation_space["asset_class_id"].n, 1)
-        n_asset_subclasses = max(observation_space["asset_subclass_id"].n, 1)
+        # Identity fields are Box(0, max_id, shape=(1,)) to avoid SB3's
+        # F.one_hot preprocessing on Discrete spaces (which causes CUDA index
+        # assertions). We infer n_embeddings from the Box high bound.
+        n_tickers = max(int(observation_space["ticker_id"].high.item()) + 1, 1)
+        n_asset_classes = max(int(observation_space["asset_class_id"].high.item()) + 1, 1)
+        n_asset_subclasses = max(int(observation_space["asset_subclass_id"].high.item()) + 1, 1)
+
+        # Store for clamping in forward
+        self._n_tickers = n_tickers
+        self._n_asset_classes = n_asset_classes
+        self._n_asset_subclasses = n_asset_subclasses
 
         self.regime_encoder = AutoencoderConditionedEncoder(
             d_model=d_model,
@@ -691,22 +706,18 @@ class V3ContinuousExtractor(BaseFeaturesExtractor):
         self._last_regime_var_weights = None
 
     @staticmethod
-    def _obs_to_index(x: torch.Tensor) -> torch.Tensor:
-        """Convert SB3 Discrete observation (may be one-hot) to long index.
+    def _obs_to_index(x: torch.Tensor, n_max: int) -> torch.Tensor:
+        """Convert Box-encoded identity observation to clamped long index.
 
-        SB3 one-hot encodes Discrete spaces before passing to the extractor.
-        For Discrete(n), value k becomes a (B, n) tensor with 1 at position k.
-        We use argmax to recover the original index in all cases.
+        Identity fields use Box(0, max_id, shape=(1,)) instead of Discrete
+        to avoid SB3's F.one_hot preprocessing which causes CUDA assertions.
+        The value is a float that we round and clamp to valid embedding range.
         """
-        if x.dim() == 0:
-            return x.long().unsqueeze(0)
-        if x.dim() == 1:
-            # Raw index batch (B,) — not one-hot encoded
-            return x.long()
-        # (B, ...) → flatten to (B, n_classes) then argmax
-        if x.dim() > 2:
-            x = x.view(x.shape[0], -1)
-        return torch.argmax(x, dim=1).long()
+        # Flatten to (B,) regardless of input shape
+        idx = x.reshape(-1) if x.dim() > 1 else x
+        if idx.dim() == 0:
+            idx = idx.unsqueeze(0)
+        return idx.long().clamp(0, n_max - 1)
 
     def forward(self, observations):
         tech = observations["tech_features"].float()       # (B, L, f_tech)
@@ -727,10 +738,10 @@ class V3ContinuousExtractor(BaseFeaturesExtractor):
                 seq_lens = seq_lens.squeeze(-1)
             seq_lens = seq_lens.long().clamp(min=1, max=seq.shape[1])
 
-        # Identity indices
-        ticker_id = self._obs_to_index(observations["ticker_id"])
-        class_id = self._obs_to_index(observations["asset_class_id"])
-        subclass_id = self._obs_to_index(observations["asset_subclass_id"])
+        # Identity indices (Box-encoded floats → clamped long)
+        ticker_id = self._obs_to_index(observations["ticker_id"], self._n_tickers)
+        class_id = self._obs_to_index(observations["asset_class_id"], self._n_asset_classes)
+        subclass_id = self._obs_to_index(observations["asset_subclass_id"], self._n_asset_subclasses)
 
         B, L, _ = tech.shape
 

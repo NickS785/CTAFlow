@@ -403,10 +403,10 @@ class MultiTickerTradingEnv(gym.Env):
             ),
             'seq_lens': spaces.Box(0, max_seq_len, shape=(1,), dtype=np.int32),
 
-            # Meta modalities
-            'ticker_id': spaces.Discrete(self.max_ticker_id),
-            'asset_class_id': spaces.Discrete(self.max_class_id),
-            'asset_subclass_id': spaces.Discrete(self.max_subclass_id),
+            # Meta modalities (Box to avoid SB3 F.one_hot CUDA assertions)
+            'ticker_id': spaces.Box(0, max(self.max_ticker_id - 1, 0), shape=(1,), dtype=np.float32),
+            'asset_class_id': spaces.Box(0, max(self.max_class_id - 1, 0), shape=(1,), dtype=np.float32),
+            'asset_subclass_id': spaces.Box(0, max(self.max_subclass_id - 1, 0), shape=(1,), dtype=np.float32),
 
             # Calendar features (per window day)
             'month': spaces.Box(0, 12, shape=(window_size,), dtype=np.int32),
@@ -653,10 +653,10 @@ class MultiTickerTradingEnv(gym.Env):
             'seq_current': data['data_seq'][idx],
             'seq_lens': np.array([data['data_seq_lens'][idx]], dtype=np.int32),
 
-            # Meta modalities (scalars for this sample)
-            'ticker_id': np.array(meta.get('ticker_id', 0), dtype=np.int64),
-            'asset_class_id': np.array(meta.get('asset_class_id', 0), dtype=np.int64),
-            'asset_subclass_id': np.array(meta.get('asset_subclass_id', 0), dtype=np.int64),
+            # Meta modalities (Box-encoded floats to avoid SB3 CUDA assertions)
+            'ticker_id': np.array([meta.get('ticker_id', 0)], dtype=np.float32),
+            'asset_class_id': np.array([meta.get('asset_class_id', 0)], dtype=np.float32),
+            'asset_subclass_id': np.array([meta.get('asset_subclass_id', 0)], dtype=np.float32),
 
             # Calendar features (per window day)
             'month': month,
@@ -754,9 +754,12 @@ class V3ContinuousPPOEnv(gym.Env):
             "seq_vpin": spaces.Box(-np.inf, np.inf, shape=self._seq_shape, dtype=np.float32),
             "seq_vpin_lens": spaces.Box(0, self.max_seq_len, shape=(1,), dtype=np.int32),
             "ae_input": spaces.Box(-np.inf, np.inf, shape=self._ae_shape, dtype=np.float32),
-            "ticker_id": spaces.Discrete(max(self.max_ticker_id, 1)),
-            "asset_class_id": spaces.Discrete(max(self.max_class_id, 1)),
-            "asset_subclass_id": spaces.Discrete(max(self.max_subclass_id, 1)),
+            # Use Box instead of Discrete to avoid SB3's F.one_hot preprocessing
+            # which can trigger CUDA index assertions. The extractor reads these
+            # as floats and converts to clamped long indices before embedding lookup.
+            "ticker_id": spaces.Box(0, max(self.max_ticker_id - 1, 0), shape=(1,), dtype=np.float32),
+            "asset_class_id": spaces.Box(0, max(self.max_class_id - 1, 0), shape=(1,), dtype=np.float32),
+            "asset_subclass_id": spaces.Box(0, max(self.max_subclass_id - 1, 0), shape=(1,), dtype=np.float32),
         })
 
         self.action_space = spaces.Discrete(3)
@@ -874,9 +877,9 @@ class V3ContinuousPPOEnv(gym.Env):
             "seq_vpin": seq,
             "seq_vpin_lens": np.array([seq_len], dtype=np.int32),
             "ae_input": ae,
-            "ticker_id": np.array(int(sample["ticker_id"]), dtype=np.int64),
-            "asset_class_id": np.array(int(sample["asset_class_id"]), dtype=np.int64),
-            "asset_subclass_id": np.array(int(sample["asset_subclass_id"]), dtype=np.int64),
+            "ticker_id": np.array([int(sample["ticker_id"])], dtype=np.float32),
+            "asset_class_id": np.array([int(sample["asset_class_id"])], dtype=np.float32),
+            "asset_subclass_id": np.array([int(sample["asset_subclass_id"])], dtype=np.float32),
             "target": float(sample["target"]),
             "ticker": sample.get("ticker"),
             "date": sample.get("date"),
