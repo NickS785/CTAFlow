@@ -108,8 +108,6 @@ class WSPRExtractor(BaseFeaturesExtractor):
             d_model=d_model
         )
 
-        # --- 4. Sequential Branch (Current Only) ---
-        # RNN for the current intraday tick/bar sequence
         self.seq_enc = IntradayRNN(
             input_dim=f_seq,
             d_model=d_model,
@@ -694,13 +692,20 @@ class V3ContinuousExtractor(BaseFeaturesExtractor):
 
     @staticmethod
     def _obs_to_index(x: torch.Tensor) -> torch.Tensor:
-        """Convert SB3 Discrete observation (may be one-hot) to long index."""
+        """Convert SB3 Discrete observation (may be one-hot) to long index.
+
+        SB3 one-hot encodes Discrete spaces before passing to the extractor.
+        For Discrete(n), value k becomes a (B, n) tensor with 1 at position k.
+        We use argmax to recover the original index in all cases.
+        """
+        if x.dim() == 0:
+            return x.long().unsqueeze(0)
         if x.dim() == 1:
-            return x.long().view(-1)
+            # Raw index batch (B,) — not one-hot encoded
+            return x.long()
+        # (B, ...) → flatten to (B, n_classes) then argmax
         if x.dim() > 2:
             x = x.view(x.shape[0], -1)
-        if x.shape[1] == 1:
-            return x[:, 0].long()
         return torch.argmax(x, dim=1).long()
 
     def forward(self, observations):
