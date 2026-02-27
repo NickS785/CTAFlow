@@ -448,7 +448,12 @@ class MMTFv3Core(nn.Module):
         # PHASE 6: PREDICTION
         # ==========================================================
         z_final = torch.cat([z_temporal, z_selected], dim=-1)       # (B, 2*d_model)
-        position = self.head(z_final)                               # (B, 1)
+
+        logits = None
+        if isinstance(self.head, QuantilePositionHead):
+            position, logits = self.head(z_final)                   # (B,1), (B,5)
+        else:
+            position = self.head(z_final)                           # (B, 1)
 
         # ==========================================================
         # TRACKING
@@ -479,6 +484,8 @@ class MMTFv3Core(nn.Module):
         results = [position]
         if return_ae_losses:
             results.append(ae_losses)
+        if logits is not None:
+            results.append(logits)
         if return_tracker:
             results.append(self._last_tracker)
         return results[0] if len(results) == 1 else tuple(results)
@@ -517,6 +524,111 @@ class MMTFv3MambaVQVAE(MMTFv3Core):
         kwargs.setdefault("backbone", "mamba")
         kwargs.setdefault("ae_type", "vqvae")
         super().__init__(**kwargs)
+
+
+# ============================================================================
+# PredictionToPosition — 5-class quantile → continuous position
+# ============================================================================
+
+def returns_to_classes(
+    returns: torch.Tensor,
+    inner: float = 0.25,
+    outer: float = 1.0,
+) -> torch.Tensor:
+    """Bucket forward returns into 5 conviction classes using σ-based thresholds.
+
+    Classes: 0=strong_neg, 1=weak_neg, 2=neutral, 3=weak_pos, 4=strong_pos
+
+    Parameters
+    ----------
+    returns : Tensor (B,) or (B, 1)
+        Forward returns.
+    inner : float
+        Inner threshold in σ units for neutral zone boundary. Default 0.25.
+    outer : float
+        Outer threshold in σ units for strong conviction boundary. Default 1.0.
+
+    Returns
+    -------
+    labels : Tensor (B,) long in {0, 1, 2, 3, 4}
+    """
+    r = returns.detach().view(-1)
+    sigma = r.std().clamp(min=1e-8)
+
+    labels = torch.full_like(r, 2, dtype=torch.long)          # neutral
+    labels[r <= -outer * sigma] = 0                            # strong neg
+    labels[(r > -outer * sigma) & (r <= -inner * sigma)] = 1   # weak neg
+    labels[(r >= inner * sigma) & (r < outer * sigma)] = 3     # weak pos
+    labels[r >= outer * sigma] = 4                             # strong pos
+    return labels
+
+
+class PredictionToPosition(nn.Module):
+    """Convert 5-class quantile logits → continuous position ∈ [-1, 1].
+
+    Classes: 0=strong_neg, 1=weak_neg, 2=neutral, 3=weak_pos, 4=strong_pos
+
+    Position = tanh(temperature * sum(p_i * anchor_i))
+    where anchors are learnable, initialized to [-1.0, -0.5, 0.0, +0.5, +1.0].
+    """
+
+    def __init__(self, temperature: float = 1.5):
+        super().__init__()
+        self.temperature = temperature
+        self.anchors = nn.Parameter(
+            torch.tensor([-1.0, -0.5, 0.0, 0.5, 1.0]),
+        )
+
+    def forward(self, logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Parameters
+        ----------
+        logits : Tensor (B, 5)
+
+        Returns
+        -------
+        position : Tensor (B, 1)
+        logits : Tensor (B, 5) — passed through for multi-loss
+        """
+        probs = torch.softmax(logits / self.temperature, dim=-1)    # (B, 5)
+        weighted = (probs * self.anchors.unsqueeze(0)).sum(dim=-1)   # (B,)
+        position = torch.tanh(weighted).unsqueeze(-1)                # (B, 1)
+        return position, logits
+
+
+class QuantilePositionHead(nn.Module):
+    """MLP → 5-class logits → PredictionToPosition → continuous position.
+
+    Replaces the standard Tanh head in MMTFv3Core when quantile_head=True.
+    """
+
+    def __init__(self, d_input: int, d_model: int, dropout: float = 0.2, temperature: float = 1.5):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(d_input, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, 5),
+        )
+        self.ptp = PredictionToPosition(temperature=temperature)
+
+    def forward(self, z_final: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Parameters
+        ----------
+        z_final : Tensor (B, d_input) — typically 2*d_model
+
+        Returns
+        -------
+        position : Tensor (B, 1)
+        logits : Tensor (B, 5)
+        """
+        logits = self.mlp(z_final)           # (B, 5)
+        position, logits = self.ptp(logits)  # (B, 1), (B, 5)
+        return position, logits
 
 
 # ============================================================================
@@ -587,12 +699,34 @@ class TickerPositionStateLayer(nn.Module):
 
 
 class StatefulMMTFv3Core(nn.Module):
-    """MMTFv3Core wrapped with a ticker-aware online position state layer."""
+    """MMTFv3Core wrapped with a ticker-aware online position state layer.
+
+    Parameters
+    ----------
+    base_model : MMTFv3Core
+        The base MMTFv3 model.
+    n_tickers : int
+        Number of tickers for position state tracking.
+    quantile_head : bool
+        If True, replace the base model's head with a QuantilePositionHead
+        that produces 5-class logits → continuous position via PTP.
+        Forward returns ``(position, ae_losses, logits)`` when True.
+    ptp_temperature : float
+        Temperature for PredictionToPosition sharpness. Default 1.5.
+    state_hidden_dim : int
+        Hidden dim for the state fusion MLP. Default 16.
+    state_momentum : float
+        EMA momentum for position state. Default 0.9.
+    update_on_eval : bool
+        Whether to update position state during evaluation. Default True.
+    """
 
     def __init__(
         self,
         base_model: MMTFv3Core,
         n_tickers: int,
+        quantile_head: bool = False,
+        ptp_temperature: float = 1.5,
         state_hidden_dim: int = 16,
         state_momentum: float = 0.9,
         update_on_eval: bool = True,
@@ -601,6 +735,16 @@ class StatefulMMTFv3Core(nn.Module):
         self.base_model = base_model
         self.recon_weight = base_model.recon_weight
         self.update_on_eval = update_on_eval
+        self.quantile_head = quantile_head
+
+        if quantile_head:
+            base_model.head = QuantilePositionHead(
+                d_input=base_model.d_model * 2,
+                d_model=base_model.d_model,
+                dropout=0.2,
+                temperature=ptp_temperature,
+            )
+
         self.state_layer = TickerPositionStateLayer(
             n_tickers=n_tickers,
             hidden_dim=state_hidden_dim,
@@ -624,11 +768,20 @@ class StatefulMMTFv3Core(nn.Module):
             return_ae_losses=True,
         )
 
-        if return_tracker:
-            base_position, ae_losses, tracker = base_out
+        # Unpack base model outputs — logits present when using quantile head
+        logits = None
+        if self.quantile_head:
+            if return_tracker:
+                base_position, ae_losses, logits, tracker = base_out
+            else:
+                base_position, ae_losses, logits = base_out
+                tracker = {}
         else:
-            base_position, ae_losses = base_out
-            tracker = {}
+            if return_tracker:
+                base_position, ae_losses, tracker = base_out
+            else:
+                base_position, ae_losses = base_out
+                tracker = {}
 
         should_update_state = self.training or self.update_on_eval
         position, prev_state, state_delta = self.state_layer(
@@ -651,6 +804,8 @@ class StatefulMMTFv3Core(nn.Module):
         outputs = [position]
         if return_ae_losses:
             outputs.append(ae_losses)
+        if logits is not None:
+            outputs.append(logits)
         if return_tracker:
             outputs.append(tracker)
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
@@ -915,5 +1070,277 @@ def print_v3_diagnostics(tracker: dict, eval_metrics: dict, epoch: int = 0) -> N
             fmt = f"{val:.4f}" if abs(val) < 10 else f"{val:.1f}"
             print(f"    {key:<22s}: {fmt}")
     print()
+
+
+# ============================================================================
+# PTP Composite Loss
+# ============================================================================
+
+class PTPLoss(nn.Module):
+    """Combined loss for PredictionToPosition training.
+
+    Components:
+      1. Profit-weighted CE on 5-class logits (classification quality)
+      2. ContinuousTradingLoss on continuous position (PnL/Sharpe)
+
+    The CE uses 5-class direction mapping: classes {0,1} → negative,
+    class {2} → neutral, classes {3,4} → positive.
+
+    Parameters
+    ----------
+    ce_weight : float
+        Weight for the classification loss component. Default 1.0.
+    pnl_weight : float
+        Weight for the continuous trading loss component. Default 1.0.
+    profit_scale : float
+        Scale factor for return-magnitude weighting in CE. Default 100.0.
+    direction_penalty : float
+        Extra penalty for wrong-direction predictions in CE. Default 1.0.
+    inner_threshold : float
+        Inner σ threshold for neutral zone in returns_to_classes. Default 0.25.
+    outer_threshold : float
+        Outer σ threshold for strong conviction in returns_to_classes. Default 1.0.
+    **trading_kwargs
+        Passed to ContinuousTradingLoss (tc_cost, direction_weight, etc.).
+    """
+
+    def __init__(
+        self,
+        ce_weight: float = 1.0,
+        pnl_weight: float = 1.0,
+        profit_scale: float = 100.0,
+        direction_penalty: float = 1.0,
+        inner_threshold: float = 0.25,
+        outer_threshold: float = 1.0,
+        **trading_kwargs,
+    ):
+        super().__init__()
+        self.ce_weight = ce_weight
+        self.pnl_weight = pnl_weight
+        self.profit_scale = profit_scale
+        self.direction_penalty = direction_penalty
+        self.inner_threshold = inner_threshold
+        self.outer_threshold = outer_threshold
+        self.trading_loss = ContinuousTradingLoss(**trading_kwargs)
+
+    def _profit_weighted_ce_5class(
+        self,
+        logits: torch.Tensor,
+        y_true: torch.Tensor,
+        returns: torch.Tensor,
+    ) -> torch.Tensor:
+        """Profit-weighted CE with correct 5-class direction mapping."""
+        ce = nn.functional.cross_entropy(logits, y_true, reduction="none")
+
+        # Weight by return magnitude
+        weights = (returns.abs() * self.profit_scale).clamp(0.1, 10.0)
+
+        # 5-class direction: {0,1}→neg, {2}→neutral, {3,4}→pos
+        with torch.no_grad():
+            y_hat = logits.argmax(dim=-1)
+            pred_dir = (y_hat > 2).float() - (y_hat < 2).float()
+            true_dir = (y_true > 2).float() - (y_true < 2).float()
+            wrong_dir = (pred_dir * true_dir) < 0
+            weights = weights + wrong_dir.float() * self.direction_penalty
+
+        return (ce * weights).mean()
+
+    def forward(
+        self,
+        position: torch.Tensor,
+        logits: torch.Tensor,
+        forward_return: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Parameters
+        ----------
+        position : Tensor (B, 1)
+            Continuous position from PTP.
+        logits : Tensor (B, 5)
+            Raw class logits for CE loss.
+        forward_return : Tensor (B,) or (B, 1)
+            Actual forward returns.
+
+        Returns
+        -------
+        total_loss : Tensor
+        metrics : dict
+        """
+        fwd = forward_return.view(-1)
+
+        # Derive class labels from returns
+        class_labels = returns_to_classes(
+            fwd, inner=self.inner_threshold, outer=self.outer_threshold,
+        )
+
+        # 1. Classification loss (profit-weighted CE on 5-class logits)
+        ce = self._profit_weighted_ce_5class(logits, class_labels, fwd)
+
+        # 2. Trading loss (PnL/Sharpe on continuous position)
+        trading, trading_metrics = self.trading_loss(position, fwd)
+
+        total = self.ce_weight * ce + self.pnl_weight * trading
+
+        # Classification metrics
+        with torch.no_grad():
+            pred_cls = logits.argmax(dim=-1)
+            cls_acc = (pred_cls == class_labels).float().mean().item() * 100.0
+            # Direction accuracy: classes 0,1 = negative, 3,4 = positive
+            pred_dir = (pred_cls > 2).long() - (pred_cls < 2).long()
+            true_dir = (class_labels > 2).long() - (class_labels < 2).long()
+            directional_mask = true_dir != 0
+            if directional_mask.any():
+                dir_match = (pred_dir[directional_mask] == true_dir[directional_mask]).float().mean().item() * 100.0
+            else:
+                dir_match = 0.0
+
+        metrics = {
+            **trading_metrics,
+            "ce_loss": ce.item(),
+            "trading_loss": trading.item(),
+            "cls_accuracy": cls_acc,
+            "cls_dir_accuracy": dir_match,
+        }
+        return total, metrics
+
+
+# ============================================================================
+# PTP Training / Evaluation Loops
+# ============================================================================
+
+def train_epoch_v3_ptp(
+    model: nn.Module,
+    loader,
+    ptp_loss: PTPLoss,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    max_norm: float = 1.0,
+    unpack_fn=None,
+) -> Tuple[float, Dict[str, float]]:
+    """Train one epoch with PTP multi-loss (CE + PnL + AE).
+
+    Expects model to return ``(position, ae_losses, logits)`` — i.e.,
+    a ``StatefulMMTFv3Core`` with ``quantile_head=True``.
+    """
+    model.train()
+    _maybe_reset_position_state(model)
+
+    total_loss = 0.0
+    metric_accum: Dict[str, float] = {}
+    n_batches = 0
+
+    for batch in loader:
+        inputs, targets = unpack_fn(batch, device=device)
+        targets = targets.float()
+
+        optimizer.zero_grad()
+        position, ae_losses, logits = model(**inputs, return_ae_losses=True)
+
+        # PTP composite loss (CE + trading)
+        ptp_total, ptp_metrics = ptp_loss(position, logits, targets)
+
+        # AE reconstruction
+        ae_loss = model.recon_weight * ae_losses["total_ae_loss"]
+        loss = ptp_total + ae_loss
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            continue
+
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+        optimizer.step()
+
+        total_loss += loss.item()
+        for k, v in ptp_metrics.items():
+            metric_accum[k] = metric_accum.get(k, 0.0) + v
+        metric_accum["ae_recon"] = metric_accum.get("ae_recon", 0.0) + ae_losses["recon_loss"].item()
+        if "kl_loss" in ae_losses:
+            metric_accum["ae_kl"] = metric_accum.get("ae_kl", 0.0) + ae_losses["kl_loss"].item()
+        n_batches += 1
+
+    n = max(n_batches, 1)
+    return total_loss / n, {k: v / n for k, v in metric_accum.items()}
+
+
+@torch.no_grad()
+def evaluate_v3_ptp(
+    model: nn.Module,
+    loader,
+    ptp_loss: PTPLoss,
+    device: torch.device,
+    unpack_fn=None,
+) -> Dict[str, float]:
+    """Evaluate PTP model with classification + trading metrics."""
+    model.eval()
+    _maybe_reset_position_state(model)
+
+    all_positions, all_returns, all_logits = [], [], []
+    total_loss = 0.0
+    n_batches = 0
+
+    for batch in loader:
+        inputs, targets = unpack_fn(batch, device=device)
+        targets = targets.float()
+
+        position, ae_losses, logits = model(**inputs, return_ae_losses=True)
+
+        ptp_total, _ = ptp_loss(position, logits, targets)
+        ae_loss = model.recon_weight * ae_losses["total_ae_loss"]
+        total_loss += (ptp_total + ae_loss).item()
+        n_batches += 1
+
+        all_positions.append(position.detach().view(-1).cpu())
+        all_returns.append(targets.detach().view(-1).cpu())
+        all_logits.append(logits.detach().cpu())
+
+    positions = torch.cat(all_positions)
+    returns = torch.cat(all_returns)
+    all_logits_cat = torch.cat(all_logits)
+    strategy_ret = positions * returns
+
+    n = max(n_batches, 1)
+    mean_ret = strategy_ret.mean().item()
+    std_ret = strategy_ret.std().item() + 1e-8
+
+    gross_profit = strategy_ret[strategy_ret > 0].sum().item()
+    gross_loss = strategy_ret[strategy_ret < 0].abs().sum().item() + 1e-8
+    cum_ret = strategy_ret.cumsum(dim=0)
+
+    correct_dir = ((positions > 0) & (returns > 0)) | ((positions < 0) & (returns < 0))
+    non_flat = positions.abs() > 0.05
+    dir_acc = (correct_dir & non_flat).float().sum().item() / max(non_flat.float().sum().item(), 1)
+
+    # Classification metrics
+    class_labels = returns_to_classes(
+        returns,
+        inner=ptp_loss.inner_threshold,
+        outer=ptp_loss.outer_threshold,
+    )
+    pred_cls = all_logits_cat.argmax(dim=-1)
+    cls_acc = (pred_cls == class_labels).float().mean().item() * 100.0
+
+    # Per-class accuracy
+    per_class = {}
+    for c in range(5):
+        mask = class_labels == c
+        if mask.any():
+            per_class[f"cls_{c}_acc"] = (pred_cls[mask] == c).float().mean().item() * 100.0
+            per_class[f"cls_{c}_count"] = int(mask.sum().item())
+
+    return {
+        "loss": total_loss / n,
+        "sharpe": mean_ret / std_ret,
+        "sortino": mean_ret / (strategy_ret.clamp(max=0.0).pow(2).mean().sqrt().item() + 1e-8),
+        "mean_strategy_ret": mean_ret,
+        "win_rate": (strategy_ret > 0).float().mean().item() * 100.0,
+        "dir_accuracy": dir_acc * 100.0,
+        "profit_factor": gross_profit / gross_loss,
+        "max_drawdown": (cum_ret.cummax(dim=0)[0] - cum_ret).max().item(),
+        "avg_exposure": positions.abs().mean().item(),
+        "avg_position": positions.mean().item(),
+        "cls_accuracy": cls_acc,
+        **per_class,
+        "n_samples": len(positions),
+    }
 
 
