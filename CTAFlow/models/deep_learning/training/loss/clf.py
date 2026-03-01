@@ -838,15 +838,21 @@ class ContinuousTradingLoss(nn.Module):
 
         # ── Turnover ────────────────────────────────────────────────
         if prev_position is not None:
-            turnover = (pos - prev_position.squeeze()).abs().mean()
+            prev = prev_position.squeeze()
+            # Handle batch size mismatch (last batch may be smaller)
+            n = min(pos.shape[0], prev.shape[0])
+            turnover = (pos[:n] - prev[:n]).abs().mean()
         else:
             turnover = pos.abs().mean()
 
         # ── 1. Risk-adjusted return (gross or TC-adjusted) ─────────
         gross_ret = pos * ret
         if self.tc_in_sharpe and prev_position is not None:
-            tc_drag = self.tc_cost * (pos - prev_position.squeeze()).abs()
-            strategy_ret = gross_ret - tc_drag
+            prev = prev_position.squeeze()
+            n = min(pos.shape[0], prev.shape[0])
+            tc_drag = self.tc_cost * (pos[:n] - prev[:n]).abs()
+            strategy_ret = gross_ret.clone()
+            strategy_ret[:n] = strategy_ret[:n] - tc_drag
         else:
             strategy_ret = gross_ret
 
@@ -878,7 +884,9 @@ class ContinuousTradingLoss(nn.Module):
         # ── 5. Holding bonus (reward position persistence) ─────────
         loss_holding = torch.tensor(0.0, device=pos.device)
         if self.holding_weight > 0 and prev_position is not None:
-            agreement = (pos * prev_position.squeeze()).clamp(min=0).mean()
+            prev = prev_position.squeeze()
+            n = min(pos.shape[0], prev.shape[0])
+            agreement = (pos[:n] * prev[:n]).clamp(min=0).mean()
             loss_holding = -self.holding_weight * agreement
 
         total = (
