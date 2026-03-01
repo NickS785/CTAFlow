@@ -799,8 +799,9 @@ class ContinuousTradingLoss(nn.Module):
     Components:
       1. Differentiable Sharpe/Sortino (batch-level risk-adjusted return)
       2. Directional accuracy (per-sample, stable early gradients)
-      3. Transaction cost / turnover penalty
+      3. Transaction cost / turnover penalty (or TC-adjusted Sharpe)
       4. Position regularization (selectivity toward target exposure)
+      5. Holding bonus (rewards position persistence)
     """
 
     def __init__(
@@ -812,6 +813,8 @@ class ContinuousTradingLoss(nn.Module):
         use_sortino: bool = False,
         downside_vol_weight: float = 0.0,
         sharpe_eps: float = 1e-6,
+        tc_in_sharpe: bool = False,
+        holding_weight: float = 0.0,
     ):
         super().__init__()
         self.tc_cost = tc_cost
@@ -821,6 +824,8 @@ class ContinuousTradingLoss(nn.Module):
         self.use_sortino = use_sortino
         self.downside_vol_weight = downside_vol_weight
         self.sharpe_eps = sharpe_eps
+        self.tc_in_sharpe = tc_in_sharpe
+        self.holding_weight = holding_weight
 
     def forward(
         self,
@@ -830,9 +835,21 @@ class ContinuousTradingLoss(nn.Module):
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         pos = position.squeeze()
         ret = forward_return.squeeze()
-        strategy_ret = pos * ret
 
-        # 1. Risk-adjusted return
+        # ── Turnover ────────────────────────────────────────────────
+        if prev_position is not None:
+            turnover = (pos - prev_position.squeeze()).abs().mean()
+        else:
+            turnover = pos.abs().mean()
+
+        # ── 1. Risk-adjusted return (gross or TC-adjusted) ─────────
+        gross_ret = pos * ret
+        if self.tc_in_sharpe and prev_position is not None:
+            tc_drag = self.tc_cost * (pos - prev_position.squeeze()).abs()
+            strategy_ret = gross_ret - tc_drag
+        else:
+            strategy_ret = gross_ret
+
         mean_r = strategy_ret.mean()
         if self.use_sortino:
             risk = strategy_ret.clamp(max=0.0).pow(2).mean().sqrt() + self.sharpe_eps
@@ -842,21 +859,27 @@ class ContinuousTradingLoss(nn.Module):
         downside_vol = strategy_ret.clamp(max=0.0).pow(2).mean().sqrt()
         loss_downside_vol = self.downside_vol_weight * downside_vol
 
-        # 2. Directional accuracy
+        # ── 2. Directional accuracy ────────────────────────────────
         pos_sign = torch.tanh(pos * 10.0)
         ret_sign = torch.tanh(ret * 100.0)
         loss_direction = F.smooth_l1_loss(pos_sign, ret_sign)
 
-        # 3. Transaction cost
-        if prev_position is not None:
-            turnover = (pos - prev_position.squeeze()).abs().mean()
+        # ── 3. Transaction cost (separate penalty, skipped when
+        #       TC is already embedded in Sharpe) ───────────────────
+        if self.tc_in_sharpe and prev_position is not None:
+            loss_tc = torch.tensor(0.0, device=pos.device)
         else:
-            turnover = pos.abs().mean()
-        loss_tc = self.tc_cost * turnover
+            loss_tc = self.tc_cost * turnover
 
-        # 4. Position regularization
+        # ── 4. Position regularization ─────────────────────────────
         avg_exposure = pos.abs().mean()
         loss_reg = self.reg_weight * (avg_exposure - self.target_exposure).pow(2)
+
+        # ── 5. Holding bonus (reward position persistence) ─────────
+        loss_holding = torch.tensor(0.0, device=pos.device)
+        if self.holding_weight > 0 and prev_position is not None:
+            agreement = (pos * prev_position.squeeze()).clamp(min=0).mean()
+            loss_holding = -self.holding_weight * agreement
 
         total = (
             loss_sharpe
@@ -864,6 +887,7 @@ class ContinuousTradingLoss(nn.Module):
             + loss_tc
             + loss_reg
             + loss_downside_vol
+            + loss_holding
         )
         metrics = {
             "loss_sharpe": loss_sharpe.item(),
@@ -871,10 +895,12 @@ class ContinuousTradingLoss(nn.Module):
             "loss_tc": loss_tc.item(),
             "loss_reg": loss_reg.item(),
             "loss_downside_vol": loss_downside_vol.item(),
+            "loss_holding": loss_holding.item(),
             "mean_strategy_ret": mean_r.item(),
             "avg_exposure": avg_exposure.item(),
             "sharpe_batch": (-loss_sharpe).item(),
             "downside_vol": downside_vol.item(),
+            "turnover": turnover.item(),
         }
         return total, metrics
 
@@ -892,6 +918,8 @@ class SharpeScheduler:
         final_reg_weight: float = 0.05,
         initial_target_exposure: float = 0.2,
         final_target_exposure: float = 0.5,
+        initial_holding_weight: float = 0.0,
+        final_holding_weight: float = 0.0,
     ):
         self.warmup_epochs = warmup_epochs
         self.total_epochs = total_epochs
@@ -901,6 +929,8 @@ class SharpeScheduler:
         self.final_rw = final_reg_weight
         self.initial_te = initial_target_exposure
         self.final_te = final_target_exposure
+        self.initial_hw = initial_holding_weight
+        self.final_hw = final_holding_weight
 
     def step(self, epoch: int, loss_fn: ContinuousTradingLoss) -> None:
         if epoch < self.warmup_epochs:
@@ -914,3 +944,4 @@ class SharpeScheduler:
         loss_fn.direction_weight = self.initial_dw + t * (self.final_dw - self.initial_dw)
         loss_fn.reg_weight = self.initial_rw + t * (self.final_rw - self.initial_rw)
         loss_fn.target_exposure = self.initial_te + t * (self.final_te - self.initial_te)
+        loss_fn.holding_weight = self.initial_hw + t * (self.final_hw - self.initial_hw)

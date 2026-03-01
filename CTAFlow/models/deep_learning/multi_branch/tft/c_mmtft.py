@@ -1255,6 +1255,7 @@ class PTPLoss(nn.Module):
         position: torch.Tensor,
         logits: torch.Tensor,
         forward_return: torch.Tensor,
+        prev_position: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Parameters
@@ -1265,6 +1266,8 @@ class PTPLoss(nn.Module):
             Raw class logits for CE loss.
         forward_return : Tensor (B,) or (B, 1)
             Actual forward returns.
+        prev_position : Tensor (B, 1), optional
+            Previous position for turnover / TC-adjusted Sharpe.
 
         Returns
         -------
@@ -1282,7 +1285,9 @@ class PTPLoss(nn.Module):
         ce = self._profit_weighted_ce_5class(logits, class_labels, fwd)
 
         # 2. Trading loss (PnL/Sharpe on continuous position)
-        trading, trading_metrics = self.trading_loss(position, fwd)
+        trading, trading_metrics = self.trading_loss(
+            position, fwd, prev_position=prev_position,
+        )
 
         total = self.ce_weight * ce + self.pnl_weight * trading
 
@@ -1333,6 +1338,7 @@ def train_epoch_v3_ptp(
     total_loss = 0.0
     metric_accum: Dict[str, float] = {}
     n_batches = 0
+    prev_pos = None  # track position across batches for turnover / TC
 
     for batch in loader:
         inputs, targets = unpack_fn(batch, device=device)
@@ -1342,7 +1348,9 @@ def train_epoch_v3_ptp(
         position, ae_losses, logits = model(**inputs, return_ae_losses=True)
 
         # PTP composite loss (CE + trading)
-        ptp_total, ptp_metrics = ptp_loss(position, logits, targets)
+        ptp_total, ptp_metrics = ptp_loss(
+            position, logits, targets, prev_position=prev_pos,
+        )
 
         # AE reconstruction
         ae_loss = model.recon_weight * ae_losses["total_ae_loss"]
@@ -1362,6 +1370,7 @@ def train_epoch_v3_ptp(
         if "kl_loss" in ae_losses:
             metric_accum["ae_kl"] = metric_accum.get("ae_kl", 0.0) + ae_losses["kl_loss"].item()
         n_batches += 1
+        prev_pos = position.detach()
 
     n = max(n_batches, 1)
     return total_loss / n, {k: v / n for k, v in metric_accum.items()}
