@@ -1198,6 +1198,7 @@ def build_v3_loaders(
     prep: V3ContinuousPrep,
     tech_lookback: int = 64,
     seq_lookback_bars: int = 12,
+    numbars_lookback: int = 8,
     use_fused_spatial: bool = False,
     batch_size: int = 64,
     val_ratio: float = 0.2,
@@ -1213,6 +1214,8 @@ def build_v3_loaders(
 
     Parameters
     ----------
+    numbars_lookback : int
+        Number of recent NumberBars frames to include per sample.
     sample_session : str, optional
         Named session filter: ``"usa"``, ``"london"``, ``"overlap"``.
     sample_session_start, sample_session_end : str, optional
@@ -1225,6 +1228,7 @@ def build_v3_loaders(
     all_samples = prep.build_samples(
         tech_lookback=tech_lookback,
         seq_lookback_bars=seq_lookback_bars,
+        numbars_lookback=numbars_lookback,
         use_fused_spatial=use_fused_spatial,
         session_only=True,
         sample_session=sample_session,
