@@ -217,17 +217,28 @@ def compute_vpin_rolling_vwap(
     return vwap.astype(np.float32)
 
 
+def _normalize_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a sorted, tz-naive DataFrame with a strict DatetimeIndex."""
+    if df.empty:
+        return df.copy()
+
+    out = df.copy()
+    if not isinstance(out.index, pd.DatetimeIndex):
+        out.index = pd.to_datetime(out.index)
+    if out.index.tz is not None:
+        out.index = out.index.tz_localize(None)
+    out = out.sort_index()
+    out = out[~out.index.duplicated(keep="last")]
+    return out
+
+
 def prepare_vpin_spatial_features(vpin_df: pd.DataFrame) -> pd.DataFrame:
     """Extract raw VPIN fields needed for fused spatial rasterization."""
     if vpin_df.empty:
         return pd.DataFrame(columns=["close", "vol", "signed_imbalance", "vpin", "rolling_vwap_2h"])
 
     work = vpin_df.copy()
-    if not isinstance(work.index, pd.DatetimeIndex):
-        work.index = pd.to_datetime(work.index)
-    if work.index.tz is not None:
-        work.index = work.index.tz_localize(None)
-    work = work.sort_index()
+    work = _normalize_datetime_index(work)
 
     out = pd.DataFrame(index=work.index)
     close_src = (
@@ -583,12 +594,7 @@ class V3ContinuousPrep:
         vpin_path = root / vpin_file
         if vpin_path.exists():
             vpin_df = pd.read_parquet(str(vpin_path))
-            if not isinstance(vpin_df.index, pd.DatetimeIndex):
-                vpin_df.index = pd.to_datetime(vpin_df.index)
-            # Strip timezone for consistent date lookups
-            if vpin_df.index.tz is not None:
-                vpin_df.index = vpin_df.index.tz_localize(None)
-            vpin_df = vpin_df.sort_index()
+            vpin_df = _normalize_datetime_index(vpin_df)
             raw_numeric = vpin_df.select_dtypes(include="number").astype(np.float32)
             self._vpin_spatial[ticker] = prepare_vpin_spatial_features(raw_numeric)
             self._seq_vpin[ticker] = scale_vpin_features(raw_numeric)
@@ -812,7 +818,7 @@ class V3ContinuousPrep:
             # Keep VPIN as a sorted timestamp-aligned array for
             # per-bar slicing (avoids lookahead from same-day buckets)
             if not vpin_df.empty:
-                vpin_sorted = vpin_df.sort_index()
+                vpin_sorted = _normalize_datetime_index(vpin_df)
                 _vpin_ts = vpin_sorted.index.values  # np datetime64
                 _vpin_vals = vpin_sorted.values.astype(np.float32)
             else:
@@ -820,7 +826,7 @@ class V3ContinuousPrep:
                 _vpin_vals = np.empty((0, 1), dtype=np.float32)
 
             if not vpin_spatial_df.empty:
-                vpin_spatial_sorted = vpin_spatial_df.sort_index()
+                vpin_spatial_sorted = _normalize_datetime_index(vpin_spatial_df)
                 _vpin_spatial_ts = vpin_spatial_sorted.index.values
             else:
                 vpin_spatial_sorted = pd.DataFrame()
@@ -915,7 +921,7 @@ class V3ContinuousPrep:
                     # NumberBars: aligned to anchor bar timestamp.
                     if _has_numbars:
                         _nb_cut = np.searchsorted(
-                            nb_ts_arr, _bar_ts64, side="right",
+                            nb_ts_arr, _bar_ts64, side="left",
                         )
                         if _nb_cut > 0:
                             _nb_lo = max(0, _nb_cut - numbars_lookback)
@@ -935,7 +941,7 @@ class V3ContinuousPrep:
 
                     # Sequential VPIN: aligned to anchor bar timestamp.
                     _cut = np.searchsorted(
-                        _vpin_ts, _bar_ts64, side="right",
+                        _vpin_ts, _bar_ts64, side="left",
                     )
                     if _cut > 0:
                         _lo = max(0, _cut - seq_lookback_bars)
