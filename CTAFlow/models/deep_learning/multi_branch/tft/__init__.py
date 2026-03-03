@@ -5,6 +5,7 @@ from .tft_encoders import (
     TransformerTemporalBackbone,
     MambaTemporalBackbone,
     NumberBarEncoder,
+    FusedSpatialEncoder,
     VPINRasterEncoder,
 )
 from .tft_models import TFTAlignedWSPR, TFTAlignedMamba
@@ -47,6 +48,7 @@ __all__ = [
     "TransformerTemporalBackbone",
     "MambaTemporalBackbone",
     "NumberBarEncoder",
+    "FusedSpatialEncoder",
     "VPINRasterEncoder",
     "TFTAlignedWSPR",
     "TFTAlignedMamba",

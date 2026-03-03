@@ -66,6 +66,7 @@ from CTAFlow.models.deep_learning.multi_branch.tft.tft_encoders import (
     TransformerTemporalBackbone,
     MambaTemporalBackbone,
     NumberBarEncoder,
+    FusedSpatialEncoder,
     VPINRasterEncoder,
 )
 from CTAFlow.models.deep_learning.training.loss.clf import ContinuousTradingLoss
@@ -183,6 +184,7 @@ class MMTFv3Core(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
+        spatial_encoder: Literal["separate", "fused"] = "separate",
         spatial_fuse_mode: str = "gated",
         spatial_fuse_temp: float = 2.0,
         # Training
@@ -194,6 +196,7 @@ class MMTFv3Core(nn.Module):
         self.ae_type = ae_type
         self.recon_weight = recon_weight
         self.backbone_type = backbone
+        self.spatial_encoder_type = spatial_encoder
         self.dropout = dropout
 
         _grn_drop = grn_dropout if grn_dropout is not None else dropout
@@ -280,18 +283,29 @@ class MMTFv3Core(nn.Module):
         # ==============================================================
         # BRANCH 2: SPATIAL (number bars + VPIN raster → fused)
         # ==============================================================
-        self.numbar_encoder = NumberBarEncoder(
-            in_channels=numbars_channels, d_model=d_model,
-        )
-        self.vpin_encoder = VPINRasterEncoder(
-            in_channels=vpin_channels, n_bins=vpin_bins,
-            n_time=vpin_time, d_model=d_model,
-            n_heads=n_heads, dropout=dropout,
-        )
-        self.spatial_fuse = SpatialFuse(
-            d_spatial=d_model, mode=spatial_fuse_mode,
-            temperature=spatial_fuse_temp,
-        )
+        if spatial_encoder == "separate":
+            self.numbar_encoder = NumberBarEncoder(
+                in_channels=numbars_channels, d_model=d_model,
+            )
+            self.vpin_encoder = VPINRasterEncoder(
+                in_channels=vpin_channels, n_bins=vpin_bins,
+                n_time=vpin_time, d_model=d_model,
+                n_heads=n_heads, dropout=dropout,
+            )
+            self.spatial_fuse = SpatialFuse(
+                d_spatial=d_model, mode=spatial_fuse_mode,
+                temperature=spatial_fuse_temp,
+            )
+            self.fused_spatial_encoder = None
+        elif spatial_encoder == "fused":
+            self.numbar_encoder = None
+            self.vpin_encoder = None
+            self.spatial_fuse = None
+            self.fused_spatial_encoder = FusedSpatialEncoder(
+                in_channels=numbars_channels + 3, d_model=d_model,
+            )
+        else:
+            raise ValueError(f"Unknown spatial_encoder: {spatial_encoder}")
 
         # ==============================================================
         # BRANCH 3: SEQUENTIAL (tabular VPIN buckets, ~1h)
@@ -353,17 +367,18 @@ class MMTFv3Core(nn.Module):
         tech_features: torch.Tensor,        # (B, L, f_tech)
         tech_lens: torch.Tensor,            # (B,)
         # Spatial (previous day)
-        numbars_recent: torch.Tensor,       # (B, T=4, 129, 4)
-        vpin_raster_recent: torch.Tensor,   # (B, 24, 4, 64)
+        numbars_recent: Optional[torch.Tensor] = None,
+        vpin_raster_recent: Optional[torch.Tensor] = None,
+        fused_spatial: Optional[torch.Tensor] = None,
         # Sequential VPIN (~1h lookback)
-        seq_vpin: torch.Tensor,             # (B, vpin_seq_len, f_seq)
-        seq_vpin_lens: torch.Tensor,        # (B,)
+        seq_vpin: Optional[torch.Tensor] = None,
+        seq_vpin_lens: Optional[torch.Tensor] = None,
         # Autoencoder input (long-term window)
-        ae_input: torch.Tensor,             # (B, ae_window, f_ae)
+        ae_input: Optional[torch.Tensor] = None,
         # Identity
-        ticker_id: torch.Tensor,            # (B,)
-        asset_class_id: torch.Tensor,       # (B,)
-        asset_subclass_id: torch.Tensor,    # (B,)
+        ticker_id: Optional[torch.Tensor] = None,
+        asset_class_id: Optional[torch.Tensor] = None,
+        asset_subclass_id: Optional[torch.Tensor] = None,
         # Control
         return_tracker: bool = False,
         return_ae_losses: bool = True,
@@ -376,6 +391,10 @@ class MMTFv3Core(nn.Module):
         tracker : dict (if return_tracker)
         """
         B, L, _ = tech_features.shape
+        if ae_input is None or seq_vpin is None or seq_vpin_lens is None:
+            raise ValueError("ae_input, seq_vpin, and seq_vpin_lens are required")
+        if ticker_id is None or asset_class_id is None or asset_subclass_id is None:
+            raise ValueError("ticker_id, asset_class_id, and asset_subclass_id are required")
 
         # ==========================================================
         # PHASE 0: AUTOENCODER → REGIME LATENT
@@ -411,9 +430,23 @@ class MMTFv3Core(nn.Module):
         # PHASE 3: CROSS-MODAL BRANCH ENCODING
         # ==========================================================
         # Branch 2: Spatial — number bars + VPIN raster
-        z_numbars = self.numbar_encoder(numbars_recent)
-        z_vpin = self.vpin_encoder(vpin_raster_recent)
-        z_spatial = self.spatial_fuse(z_numbars, z_vpin)
+        if self.spatial_encoder_type == "separate":
+            if numbars_recent is None or vpin_raster_recent is None:
+                raise ValueError(
+                    "numbars_recent and vpin_raster_recent are required when spatial_encoder='separate'"
+                )
+            z_numbars = self.numbar_encoder(numbars_recent)
+            z_vpin = self.vpin_encoder(vpin_raster_recent)
+            z_spatial = self.spatial_fuse(z_numbars, z_vpin)
+            spatial_importance = self.spatial_fuse.get_importance_stats()
+        else:
+            if fused_spatial is None:
+                raise ValueError("fused_spatial is required when spatial_encoder='fused'")
+            z_spatial = self.fused_spatial_encoder(fused_spatial)
+            spatial_importance = {
+                "mode": "fused",
+                "channels": int(fused_spatial.shape[2]) if fused_spatial.dim() == 4 else None,
+            }
 
         # Branch 3: Sequential — tabular VPIN
         z_seq = self.seq_net(seq_vpin, lengths=seq_vpin_lens)
@@ -463,7 +496,6 @@ class MMTFv3Core(nn.Module):
         # ==========================================================
         # TRACKING
         # ==========================================================
-        spatial_importance = self.spatial_fuse.get_importance_stats()
         self._last_tracker = {
             "branch_weights": {
                 name: branch_weights[:, i].mean().item()

@@ -555,6 +555,83 @@ class NumberBarEncoder(nn.Module):
         return self.out_norm(self.out_proj(x))
 
 
+class _SpatialResBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, padding=1, bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        if stride != 1 or in_channels != out_channels:
+            self.skip = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+        else:
+            self.skip = nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.skip(x)
+        out = F.gelu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return F.gelu(out + residual)
+
+
+class FusedSpatialEncoder(nn.Module):
+    """Encode fused NumberBars + VPIN grids (B, T, C, bins) to (B, d_model)."""
+
+    def __init__(self, in_channels: int = 7, d_model: int = 128):
+        super().__init__()
+        self.in_channels = in_channels
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+        )
+        self.block1 = nn.Sequential(
+            _SpatialResBlock(32, 32),
+            _SpatialResBlock(32, 32),
+        )
+        self.block2 = nn.Sequential(
+            _SpatialResBlock(32, 64, stride=2),
+            _SpatialResBlock(64, 64),
+        )
+        self.block3 = nn.Sequential(
+            _SpatialResBlock(64, 128, stride=2),
+            _SpatialResBlock(128, 128),
+        )
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.proj = nn.Linear(128, d_model)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 4:
+            raise ValueError(f"FusedSpatialEncoder expected 4D input, got shape={tuple(x.shape)}")
+
+        if x.shape[1] == self.in_channels:
+            x_cf = x
+        elif x.shape[2] == self.in_channels:
+            x_cf = x.permute(0, 2, 1, 3)
+        elif x.shape[-1] == self.in_channels:
+            x_cf = x.permute(0, 3, 1, 2)
+        else:
+            raise ValueError(
+                f"FusedSpatialEncoder expected channels={self.in_channels} in one axis, "
+                f"got shape={tuple(x.shape)}"
+            )
+
+        out = self.stem(x_cf)
+        out = self.block1(out)
+        out = self.block2(out)
+        out = self.block3(out)
+        out = self.pool(out).flatten(1)
+        return self.norm(self.proj(out))
+
+
 class VPINRasterEncoder(nn.Module):
     """Encode single-day VPIN raster (B, T, C, bins) to (B, d_model)."""
 
