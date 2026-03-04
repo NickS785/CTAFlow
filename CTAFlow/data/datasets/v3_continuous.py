@@ -36,7 +36,7 @@ from CTAFlow.data.raw_formatting.intraday_manager import read_exported_df
 def _load_npz_arrays(
     path: Union[str, Path],
     array_keys: Sequence[str] = ("tensor", "profiles", "data", "rasterized", "arr_0"),
-    date_keys: Sequence[str] = ("dates", "date", "dates_str", "arr_1"),
+    date_keys: Sequence[str] = ("dates", "date", "dates_str", "idx", "arr_1"),
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     npz = np.load(str(path), allow_pickle=True)
     arr_key = next((k for k in array_keys if k in npz.files), None)
@@ -618,12 +618,28 @@ class V3ContinuousPrep:
 
     @staticmethod
     def _load_spatial_npz(path: Path) -> Dict[date, np.ndarray]:
-        """Load NPZ as date->array dict (handles both indexed and date-keyed)."""
+        """Load NPZ as date->array dict (handles both indexed and date-keyed).
+
+        If multiple rows share the same date (e.g. intraday rasterized bars),
+        they are stacked into a single ``(T, C, Bins)`` array per date.
+        """
         try:
             arr, dates_raw = _load_npz_arrays(path)
             if dates_raw is not None:
                 dates = _dates_to_python(dates_raw)
-                return {d: arr[i] for i, d in enumerate(dates) if i < len(arr)}
+                # Group rows by date (handles both 1-per-day and N-per-day)
+                from collections import defaultdict
+                groups: Dict[date, list] = defaultdict(list)
+                for i, d in enumerate(dates):
+                    if i < len(arr):
+                        groups[d].append(i)
+                out: Dict[date, np.ndarray] = {}
+                for d, idxs in groups.items():
+                    if len(idxs) == 1:
+                        out[d] = arr[idxs[0]]
+                    else:
+                        out[d] = arr[idxs]  # (T, C, Bins)
+                return out
             else:
                 return {}
         except ValueError:

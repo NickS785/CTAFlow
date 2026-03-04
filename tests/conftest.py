@@ -13,12 +13,17 @@ if "sierrapy" not in sys.modules:
     parser_mod.AsyncScidReader = object
     parser_mod.bucket_by_volume = lambda *args, **kwargs: None
     parser_mod.resample_ohlcv = lambda *args, **kwargs: None
+    scid_parse_mod = types.ModuleType("sierrapy.parser.scid_parse")
+    scid_parse_mod.FastScidReader = object
+    scid_parse_mod.ScidTickerFileManager = object
+    scid_parse_mod.ScidContractInfo = object
 
     sierrapy_mod = types.ModuleType("sierrapy")
     sierrapy_mod.parser = parser_mod
 
     sys.modules["sierrapy"] = sierrapy_mod
     sys.modules["sierrapy.parser"] = parser_mod
+    sys.modules["sierrapy.parser.scid_parse"] = scid_parse_mod
 
 if "numba" not in sys.modules:
     numba_mod = types.ModuleType("numba")
@@ -36,6 +41,20 @@ if "numba" not in sys.modules:
     numba_mod.prange = range  # type: ignore[assignment]
 
     sys.modules["numba"] = numba_mod
+    sys.modules["numba.typed"] = types.ModuleType("numba.typed")
+
+if "shap" not in sys.modules:
+    shap_mod = types.ModuleType("shap")
+
+    class _DeepExplainer:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def shap_values(self, x):
+            return x
+
+    shap_mod.DeepExplainer = _DeepExplainer
+    sys.modules["shap"] = shap_mod
 
 def _load_repo_package(module_name: str, package_root: Path):
     spec = importlib.util.spec_from_file_location(
