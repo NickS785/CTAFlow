@@ -357,6 +357,12 @@ def compute_ae_daily_features(
 
     Returns dict[date -> np.array([ret_1d, ret_5d, ret_21d, rv_1d])].
     Features are rolling z-scored and clipped to [-clip_val, clip_val].
+
+    Notes
+    -----
+    The features are keyed by the day on which they become fully observed.
+    ``build_samples()`` then consumes an AE window ending on the *previous*
+    trading date, keeping the AE branch strictly causal for an intraday anchor.
     """
     df = intraday_df.copy()
     if not isinstance(df.index, pd.DatetimeIndex):
@@ -965,6 +971,14 @@ class V3ContinuousPrep:
                         "target": target_arr[bar_idx],
                         "ticker": ticker,
                         "date": current_date,
+                        "anchor_ts": pd.Timestamp(bar_ts),
+                        "target_end_ts": (
+                            pd.Timestamp(df.index[bar_idx + self.target_steps])
+                            if (bar_idx + self.target_steps) < len(df)
+                            else pd.NaT
+                        ),
+                        "ae_window_start_date": ae_dates_window[0],
+                        "ae_window_end_date": ae_dates_window[-1],
                     }
 
                     if use_fused_spatial:

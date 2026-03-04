@@ -52,6 +52,7 @@ from CTAFlow.models.deep_learning.multi_branch.market_context_models import (
 )
 from CTAFlow.models.deep_learning.encoders import (
     IntradayRNN,
+    IntradayTransformer,
     SpatialFuse,
 )
 
@@ -187,6 +188,9 @@ class MMTFv3Core(nn.Module):
         spatial_encoder: Literal["separate", "fused"] = "separate",
         spatial_fuse_mode: str = "gated",
         spatial_fuse_temp: float = 2.0,
+        # Sequential encoder
+        seq_layers: int = 2,
+        seq_nheads: int = 4,
         # Training
         dropout: float = 0.2,
         grn_dropout: float | None = None,
@@ -310,9 +314,9 @@ class MMTFv3Core(nn.Module):
         # ==============================================================
         # BRANCH 3: SEQUENTIAL (tabular VPIN buckets, ~1h)
         # ==============================================================
-        self.seq_net = IntradayRNN(
-            input_dim=f_seq, d_model=d_model, num_layers=1,
-            dropout=dropout,
+        self.seq_net = IntradayTransformer(
+            input_dim=f_seq, d_model=d_model, num_layers=seq_layers,
+            dropout=dropout, nhead=seq_nheads,
         )
 
         # ==============================================================
@@ -496,11 +500,19 @@ class MMTFv3Core(nn.Module):
         # ==========================================================
         # TRACKING
         # ==========================================================
+        # --- Branch weight stats ---
+        bw_entropy = -(branch_weights * (branch_weights + 1e-8).log()).sum(dim=-1).mean().item()
+
         self._last_tracker = {
             "branch_weights": {
                 name: branch_weights[:, i].mean().item()
                 for i, name in enumerate(["backbone_fused", "spatial", "sequential"])
             },
+            "branch_weights_std": {
+                name: branch_weights[:, i].std().item()
+                for i, name in enumerate(["backbone_fused", "spatial", "sequential"])
+            },
+            "branch_weights_entropy": bw_entropy,
             "regime_var_weights": {
                 name: self.regime_encoder.last_var_weights[:, i].mean().item()
                 for i, name in enumerate(self.regime_encoder.var_names)
@@ -508,6 +520,7 @@ class MMTFv3Core(nn.Module):
             "spatial_fuse": spatial_importance,
             "temporal_attn": attn_weights.detach().squeeze(1),
             "backbone": dict(self.fusion_backbone.last_tracker),
+            "seq_net": dict(self.seq_net.last_tracker),
             "ae_losses": {
                 k: v.item() if torch.is_tensor(v) else v
                 for k, v in ae_losses.items()
@@ -1169,12 +1182,15 @@ def print_v3_diagnostics(tracker: dict, eval_metrics: dict, epoch: int = 0) -> N
     print(f"{'='*60}")
 
     bw = tracker.get("branch_weights", {})
+    bw_std = tracker.get("branch_weights_std", {})
     if bw:
+        bw_ent = tracker.get("branch_weights_entropy", 0)
         max_w = max(bw.values()) if bw else 1
-        print("\n  Branch Importance:")
+        print(f"\n  Branch Importance (entropy={bw_ent:.3f}):")
         for name, weight in sorted(bw.items(), key=lambda x: -x[1]):
+            std = bw_std.get(name, 0)
             bar = "#" * int(weight / max(max_w, 1e-8) * 40)
-            print(f"    {name:<16s}: {weight:.4f} {bar}")
+            print(f"    {name:<16s}: {weight:.4f} +/- {std:.4f} {bar}")
 
     sf = tracker.get("spatial_fuse")
     if sf:
@@ -1190,7 +1206,15 @@ def print_v3_diagnostics(tracker: dict, eval_metrics: dict, epoch: int = 0) -> N
 
     bb = tracker.get("backbone", {})
     if bb:
-        print(f"\n  Backbone: {bb}")
+        bb_ent = bb.get("pool_weights_entropy", 0)
+        bb_max = bb.get("pool_max_weight", 0)
+        print(f"\n  Backbone: entropy={bb_ent:.3f}, max_pool_wt={bb_max:.3f}")
+
+    sn = tracker.get("seq_net", {})
+    if sn:
+        sn_ent = sn.get("pool_entropy", 0)
+        sn_max = sn.get("pool_max_weight", 0)
+        print(f"  Seq Net:  entropy={sn_ent:.3f}, max_pool_wt={sn_max:.3f}")
 
     ae = tracker.get("ae_losses", {})
     if ae:

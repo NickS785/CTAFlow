@@ -862,6 +862,75 @@ class IntradayRNN(nn.Module):
         return self.norm(embedding)
 
 
+class IntradayTransformer(nn.Module):
+    """
+    Transformer encoder for the Sequential branch (Intraday VPIN time-series).
+
+    Drop-in replacement for IntradayRNN, better suited for sequence lengths
+    of 24-96 where self-attention captures long-range dependencies more
+    effectively than a GRU.
+
+    Input:  (B, SeqLen, Features)
+    Output: (B, d_model)
+    """
+
+    def __init__(self, input_dim, d_model=128, num_layers=2, dropout=0.2, nhead=4):
+        super().__init__()
+        self.d_model = d_model
+
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+        )
+
+        self.pos_enc = PositionalEncoding(d_model, max_len=256)
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=4 * d_model,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(layer, num_layers=num_layers)
+
+        self.pool_score = nn.Linear(d_model, 1)
+        self.norm = nn.LayerNorm(d_model)
+        self.last_tracker: dict = {}
+
+    def forward(self, x, lengths=None):
+        B, T, _ = x.shape
+
+        h = self.input_proj(x)
+        h = self.pos_enc(h)
+
+        key_padding_mask = None
+        if lengths is not None:
+            t_idx = torch.arange(T, device=x.device)[None, :]
+            key_padding_mask = t_idx >= lengths[:, None]
+
+        h = self.transformer(h, src_key_padding_mask=key_padding_mask)
+
+        # Attention pooling with weight tracking
+        logits = self.pool_score(h).squeeze(-1)  # (B, T)
+        if key_padding_mask is not None:
+            logits = logits.masked_fill(key_padding_mask, -1e9)
+        pool_weights = F.softmax(logits, dim=-1)  # (B, T)
+        embedding = torch.einsum("bt,btd->bd", pool_weights, h)
+
+        # Track pool attention distribution
+        self.last_tracker = {
+            "pool_weights": pool_weights.detach(),
+            "pool_entropy": -(pool_weights * (pool_weights + 1e-8).log()).sum(dim=-1).mean().item(),
+            "pool_max_weight": pool_weights.max(dim=-1).values.mean().item(),
+        }
+
+        return self.norm(embedding)
+
+
 class MetaModalityEncoder(nn.Module):
     """Encodes asset identity + calendar time as its own modality.
 
@@ -951,6 +1020,7 @@ class MetaModalityEncoder(nn.Module):
             device = ticker_id.device
 
         B = ticker_id.shape[0]
+
 
         # --- context embedding (B, ctx_dim) -> expand to (B, W, ctx_dim) ---
         z_ctx = (

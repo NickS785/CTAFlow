@@ -424,9 +424,11 @@ class TransformerTemporalBackbone(nn.Module):
         gate_weights = F.softmax(gate_logits, dim=-1)
         fused_token = torch.einsum("bl,bld->bd", gate_weights, fused_seq)
         self.last_tracker = {
+            "pool_weights": gate_weights.detach(),
             "pool_weights_entropy": (
                 -(gate_weights * (gate_weights + 1e-8).log()).sum(dim=-1).mean().item()
             ),
+            "pool_max_weight": gate_weights.max(dim=-1).values.mean().item(),
         }
         return fused_seq, fused_token
 
