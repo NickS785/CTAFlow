@@ -1272,6 +1272,7 @@ class PTPLoss(nn.Module):
         profit_scale: float = 100.0,
         direction_penalty: float = 1.0,
         outer_threshold: float = 1.0,
+        inner_threshold: float = None,  # unused, kept for backward compat
         **trading_kwargs,
     ):
         super().__init__()
