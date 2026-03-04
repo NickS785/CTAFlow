@@ -585,45 +585,46 @@ class MMTFv3MambaVQVAE(MMTFv3Core):
 
 def returns_to_classes(
     returns: torch.Tensor,
-    inner: float = 0.25,
     outer: float = 1.0,
+    **kwargs,
 ) -> torch.Tensor:
-    """Bucket forward returns into 5 conviction classes using σ-based thresholds.
+    """Bucket forward returns into 4 conviction classes using σ-based thresholds.
 
-    Classes: 0=strong_neg, 1=weak_neg, 2=neutral, 3=weak_pos, 4=strong_pos
+    Classes: 0=strong_neg, 1=weak_neg, 2=weak_pos, 3=strong_pos
+    No neutral class — the market is rarely flat.
 
     Parameters
     ----------
     returns : Tensor (B,) or (B, 1)
         Forward returns.
-    inner : float
-        Inner threshold in σ units for neutral zone boundary. Default 0.25.
     outer : float
-        Outer threshold in σ units for strong conviction boundary. Default 1.0.
+        Threshold in σ units for strong conviction boundary. Default 1.0.
 
     Returns
     -------
-    labels : Tensor (B,) long in {0, 1, 2, 3, 4}
+    labels : Tensor (B,) long in {0, 1, 2, 3}
     """
     r = returns.detach().view(-1)
     sigma = r.std().clamp(min=1e-8)
 
-    labels = torch.full_like(r, 2, dtype=torch.long)          # neutral
+    labels = torch.full_like(r, 1, dtype=torch.long)          # weak neg default
     labels[r <= -outer * sigma] = 0                            # strong neg
-    labels[(r > -outer * sigma) & (r <= -inner * sigma)] = 1   # weak neg
-    labels[(r >= inner * sigma) & (r < outer * sigma)] = 3     # weak pos
-    labels[r >= outer * sigma] = 4                             # strong pos
+    labels[(r > -outer * sigma) & (r < 0)] = 1                 # weak neg
+    labels[(r >= 0) & (r < outer * sigma)] = 2                 # weak pos
+    labels[r >= outer * sigma] = 3                             # strong pos
     return labels
 
 
 class PredictionToPosition(nn.Module):
-    """Convert 5-class quantile logits → continuous position ∈ [-1, 1].
+    """Convert 4-class quantile logits → continuous position ∈ [-1, 1].
 
-    Classes: 0=strong_neg, 1=weak_neg, 2=neutral, 3=weak_pos, 4=strong_pos
+    Classes: 0=strong_neg, 1=weak_neg, 2=weak_pos, 3=strong_pos
 
     Position = tanh(temperature * sum(p_i * anchor_i))
-    where anchors are learnable, initialized to [-1.0, -0.5, 0.0, +0.5, +1.0].
+    where anchors are learnable, initialized to [-1.0, -0.33, +0.33, +1.0].
     """
+
+    N_CLASSES = 4
 
     def __init__(
         self,
@@ -638,7 +639,7 @@ class PredictionToPosition(nn.Module):
         self.max_anchor_shift = max_anchor_shift
         self.max_temp_scale = max_temp_scale
         self.anchors = nn.Parameter(
-            torch.tensor([-1.0, -0.5, 0.0, 0.5, 1.0]),
+            torch.tensor([-1.0, -0.33, 0.33, 1.0]),
         )
         if context_dim > 0:
             ctx_hidden = max(16, min(128, context_dim))
@@ -646,7 +647,7 @@ class PredictionToPosition(nn.Module):
                 nn.Linear(context_dim, ctx_hidden),
                 nn.LayerNorm(ctx_hidden),
                 nn.GELU(),
-                nn.Linear(ctx_hidden, 5),
+                nn.Linear(ctx_hidden, self.N_CLASSES),
             )
             self.context_to_temp = nn.Sequential(
                 nn.Linear(context_dim, ctx_hidden),
@@ -667,12 +668,12 @@ class PredictionToPosition(nn.Module):
         """
         Parameters
         ----------
-        logits : Tensor (B, 5)
+        logits : Tensor (B, 4)
 
         Returns
         -------
         position : Tensor (B, 1)
-        logits : Tensor (B, 5) — passed through for multi-loss
+        logits : Tensor (B, 4) — passed through for multi-loss
         """
         batch_size = logits.size(0)
         anchors = self.anchors.unsqueeze(0).expand(batch_size, -1)
@@ -708,8 +709,9 @@ class PredictionToPosition(nn.Module):
 
 
 class QuantilePositionHead(nn.Module):
-    """MLP → 5-class logits → PredictionToPosition → continuous position.
+    """MLP → 4-class logits → PredictionToPosition → continuous position.
 
+    Classes: 0=strong_neg, 1=weak_neg, 2=weak_pos, 3=strong_pos.
     Replaces the standard Tanh head in MMTFv3Core when quantile_head=True.
     """
 
@@ -738,7 +740,7 @@ class QuantilePositionHead(nn.Module):
         self.hidden_to_logits = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.GELU(),
-            nn.Linear(d_model // 2, 5),
+            nn.Linear(d_model // 2, PredictionToPosition.N_CLASSES),
         )
         self.ptp = PredictionToPosition(
             temperature=temperature,
@@ -758,13 +760,13 @@ class QuantilePositionHead(nn.Module):
         Returns
         -------
         position : Tensor (B, 1)
-        logits : Tensor (B, 5)
+        logits : Tensor (B, 4)
         """
         hidden = self.feature_proj(z_final)
         if context is not None and self.context_proj is not None:
             hidden = hidden + self.context_proj(context)
-        logits = self.hidden_to_logits(hidden)                       # (B, 5)
-        position, logits = self.ptp(logits, context=context)        # (B, 1), (B, 5)
+        logits = self.hidden_to_logits(hidden)                       # (B, 4)
+        position, logits = self.ptp(logits, context=context)        # (B, 1), (B, 4)
         return position, logits
 
     def quantile_parameters(self) -> Iterable[nn.Parameter]:
@@ -1241,11 +1243,11 @@ class PTPLoss(nn.Module):
     """Combined loss for PredictionToPosition training.
 
     Components:
-      1. Profit-weighted CE on 5-class logits (classification quality)
+      1. Profit-weighted CE on 4-class logits (classification quality)
       2. ContinuousTradingLoss on continuous position (PnL/Sharpe)
 
-    The CE uses 5-class direction mapping: classes {0,1} → negative,
-    class {2} → neutral, classes {3,4} → positive.
+    The CE uses 4-class direction mapping: classes {0,1} → negative,
+    classes {2,3} → positive. No neutral class.
 
     Parameters
     ----------
@@ -1257,10 +1259,8 @@ class PTPLoss(nn.Module):
         Scale factor for return-magnitude weighting in CE. Default 100.0.
     direction_penalty : float
         Extra penalty for wrong-direction predictions in CE. Default 1.0.
-    inner_threshold : float
-        Inner σ threshold for neutral zone in returns_to_classes. Default 0.25.
     outer_threshold : float
-        Outer σ threshold for strong conviction in returns_to_classes. Default 1.0.
+        σ threshold for strong conviction in returns_to_classes. Default 1.0.
     **trading_kwargs
         Passed to ContinuousTradingLoss (tc_cost, direction_weight, etc.).
     """
@@ -1271,7 +1271,6 @@ class PTPLoss(nn.Module):
         pnl_weight: float = 1.0,
         profit_scale: float = 100.0,
         direction_penalty: float = 1.0,
-        inner_threshold: float = 0.25,
         outer_threshold: float = 1.0,
         **trading_kwargs,
     ):
@@ -1280,27 +1279,26 @@ class PTPLoss(nn.Module):
         self.pnl_weight = pnl_weight
         self.profit_scale = profit_scale
         self.direction_penalty = direction_penalty
-        self.inner_threshold = inner_threshold
         self.outer_threshold = outer_threshold
         self.trading_loss = ContinuousTradingLoss(**trading_kwargs)
 
-    def _profit_weighted_ce_5class(
+    def _profit_weighted_ce(
         self,
         logits: torch.Tensor,
         y_true: torch.Tensor,
         returns: torch.Tensor,
     ) -> torch.Tensor:
-        """Profit-weighted CE with correct 5-class direction mapping."""
+        """Profit-weighted CE with 4-class direction mapping."""
         ce = nn.functional.cross_entropy(logits, y_true, reduction="none")
 
         # Weight by return magnitude
         weights = (returns.abs() * self.profit_scale).clamp(0.1, 10.0)
 
-        # 5-class direction: {0,1}→neg, {2}→neutral, {3,4}→pos
+        # 4-class direction: {0,1}→neg, {2,3}→pos
         with torch.no_grad():
             y_hat = logits.argmax(dim=-1)
-            pred_dir = (y_hat > 2).float() - (y_hat < 2).float()
-            true_dir = (y_true > 2).float() - (y_true < 2).float()
+            pred_dir = (y_hat >= 2).float() - (y_hat < 2).float()
+            true_dir = (y_true >= 2).float() - (y_true < 2).float()
             wrong_dir = (pred_dir * true_dir) < 0
             weights = weights + wrong_dir.float() * self.direction_penalty
 
@@ -1318,7 +1316,7 @@ class PTPLoss(nn.Module):
         ----------
         position : Tensor (B, 1)
             Continuous position from PTP.
-        logits : Tensor (B, 5)
+        logits : Tensor (B, 4)
             Raw class logits for CE loss.
         forward_return : Tensor (B,) or (B, 1)
             Actual forward returns.
@@ -1334,11 +1332,11 @@ class PTPLoss(nn.Module):
 
         # Derive class labels from returns
         class_labels = returns_to_classes(
-            fwd, inner=self.inner_threshold, outer=self.outer_threshold,
+            fwd, outer=self.outer_threshold,
         )
 
-        # 1. Classification loss (profit-weighted CE on 5-class logits)
-        ce = self._profit_weighted_ce_5class(logits, class_labels, fwd)
+        # 1. Classification loss (profit-weighted CE on 4-class logits)
+        ce = self._profit_weighted_ce(logits, class_labels, fwd)
 
         # 2. Trading loss (PnL/Sharpe on continuous position)
         trading, trading_metrics = self.trading_loss(
@@ -1351,14 +1349,10 @@ class PTPLoss(nn.Module):
         with torch.no_grad():
             pred_cls = logits.argmax(dim=-1)
             cls_acc = (pred_cls == class_labels).float().mean().item() * 100.0
-            # Direction accuracy: classes 0,1 = negative, 3,4 = positive
-            pred_dir = (pred_cls > 2).long() - (pred_cls < 2).long()
-            true_dir = (class_labels > 2).long() - (class_labels < 2).long()
-            directional_mask = true_dir != 0
-            if directional_mask.any():
-                dir_match = (pred_dir[directional_mask] == true_dir[directional_mask]).float().mean().item() * 100.0
-            else:
-                dir_match = 0.0
+            # Direction accuracy: classes 0,1 = negative, 2,3 = positive
+            pred_dir = (pred_cls >= 2).long() - (pred_cls < 2).long()
+            true_dir = (class_labels >= 2).long() - (class_labels < 2).long()
+            dir_match = (pred_dir == true_dir).float().mean().item() * 100.0
 
         metrics = {
             **trading_metrics,
@@ -1486,15 +1480,15 @@ def evaluate_v3_ptp(
     # Classification metrics
     class_labels = returns_to_classes(
         returns,
-        inner=ptp_loss.inner_threshold,
         outer=ptp_loss.outer_threshold,
     )
     pred_cls = all_logits_cat.argmax(dim=-1)
     cls_acc = (pred_cls == class_labels).float().mean().item() * 100.0
 
     # Per-class accuracy
+    cls_names = {0: "strong_neg", 1: "weak_neg", 2: "weak_pos", 3: "strong_pos"}
     per_class = {}
-    for c in range(5):
+    for c in range(PredictionToPosition.N_CLASSES):
         mask = class_labels == c
         if mask.any():
             per_class[f"cls_{c}_acc"] = (pred_cls[mask] == c).float().mean().item() * 100.0
