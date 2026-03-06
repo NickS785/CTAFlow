@@ -521,6 +521,7 @@ class MMTFv3Core(nn.Module):
             "temporal_attn": attn_weights.detach().squeeze(1),
             "backbone": dict(self.fusion_backbone.last_tracker),
             "seq_net": dict(self.seq_net.last_tracker),
+            "seq_feature_weights": self.seq_net.last_tracker.get("feature_weights"),
             "ae_losses": {
                 k: v.item() if torch.is_tensor(v) else v
                 for k, v in ae_losses.items()
@@ -1216,7 +1217,25 @@ def print_v3_diagnostics(tracker: dict, eval_metrics: dict, epoch: int = 0) -> N
     if sn:
         sn_ent = sn.get("pool_entropy", 0)
         sn_max = sn.get("pool_max_weight", 0)
-        print(f"  Seq Net:  entropy={sn_ent:.3f}, max_pool_wt={sn_max:.3f}")
+        sn_feat_ent = sn.get("feature_entropy", 0)
+        sn_feat_max = sn.get("feature_max_weight", 0)
+        print(f"  Seq Net:  pool_entropy={sn_ent:.3f}, max_pool_wt={sn_max:.3f}, "
+              f"feat_entropy={sn_feat_ent:.3f}, feat_max_wt={sn_feat_max:.3f}")
+
+    seq_fw = tracker.get("seq_feature_weights")
+    if seq_fw is not None:
+        fw = seq_fw if isinstance(seq_fw, dict) else None
+        if fw is None and hasattr(seq_fw, "cpu"):
+            # Raw tensor — print top-5 and bottom-5 by weight
+            vals = seq_fw.cpu().numpy()
+            ranked = sorted(enumerate(vals), key=lambda x: -x[1])
+            print(f"\n  Seq Feature Importance (top-5 / bottom-5):")
+            for idx, w in ranked[:5]:
+                bar = "#" * int(w / max(vals.max(), 1e-8) * 30)
+                print(f"    feat[{idx:>3d}]: {w:.4f} {bar}")
+            print(f"    ...")
+            for idx, w in ranked[-5:]:
+                print(f"    feat[{idx:>3d}]: {w:.4f}")
 
     ae = tracker.get("ae_losses", {})
     if ae:

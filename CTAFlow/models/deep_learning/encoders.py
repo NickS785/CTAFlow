@@ -877,6 +877,10 @@ class IntradayTransformer(nn.Module):
     def __init__(self, input_dim, d_model=128, num_layers=2, dropout=0.2, nhead=4):
         super().__init__()
         self.d_model = d_model
+        self.input_dim = input_dim
+
+        # Learnable per-feature gate (softmax → interpretable importance)
+        self.feature_gate_logits = nn.Parameter(torch.zeros(input_dim))
 
         self.input_proj = nn.Sequential(
             nn.Linear(input_dim, d_model),
@@ -904,7 +908,11 @@ class IntradayTransformer(nn.Module):
     def forward(self, x, lengths=None):
         B, T, _ = x.shape
 
-        h = self.input_proj(x)
+        # Per-feature gating (softmax over input_dim)
+        feature_weights = F.softmax(self.feature_gate_logits, dim=-1)  # (input_dim,)
+        x_gated = x * (feature_weights * self.input_dim)  # scale so mean gate ≈ 1
+
+        h = self.input_proj(x_gated)
         h = self.pos_enc(h)
 
         key_padding_mask = None
@@ -921,11 +929,14 @@ class IntradayTransformer(nn.Module):
         pool_weights = F.softmax(logits, dim=-1)  # (B, T)
         embedding = torch.einsum("bt,btd->bd", pool_weights, h)
 
-        # Track pool attention distribution
+        # Track pool attention + feature importance
         self.last_tracker = {
             "pool_weights": pool_weights.detach(),
             "pool_entropy": -(pool_weights * (pool_weights + 1e-8).log()).sum(dim=-1).mean().item(),
             "pool_max_weight": pool_weights.max(dim=-1).values.mean().item(),
+            "feature_weights": feature_weights.detach(),
+            "feature_entropy": -(feature_weights * (feature_weights + 1e-8).log()).sum().item(),
+            "feature_max_weight": feature_weights.max().item(),
         }
 
         return self.norm(embedding)

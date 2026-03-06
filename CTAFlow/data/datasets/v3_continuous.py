@@ -1321,3 +1321,61 @@ def build_v3_loaders(
         collate_fn=v3_collate_fn, num_workers=num_workers,
     )
     return train_loader, val_loader
+
+
+def loaders_from_samples(
+    train_samples: List[Dict],
+    val_samples: List[Dict],
+    prep: V3ContinuousPrep,
+    batch_size: int = 64,
+    use_fused_spatial: bool = False,
+    tech_lookback: Optional[int] = None,
+    shuffle_train: bool = True,
+    num_workers: int = 0,
+) -> Tuple[DataLoader, DataLoader]:
+    """Build DataLoaders from pre-built sample lists (skips build_samples).
+
+    Use this when the expensive ``build_samples()`` has already been called
+    and you only need to vary ``batch_size`` or ``tech_lookback`` across
+    Optuna trials without recomputing samples.
+
+    Parameters
+    ----------
+    tech_lookback : int, optional
+        If set and smaller than the stored tech window, each sample's
+        ``tech_features`` is truncated to the last ``tech_lookback`` bars.
+    """
+    if tech_lookback is not None:
+        def _trunc(samples):
+            out = []
+            for s in samples:
+                tf = s["tech_features"]
+                if tf.shape[0] > tech_lookback:
+                    s = {**s, "tech_features": tf[-tech_lookback:], "tech_len": tech_lookback}
+                out.append(s)
+            return out
+        train_samples = _trunc(train_samples)
+        val_samples = _trunc(val_samples)
+
+    p_shape = prep.profile_shape
+    r_shape = prep.raster_shape
+    fused_tail_shape = (prep.numbars_bar_shape[0] + 3, prep.numbars_bar_shape[1])
+
+    train_ds = V3ContinuousDataset(
+        train_samples, profile_shape=p_shape,
+        raster_shape=r_shape, fused_tail_shape=fused_tail_shape,
+    )
+    val_ds = V3ContinuousDataset(
+        val_samples, profile_shape=p_shape,
+        raster_shape=r_shape, fused_tail_shape=fused_tail_shape,
+    )
+
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=shuffle_train,
+        collate_fn=v3_collate_fn, num_workers=num_workers,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False,
+        collate_fn=v3_collate_fn, num_workers=num_workers,
+    )
+    return train_loader, val_loader
