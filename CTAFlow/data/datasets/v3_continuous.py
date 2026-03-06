@@ -13,6 +13,7 @@ tensors matching MMTFv3Core.forward() signature.
 """
 from __future__ import annotations
 
+import bisect
 from datetime import date, time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -298,41 +299,32 @@ def rasterize_vpin_to_grid(
     if (not np.all(np.isfinite(offsets))) or np.nanstd(offsets) < 1e-6:
         offsets = np.linspace(-fallback_span, fallback_span, n_bins, dtype=np.float32)
 
-    close = pd.to_numeric(vpin_window.get("close"), errors="coerce").to_numpy(dtype=np.float32)
-    vol = pd.to_numeric(vpin_window.get("vol"), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-    signed_imb = pd.to_numeric(
-        vpin_window.get("signed_imbalance"), errors="coerce",
-    ).fillna(0.0).to_numpy(dtype=np.float32)
-    vpin = pd.to_numeric(vpin_window.get("vpin"), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+    # Extract as numpy directly — input from prepare_vpin_spatial_features is float32
+    close = np.asarray(vpin_window["close"].values, dtype=np.float32) if "close" in vpin_window.columns else np.full(len(vpin_window), np.nan, dtype=np.float32)
+    vol = np.nan_to_num(np.asarray(vpin_window["vol"].values, dtype=np.float32)) if "vol" in vpin_window.columns else np.zeros(len(vpin_window), dtype=np.float32)
+    signed_imb = np.nan_to_num(np.asarray(vpin_window["signed_imbalance"].values, dtype=np.float32)) if "signed_imbalance" in vpin_window.columns else np.zeros(len(vpin_window), dtype=np.float32)
+    vpin_arr = np.nan_to_num(np.asarray(vpin_window["vpin"].values, dtype=np.float32)) if "vpin" in vpin_window.columns else np.zeros(len(vpin_window), dtype=np.float32)
 
-    rel_price = ((close - float(center_price)) / float(center_price)) * float(price_scale)
-    valid = (
-        np.isfinite(rel_price)
-        & np.isfinite(vol)
-        & np.isfinite(signed_imb)
-        & np.isfinite(vpin)
-        & (vol > 0)
-    )
+    cp = float(center_price)
+    ps = float(price_scale)
+    rel_price = ((close - cp) / cp) * ps
+    valid = np.isfinite(rel_price) & (vol > 0)
     if not np.any(valid):
         return grid
 
     rel_valid = rel_price[valid]
     vol_valid = vol[valid]
     imb_valid = signed_imb[valid]
-    vpin_valid = vpin[valid]
+    vpin_valid = vpin_arr[valid]
     bin_idx = np.abs(rel_valid[:, None] - offsets[None, :]).argmin(axis=1)
 
-    vol_sum = np.zeros(n_bins, dtype=np.float32)
-    imb_num = np.zeros(n_bins, dtype=np.float32)
-    vpin_sum = np.zeros(n_bins, dtype=np.float32)
-    vpin_count = np.zeros(n_bins, dtype=np.float32)
+    # Use np.bincount instead of unbuffered np.add.at (much faster)
+    vol_sum = np.bincount(bin_idx, weights=vol_valid, minlength=n_bins).astype(np.float32)
+    imb_num = np.bincount(bin_idx, weights=imb_valid * vol_valid, minlength=n_bins).astype(np.float32)
+    vpin_sum = np.bincount(bin_idx, weights=vpin_valid, minlength=n_bins).astype(np.float32)
+    vpin_count = np.bincount(bin_idx, minlength=n_bins).astype(np.float32)
 
-    np.add.at(vol_sum, bin_idx, vol_valid)
-    np.add.at(imb_num, bin_idx, imb_valid * vol_valid)
-    np.add.at(vpin_sum, bin_idx, vpin_valid)
-    np.add.at(vpin_count, bin_idx, 1.0)
-
-    total_vol = float(vol_sum.sum())
+    total_vol = vol_sum.sum()
     if total_vol > 0:
         grid[0] = vol_sum / total_vol
     nonzero_vol = vol_sum > 0
@@ -390,12 +382,10 @@ def compute_ae_daily_features(
     if len(daily) < 22:
         return {}
 
-    # Intraday log returns for RV
+    # Intraday log returns for RV (vectorized — avoids Python lambda callback)
     logp = np.log(close.clip(lower=eps))
     intra_ret = logp.diff()
-    daily_rv = intra_ret.groupby(df.index.normalize()).apply(
-        lambda x: np.sqrt(np.nansum(x.values ** 2))
-    )
+    daily_rv = (intra_ret ** 2).groupby(df.index.normalize()).sum().pipe(np.sqrt)
     daily_rv.index = pd.to_datetime(daily_rv.index).normalize()
 
     # Daily returns
@@ -850,17 +840,34 @@ class V3ContinuousPrep:
             if not vpin_spatial_df.empty:
                 vpin_spatial_sorted = _normalize_datetime_index(vpin_spatial_df)
                 _vpin_spatial_ts = vpin_spatial_sorted.index.values
+                _has_vpin_spatial = True
+                _vpin_spatial_vwap = vpin_spatial_sorted["rolling_vwap_2h"].values
             else:
                 vpin_spatial_sorted = pd.DataFrame()
                 _vpin_spatial_ts = np.array([], dtype="datetime64[ns]")
+                _has_vpin_spatial = False
+                _vpin_spatial_vwap = np.array([], dtype=np.float32)
+
+            # Pre-compute reusable arrays for the bar loop
+            _df_index_values = df.index.values.astype("datetime64[ns]")
+            bar_idx_to_ts = df.index  # avoid repeated df.index[i]
+            _one_hour = np.timedelta64(1, "h")
+            _nb_zero = np.zeros(
+                (1,) + (nb_vals_arr.shape[1:] if len(nb_vals_arr) > 0 else (4, 32)),
+                dtype=np.float32,
+            )
+            _vpin_zero = np.zeros(
+                (1, _vpin_vals.shape[1] if _vpin_vals.shape[1] > 0 else 1),
+                dtype=np.float32,
+            )
 
             # Sorted unique dates for AE window
             unique_dates = sorted(set(dates))
             date_to_idx = {d: i for i, d in enumerate(unique_dates)}
 
-            # Build sorted list of AE dates for nearest-fill lookup
-            ae_date_set = set(ae_feats.keys())
-            ae_sorted = sorted(ae_date_set)
+            # Build sorted list of AE dates for O(log N) nearest-fill lookup
+            ae_sorted = sorted(ae_feats.keys())
+            ae_sorted_ords = [d.toordinal() for d in ae_sorted]
 
             # Collect eligible bar indices per day then apply stride
             day_bars: Dict[date, List[int]] = {}
@@ -908,21 +915,16 @@ class V3ContinuousPrep:
                     continue
                 ae_dates_window = unique_dates[ae_start_idx:ae_end_idx]
 
-                # Lenient AE fill: use nearest available for missing dates
+                # Lenient AE fill: use nearest available via bisect (O(log N))
                 ae_vec_list = []
                 for ad in ae_dates_window:
                     if ad in ae_feats:
                         ae_vec_list.append(ae_feats[ad])
                     else:
-                        # Forward-fill from most recent available date
-                        filled = None
-                        for prev_ad in reversed(ae_sorted):
-                            if prev_ad <= ad:
-                                filled = ae_feats[prev_ad]
-                                break
-                        if filled is None:
+                        pos = bisect.bisect_right(ae_sorted_ords, ad.toordinal()) - 1
+                        if pos < 0:
                             break
-                        ae_vec_list.append(filled)
+                        ae_vec_list.append(ae_feats[ae_sorted[pos]])
 
                 if len(ae_vec_list) < len(ae_dates_window):
                     _skip_ae_missing += 1
@@ -932,47 +934,48 @@ class V3ContinuousPrep:
 
                 raster = None if use_fused_spatial else rasters.get(prev_date)
 
-                for bar_idx in bar_indices:
+                # -- Batch searchsorted for all bars in this day --
+                _bar_indices_arr = np.array(bar_indices)
+                _bar_ts64_all = _df_index_values[_bar_indices_arr]
+
+                if _has_numbars:
+                    _nb_cuts_all = np.searchsorted(
+                        nb_ts_arr, _bar_ts64_all, side="left",
+                    )
+                else:
+                    _nb_cuts_all = np.zeros(len(bar_indices), dtype=np.intp)
+
+                _vpin_cuts_all = np.searchsorted(
+                    _vpin_ts, _bar_ts64_all, side="left",
+                )
+
+                for bi, bar_idx in enumerate(bar_indices):
                     start = bar_idx - tech_lookback
                     tech_window = tech_arr[start:bar_idx]
                     tech_len = tech_lookback
+                    _bar_ts64 = _bar_ts64_all[bi]
 
-                    bar_ts = df.index[bar_idx]
-                    _bar_ts64 = np.datetime64(bar_ts, "ns")
-
-                    # NumberBars: aligned to anchor bar timestamp.
+                    # NumberBars: use precomputed cut index
                     if _has_numbars:
-                        _nb_cut = np.searchsorted(
-                            nb_ts_arr, _bar_ts64, side="left",
-                        )
+                        _nb_cut = int(_nb_cuts_all[bi])
                         if _nb_cut > 0:
                             _nb_lo = max(0, _nb_cut - numbars_lookback)
                             nb_ts = nb_ts_arr[_nb_lo:_nb_cut]
                             nb_data = nb_vals_arr[_nb_lo:_nb_cut]
                         else:
-                            nb_ts = np.array([_bar_ts64], dtype="datetime64[ns]")
-                            nb_data = np.zeros(
-                                (1,) + nb_vals_arr.shape[1:],
-                                dtype=np.float32,
-                            )
+                            nb_ts = _bar_ts64[np.newaxis]
+                            nb_data = _nb_zero
                     else:
-                        nb_ts = np.array([_bar_ts64], dtype="datetime64[ns]")
-                        nb_data = np.zeros(
-                            (1, 4, 32), dtype=np.float32,
-                        )
+                        nb_ts = _bar_ts64[np.newaxis]
+                        nb_data = _nb_zero
 
-                    # Sequential VPIN: aligned to anchor bar timestamp.
-                    _cut = np.searchsorted(
-                        _vpin_ts, _bar_ts64, side="left",
-                    )
+                    # Sequential VPIN: use precomputed cut index
+                    _cut = int(_vpin_cuts_all[bi])
                     if _cut > 0:
                         _lo = max(0, _cut - seq_lookback_bars)
                         seq_data = _vpin_vals[_lo:_cut]
                     else:
-                        seq_data = np.zeros(
-                            (1, _vpin_vals.shape[1]),
-                            dtype=np.float32,
-                        )
+                        seq_data = _vpin_zero
                     seq_len = len(seq_data)
 
                     sample = {
@@ -987,9 +990,9 @@ class V3ContinuousPrep:
                         "target": target_arr[bar_idx],
                         "ticker": ticker,
                         "date": current_date,
-                        "anchor_ts": pd.Timestamp(bar_ts),
+                        "anchor_ts": pd.Timestamp(bar_idx_to_ts[bar_idx]),
                         "target_end_ts": (
-                            pd.Timestamp(df.index[bar_idx + self.target_steps])
+                            pd.Timestamp(bar_idx_to_ts[bar_idx + self.target_steps])
                             if (bar_idx + self.target_steps) < len(df)
                             else pd.NaT
                         ),
@@ -1001,21 +1004,24 @@ class V3ContinuousPrep:
                         vpin_spatial = np.zeros(
                             (nb_data.shape[0], 3, nb_data.shape[2]), dtype=np.float32,
                         )
-                        if not vpin_spatial_sorted.empty:
-                            for nb_i, nb_end in enumerate(nb_ts):
-                                nb_end64 = np.datetime64(nb_end, "ns")
-                                nb_start64 = nb_end64 - np.timedelta64(1, "h")
-                                vpin_lo = np.searchsorted(
-                                    _vpin_spatial_ts, nb_start64, side="right",
-                                )
-                                vpin_hi = np.searchsorted(
-                                    _vpin_spatial_ts, nb_end64, side="right",
-                                )
+                        if _has_vpin_spatial:
+                            # Batch searchsorted for all nb frames at once
+                            nb_ends64 = nb_ts.astype("datetime64[ns]")
+                            nb_starts64 = nb_ends64 - _one_hour
+                            vpin_los = np.searchsorted(
+                                _vpin_spatial_ts, nb_starts64, side="right",
+                            )
+                            vpin_his = np.searchsorted(
+                                _vpin_spatial_ts, nb_ends64, side="right",
+                            )
+                            for nb_i in range(len(nb_ts)):
+                                vpin_hi = int(vpin_his[nb_i])
                                 if vpin_hi <= 0:
                                     continue
+                                vpin_lo = int(vpin_los[nb_i])
                                 vpin_window = vpin_spatial_sorted.iloc[vpin_lo:vpin_hi]
                                 center_price = float(
-                                    vpin_spatial_sorted["rolling_vwap_2h"].iloc[vpin_hi - 1]
+                                    _vpin_spatial_vwap[vpin_hi - 1]
                                 )
                                 vpin_spatial[nb_i] = rasterize_vpin_to_grid(
                                     vpin_window=vpin_window,
