@@ -17,6 +17,40 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _compute_profile_levels(
+    tick_data: pd.DataFrame,
+    profile_ext,
+    tick_size: float,
+    value_area_pct: float = 0.7,
+) -> tuple:
+    """Compute (poc, val, vah, vwap) from tick data using a profile extractor.
+
+    Returns (nan, nan, nan, None) if data is empty or computation fails.
+    """
+    if tick_data.empty or profile_ext is None:
+        return np.nan, np.nan, np.nan, None
+    try:
+        profile = profile_ext.calculate_volume_profile(tick_data, tick_size=tick_size)
+        if profile.empty or 'TotalVolume' not in profile.columns:
+            return np.nan, np.nan, np.nan, None
+        total_vol = profile['TotalVolume'].sum()
+        poc = profile['TotalVolume'].idxmax()
+        sorted_profile = profile.sort_values('TotalVolume', ascending=False)
+        cumvol = sorted_profile['TotalVolume'].cumsum()
+        va_levels = sorted_profile[cumvol <= total_vol * value_area_pct].index
+        val = va_levels.min() if len(va_levels) > 0 else poc
+        vah = va_levels.max() if len(va_levels) > 0 else poc
+        # VWAP from raw ticks
+        vwap = None
+        if 'Close' in tick_data.columns and 'TotalVolume' in tick_data.columns:
+            tv = tick_data['TotalVolume'].sum()
+            if tv > 0:
+                vwap = (tick_data['Close'] * tick_data['TotalVolume']).sum() / tv
+        return poc, val, vah, vwap
+    except Exception:
+        return np.nan, np.nan, np.nan, None
+
+
 def get_default_tick_size(ticker: str) -> Optional[float]:
     """
     Get the default minimum tick size for a ticker from CONTRACT_SPECS_RAW.
@@ -109,6 +143,9 @@ def _extract_single_date_worker(args: tuple) -> Dict:
     start_dt = min(starts)
     end_dt = max(ends)
 
+    # Expand fetch window 24h back for causal profile computation (ps/pd)
+    fetch_start = min(start_dt, vpin_start - pd.Timedelta(hours=24))
+
     results = {
         'date': dt,
         'vpin': pd.DataFrame(),
@@ -120,7 +157,7 @@ def _extract_single_date_worker(args: tuple) -> Dict:
 
     try:
         df_raw = base.get_stitched_data(
-            start_time=start_dt,
+            start_time=fetch_start,
             end_time=end_dt,
             columns=["Close", "TotalVolume", "BidVolume", "AskVolume"]
         )
@@ -136,11 +173,10 @@ def _extract_single_date_worker(args: tuple) -> Dict:
     df_raw.index = df_raw.index.tz_convert(config.tz)
 
     # Profile: from profile_start to profile_end (full profile window)
-    poc, val, vah = np.nan, np.nan, np.nan
-    profile_vwap = None  # Shared VWAP for NumberBars alignment
+    # Used for spatial profile output and NumberBars alignment
+    profile_vwap = None
     if config.include_profile and profile_ext is not None and profile_start is not None:
-        profile_end_time = profile_end.time() if profile_end is not None else vpin_start.time()
-        profile_data = df_raw.between_time(profile_start.time(), profile_end_time, inclusive='both')
+        profile_data = df_raw.loc[profile_start:profile_end]
         if not profile_data.empty:
             try:
                 profile = profile_ext.calculate_volume_profile(
@@ -148,26 +184,32 @@ def _extract_single_date_worker(args: tuple) -> Dict:
                     tick_size=config.profile_tick_size
                 )
                 results['profile'] = profile
-
-                if not profile.empty and 'TotalVolume' in profile.columns:
-                    total_vol = profile['TotalVolume'].sum()
-                    poc = profile['TotalVolume'].idxmax()
-
-                    sorted_profile = profile.sort_values('TotalVolume', ascending=False)
-                    cumvol = sorted_profile['TotalVolume'].cumsum()
-                    va_threshold = total_vol * config.value_area_pct
-                    va_levels = sorted_profile[cumvol <= va_threshold].index
-                    val = va_levels.min() if len(va_levels) > 0 else poc
-                    vah = va_levels.max() if len(va_levels) > 0 else poc
-
-                # Calculate VWAP from profile period for NumberBars alignment
-                if 'Close' in profile_data.columns and 'TotalVolume' in profile_data.columns:
-                    total_vol = profile_data['TotalVolume'].sum()
-                    if total_vol > 0:
-                        profile_vwap = (profile_data['Close'] * profile_data['TotalVolume']).sum() / total_vol
-
+                _, _, _, profile_vwap = _compute_profile_levels(
+                    profile_data, profile_ext, config.profile_tick_size, config.value_area_pct
+                )
             except Exception as e:
                 logger.warning(f"Profile calculation failed for {dt.date()}: {e}")
+
+    # Causal profile levels for VPIN sequential branch
+    # ps_* = previous session (yesterday's profile window)
+    # pd_* = previous 24h from current VPIN start
+    ps_poc, ps_val, ps_vah = np.nan, np.nan, np.nan
+    pd_poc, pd_val, pd_vah = np.nan, np.nan, np.nan
+    if config.include_profile and profile_ext is not None:
+        tick_sz = config.profile_tick_size
+        va_pct = config.value_area_pct
+        # Previous session: yesterday's profile_start to profile_end
+        if profile_start is not None and profile_end is not None:
+            prev_day = dt - pd.Timedelta(days=1)
+            prev_date_str = prev_day.strftime('%Y-%m-%d')
+            ps_start = pd.Timestamp(f"{prev_date_str} {config.profile_start_time}").tz_localize(tz)
+            ps_end = pd.Timestamp(f"{prev_date_str} {config.profile_end_time}").tz_localize(tz)
+            ps_data = df_raw.loc[ps_start:ps_end]
+            ps_poc, ps_val, ps_vah, _ = _compute_profile_levels(ps_data, profile_ext, tick_sz, va_pct)
+        # Previous 24h from VPIN start
+        pd_start = vpin_start - pd.Timedelta(hours=24)
+        pd_data = df_raw.loc[pd_start:vpin_start]
+        pd_poc, pd_val, pd_vah, _ = _compute_profile_levels(pd_data, profile_ext, tick_sz, va_pct)
 
     # Number Bars extraction - use calculate_number_bars with pre-fetched data
     if config.include_number_bars and nb_ext is not None:
@@ -246,9 +288,13 @@ def _extract_single_date_worker(args: tuple) -> Dict:
                 include_sequence_features=config.include_sequence_features
             )
             if not vpin_df.empty:
-                # NOTE: poc, val, vah, profile_vwap intentionally excluded —
-                # they are full-session values that leak future price info
-                # into intraday VPIN buckets. Use causal rolling VWAP instead.
+                # Causal profile levels (no forward-looking data)
+                vpin_df['ps_poc'] = ps_poc
+                vpin_df['ps_val'] = ps_val
+                vpin_df['ps_vah'] = ps_vah
+                vpin_df['pd_poc'] = pd_poc
+                vpin_df['pd_val'] = pd_val
+                vpin_df['pd_vah'] = pd_vah
                 if config.include_ib:
                     vpin_df['ib_high'] = ib_high
                     vpin_df['ib_low'] = ib_low
@@ -335,6 +381,9 @@ class FeatureExtractorConfig:
     raster_vol_scale: float = 10.0  # Log volume normalization divisor
     raster_price_scale: float = 100.0  # Price normalization multiplier
 
+    # Contract cache for fast reloading (skip filesystem scan)
+    contract_cache: Optional[str] = None  # Path to cached contract map pickle
+
     def __post_init__(self):
         """Resolve default tick size from contract specs if not provided."""
         if self.profile_tick_size is None:
@@ -352,7 +401,8 @@ class MultiFeatureExtraction(ScidBaseExtractor):
     then computes all requested features from that shared data.
 
     Features:
-    - VPIN: Volume-synchronized probability of informed trading (includes profile_vwap)
+    - VPIN: Volume-synchronized probability of informed trading with causal profile levels
+      (ps_poc/val/vah from previous session, pd_poc/val/vah from previous 24h)
       Variable-length sequences stored as Parquet
     - Profile: Volume profile with POC, VAL, VAH
       When exported via VolumeProfileEncoder: 4 channels [VolumeShape, Imbalance, Magnitude, PriceLabels]
@@ -367,7 +417,8 @@ class MultiFeatureExtraction(ScidBaseExtractor):
     """
 
     def __init__(self, config: FeatureExtractorConfig, dates: List[Union[str, pd.Timestamp, date]]):
-        super().__init__(config.data_dir, config.ticker, config.tz)
+        super().__init__(config.data_dir, config.ticker, config.tz,
+                         contract_cache=config.contract_cache)
         self.config = config
         self.vpin_extractor = VPINExtractor(
             config.data_dir, config.ticker, config.tz,
@@ -437,7 +488,10 @@ class MultiFeatureExtraction(ScidBaseExtractor):
             ).tz_localize(self.config.tz)
             starts.append(pre_start)
 
-        return min(starts), max(ends)
+        # Expand 24h back for causal profile computation (ps/pd)
+        earliest = min(starts)
+        earliest = min(earliest, vpin_start - pd.Timedelta(hours=24))
+        return earliest, max(ends)
 
     def _get_yearly_bucket_size(self, year: int) -> int:
         """
@@ -603,7 +657,6 @@ class MultiFeatureExtraction(ScidBaseExtractor):
         )
 
         # Profile-related calculations
-        poc, val, vah = np.nan, np.nan, np.nan
         profile_start = None
         profile_end = None
         profile_vwap = None  # Shared VWAP for NumberBars alignment
@@ -612,9 +665,7 @@ class MultiFeatureExtraction(ScidBaseExtractor):
             profile_start, profile_end = self._build_time_range(
                 dt, self.config.profile_start_time, self.config.profile_end_time
             )
-            profile_data = df_raw.between_time(
-                profile_start.time(), profile_end.time(), inclusive='both'
-            )
+            profile_data = df_raw.loc[profile_start:profile_end]
             if not profile_data.empty:
                 try:
                     profile = self.profile_extractor.calculate_volume_profile(
@@ -622,26 +673,37 @@ class MultiFeatureExtraction(ScidBaseExtractor):
                         tick_size=self.config.profile_tick_size
                     )
                     results['profile'] = profile
-
-                    if not profile.empty and 'TotalVolume' in profile.columns:
-                        total_vol = profile['TotalVolume'].sum()
-                        poc = profile['TotalVolume'].idxmax()
-
-                        sorted_profile = profile.sort_values('TotalVolume', ascending=False)
-                        cumvol = sorted_profile['TotalVolume'].cumsum()
-                        va_threshold = total_vol * self.config.value_area_pct
-                        va_levels = sorted_profile[cumvol <= va_threshold].index
-                        val = va_levels.min() if len(va_levels) > 0 else poc
-                        vah = va_levels.max() if len(va_levels) > 0 else poc
-
-                    # Calculate VWAP from profile period for NumberBars alignment
-                    if 'Close' in profile_data.columns and 'TotalVolume' in profile_data.columns:
-                        total_vol = profile_data['TotalVolume'].sum()
-                        if total_vol > 0:
-                            profile_vwap = (profile_data['Close'] * profile_data['TotalVolume']).sum() / total_vol
-
+                    _, _, _, profile_vwap = _compute_profile_levels(
+                        profile_data, self.profile_extractor,
+                        self.config.profile_tick_size, self.config.value_area_pct
+                    )
                 except Exception as e:
                     logger.warning(f"Profile calculation failed for {dt.date()}: {e}")
+
+        # Causal profile levels for VPIN sequential branch
+        # ps_* = previous session (yesterday's profile window)
+        # pd_* = previous 24h from current VPIN start
+        ps_poc, ps_val, ps_vah = np.nan, np.nan, np.nan
+        pd_poc, pd_val, pd_vah = np.nan, np.nan, np.nan
+        if self.config.include_profile and self.profile_extractor is not None:
+            tick_sz = self.config.profile_tick_size
+            va_pct = self.config.value_area_pct
+            # Previous session: yesterday's profile_start to profile_end
+            if profile_start is not None and profile_end is not None:
+                prev_day = dt - pd.Timedelta(days=1)
+                ps_start, ps_end = self._build_time_range(
+                    prev_day, self.config.profile_start_time, self.config.profile_end_time
+                )
+                ps_data = df_raw.loc[ps_start:ps_end]
+                ps_poc, ps_val, ps_vah, _ = _compute_profile_levels(
+                    ps_data, self.profile_extractor, tick_sz, va_pct
+                )
+            # Previous 24h from VPIN start
+            pd_start = vpin_start - pd.Timedelta(hours=24)
+            pd_data = df_raw.loc[pd_start:vpin_start]
+            pd_poc, pd_val, pd_vah, _ = _compute_profile_levels(
+                pd_data, self.profile_extractor, tick_sz, va_pct
+            )
 
         # Number Bars extraction - use calculate_number_bars with pre-fetched data
         if self.config.include_number_bars and self.number_bars_extractor is not None:
@@ -708,9 +770,13 @@ class MultiFeatureExtraction(ScidBaseExtractor):
                     include_sequence_features=self.config.include_sequence_features
                 )
                 if not vpin_df.empty:
-                    # NOTE: poc, val, vah, profile_vwap intentionally excluded —
-                    # they are full-session values that leak future price info
-                    # into intraday VPIN buckets. Use causal rolling VWAP instead.
+                    # Causal profile levels (no forward-looking data)
+                    vpin_df['ps_poc'] = ps_poc
+                    vpin_df['ps_val'] = ps_val
+                    vpin_df['ps_vah'] = ps_vah
+                    vpin_df['pd_poc'] = pd_poc
+                    vpin_df['pd_val'] = pd_val
+                    vpin_df['pd_vah'] = pd_vah
                     if self.config.include_ib:
                         vpin_df['ib_high'] = ib_high
                         vpin_df['ib_low'] = ib_low

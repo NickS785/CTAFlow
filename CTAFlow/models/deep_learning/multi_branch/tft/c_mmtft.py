@@ -1028,10 +1028,15 @@ def train_epoch_v3_stateful(
     device: torch.device,
     max_norm: float = 1.0,
     unpack_fn=None,
+    scaler: Optional[torch.amp.GradScaler] = None,
 ) -> Tuple[float, Dict[str, float]]:
-    """Train one epoch with online ticker state updates."""
+    """Train one epoch with online ticker state updates.
+
+    Pass ``scaler=torch.amp.GradScaler()`` to enable mixed-precision training.
+    """
     model.train()
     _maybe_reset_position_state(model)
+    use_amp = scaler is not None
 
     total_loss = 0.0
     metric_accum: Dict[str, float] = {}
@@ -1042,18 +1047,25 @@ def train_epoch_v3_stateful(
         targets = targets.float()
 
         optimizer.zero_grad()
-        position, ae_losses = model(**inputs, return_ae_losses=True)
-
-        trading_loss, metrics = loss_fn(position, targets)
-        ae_loss = model.recon_weight * ae_losses["total_ae_loss"]
-        loss = trading_loss + ae_loss
+        with torch.amp.autocast(device.type, enabled=use_amp):
+            position, ae_losses = model(**inputs, return_ae_losses=True)
+            trading_loss, metrics = loss_fn(position, targets)
+            ae_loss = model.recon_weight * ae_losses["total_ae_loss"]
+            loss = trading_loss + ae_loss
 
         if torch.isnan(loss) or torch.isinf(loss):
             continue
 
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-        optimizer.step()
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            optimizer.step()
 
         total_loss += loss.item()
         for k, v in metrics.items():
@@ -1396,14 +1408,17 @@ def train_epoch_v3_ptp(
     device: torch.device,
     max_norm: float = 1.0,
     unpack_fn=None,
+    scaler: Optional[torch.amp.GradScaler] = None,
 ) -> Tuple[float, Dict[str, float]]:
     """Train one epoch with PTP multi-loss (CE + PnL + AE).
 
     Expects model to return ``(position, ae_losses, logits)`` — i.e.,
     a ``StatefulMMTFv3Core`` with ``quantile_head=True``.
+    Pass ``scaler=torch.amp.GradScaler()`` to enable mixed-precision training.
     """
     model.train()
     _maybe_reset_position_state(model)
+    use_amp = scaler is not None
 
     total_loss = 0.0
     metric_accum: Dict[str, float] = {}
@@ -1415,23 +1430,31 @@ def train_epoch_v3_ptp(
         targets = targets.float()
 
         optimizer.zero_grad()
-        position, ae_losses, logits = model(**inputs, return_ae_losses=True)
+        with torch.amp.autocast(device.type, enabled=use_amp):
+            position, ae_losses, logits = model(**inputs, return_ae_losses=True)
 
-        # PTP composite loss (CE + trading)
-        ptp_total, ptp_metrics = ptp_loss(
-            position, logits, targets, prev_position=prev_pos,
-        )
+            # PTP composite loss (CE + trading)
+            ptp_total, ptp_metrics = ptp_loss(
+                position, logits, targets, prev_position=prev_pos,
+            )
 
-        # AE reconstruction
-        ae_loss = model.recon_weight * ae_losses["total_ae_loss"]
-        loss = ptp_total + ae_loss
+            # AE reconstruction
+            ae_loss = model.recon_weight * ae_losses["total_ae_loss"]
+            loss = ptp_total + ae_loss
 
         if torch.isnan(loss) or torch.isinf(loss):
             continue
 
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-        optimizer.step()
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            optimizer.step()
 
         total_loss += loss.item()
         for k, v in ptp_metrics.items():

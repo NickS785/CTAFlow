@@ -1,6 +1,8 @@
 import pandas as pd
 import numpy as np
+import pickle
 from datetime import datetime, date
+from pathlib import Path
 from typing import Optional, List, Union
 import logging
 
@@ -10,11 +12,32 @@ from ..data.contract_expiry_rules import calculate_expiry, get_roll_buffer_days
 
 logger = logging.getLogger(__name__)
 
+# Default cache location for contract maps
+_DEFAULT_CACHE_DIR = Path.home() / ".cache" / "ctaflow"
+
 
 class SmartScidManager(ScidTickerFileManager):
     """
     Extends SierraPy's file manager to use CTAFlow's precise expiry rules.
+
+    Supports caching the contract map to disk to avoid slow filesystem
+    rescans on every instantiation.  Use ``save_contract_cache()`` after the
+    first run, then pass ``cache_path`` on subsequent runs.
     """
+
+    def __init__(self, folder: str, *, service: str = "sierra",
+                 cache_path: Optional[Union[str, Path]] = None):
+        if cache_path is not None and Path(cache_path).exists():
+            # Fast path: load cached contract map instead of scanning
+            self.folder = Path(folder)
+            self.service = service.lower()
+            self._ticker_files, self._ticker_contracts = {}, {}
+            self._load_contract_cache(cache_path)
+            logger.info(f"Loaded contract cache from {cache_path} "
+                        f"({sum(len(v) for v in self._ticker_contracts.values())} contracts)")
+        else:
+            # Normal path: scan filesystem (slow)
+            super().__init__(folder, service=service)
 
     def _calculate_contract_expiry(self, contract: ScidContractInfo) -> pd.Timestamp:
         try:
@@ -31,6 +54,43 @@ class SmartScidManager(ScidTickerFileManager):
             logger.warning(f"CTAFlow expiry calc failed for {contract.ticker}: {e}")
             return super()._calculate_contract_expiry(contract)
 
+    def save_contract_cache(self, path: Optional[Union[str, Path]] = None) -> Path:
+        """Save the contract map to a pickle file for fast reloading."""
+        if path is None:
+            _DEFAULT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            path = _DEFAULT_CACHE_DIR / f"contract_map_{self.folder.name}.pkl"
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "folder": str(self.folder),
+            "service": self.service,
+            "ticker_files": {k: [str(p) for p in v] for k, v in self._ticker_files.items()},
+            "ticker_contracts": {
+                k: [(c.ticker, c.month, c.year, c.exchange, str(c.file_path), c.service)
+                    for c in v]
+                for k, v in self._ticker_contracts.items()
+            },
+        }
+        with open(path, "wb") as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        logger.info(f"Saved contract cache to {path} "
+                    f"({sum(len(v) for v in self._ticker_contracts.values())} contracts)")
+        return path
+
+    def _load_contract_cache(self, path: Union[str, Path]) -> None:
+        """Load contract map from a pickle file."""
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        self._ticker_files = {
+            k: [Path(p) for p in v] for k, v in data["ticker_files"].items()
+        }
+        self._ticker_contracts = {
+            k: [ScidContractInfo(ticker=t[0], month=t[1], year=t[2],
+                                 exchange=t[3], file_path=Path(t[4]), service=t[5])
+                for t in v]
+            for k, v in data["ticker_contracts"].items()
+        }
+
 
 class ScidBaseExtractor:
     """
@@ -38,8 +98,9 @@ class ScidBaseExtractor:
     Handles timezone conversion, contract rolling, and file reading.
     """
 
-    def __init__(self, data_dir: str, ticker: Optional[str] = None, tz: str = "America/Chicago"):
-        self.manager = SmartScidManager(data_dir)
+    def __init__(self, data_dir: str, ticker: Optional[str] = None, tz: str = "America/Chicago",
+                 contract_cache: Optional[Union[str, Path]] = None):
+        self.manager = SmartScidManager(data_dir, cache_path=contract_cache)
         self.ticker = ticker
         self.tz = tz
 

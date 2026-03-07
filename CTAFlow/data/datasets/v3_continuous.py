@@ -96,16 +96,18 @@ _VPIN_SCALE_RULES: Dict[str, Tuple[str, ...]] = {
     "max_buy_run":       ("divide", 4.0),
     "max_sell_run":      ("divide", 4.0),
     "bucket":            ("skip",),                        # ordinal, not useful
-    # Forward-looking columns: computed from full-session data, contain future
-    # price information. Must be dropped to prevent lookahead bias.
+    # Legacy forward-looking columns (should no longer appear in new extractions)
     "profile_vwap":      ("skip",),
     "poc":               ("skip",),
     "val":               ("skip",),
     "vah":               ("skip",),
 }
 # Price-like columns normalized as (value - rolling_vwap) / rolling_vwap * 100
-# Uses causal 2h rolling VWAP instead of close for centering.
-_VPIN_PRICE_COLS = {"close", "ib_high", "ib_low"}
+# Uses causal 2h rolling VWAP for centering.
+# ps_* = previous session profile, pd_* = previous 24h profile (both causal).
+_VPIN_PRICE_COLS = {"close", "ib_high", "ib_low",
+                    "ps_poc", "ps_val", "ps_vah",
+                    "pd_poc", "pd_val", "pd_vah"}
 
 
 def scale_vpin_features(
@@ -116,9 +118,9 @@ def scale_vpin_features(
 ) -> pd.DataFrame:
     """Scale VPIN sequential features to ~[-5, +5] range.
 
-    - Forward-looking columns (profile_vwap, poc, val, vah) are dropped.
-    - Price-like columns are normalized as basis-point displacement from
-      a causal 2h rolling VWAP: ``(price - rolling_vwap) / rolling_vwap * 100``.
+    - Legacy forward-looking columns (profile_vwap, poc, val, vah) are dropped.
+    - Price-like columns (close, ib_high/low, ps_*/pd_* causal profile levels)
+      are normalized as bps displacement from a causal 2h rolling VWAP.
     - Known columns get fixed transformations.
     - Unknown columns get rolling z-score.
     """
