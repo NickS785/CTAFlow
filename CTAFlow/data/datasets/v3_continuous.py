@@ -96,46 +96,66 @@ _VPIN_SCALE_RULES: Dict[str, Tuple[str, ...]] = {
     "max_buy_run":       ("divide", 4.0),
     "max_sell_run":      ("divide", 4.0),
     "bucket":            ("skip",),                        # ordinal, not useful
+    # Forward-looking columns: computed from full-session data, contain future
+    # price information. Must be dropped to prevent lookahead bias.
+    "profile_vwap":      ("skip",),
+    "poc":               ("skip",),
+    "val":               ("skip",),
+    "vah":               ("skip",),
 }
-# Price-like columns get rolling z-score
-_VPIN_PRICE_COLS = {"close", "poc", "val", "vah", "ib_high", "ib_low", "profile_vwap"}
+# Price-like columns normalized as (value - rolling_vwap) / rolling_vwap * 100
+# Uses causal 2h rolling VWAP instead of close for centering.
+_VPIN_PRICE_COLS = {"close", "ib_high", "ib_low"}
 
 
 def scale_vpin_features(
     df: pd.DataFrame,
     zscore_window: int = 252,
     clip_val: float = 5.0,
+    vwap_window: str = "2h",
 ) -> pd.DataFrame:
     """Scale VPIN sequential features to ~[-5, +5] range.
 
-    - Known columns get fixed transformations (matching normalize_sequential_features).
-    - Price-like columns get rolling z-score relative to close.
+    - Forward-looking columns (profile_vwap, poc, val, vah) are dropped.
+    - Price-like columns are normalized as basis-point displacement from
+      a causal 2h rolling VWAP: ``(price - rolling_vwap) / rolling_vwap * 100``.
+    - Known columns get fixed transformations.
     - Unknown columns get rolling z-score.
     """
     out = df.copy()
 
-    # Price-like columns: normalize relative to close
-    if "close" in out.columns:
-        close = out["close"].copy()
-        close_safe = close.replace(0, np.nan).ffill()
-        for col in _VPIN_PRICE_COLS:
-            if col == "close" or col not in out.columns:
-                continue
-            # (value - close) / close * 100  →  basis points
-            out[col] = ((out[col] - close_safe) / close_safe * 100.0).clip(-clip_val, clip_val)
-        # Close itself: rolling z-score of log returns
-        log_ret = np.log(close_safe).diff()
-        rm = log_ret.rolling(zscore_window, min_periods=20).mean()
-        rs = log_ret.rolling(zscore_window, min_periods=20).std().clip(lower=1e-8)
-        out["close"] = ((log_ret - rm) / rs * 2.0).clip(-clip_val, clip_val)
+    # 1. Drop forward-looking columns immediately
+    _drop_cols = [c for c, r in _VPIN_SCALE_RULES.items()
+                  if r[0] == "skip" and c in out.columns]
+    if _drop_cols:
+        out.drop(columns=_drop_cols, inplace=True)
 
-    # Apply fixed scaling rules
+    # 2. Price-like columns: normalize as displacement from causal rolling VWAP.
+    #    Must compute VWAP from raw close/vol BEFORE other transforms.
+    if "close" in out.columns:
+        raw_close = pd.to_numeric(out["close"], errors="coerce").replace(0, np.nan).ffill()
+        raw_vol = pd.to_numeric(out.get("vol", pd.Series(1.0, index=out.index)),
+                                errors="coerce").fillna(0.0)
+
+        # Causal rolling VWAP (no lookahead)
+        numer = (raw_close * raw_vol).rolling(vwap_window, min_periods=1).sum()
+        denom = raw_vol.rolling(vwap_window, min_periods=1).sum().replace(0.0, np.nan)
+        rolling_vwap = (numer / denom).ffill().bfill()
+
+        # Normalize price-like columns as bps displacement from rolling VWAP
+        for col in _VPIN_PRICE_COLS:
+            if col not in out.columns:
+                continue
+            raw = pd.to_numeric(out[col], errors="coerce").replace(0, np.nan).ffill()
+            out[col] = ((raw - rolling_vwap) / rolling_vwap * 100.0).clip(-clip_val, clip_val)
+
+    # 3. Apply fixed scaling rules (non-skip, non-price columns)
     for col, rule in _VPIN_SCALE_RULES.items():
         if col not in out.columns:
             continue
         method = rule[0]
         if method == "skip":
-            out.drop(columns=[col], inplace=True, errors="ignore")
+            continue  # already dropped
         elif method == "center_scale":
             center, scale = rule[1], rule[2]
             out[col] = ((out[col] - center) * scale).clip(-clip_val, clip_val)
@@ -146,7 +166,7 @@ def scale_vpin_features(
         elif method == "log_shift":
             out[col] = (np.log1p(out[col].clip(lower=0)) - rule[1]).clip(-clip_val, clip_val)
 
-    # Remaining unknown columns: rolling z-score
+    # 4. Remaining unknown columns: rolling z-score
     handled = set(_VPIN_SCALE_RULES.keys()) | _VPIN_PRICE_COLS
     for col in out.columns:
         if col in handled:

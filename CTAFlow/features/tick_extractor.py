@@ -246,14 +246,12 @@ def _extract_single_date_worker(args: tuple) -> Dict:
                 include_sequence_features=config.include_sequence_features
             )
             if not vpin_df.empty:
-                vpin_df['poc'] = poc
-                vpin_df['val'] = val
-                vpin_df['vah'] = vah
+                # NOTE: poc, val, vah, profile_vwap intentionally excluded —
+                # they are full-session values that leak future price info
+                # into intraday VPIN buckets. Use causal rolling VWAP instead.
                 if config.include_ib:
                     vpin_df['ib_high'] = ib_high
                     vpin_df['ib_low'] = ib_low
-                # Add profile VWAP (shared centering reference for all modalities)
-                vpin_df['profile_vwap'] = profile_vwap if profile_vwap is not None else np.nan
                 for key, value in pre_summary.items():
                     vpin_df[key] = value
             results['vpin'] = vpin_df
@@ -710,14 +708,12 @@ class MultiFeatureExtraction(ScidBaseExtractor):
                     include_sequence_features=self.config.include_sequence_features
                 )
                 if not vpin_df.empty:
-                    vpin_df['poc'] = poc
-                    vpin_df['val'] = val
-                    vpin_df['vah'] = vah
+                    # NOTE: poc, val, vah, profile_vwap intentionally excluded —
+                    # they are full-session values that leak future price info
+                    # into intraday VPIN buckets. Use causal rolling VWAP instead.
                     if self.config.include_ib:
                         vpin_df['ib_high'] = ib_high
                         vpin_df['ib_low'] = ib_low
-                    # Add profile VWAP (shared centering reference for all modalities)
-                    vpin_df['profile_vwap'] = profile_vwap if profile_vwap is not None else np.nan
                     # Add pre-summary to VPIN
                     for key, value in pre_summary.items():
                         vpin_df[key] = value

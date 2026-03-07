@@ -468,12 +468,13 @@ class SequenceRasterizer:
         work = work[(work["vol"] > 0) & work["close"].notna()].copy()
 
         if work.empty:
-            return pd.DataFrame(columns=["ts_end", "close", "profile_vwap", "vol", "imb_frac", "bucket_return"])
+            return pd.DataFrame(columns=["ts_end", "close", "vol", "imb_frac", "bucket_return"])
 
         work = work.sort_values("ts")
 
-        vwap_denom = work["vol"].sum()
-        session_vwap = float((work["close"] * work["vol"]).sum() / vwap_denom) if vwap_denom > 0 else np.nan
+        # NOTE: session_vwap removed — it was a full-session value that leaked
+        # future price info into intraday buckets. Rasterizer falls back to
+        # per-bar VWAP centering when profile_vwap is absent.
 
         vol = work["vol"].to_numpy(dtype=np.float64)
         buy = work["buy_vol"].to_numpy(dtype=np.float64)
@@ -556,7 +557,7 @@ class SequenceRasterizer:
             )
 
         if not buckets:
-            return pd.DataFrame(columns=["ts_end", "close", "profile_vwap", "vol", "imb_frac", "bucket_return"])
+            return pd.DataFrame(columns=["ts_end", "close", "vol", "imb_frac", "bucket_return"])
 
         seq = pd.DataFrame(buckets)
         seq["buy"] = seq["buy"].astype(np.float64)
@@ -565,9 +566,8 @@ class SequenceRasterizer:
         seq["imb_frac"] = (seq["buy"] - seq["sell"]).abs() / seq["vol"].replace(0, np.nan)
         seq["bucket_return"] = np.log(seq["close_last"] / seq["close_first"].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
         seq["close"] = seq["close_last"]
-        seq["profile_vwap"] = session_vwap
 
-        return seq[["ts_end", "close", "profile_vwap", "vol", "imb_frac", "bucket_return"]]
+        return seq[["ts_end", "close", "vol", "imb_frac", "bucket_return"]]
 
     def _rasterize_sequence(self, df, num_bars=4, interval_mins=None, session_start=None, session_end=None):
         """Core rasterizer for VPIN-style sequence data."""
