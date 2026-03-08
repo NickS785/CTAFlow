@@ -207,9 +207,10 @@ def _extract_single_date_worker(args: tuple) -> Dict:
             ps_data = df_raw.loc[ps_start:ps_end]
             ps_poc, ps_val, ps_vah, _ = _compute_profile_levels(ps_data, profile_ext, tick_sz, va_pct)
         # Previous 24h from VPIN start
-        pd_start = vpin_start - pd.Timedelta(hours=24)
-        pd_data = df_raw.loc[pd_start:vpin_start]
-        pd_poc, pd_val, pd_vah, _ = _compute_profile_levels(pd_data, profile_ext, tick_sz, va_pct)
+        if config.include_prev_24h_profile:
+            pd_start = vpin_start - pd.Timedelta(hours=24)
+            pd_data = df_raw.loc[pd_start:vpin_start]
+            pd_poc, pd_val, pd_vah, _ = _compute_profile_levels(pd_data, profile_ext, tick_sz, va_pct)
 
     # Number Bars extraction - use calculate_number_bars with pre-fetched data
     if config.include_number_bars and nb_ext is not None:
@@ -292,9 +293,10 @@ def _extract_single_date_worker(args: tuple) -> Dict:
                 vpin_df['ps_poc'] = ps_poc
                 vpin_df['ps_val'] = ps_val
                 vpin_df['ps_vah'] = ps_vah
-                vpin_df['pd_poc'] = pd_poc
-                vpin_df['pd_val'] = pd_val
-                vpin_df['pd_vah'] = pd_vah
+                if config.include_prev_24h_profile:
+                    vpin_df['pd_poc'] = pd_poc
+                    vpin_df['pd_val'] = pd_val
+                    vpin_df['pd_vah'] = pd_vah
                 if config.include_ib:
                     vpin_df['ib_high'] = ib_high
                     vpin_df['ib_low'] = ib_low
@@ -380,6 +382,9 @@ class FeatureExtractorConfig:
     raster_session_start: str = "09:30"  # Session start for interval alignment
     raster_vol_scale: float = 10.0  # Log volume normalization divisor
     raster_price_scale: float = 100.0  # Price normalization multiplier
+
+    # Causal profile options
+    include_prev_24h_profile: bool = True  # pd_poc/val/vah from 24h before VPIN start
 
     # Contract cache for fast reloading (skip filesystem scan)
     contract_cache: Optional[str] = None  # Path to cached contract map pickle
@@ -699,11 +704,12 @@ class MultiFeatureExtraction(ScidBaseExtractor):
                     ps_data, self.profile_extractor, tick_sz, va_pct
                 )
             # Previous 24h from VPIN start
-            pd_start = vpin_start - pd.Timedelta(hours=24)
-            pd_data = df_raw.loc[pd_start:vpin_start]
-            pd_poc, pd_val, pd_vah, _ = _compute_profile_levels(
-                pd_data, self.profile_extractor, tick_sz, va_pct
-            )
+            if self.config.include_prev_24h_profile:
+                pd_start = vpin_start - pd.Timedelta(hours=24)
+                pd_data = df_raw.loc[pd_start:vpin_start]
+                pd_poc, pd_val, pd_vah, _ = _compute_profile_levels(
+                    pd_data, self.profile_extractor, tick_sz, va_pct
+                )
 
         # Number Bars extraction - use calculate_number_bars with pre-fetched data
         if self.config.include_number_bars and self.number_bars_extractor is not None:
@@ -774,9 +780,10 @@ class MultiFeatureExtraction(ScidBaseExtractor):
                     vpin_df['ps_poc'] = ps_poc
                     vpin_df['ps_val'] = ps_val
                     vpin_df['ps_vah'] = ps_vah
-                    vpin_df['pd_poc'] = pd_poc
-                    vpin_df['pd_val'] = pd_val
-                    vpin_df['pd_vah'] = pd_vah
+                    if self.config.include_prev_24h_profile:
+                        vpin_df['pd_poc'] = pd_poc
+                        vpin_df['pd_val'] = pd_val
+                        vpin_df['pd_vah'] = pd_vah
                     if self.config.include_ib:
                         vpin_df['ib_high'] = ib_high
                         vpin_df['ib_low'] = ib_low

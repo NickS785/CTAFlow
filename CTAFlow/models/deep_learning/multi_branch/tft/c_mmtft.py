@@ -73,6 +73,11 @@ from CTAFlow.models.deep_learning.multi_branch.tft.tft_encoders import (
 from CTAFlow.models.deep_learning.training.loss.clf import ContinuousTradingLoss
 
 
+def _default_unpack_v3(batch, device):
+    """Lazy-import fallback for unpack_fn when None is passed."""
+    from CTAFlow.data.datasets.v3_continuous import unpack_v3_batch
+    return unpack_v3_batch(batch, device=device)
+
 
 # ============================================================================
 # MMTFv3 Core — Temporal Fusion Transformer/Mamba
@@ -991,7 +996,8 @@ def train_epoch_v3(
     n_batches = 0
 
     for batch in loader:
-        inputs, targets = unpack_fn(batch, device=device)
+        _unpack = unpack_fn or _default_unpack_v3
+        inputs, targets = _unpack(batch, device=device)
         targets = targets.float()
 
         optimizer.zero_grad()
@@ -1043,7 +1049,8 @@ def train_epoch_v3_stateful(
     n_batches = 0
 
     for batch in loader:
-        inputs, targets = unpack_fn(batch, device=device)
+        _unpack = unpack_fn or _default_unpack_v3
+        inputs, targets = _unpack(batch, device=device)
         targets = targets.float()
 
         optimizer.zero_grad()
@@ -1094,7 +1101,8 @@ def evaluate_v3(
     n_batches = 0
 
     for batch in loader:
-        inputs, targets = unpack_fn(batch, device=device)
+        _unpack = unpack_fn or _default_unpack_v3
+        inputs, targets = _unpack(batch, device=device)
         targets = targets.float()
         position, ae_losses = model(**inputs, return_ae_losses=True)
         trading_loss, _ = loss_fn(position, targets)
@@ -1150,7 +1158,8 @@ def evaluate_v3_stateful(
     n_batches = 0
 
     for batch in loader:
-        inputs, targets = unpack_fn(batch, device=device)
+        _unpack = unpack_fn or _default_unpack_v3
+        inputs, targets = _unpack(batch, device=device)
         targets = targets.float()
         position, ae_losses = model(**inputs, return_ae_losses=True)
         trading_loss, _ = loss_fn(position, targets)
@@ -1426,7 +1435,8 @@ def train_epoch_v3_ptp(
     prev_pos = None  # track position across batches for turnover / TC
 
     for batch in loader:
-        inputs, targets = unpack_fn(batch, device=device)
+        _unpack = unpack_fn or _default_unpack_v3
+        inputs, targets = _unpack(batch, device=device)
         targets = targets.float()
 
         optimizer.zero_grad()
@@ -1487,7 +1497,8 @@ def evaluate_v3_ptp(
     n_batches = 0
 
     for batch in loader:
-        inputs, targets = unpack_fn(batch, device=device)
+        _unpack = unpack_fn or _default_unpack_v3
+        inputs, targets = _unpack(batch, device=device)
         targets = targets.float()
 
         position, ae_losses, logits = model(**inputs, return_ae_losses=True)
