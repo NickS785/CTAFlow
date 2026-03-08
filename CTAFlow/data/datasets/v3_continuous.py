@@ -114,32 +114,31 @@ def scale_vpin_features(
     df: pd.DataFrame,
     zscore_window: int = 252,
     clip_val: float = 5.0,
-    vwap_window: str = "2h",
+    vwap_window: int = 60,
 ) -> pd.DataFrame:
     """Scale VPIN sequential features to ~[-5, +5] range.
 
     - Legacy forward-looking columns (profile_vwap, poc, val, vah) are dropped.
     - Price-like columns (close, ib_high/low, ps_*/pd_* causal profile levels)
-      are normalized as bps displacement from a causal 2h rolling VWAP.
+      are normalized as bps displacement from a causal rolling VWAP.
     - Known columns get fixed transformations.
     - Unknown columns get rolling z-score.
-    """
-    out = df.copy()
 
+    ``vwap_window`` is an integer bucket count (default 60 ~ 2h).
+    """
     # 1. Drop forward-looking columns immediately
-    _drop_cols = [c for c, r in _VPIN_SCALE_RULES.items()
-                  if r[0] == "skip" and c in out.columns]
-    if _drop_cols:
-        out.drop(columns=_drop_cols, inplace=True)
+    drop_cols = [c for c, r in _VPIN_SCALE_RULES.items()
+                 if r[0] == "skip" and c in df.columns]
+    keep_cols = [c for c in df.columns if c not in drop_cols]
+    out = df[keep_cols].copy()
 
     # 2. Price-like columns: normalize as displacement from causal rolling VWAP.
     #    Must compute VWAP from raw close/vol BEFORE other transforms.
     if "close" in out.columns:
-        raw_close = pd.to_numeric(out["close"], errors="coerce").replace(0, np.nan).ffill()
-        raw_vol = pd.to_numeric(out.get("vol", pd.Series(1.0, index=out.index)),
-                                errors="coerce").fillna(0.0)
+        raw_close = out["close"].replace(0, np.nan).ffill()
+        raw_vol = out["vol"] if "vol" in out.columns else pd.Series(1.0, index=out.index)
 
-        # Causal rolling VWAP (no lookahead)
+        # Causal rolling VWAP (integer window — fast)
         numer = (raw_close * raw_vol).rolling(vwap_window, min_periods=1).sum()
         denom = raw_vol.rolling(vwap_window, min_periods=1).sum().replace(0.0, np.nan)
         rolling_vwap = (numer / denom).ffill().bfill()
@@ -148,7 +147,7 @@ def scale_vpin_features(
         for col in _VPIN_PRICE_COLS:
             if col not in out.columns:
                 continue
-            raw = pd.to_numeric(out[col], errors="coerce").replace(0, np.nan).ffill()
+            raw = out[col].replace(0, np.nan).ffill()
             out[col] = ((raw - rolling_vwap) / rolling_vwap * 100.0).clip(-clip_val, clip_val)
 
     # 3. Apply fixed scaling rules (non-skip, non-price columns)
@@ -157,7 +156,7 @@ def scale_vpin_features(
             continue
         method = rule[0]
         if method == "skip":
-            continue  # already dropped
+            continue
         elif method == "center_scale":
             center, scale = rule[1], rule[2]
             out[col] = ((out[col] - center) * scale).clip(-clip_val, clip_val)
@@ -170,12 +169,11 @@ def scale_vpin_features(
 
     # 4. Remaining unknown columns: rolling z-score
     handled = set(_VPIN_SCALE_RULES.keys()) | _VPIN_PRICE_COLS
-    for col in out.columns:
-        if col in handled:
-            continue
-        rm = out[col].rolling(zscore_window, min_periods=20).mean()
-        rs = out[col].rolling(zscore_window, min_periods=20).std().clip(lower=1e-8)
-        out[col] = ((out[col] - rm) / rs * 2.0).clip(-clip_val, clip_val)
+    unknown = [c for c in out.columns if c not in handled]
+    if unknown:
+        rm = out[unknown].rolling(zscore_window, min_periods=20).mean()
+        rs = out[unknown].rolling(zscore_window, min_periods=20).std().clip(lower=1e-8)
+        out[unknown] = ((out[unknown] - rm) / rs * 2.0).clip(-clip_val, clip_val)
 
     out = out.ffill().bfill().fillna(0.0)
     return out
@@ -222,14 +220,16 @@ def scale_numbars(
 
 def compute_vpin_rolling_vwap(
     vpin_df: pd.DataFrame,
-    window: str = "2h",
+    window: Union[str, int] = 60,
 ) -> pd.Series:
-    """Compute a rolling VWAP over VPIN buckets for spatial alignment."""
+    """Compute a rolling VWAP over VPIN buckets for spatial alignment.
+
+    ``window`` can be an int (number of buckets, fast) or a time string
+    like ``"2h"`` (slower on large DataFrames). Default 60 buckets ≈ 2h
+    for typical ~400 buckets/14h sessions.
+    """
     if vpin_df.empty:
         return pd.Series(dtype=np.float32)
-
-    if not isinstance(vpin_df.index, pd.DatetimeIndex):
-        raise TypeError("VPIN DataFrame index must be a DatetimeIndex")
 
     close = pd.to_numeric(vpin_df.get("close"), errors="coerce")
     vol = pd.to_numeric(vpin_df.get("vol"), errors="coerce").fillna(0.0)
@@ -255,49 +255,41 @@ def _normalize_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def prepare_vpin_spatial_features(vpin_df: pd.DataFrame) -> pd.DataFrame:
-    """Extract raw VPIN fields needed for fused spatial rasterization."""
+def prepare_vpin_spatial_features(
+    vpin_df: pd.DataFrame,
+    _already_normalized: bool = False,
+) -> pd.DataFrame:
+    """Extract raw VPIN fields needed for fused spatial rasterization.
+
+    If ``_already_normalized=True``, skip the copy + sort + dedup step
+    (caller guarantees the df is already sorted with a tz-naive DatetimeIndex).
+    """
     if vpin_df.empty:
         return pd.DataFrame(columns=["close", "vol", "signed_imbalance", "vpin", "rolling_vwap_2h"])
 
-    work = vpin_df.copy()
-    work = _normalize_datetime_index(work)
+    work = vpin_df if _already_normalized else _normalize_datetime_index(vpin_df)
 
-    out = pd.DataFrame(index=work.index)
-    close_src = (
-        work["close"]
-        if "close" in work.columns
-        else work.get("close_last", pd.Series(np.nan, index=work.index))
+    close = work["close"] if "close" in work.columns else work.get("close_last", np.nan)
+    vol = work["vol"].fillna(0.0) if "vol" in work.columns else (
+        work.get("buy", 0.0).fillna(0.0) + work.get("sell", 0.0).fillna(0.0)
     )
-    out["close"] = pd.to_numeric(close_src, errors="coerce")
-
-    if "vol" in work.columns:
-        out["vol"] = pd.to_numeric(work["vol"], errors="coerce").fillna(0.0)
-    else:
-        buy = pd.to_numeric(
-            work.get("buy", pd.Series(0.0, index=work.index)),
-            errors="coerce",
-        ).fillna(0.0)
-        sell = pd.to_numeric(
-            work.get("sell", pd.Series(0.0, index=work.index)),
-            errors="coerce",
-        ).fillna(0.0)
-        out["vol"] = buy + sell
 
     if "signed_imbalance" in work.columns:
-        signed_imb = pd.to_numeric(work["signed_imbalance"], errors="coerce")
+        signed_imb = work["signed_imbalance"].fillna(0.0).clip(-1.0, 1.0)
     elif "buy" in work.columns and "sell" in work.columns:
-        buy = pd.to_numeric(work["buy"], errors="coerce").fillna(0.0)
-        sell = pd.to_numeric(work["sell"], errors="coerce").fillna(0.0)
-        signed_imb = (buy - sell) / out["vol"].replace(0.0, np.nan)
+        signed_imb = ((work["buy"].fillna(0.0) - work["sell"].fillna(0.0))
+                      / vol.replace(0.0, np.nan)).fillna(0.0).clip(-1.0, 1.0)
     else:
-        signed_imb = pd.Series(0.0, index=work.index)
-    out["signed_imbalance"] = signed_imb.fillna(0.0).clip(-1.0, 1.0)
+        signed_imb = 0.0
 
-    out["vpin"] = pd.to_numeric(
-        work.get("vpin", pd.Series(0.0, index=work.index)),
-        errors="coerce",
-    ).fillna(0.0)
+    vpin_col = work["vpin"].fillna(0.0) if "vpin" in work.columns else 0.0
+
+    out = pd.DataFrame({
+        "close": close,
+        "vol": vol,
+        "signed_imbalance": signed_imb,
+        "vpin": vpin_col,
+    }, index=work.index)
     out["rolling_vwap_2h"] = compute_vpin_rolling_vwap(out)
 
     out = out.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0.0)
@@ -608,13 +600,15 @@ class V3ContinuousPrep:
         else:
             self._rasters[ticker] = {}
 
-        # 4. Sequential VPIN — load, scale, store
+        # 4. Sequential VPIN — load, normalize once, then scale/prepare
         vpin_path = root / vpin_file
         if vpin_path.exists():
             vpin_df = pd.read_parquet(str(vpin_path))
             vpin_df = _normalize_datetime_index(vpin_df)
-            raw_numeric = vpin_df.select_dtypes(include="number").astype(np.float32)
-            self._vpin_spatial[ticker] = prepare_vpin_spatial_features(raw_numeric)
+            raw_numeric = vpin_df.select_dtypes(include="number")
+            self._vpin_spatial[ticker] = prepare_vpin_spatial_features(
+                raw_numeric, _already_normalized=True,
+            )
             self._seq_vpin[ticker] = scale_vpin_features(raw_numeric)
         else:
             self._seq_vpin[ticker] = pd.DataFrame()
