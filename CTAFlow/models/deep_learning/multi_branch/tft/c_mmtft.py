@@ -1111,6 +1111,23 @@ def train_epoch_v3_stateful(
     return total_loss / n, {k: v / n for k, v in metric_accum.items()}
 
 
+def _exposure_adjusted_sharpe(
+    raw_sharpe: float,
+    avg_exposure: float,
+    min_exposure: float = 0.15,
+) -> float:
+    """Penalize low-exposure Sharpe so conservative models don't dominate.
+
+    Below ``min_exposure`` the Sharpe is quadratically discounted toward 0,
+    preventing "do-nothing" strategies from winning Optuna selection.
+    """
+    if avg_exposure < min_exposure:
+        penalty = (avg_exposure / min_exposure) ** 2
+    else:
+        penalty = 1.0
+    return raw_sharpe * penalty
+
+
 @torch.no_grad()
 def evaluate_v3(
     model: MMTFv3Core,
@@ -1152,16 +1169,21 @@ def evaluate_v3(
     non_flat = positions.abs() > 0.05
     dir_acc = (correct_dir & non_flat).float().sum().item() / max(non_flat.float().sum().item(), 1)
 
+    avg_exposure = positions.abs().mean().item()
+    raw_sharpe = mean_ret / std_ret
+    adj_sharpe = _exposure_adjusted_sharpe(raw_sharpe, avg_exposure)
+
     return {
         "loss": total_loss / n,
-        "sharpe": mean_ret / std_ret,
+        "sharpe": adj_sharpe,
+        "sharpe_raw": raw_sharpe,
         "sortino": mean_ret / (strategy_ret.clamp(max=0.0).pow(2).mean().sqrt().item() + 1e-8),
         "mean_strategy_ret": mean_ret,
         "win_rate": (strategy_ret > 0).float().mean().item() * 100.0,
         "dir_accuracy": dir_acc * 100.0,
         "profit_factor": gross_profit / gross_loss,
         "max_drawdown": (cum_ret.cummax(dim=0)[0] - cum_ret).max().item(),
-        "avg_exposure": positions.abs().mean().item(),
+        "avg_exposure": avg_exposure,
         "avg_position": positions.mean().item(),
         "n_samples": len(positions),
     }
@@ -1209,16 +1231,21 @@ def evaluate_v3_stateful(
     non_flat = positions.abs() > 0.05
     dir_acc = (correct_dir & non_flat).float().sum().item() / max(non_flat.float().sum().item(), 1)
 
+    avg_exposure = positions.abs().mean().item()
+    raw_sharpe = mean_ret / std_ret
+    adj_sharpe = _exposure_adjusted_sharpe(raw_sharpe, avg_exposure)
+
     return {
         "loss": total_loss / n,
-        "sharpe": mean_ret / std_ret,
+        "sharpe": adj_sharpe,
+        "sharpe_raw": raw_sharpe,
         "sortino": mean_ret / (strategy_ret.clamp(max=0.0).pow(2).mean().sqrt().item() + 1e-8),
         "mean_strategy_ret": mean_ret,
         "win_rate": (strategy_ret > 0).float().mean().item() * 100.0,
         "dir_accuracy": dir_acc * 100.0,
         "profit_factor": gross_profit / gross_loss,
         "max_drawdown": (cum_ret.cummax(dim=0)[0] - cum_ret).max().item(),
-        "avg_exposure": positions.abs().mean().item(),
+        "avg_exposure": avg_exposure,
         "avg_position": positions.mean().item(),
         "n_samples": len(positions),
     }
@@ -1588,16 +1615,30 @@ def evaluate_v3_ptp(
             per_class[f"cls_{c}_acc"] = (pred_cls[mask] == c).float().mean().item() * 100.0
             per_class[f"cls_{c}_count"] = int(mask.sum().item())
 
+    avg_exposure = positions.abs().mean().item()
+    raw_sharpe = mean_ret / std_ret
+
+    # Exposure-adjusted Sharpe: penalize low participation.
+    # Below min_exposure (0.15) the score is heavily discounted so
+    # "do-nothing" models can never win Optuna selection.
+    _min_exp = 0.15
+    if avg_exposure < _min_exp:
+        exposure_penalty = (avg_exposure / _min_exp) ** 2   # quadratic ramp
+    else:
+        exposure_penalty = 1.0
+    adj_sharpe = raw_sharpe * exposure_penalty
+
     metrics = {
         "loss": total_loss / n,
-        "sharpe": mean_ret / std_ret,
+        "sharpe": adj_sharpe,
+        "sharpe_raw": raw_sharpe,
         "sortino": mean_ret / (strategy_ret.clamp(max=0.0).pow(2).mean().sqrt().item() + 1e-8),
         "mean_strategy_ret": mean_ret,
         "win_rate": (strategy_ret > 0).float().mean().item() * 100.0,
         "dir_accuracy": dir_acc * 100.0,
         "profit_factor": gross_profit / gross_loss,
         "max_drawdown": (cum_ret.cummax(dim=0)[0] - cum_ret).max().item(),
-        "avg_exposure": positions.abs().mean().item(),
+        "avg_exposure": avg_exposure,
         "avg_position": positions.mean().item(),
         "cls_accuracy": cls_acc,
         **per_class,
