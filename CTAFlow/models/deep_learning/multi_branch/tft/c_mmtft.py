@@ -1730,12 +1730,12 @@ class HeadAwarePTPScheduler:
         )
         ptp_train = None
         ptp_val = None
-        if "train_trading_loss" in metrics:
+        if metrics.get("train_trading_loss") is not None:
             ptp_train = metrics["train_trading_loss"] + self.ptp_downside_weight * metrics.get(
                 "train_downside_vol",
                 0.0,
             )
-        if "val_trading_loss" in metrics:
+        if metrics.get("val_trading_loss") is not None:
             ptp_val = metrics["val_trading_loss"] + self.ptp_downside_weight * metrics.get(
                 "val_downside_vol",
                 0.0,
