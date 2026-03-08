@@ -925,7 +925,7 @@ class IntradayTransformer(nn.Module):
         # Attention pooling with weight tracking
         logits = self.pool_score(h).squeeze(-1)  # (B, T)
         if key_padding_mask is not None:
-            logits = logits.masked_fill(key_padding_mask, -1e9)
+            logits = logits.masked_fill(key_padding_mask, torch.finfo(logits.dtype).min)
         pool_weights = F.softmax(logits, dim=-1)  # (B, T)
         embedding = torch.einsum("bt,btd->bd", pool_weights, h)
 
