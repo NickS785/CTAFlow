@@ -50,6 +50,9 @@ from CTAFlow.models.deep_learning.multi_branch.market_context_models import (
     BranchVariableSelection,
     GatedResidualNetwork,
 )
+from CTAFlow.models.deep_learning.multi_branch.tft.mmtf_v2_models import (
+    BranchVariableSelectionV2,
+)
 from CTAFlow.models.deep_learning.encoders import (
     IntradayRNN,
     IntradayTransformer,
@@ -199,6 +202,11 @@ class MMTFv3Core(nn.Module):
         # Training
         dropout: float = 0.2,
         grn_dropout: float | None = None,
+        # Anti-collapse (BVS V2)
+        bvs_temperature: float = 1.5,
+        bvs_entropy_weight: float = 0.1,
+        bvs_min_weight: float = 0.05,
+        bvs_pre_norm: bool = True,
     ):
         super().__init__()
         self.d_model = d_model
@@ -327,11 +335,15 @@ class MMTFv3Core(nn.Module):
         # ==============================================================
         # BRANCH SELECTION (regime-conditioned via c_s)
         # ==============================================================
-        self.branch_selector = BranchVariableSelection(
+        self.branch_selector = BranchVariableSelectionV2(
             n_branches=3,
             d_branch=d_model,
             d_context=d_model,
             dropout=_grn_drop,
+            temperature=bvs_temperature,
+            entropy_weight=bvs_entropy_weight,
+            min_weight=bvs_min_weight,
+            use_pre_norm=bvs_pre_norm,
         )
 
         # ==============================================================
@@ -518,6 +530,13 @@ class MMTFv3Core(nn.Module):
                 for i, name in enumerate(["backbone_fused", "spatial", "sequential"])
             },
             "branch_weights_entropy": bw_entropy,
+            "branch_weights_min": branch_weights.min(dim=-1).values.mean().item(),
+            "bvs_entropy_loss": (
+                self.branch_selector.last_entropy_loss.item()
+                if hasattr(self.branch_selector, "last_entropy_loss")
+                and self.branch_selector.last_entropy_loss is not None
+                else 0.0
+            ),
             "regime_var_weights": {
                 name: self.regime_encoder.last_var_weights[:, i].mean().item()
                 for i, name in enumerate(self.regime_encoder.var_names)
@@ -1005,7 +1024,8 @@ def train_epoch_v3(
 
         trading_loss, metrics = loss_fn(position, targets)
         ae_loss = model.recon_weight * ae_losses["total_ae_loss"]
-        loss = trading_loss + ae_loss
+        bvs_entropy_loss = _get_bvs_entropy_loss(model)
+        loss = trading_loss + ae_loss + bvs_entropy_loss
 
         if torch.isnan(loss) or torch.isinf(loss):
             continue
@@ -1020,6 +1040,8 @@ def train_epoch_v3(
         metric_accum["ae_recon"] = metric_accum.get("ae_recon", 0.0) + ae_losses["recon_loss"].item()
         if "kl_loss" in ae_losses:
             metric_accum["ae_kl"] = metric_accum.get("ae_kl", 0.0) + ae_losses["kl_loss"].item()
+        if bvs_entropy_loss.item() > 0:
+            metric_accum["bvs_entropy"] = metric_accum.get("bvs_entropy", 0.0) + bvs_entropy_loss.item()
         n_batches += 1
 
     n = max(n_batches, 1)
@@ -1058,7 +1080,8 @@ def train_epoch_v3_stateful(
             position, ae_losses = model(**inputs, return_ae_losses=True)
             trading_loss, metrics = loss_fn(position, targets)
             ae_loss = model.recon_weight * ae_losses["total_ae_loss"]
-            loss = trading_loss + ae_loss
+            bvs_entropy_loss = _get_bvs_entropy_loss(model)
+            loss = trading_loss + ae_loss + bvs_entropy_loss
 
         if torch.isnan(loss) or torch.isinf(loss):
             continue
@@ -1080,6 +1103,8 @@ def train_epoch_v3_stateful(
         metric_accum["ae_recon"] = metric_accum.get("ae_recon", 0.0) + ae_losses["recon_loss"].item()
         if "kl_loss" in ae_losses:
             metric_accum["ae_kl"] = metric_accum.get("ae_kl", 0.0) + ae_losses["kl_loss"].item()
+        if bvs_entropy_loss.item() > 0:
+            metric_accum["bvs_entropy"] = metric_accum.get("bvs_entropy", 0.0) + bvs_entropy_loss.item()
         n_batches += 1
 
     n = max(n_batches, 1)
@@ -1409,6 +1434,16 @@ class PTPLoss(nn.Module):
 # PTP Training / Evaluation Loops
 # ============================================================================
 
+def _get_bvs_entropy_loss(model: nn.Module) -> torch.Tensor:
+    """Extract BVS entropy regularization loss from model (any wrapper depth)."""
+    # Unwrap StatefulMMTFv3Core → base_model
+    core = getattr(model, "base_model", model)
+    selector = getattr(core, "branch_selector", None)
+    if selector is not None and hasattr(selector, "get_entropy_loss"):
+        return selector.get_entropy_loss()
+    return torch.tensor(0.0, device=next(model.parameters()).device)
+
+
 def train_epoch_v3_ptp(
     model: nn.Module,
     loader,
@@ -1450,7 +1485,10 @@ def train_epoch_v3_ptp(
 
             # AE reconstruction
             ae_loss = model.recon_weight * ae_losses["total_ae_loss"]
-            loss = ptp_total + ae_loss
+
+            # BVS entropy regularization (anti-collapse)
+            bvs_entropy_loss = _get_bvs_entropy_loss(model)
+            loss = ptp_total + ae_loss + bvs_entropy_loss
 
         if torch.isnan(loss) or torch.isinf(loss):
             continue
@@ -1472,6 +1510,8 @@ def train_epoch_v3_ptp(
         metric_accum["ae_recon"] = metric_accum.get("ae_recon", 0.0) + ae_losses["recon_loss"].item()
         if "kl_loss" in ae_losses:
             metric_accum["ae_kl"] = metric_accum.get("ae_kl", 0.0) + ae_losses["kl_loss"].item()
+        if bvs_entropy_loss.item() > 0:
+            metric_accum["bvs_entropy"] = metric_accum.get("bvs_entropy", 0.0) + bvs_entropy_loss.item()
         n_batches += 1
         prev_pos = position.detach()
 
