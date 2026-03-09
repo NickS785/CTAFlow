@@ -815,6 +815,7 @@ class ContinuousTradingLoss(nn.Module):
         sharpe_eps: float = 1e-6,
         tc_in_sharpe: bool = False,
         holding_weight: float = 0.0,
+        exposure_asymmetry: float = 3.0,
     ):
         super().__init__()
         self.tc_cost = tc_cost
@@ -826,6 +827,7 @@ class ContinuousTradingLoss(nn.Module):
         self.sharpe_eps = sharpe_eps
         self.tc_in_sharpe = tc_in_sharpe
         self.holding_weight = holding_weight
+        self.exposure_asymmetry = exposure_asymmetry
 
     def forward(
         self,
@@ -861,7 +863,14 @@ class ContinuousTradingLoss(nn.Module):
             risk = strategy_ret.clamp(max=0.0).pow(2).mean().sqrt() + self.sharpe_eps
         else:
             risk = strategy_ret.std(unbiased=False) + self.sharpe_eps
-        loss_sharpe = -mean_r / risk
+        raw_sharpe = -mean_r / risk
+
+        # Exposure-gate: scale Sharpe benefit by participation so
+        # near-zero positions can't collect risk-adjusted credit.
+        avg_exposure = pos.abs().mean()
+        exp_ratio = (avg_exposure / max(self.target_exposure, 0.05)).clamp(max=1.0)
+        loss_sharpe = raw_sharpe * exp_ratio
+
         downside_vol = strategy_ret.clamp(max=0.0).pow(2).mean().sqrt()
         loss_downside_vol = self.downside_vol_weight * downside_vol
 
@@ -877,9 +886,17 @@ class ContinuousTradingLoss(nn.Module):
         else:
             loss_tc = self.tc_cost * turnover
 
-        # ── 4. Position regularization ─────────────────────────────
-        avg_exposure = pos.abs().mean()
-        loss_reg = self.reg_weight * (avg_exposure - self.target_exposure).pow(2)
+        # ── 4. Position regularization (asymmetric) ─────────────────
+        # Under-exposure is penalized `exposure_asymmetry`× harder than
+        # over-exposure, preventing the model from going conservative
+        # on volatile tickers to game the Sharpe ratio.
+        exposure_gap = avg_exposure - self.target_exposure
+        under_scale = torch.where(
+            exposure_gap < 0,
+            torch.tensor(self.exposure_asymmetry, device=pos.device),
+            torch.ones(1, device=pos.device),
+        )
+        loss_reg = self.reg_weight * under_scale * exposure_gap.pow(2)
 
         # ── 5. Holding bonus (reward position persistence) ─────────
         loss_holding = torch.tensor(0.0, device=pos.device)
