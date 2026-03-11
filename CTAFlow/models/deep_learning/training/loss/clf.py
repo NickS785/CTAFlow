@@ -816,6 +816,7 @@ class ContinuousTradingLoss(nn.Module):
         tc_in_sharpe: bool = False,
         holding_weight: float = 0.0,
         exposure_asymmetry: float = 3.0,
+        exposure_gate_floor: float = 0.15,
     ):
         super().__init__()
         self.tc_cost = tc_cost
@@ -828,6 +829,7 @@ class ContinuousTradingLoss(nn.Module):
         self.tc_in_sharpe = tc_in_sharpe
         self.holding_weight = holding_weight
         self.exposure_asymmetry = exposure_asymmetry
+        self.exposure_gate_floor = exposure_gate_floor
 
     def forward(
         self,
@@ -867,8 +869,11 @@ class ContinuousTradingLoss(nn.Module):
 
         # Exposure-gate: scale Sharpe benefit by participation so
         # near-zero positions can't collect risk-adjusted credit.
+        # Uses a fixed floor (not the scheduler-mutated target_exposure)
+        # to avoid GPU-dependent convergence races.
         avg_exposure = pos.abs().mean()
-        exp_ratio = (avg_exposure / max(self.target_exposure, 0.05)).clamp(max=1.0)
+        gate_denom = max(self.exposure_gate_floor, 0.05)
+        exp_ratio = (avg_exposure / gate_denom).clamp(max=1.0)
         loss_sharpe = raw_sharpe * exp_ratio
 
         downside_vol = strategy_ret.clamp(max=0.0).pow(2).mean().sqrt()
@@ -894,7 +899,7 @@ class ContinuousTradingLoss(nn.Module):
         under_scale = torch.where(
             exposure_gap < 0,
             torch.tensor(self.exposure_asymmetry, device=pos.device),
-            torch.ones(1, device=pos.device),
+            torch.tensor(1.0, device=pos.device),
         )
         loss_reg = self.reg_weight * under_scale * exposure_gap.pow(2)
 
