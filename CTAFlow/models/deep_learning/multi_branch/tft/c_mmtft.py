@@ -1114,21 +1114,41 @@ def train_epoch_v3_stateful(
     return total_loss / n, {k: v / n for k, v in metric_accum.items()}
 
 
-def _exposure_adjusted_sharpe(
-    raw_sharpe: float,
+def _selection_score(
+    sharpe: float,
+    sortino: float,
+    profit_factor: float,
     avg_exposure: float,
     min_exposure: float = 0.15,
+    sharpe_weight: float = 0.4,
+    sortino_weight: float = 0.3,
+    pf_weight: float = 0.3,
 ) -> float:
-    """Penalize low-exposure Sharpe so conservative models don't dominate.
+    """Composite score for model checkpoint selection.
 
-    Below ``min_exposure`` the Sharpe is quadratically discounted toward 0,
-    preventing "do-nothing" strategies from winning Optuna selection.
+    Blends Sharpe, Sortino, and log-profit-factor into a single score.
+    All components are exposure-gated so do-nothing models score ~0.
+
+    Profit factor is log-transformed (``log(PF)``) so its scale is
+    comparable to Sharpe/Sortino (~0-3 range) and extreme values
+    don't dominate.
+
+    Default weights: 40% Sharpe, 30% Sortino, 30% log-PF.
     """
     if avg_exposure < min_exposure:
         penalty = (avg_exposure / min_exposure) ** 2
     else:
         penalty = 1.0
-    return raw_sharpe * penalty
+
+    import math
+    log_pf = math.log(max(profit_factor, 1e-8))
+
+    raw = (
+        sharpe_weight * sharpe
+        + sortino_weight * sortino
+        + pf_weight * log_pf
+    )
+    return raw * penalty
 
 
 @torch.no_grad()
@@ -1173,22 +1193,23 @@ def evaluate_v3(
     dir_acc = (correct_dir & non_flat).float().sum().item() / max(non_flat.float().sum().item(), 1)
 
     avg_exposure = positions.abs().mean().item()
-    raw_sharpe = mean_ret / std_ret
-    adj_sharpe = _exposure_adjusted_sharpe(raw_sharpe, avg_exposure)
+    sharpe = mean_ret / std_ret
+    sortino = mean_ret / (strategy_ret.clamp(max=0.0).pow(2).mean().sqrt().item() + 1e-8)
+    profit_factor = gross_profit / gross_loss
 
     return {
         "loss": total_loss / n,
-        "sharpe": adj_sharpe,
-        "sharpe_raw": raw_sharpe,
-        "sortino": mean_ret / (strategy_ret.clamp(max=0.0).pow(2).mean().sqrt().item() + 1e-8),
+        "sharpe": sharpe,
+        "sortino": sortino,
         "mean_strategy_ret": mean_ret,
         "win_rate": (strategy_ret > 0).float().mean().item() * 100.0,
         "dir_accuracy": dir_acc * 100.0,
-        "profit_factor": gross_profit / gross_loss,
+        "profit_factor": profit_factor,
         "max_drawdown": (cum_ret.cummax(dim=0)[0] - cum_ret).max().item(),
         "avg_exposure": avg_exposure,
         "avg_position": positions.mean().item(),
         "n_samples": len(positions),
+        "selection_score": _selection_score(sharpe, sortino, profit_factor, avg_exposure),
     }
 
 
@@ -1235,22 +1256,23 @@ def evaluate_v3_stateful(
     dir_acc = (correct_dir & non_flat).float().sum().item() / max(non_flat.float().sum().item(), 1)
 
     avg_exposure = positions.abs().mean().item()
-    raw_sharpe = mean_ret / std_ret
-    adj_sharpe = _exposure_adjusted_sharpe(raw_sharpe, avg_exposure)
+    sharpe = mean_ret / std_ret
+    sortino = mean_ret / (strategy_ret.clamp(max=0.0).pow(2).mean().sqrt().item() + 1e-8)
+    profit_factor = gross_profit / gross_loss
 
     return {
         "loss": total_loss / n,
-        "sharpe": adj_sharpe,
-        "sharpe_raw": raw_sharpe,
-        "sortino": mean_ret / (strategy_ret.clamp(max=0.0).pow(2).mean().sqrt().item() + 1e-8),
+        "sharpe": sharpe,
+        "sortino": sortino,
         "mean_strategy_ret": mean_ret,
         "win_rate": (strategy_ret > 0).float().mean().item() * 100.0,
         "dir_accuracy": dir_acc * 100.0,
-        "profit_factor": gross_profit / gross_loss,
+        "profit_factor": profit_factor,
         "max_drawdown": (cum_ret.cummax(dim=0)[0] - cum_ret).max().item(),
         "avg_exposure": avg_exposure,
         "avg_position": positions.mean().item(),
         "n_samples": len(positions),
+        "selection_score": _selection_score(sharpe, sortino, profit_factor, avg_exposure),
     }
 
 
@@ -1623,30 +1645,22 @@ def evaluate_v3_ptp(
             per_class[f"cls_{c}_count"] = int(mask.sum().item())
 
     avg_exposure = positions.abs().mean().item()
-    raw_sharpe = mean_ret / std_ret
-
-    # Exposure-adjusted Sharpe: penalize low participation.
-    # Below min_exposure (0.15) the score is heavily discounted so
-    # "do-nothing" models can never win Optuna selection.
-    _min_exp = 0.15
-    if avg_exposure < _min_exp:
-        exposure_penalty = (avg_exposure / _min_exp) ** 2   # quadratic ramp
-    else:
-        exposure_penalty = 1.0
-    adj_sharpe = raw_sharpe * exposure_penalty
+    sharpe = mean_ret / std_ret
+    sortino = mean_ret / (strategy_ret.clamp(max=0.0).pow(2).mean().sqrt().item() + 1e-8)
+    profit_factor = gross_profit / gross_loss
 
     metrics = {
         "loss": total_loss / n,
-        "sharpe": adj_sharpe,
-        "sharpe_raw": raw_sharpe,
-        "sortino": mean_ret / (strategy_ret.clamp(max=0.0).pow(2).mean().sqrt().item() + 1e-8),
+        "sharpe": sharpe,
+        "sortino": sortino,
         "mean_strategy_ret": mean_ret,
         "win_rate": (strategy_ret > 0).float().mean().item() * 100.0,
         "dir_accuracy": dir_acc * 100.0,
-        "profit_factor": gross_profit / gross_loss,
+        "profit_factor": profit_factor,
         "max_drawdown": (cum_ret.cummax(dim=0)[0] - cum_ret).max().item(),
         "avg_exposure": avg_exposure,
         "avg_position": positions.mean().item(),
+        "selection_score": _selection_score(sharpe, sortino, profit_factor, avg_exposure),
         "cls_accuracy": cls_acc,
         **per_class,
         "n_samples": len(positions),
