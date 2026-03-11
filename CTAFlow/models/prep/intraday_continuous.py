@@ -617,8 +617,12 @@ class ContinuousIntradayPrep:
                     rolling_days=rolling_days,
                     refit_interval=refit_interval,
                 )
-                df["deseasonalized_vol"] = result["adjusted"].reindex(df.index)
-                df["seasonal_vol_factor"] = result["seasonal"].reindex(df.index)
+                # Map results back positionally (avoids reindex failures
+                # when the datetime index has duplicate timestamps).
+                df["deseasonalized_vol"] = np.nan
+                df.loc[valid_mask, "deseasonalized_vol"] = result["adjusted"].values
+                df["seasonal_vol_factor"] = np.nan
+                df.loc[valid_mask, "seasonal_vol_factor"] = result["seasonal"].values
 
                 # Scale returns by seasonal factor
                 if deseasonalize_returns:
@@ -643,8 +647,10 @@ class ContinuousIntradayPrep:
                     rolling_days=rolling_days,
                     refit_interval=refit_interval,
                 )
-                df["deseasonalized_volume"] = result["adjusted"].reindex(df.index)
-                df["seasonal_volume_factor"] = result["seasonal"].reindex(df.index)
+                df["deseasonalized_volume"] = np.nan
+                df.loc[valid_mask, "deseasonalized_volume"] = result["adjusted"].values
+                df["seasonal_volume_factor"] = np.nan
+                df.loc[valid_mask, "seasonal_volume_factor"] = result["seasonal"].values
             else:
                 df["deseasonalized_volume"] = volume
                 df["seasonal_volume_factor"] = 1.0
