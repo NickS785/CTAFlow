@@ -18,7 +18,7 @@ Proper Temporal Fusion architecture:
 
   Phase 4: BVS([fused_token, z_spatial, z_seq], context=c_s) → z_selected
 
-  Phase 5: Enrichment + Temporal Attention
+  Phase 5: Enrichment + Temporal Attentioni
            enrichment_ctx = GRN(c_e)
            temporal_attn(query=enrichment_ctx, K/V=fused_seq) → z_temporal
 
@@ -1078,10 +1078,13 @@ def train_epoch_v3_stateful(
         optimizer.zero_grad()
         with torch.amp.autocast(device.type, enabled=use_amp):
             position, ae_losses = model(**inputs, return_ae_losses=True)
-            trading_loss, metrics = loss_fn(position, targets)
-            ae_loss = model.recon_weight * ae_losses["total_ae_loss"]
-            bvs_entropy_loss = _get_bvs_entropy_loss(model)
-            loss = trading_loss + ae_loss + bvs_entropy_loss
+
+        # Compute loss in fp32 — Sharpe-like ratios underflow in fp16
+        position = position.float()
+        trading_loss, metrics = loss_fn(position, targets)
+        ae_loss = model.recon_weight * ae_losses["total_ae_loss"].float()
+        bvs_entropy_loss = _get_bvs_entropy_loss(model)
+        loss = trading_loss + ae_loss + bvs_entropy_loss
 
         if torch.isnan(loss) or torch.isinf(loss):
             continue
@@ -1505,17 +1508,21 @@ def train_epoch_v3_ptp(
         with torch.amp.autocast(device.type, enabled=use_amp):
             position, ae_losses, logits = model(**inputs, return_ae_losses=True)
 
-            # PTP composite loss (CE + trading)
-            ptp_total, ptp_metrics = ptp_loss(
-                position, logits, targets, prev_position=prev_pos,
-            )
+        # Compute loss in fp32 — Sharpe-like ratios underflow in fp16
+        position = position.float()
+        logits = logits.float()
 
-            # AE reconstruction
-            ae_loss = model.recon_weight * ae_losses["total_ae_loss"]
+        # PTP composite loss (CE + trading)
+        ptp_total, ptp_metrics = ptp_loss(
+            position, logits, targets, prev_position=prev_pos,
+        )
 
-            # BVS entropy regularization (anti-collapse)
-            bvs_entropy_loss = _get_bvs_entropy_loss(model)
-            loss = ptp_total + ae_loss + bvs_entropy_loss
+        # AE reconstruction
+        ae_loss = model.recon_weight * ae_losses["total_ae_loss"].float()
+
+        # BVS entropy regularization (anti-collapse)
+        bvs_entropy_loss = _get_bvs_entropy_loss(model)
+        loss = ptp_total + ae_loss + bvs_entropy_loss
 
         if torch.isnan(loss) or torch.isinf(loss):
             continue
