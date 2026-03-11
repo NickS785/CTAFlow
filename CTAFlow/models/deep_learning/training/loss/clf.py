@@ -816,7 +816,6 @@ class ContinuousTradingLoss(nn.Module):
         tc_in_sharpe: bool = False,
         holding_weight: float = 0.0,
         exposure_asymmetry: float = 3.0,
-        exposure_gate_floor: float = 0.15,
     ):
         super().__init__()
         self.tc_cost = tc_cost
@@ -829,7 +828,6 @@ class ContinuousTradingLoss(nn.Module):
         self.tc_in_sharpe = tc_in_sharpe
         self.holding_weight = holding_weight
         self.exposure_asymmetry = exposure_asymmetry
-        self.exposure_gate_floor = exposure_gate_floor
 
     def forward(
         self,
@@ -865,16 +863,9 @@ class ContinuousTradingLoss(nn.Module):
             risk = strategy_ret.clamp(max=0.0).pow(2).mean().sqrt() + self.sharpe_eps
         else:
             risk = strategy_ret.std(unbiased=False) + self.sharpe_eps
-        raw_sharpe = -mean_r / risk
+        loss_sharpe = -mean_r / risk
 
-        # Exposure-gate: scale Sharpe benefit by participation so
-        # near-zero positions can't collect risk-adjusted credit.
-        # Uses a fixed floor (not the scheduler-mutated target_exposure)
-        # to avoid GPU-dependent convergence races.
         avg_exposure = pos.abs().mean()
-        gate_denom = max(self.exposure_gate_floor, 0.05)
-        exp_ratio = (avg_exposure / gate_denom).clamp(max=1.0)
-        loss_sharpe = raw_sharpe * exp_ratio
 
         downside_vol = strategy_ret.clamp(max=0.0).pow(2).mean().sqrt()
         loss_downside_vol = self.downside_vol_weight * downside_vol
