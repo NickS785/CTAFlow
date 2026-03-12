@@ -271,6 +271,41 @@ class _SeqEncoder(nn.Module):
 
 
 # ============================================================================
+class RegimeGatedFusion(nn.Module):
+    """Use the regime embedding to route sequential vs spatial features."""
+
+    def __init__(self, d_model: int, regime_dim: int, dropout: float = 0.2):
+        super().__init__()
+        self.regime_gate = nn.Sequential(
+            nn.Linear(regime_dim, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, 2),
+        )
+        self.fusion_proj = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(
+        self,
+        z_seq: torch.Tensor,
+        z_spatial: torch.Tensor,
+        z_regime: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        gates = F.softmax(self.regime_gate(z_regime), dim=-1)
+        gate_seq = gates[:, 0:1]
+        gate_spatial = gates[:, 1:2]
+
+        z_seq_weighted = z_seq * gate_seq
+        z_spatial_weighted = z_spatial * gate_spatial
+        z_fused = self.fusion_proj(
+            torch.cat([z_seq_weighted, z_spatial_weighted], dim=-1)
+        )
+        return z_fused, gate_seq, gate_spatial
+
+
+# ============================================================================
 # HybridTCN — main model
 # ============================================================================
 
@@ -405,7 +440,12 @@ class HybridTCN(nn.Module):
 
         # ── 6. Branch fusion ─────────────────────────────────────────
         # TCN (tcn_out_dim) + spatial (d_model) + sequential (d_model) + regime (d_latent) + static (d_model)
-        fusion_dim = tcn_out_dim + d_model + d_model + d_latent + d_model
+        self.regime_fusion = RegimeGatedFusion(
+            d_model=d_model,
+            regime_dim=d_latent,
+            dropout=dropout,
+        )
+        fusion_dim = tcn_out_dim + d_model + d_latent + d_model
         self.fusion = nn.Sequential(
             nn.Linear(fusion_dim, d_model * 2),
             nn.GELU(),
@@ -507,7 +547,12 @@ class HybridTCN(nn.Module):
         ], dim=-1))
 
         # ── 6. Fusion ────────────────────────────────────────────────
-        z_cat = torch.cat([z_temporal, z_spatial, z_seq, z_regime, z_static], dim=-1)
+        z_branch, gate_seq, gate_spatial = self.regime_fusion(
+            z_seq=z_seq,
+            z_spatial=z_spatial,
+            z_regime=z_regime,
+        )
+        z_cat = torch.cat([z_temporal, z_branch, z_regime, z_static], dim=-1)
         z_fused = self.fusion(z_cat)
 
         # ── 7. Position ──────────────────────────────────────────────
@@ -527,6 +572,8 @@ class HybridTCN(nn.Module):
         self._last_tracker = {
             "avg_position": position.detach().mean().item(),
             "avg_regime_weight": regime_weight.detach().mean().item(),
+            "weight_seq_branch": gate_seq.detach().mean().item(),
+            "weight_spatial_branch": gate_spatial.detach().mean().item(),
             "tcn_receptive_field": self.tcn.receptive_field,
         }
 

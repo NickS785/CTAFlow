@@ -7,12 +7,10 @@ if [ $# -lt 1 ]; then
 fi
 
 export ROOT_DIR=/workspace
-cd "$ROOT_DIR/CTAFlow" && git pull
+cd "$ROOT_DIR/CTAFlow" && git stash && git pull
 cd "$ROOT_DIR"
 source venv/bin/activate
 pip install -e CTAFlow
-pip install fredapi
 python -m ipykernel install --user --name venv --display-name "CTAVenv"
-export FRED_API_KEY="$1"
 
-echo "FRED_API_KEY set. Environment ready."
+echo "Env set. Environment ready."
