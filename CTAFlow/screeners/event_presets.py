@@ -25,8 +25,8 @@ class EventDefinition:
 EIA_NG_STORAGE = EventDefinition(
     code="EIA_NG_STORAGE",
     description="Weekly EIA Natural Gas Storage Report",
-    local_tz="America/New_York",
-    release_time_local=time(10, 30),
+    local_tz="America/Chicago",
+    release_time_local=time(9, 30),
     weekday=3,
     week_of_month=None,
 )

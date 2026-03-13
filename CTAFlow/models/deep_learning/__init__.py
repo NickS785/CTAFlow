@@ -37,6 +37,12 @@ from .multi_branch.mamba_model import (
     MambaWeightTracker,
 )
 from .multi_branch.tri_modal import TriModalModel, RecurrentTriModal
+from .multi_branch.tft import (
+    EventPhaseTFT,
+    EventPhaseTFTConfig,
+    JointEventPhaseTFT,
+    JointEventPhaseTFTConfig,
+)
 from .multi_asset_qlstm import QLSTMConfig, QLSTMModel
 from .density_quantile import (
     DEFAULT_DQ_QUANTILES,
@@ -93,6 +99,10 @@ __all__ = [
     "MambaWeightTracker",
     "RecurrentTriModal",
     "TriModalModel",
+    "EventPhaseTFT",
+    "EventPhaseTFTConfig",
+    "JointEventPhaseTFT",
+    "JointEventPhaseTFTConfig",
     "QLSTMConfig",
     "QLSTMModel",
     "DEFAULT_DQ_QUANTILES",

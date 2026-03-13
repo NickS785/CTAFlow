@@ -10,6 +10,21 @@ from .tft_encoders import (
 )
 from .tft_models import TFTAlignedWSPR, TFTAlignedMamba
 from .tft_simple import TFTAlignedMambaSimple
+from .event_phase_tft import (
+    DEFAULT_EVENT_PHASE_QUANTILES,
+    EventPhaseTFT,
+    EventPhaseTFTConfig,
+    JointEventPhaseTFT,
+    JointEventPhaseTFTConfig,
+    MultiHorizonQuantileHead,
+    PhaseSpecificVariableSelection,
+    QuantileExposureConfig,
+    QuantileToExposureHead,
+    SinglePointClassHead,
+    ClassificationEventTFT,
+    ClassificationEventTFTConfig,
+    BarClassificationHead,
+)
 from .mmtf_core import MMTFCore
 from .mmtf_models import MMTFTransformer, MMTFMamba
 from .mmtf_v2_models import (
@@ -53,6 +68,19 @@ __all__ = [
     "TFTAlignedWSPR",
     "TFTAlignedMamba",
     "TFTAlignedMambaSimple",
+    "DEFAULT_EVENT_PHASE_QUANTILES",
+    "EventPhaseTFT",
+    "EventPhaseTFTConfig",
+    "JointEventPhaseTFT",
+    "JointEventPhaseTFTConfig",
+    "MultiHorizonQuantileHead",
+    "PhaseSpecificVariableSelection",
+    "QuantileExposureConfig",
+    "QuantileToExposureHead",
+    "SinglePointClassHead",
+    "ClassificationEventTFT",
+    "ClassificationEventTFTConfig",
+    "BarClassificationHead",
     "MMTFCore",
     "MMTFTransformer",
     "MMTFMamba",
