@@ -29,6 +29,13 @@ from .tft import (
     tft_aligned_collate_fn,
     unpack_batch_for_model,
 )
+from .macro_gat import (
+    MacroGATContinuousPrep,
+    MacroGATDataset,
+    macro_gat_collate_fn,
+    unpack_macro_gat_batch,
+    build_macro_gat_loaders,
+)
 __all__ = [
     "ContinuousWindowDataset",
     "ContinuousRasterAlignedDataset",
@@ -55,4 +62,9 @@ __all__ = [
     "TFTAlignedSample",
     "tft_aligned_collate_fn",
     "unpack_batch_for_model",
+    "MacroGATContinuousPrep",
+    "MacroGATDataset",
+    "macro_gat_collate_fn",
+    "unpack_macro_gat_batch",
+    "build_macro_gat_loaders",
 ]
