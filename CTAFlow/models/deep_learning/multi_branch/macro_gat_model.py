@@ -25,6 +25,64 @@ from .mamba_model import MambaBlock, MambaFusionHead
 
 
 # ---------------------------------------------------------------------------
+# Short-sequence fusion head (replaces Mamba for 3-token sequences)
+# ---------------------------------------------------------------------------
+
+class BranchFusionHead(nn.Module):
+    """Attention + MLP head for fusing a small number of branch tokens.
+
+    mamba_ssm's CUDA selective-scan kernel is unreliable for very short
+    sequences (L <= 4).  This module uses multi-head self-attention
+    instead, which is well-suited for 3-token fusion and fully stable.
+    """
+
+    def __init__(
+        self,
+        d_model: int = 128,
+        out_dim: int = 4,
+        n_heads: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, out_dim),
+        )
+        self.last_tracker: Dict[str, object] = {}
+
+    def forward(self, x: torch.Tensor, pool: str = "mean") -> torch.Tensor:
+        """x: (B, T, d_model) → (B, out_dim)"""
+        attn_out, attn_w = self.attn(x, x, x)
+        x = self.norm1(x + attn_out)
+        x = self.norm2(x + self.ffn(x))
+        if pool == "last":
+            p = x[:, -1, :]
+        else:
+            p = x.mean(dim=1)
+        self.last_tracker = {
+            "attn_weights": attn_w.detach() if attn_w is not None else None,
+            "pool_mode": pool,
+        }
+        return self.head(p)
+
+
+# ---------------------------------------------------------------------------
 # GAT Node Encoders (from MACRO_GAT.md design)
 # ---------------------------------------------------------------------------
 
@@ -323,6 +381,7 @@ class MacroGATMamba(nn.Module):
         node_config: Optional[Dict[str, Tuple[str, int]]] = None,
         macro_temporal_hidden: int = 64,
         macro_num_heads: int = 4,
+        nb_max_T: int = 32,
         n_mamba_layers: int = 2,
         d_state: int = 16,
         d_conv: int = 4,
@@ -338,6 +397,7 @@ class MacroGATMamba(nn.Module):
             c_in=nb_channels,
             d_model=d_model,
             dropout=dropout,
+            max_T=nb_max_T,
         )
         self.raster_enc = RasterResNet(
             in_ch=raster_channels,
@@ -367,15 +427,13 @@ class MacroGATMamba(nn.Module):
 
         # --- Mamba Fusion Head ---
         # Token sequence is exactly 3 (spatial, macro, tech).
-        # mamba_ssm requires d_conv <= seq_len to avoid OOB indexing.
-        head_d_conv = min(d_conv, 3)
         self.head = MambaFusionHead(
             input_dim=d_model,
             d_model=d_model,
             out_dim=num_classes,
             n_layers=n_mamba_layers,
             d_state=d_state,
-            d_conv=head_d_conv,
+            d_conv=d_conv,
             expand=expand,
             dropout=dropout,
         )
