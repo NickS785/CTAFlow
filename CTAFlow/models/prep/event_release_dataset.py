@@ -670,8 +670,11 @@ def build_session_samples(
     stride: int = 6,
     horizon_bars: int = 6,
     price_context_cols: Optional[Sequence[str]] = None,
+    include_next_day_rth: bool = False,
+    next_day_rth_start: str = "08:30",
+    next_day_rth_end: str = "13:00",
 ) -> List[dict]:
-    """Build one sample per eligible bar on event days.
+    """Build one sample per eligible bar in the event session window.
 
     Each sample carries the event day's shared phase orderflow as context
     and the bar's own technical features + rolling forward return target.
@@ -698,6 +701,13 @@ def build_session_samples(
     price_context_cols : list of str, optional
         Extra columns from the frame to append to bar_features.
         Default: ctx_* columns from ``_build_price_context``.
+    include_next_day_rth : bool
+        If True, extend the sample window into the next calendar day's
+        US RTH session.
+    next_day_rth_start : str
+        Next-day RTH start time in ``"HH:MM"`` format.
+    next_day_rth_end : str
+        Next-day RTH end time in ``"HH:MM"`` format.
 
     Returns
     -------
@@ -714,6 +724,8 @@ def build_session_samples(
 
     frame = prep.frame
     close_h, close_m = (int(x) for x in session_close_time.split(":"))
+    next_rth_start_h, next_rth_start_m = (int(x) for x in next_day_rth_start.split(":"))
+    next_rth_end_h, next_rth_end_m = (int(x) for x in next_day_rth_end.split(":"))
 
     target_col = f"target_ret_{horizon_bars}"
     if target_col not in frame.columns:
@@ -739,6 +751,40 @@ def build_session_samples(
     class_arr = frame[class_col].to_numpy(dtype=np.float64)
     timestamps = frame.index
 
+    def _time_tuple(ts: pd.Timestamp) -> Tuple[int, int]:
+        return int(ts.hour), int(ts.minute)
+
+    def _strip_tz(ts: pd.Timestamp) -> pd.Timestamp:
+        return ts.tz_localize(None) if getattr(ts, "tzinfo", None) is not None else ts
+
+    def _is_event_day_bar(
+        ts: pd.Timestamp,
+        future_ts: pd.Timestamp,
+        *,
+        sample_date: date,
+        window_start: pd.Timestamp,
+    ) -> bool:
+        if ts.date() != sample_date or future_ts.date() != sample_date:
+            return False
+        if _strip_tz(ts) < _strip_tz(window_start):
+            return False
+        return _time_tuple(ts) <= (close_h, close_m) and _time_tuple(future_ts) <= (close_h, close_m)
+
+    def _is_next_day_rth_bar(
+        ts: pd.Timestamp,
+        future_ts: pd.Timestamp,
+        *,
+        sample_date: date,
+    ) -> bool:
+        if ts.date() != sample_date or future_ts.date() != sample_date:
+            return False
+        ts_time = _time_tuple(ts)
+        future_time = _time_tuple(future_ts)
+        return (
+            (next_rth_start_h, next_rth_start_m) <= ts_time <= (next_rth_end_h, next_rth_end_m)
+            and future_time <= (next_rth_end_h, next_rth_end_m)
+        )
+
     samples: List[dict] = []
     for ev_date in sorted(event_dates):
         post_end = post_end_times.get(ev_date)
@@ -748,32 +794,30 @@ def build_session_samples(
         if phase_of is None:
             continue
 
-        day_mask = timestamps.date == ev_date
-        day_indices = np.flatnonzero(
-            day_mask.values if hasattr(day_mask, "values") else day_mask
-        )
-        if len(day_indices) == 0:
-            continue
-
         eligible = []
-        for idx in day_indices:
+        next_day = ev_date + pd.Timedelta(days=1)
+        for idx in range(len(timestamps)):
             ts = timestamps[idx]
-            ts_naive = ts.replace(tzinfo=None) if hasattr(ts, "replace") and ts.tzinfo else ts
-            post_naive = (
-                post_end.replace(tzinfo=None)
-                if hasattr(post_end, "replace") and post_end.tzinfo
-                else post_end
-            )
-            if ts_naive < post_naive:
-                continue
-            if ts.hour > close_h or (ts.hour == close_h and ts.minute > close_m):
-                continue
             future_idx = idx + horizon_bars
             if future_idx >= len(frame):
                 continue
+            future_ts = timestamps[future_idx]
             if not np.isfinite(target_arr[idx]):
                 continue
             if np.isnan(class_arr[idx]):
+                continue
+            in_event_window = _is_event_day_bar(
+                ts,
+                future_ts,
+                sample_date=ev_date,
+                window_start=post_end,
+            )
+            in_next_day_window = include_next_day_rth and _is_next_day_rth_bar(
+                ts,
+                future_ts,
+                sample_date=next_day,
+            )
+            if not (in_event_window or in_next_day_window):
                 continue
             eligible.append(idx)
 
@@ -792,7 +836,8 @@ def build_session_samples(
                     "target_return": float(target_arr[idx]),
                     "target_class": int(class_arr[idx]),
                     "is_last_bar": is_last,
-                    "date": ev_date,
+                    "date": timestamps[idx].date(),
+                    "event_date": ev_date,
                 }
             )
 
@@ -828,6 +873,7 @@ class EventSessionDataset(Dataset):
         }
         if self.return_metadata:
             out["date"] = s["date"]
+            out["event_date"] = s.get("event_date", s["date"])
         return out
 
 
@@ -844,4 +890,6 @@ def event_session_collate_fn(
     }
     if "date" in batch[0]:
         collated["_dates"] = [b["date"] for b in batch]
+    if "event_date" in batch[0]:
+        collated["_event_dates"] = [b["event_date"] for b in batch]
     return collated
