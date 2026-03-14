@@ -536,6 +536,9 @@ class MultiAssetMomentum(DeepIDMomentum):  # type: ignore[misc]
         self._per_ticker_summary_rename: Optional[Dict[str, Dict[str, str]]] = None
         self._recomputed_summaries: Dict[str, pd.DataFrame] = {}
 
+        # cache for aligned sequential (VPIN) columns
+        self._aligned_sequential_cols: Optional[List[str]] = None
+
     # ---------- naming / discovery ----------
 
     def discover_tickers(self) -> List[str]:
@@ -846,6 +849,72 @@ class MultiAssetMomentum(DeepIDMomentum):  # type: ignore[misc]
         self._aligned_summary_cols = aligned
         self._per_ticker_summary_cols = per
         self._per_ticker_summary_rename = rename
+
+    def prepare_sequential_schema(
+        self,
+        tickers: Optional[Sequence[str]] = None,
+        *,
+        exclude_cols: Sequence[str] = ("date", "ts_end", "bucket"),
+    ) -> List[str]:
+        """Compute the intersection of VPIN parquet columns across tickers.
+
+        Tickers like HE/LE may lack columns (e.g. ``pd_poc``, ``pd_val``,
+        ``pd_vah``) present in other tickers.  This method reads only the
+        parquet schema (no data loaded) for each ticker's VPIN file and
+        returns the ordered intersection of numeric feature columns, caching
+        the result in ``self._aligned_sequential_cols``.
+
+        Parameters
+        ----------
+        tickers : sequence of str, optional
+            Tickers to inspect.  Defaults to all discovered tickers.
+        exclude_cols : sequence of str
+            Metadata columns to exclude from alignment (always excluded).
+
+        Returns
+        -------
+        list of str
+            Ordered common columns across all tickers.
+        """
+        use_tickers = list(tickers) if tickers is not None else self._tickers
+        gf = self.generic_files
+        exclude = set(exclude_cols)
+
+        per_ticker_cols: Dict[str, List[str]] = {}
+        for t in use_tickers:
+            vpin_path = self.path_for(t, gf.vpin, must_exist=True)
+            try:
+                import pyarrow.parquet as pq
+                schema = pq.read_schema(str(vpin_path))
+                cols = [f.name for f in schema if f.name not in exclude]
+            except Exception:
+                # Fallback: read a single row to get column names
+                df_head = pd.read_parquet(vpin_path).head(1)
+                cols = [c for c in df_head.columns if c not in exclude]
+            per_ticker_cols[t] = cols
+
+        # Ordered intersection: preserve column order from first ticker
+        first_cols = per_ticker_cols[use_tickers[0]]
+        all_sets = [set(v) for v in per_ticker_cols.values()]
+        common = set.intersection(*all_sets) if all_sets else set()
+        aligned = [c for c in first_cols if c in common]
+
+        if not aligned:
+            warnings.warn(
+                f"No common VPIN columns across tickers {use_tickers}. "
+                f"Per-ticker columns: { {t: len(v) for t, v in per_ticker_cols.items()} }"
+            )
+        else:
+            dropped = set(first_cols) - common
+            if dropped:
+                warnings.warn(
+                    f"Sequential schema alignment dropped {len(dropped)} columns "
+                    f"not present in all tickers: {sorted(dropped)}. "
+                    f"Keeping {len(aligned)} common columns."
+                )
+
+        self._aligned_sequential_cols = aligned
+        return aligned
 
     def detect_summary_schema(
         self,
@@ -1813,6 +1882,13 @@ class MultiAssetMomentum(DeepIDMomentum):  # type: ignore[misc]
         if self._aligned_summary_cols is None:
             self.prepare_summary_schema(use_tickers)
 
+        # Ensure sequential (VPIN) schema aligned across tickers
+        if self._aligned_sequential_cols is None and len(use_tickers) > 1:
+            self.prepare_sequential_schema(use_tickers)
+
+        # Capture aligned sequential cols for injection into per-ticker loaders
+        aligned_seq_cols = self._aligned_sequential_cols
+
         per: Dict[str, Any] = {}
 
         def _build_ticker_loaders(t: str, cutoff_date: Optional[pd.Timestamp] = None) -> Tuple[str, Any]:
@@ -1821,6 +1897,10 @@ class MultiAssetMomentum(DeepIDMomentum):  # type: ignore[misc]
 
             # Build kwargs for this ticker
             ticker_kwargs = {**loader_kwargs}
+
+            # Inject aligned sequential columns if computed and not already specified
+            if aligned_seq_cols and "sequential_cols" not in ticker_kwargs:
+                ticker_kwargs["sequential_cols"] = aligned_seq_cols
 
             # If WSPR mode, inject ticker metadata into the loader kwargs
             if use_wspr:
