@@ -13,6 +13,7 @@ Leverages MacroClient for FRED data and yfinance for Gold/DXY.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -125,19 +126,22 @@ class MacroGATPrep:
         self.fred_api_key = fred_api_key
         self._fred = None
 
-    def _get_fred(self):
-        if self._fred is not None:
+    def _resolve_fred_api_key(self, fred_api_key: Optional[str] = None) -> Optional[str]:
+        return fred_api_key or self.fred_api_key or os.getenv("FRED_API_KEY")
+
+    def _get_fred(self, fred_api_key: Optional[str] = None):
+        key = self._resolve_fred_api_key(fred_api_key)
+        if self._fred is not None and key == self.fred_api_key:
             return self._fred
         try:
             from fredapi import Fred
         except ImportError:
             logger.error("fredapi not installed — pip install fredapi")
             return None
-        import os
-        key = self.fred_api_key or os.getenv("FRED_API_KEY")
         if not key:
             logger.error("FRED_API_KEY not set")
             return None
+        self.fred_api_key = key
         self._fred = Fred(api_key=key)
         return self._fred
 
@@ -149,9 +153,10 @@ class MacroGATPrep:
         self,
         start_date: datetime,
         end_date: Optional[datetime] = None,
+        fred_api_key: Optional[str] = None,
     ) -> pd.DataFrame:
         """Fetch DGS10, DGS2, DFII10 (TIPS) from FRED."""
-        fred = self._get_fred()
+        fred = self._get_fred(fred_api_key=fred_api_key)
         if fred is None:
             return pd.DataFrame()
 
@@ -208,11 +213,14 @@ class MacroGATPrep:
         self,
         start_date: datetime,
         end_date: Optional[datetime] = None,
+        fred_api_key: Optional[str] = None,
     ) -> pd.DataFrame:
         """Fetch economic indicators via MacroClient and return YoY values."""
         from CTAFlow.data.ext.macro_client import MacroClient
 
-        client = MacroClient(fred_api_key=self.fred_api_key)
+        client = MacroClient(
+            fred_api_key=self._resolve_fred_api_key(fred_api_key),
+        )
         econ = client.fetch_econ_data(start_date=start_date, end_date=end_date)
         return econ
 
@@ -280,6 +288,7 @@ class MacroGATPrep:
         self,
         start_date: datetime,
         end_date: Optional[datetime] = None,
+        fred_api_key: Optional[str] = None,
     ) -> Dict[str, pd.DataFrame]:
         """
         Fetch all data and build node feature DataFrames.
@@ -289,9 +298,17 @@ class MacroGATPrep:
         economic nodes have variable features (Inflation=3, Labor=2, Growth=2).
         """
         # Fetch raw data
-        fred_yields = self.fetch_fred_yields(start_date, end_date)
+        fred_yields = self.fetch_fred_yields(
+            start_date,
+            end_date,
+            fred_api_key=fred_api_key,
+        )
         yahoo_assets = self.fetch_yahoo_assets(start_date, end_date)
-        econ_df = self.fetch_econ_data(start_date, end_date)
+        econ_df = self.fetch_econ_data(
+            start_date,
+            end_date,
+            fred_api_key=fred_api_key,
+        )
 
         # Build asset nodes
         asset_nodes = self.build_asset_nodes(yahoo_assets, fred_yields)

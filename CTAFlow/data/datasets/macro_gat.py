@@ -108,6 +108,7 @@ class MacroGATContinuousPrep:
         self.target_steps = target_horizon_minutes // bar_minutes  # 6 for 30min
         self.macro_lookback = macro_lookback
         self.quartile_window = quartile_window
+        self.fred_api_key = fred_api_key
 
         self.prep = ContinuousIntradayPrep(
             sessions=self.sessions, bar_minutes=bar_minutes,
@@ -138,6 +139,7 @@ class MacroGATContinuousPrep:
         numbars_file: str = "{TICKER}_numbars.npz",
         raster_file: str = "rasterized.npz",
         macro_start_date: Optional[str] = None,
+        fred_api_key: Optional[str] = None,
     ) -> "MacroGATContinuousPrep":
         """Load all data from standard directory layout.
 
@@ -150,7 +152,12 @@ class MacroGATContinuousPrep:
         macro_start_date : str, optional
             Override start date for macro data fetch. If None, derived
             from intraday data with extra lookback.
+        fred_api_key : str, optional
+            Override the configured FRED API key for this load call.
         """
+        if fred_api_key is not None:
+            self.fred_api_key = fred_api_key
+
         root = Path(root_dir) / ticker
 
         # 1. Intraday technical features + 30min target
@@ -221,7 +228,9 @@ class MacroGATContinuousPrep:
 
         print(f"  Fetching macro data: {m_start.date()} → {m_end.date()}")
         self._macro_nodes = self.macro_prep.fetch_and_build(
-            start_date=m_start, end_date=m_end,
+            start_date=m_start,
+            end_date=m_end,
+            fred_api_key=self.fred_api_key,
         )
 
         # Summary
