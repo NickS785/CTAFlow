@@ -366,13 +366,16 @@ class MacroGATMamba(nn.Module):
         )
 
         # --- Mamba Fusion Head ---
+        # Token sequence is exactly 3 (spatial, macro, tech).
+        # mamba_ssm requires d_conv <= seq_len to avoid OOB indexing.
+        head_d_conv = min(d_conv, 3)
         self.head = MambaFusionHead(
             input_dim=d_model,
             d_model=d_model,
             out_dim=num_classes,
             n_layers=n_mamba_layers,
             d_state=d_state,
-            d_conv=d_conv,
+            d_conv=head_d_conv,
             expand=expand,
             dropout=dropout,
         )
