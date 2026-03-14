@@ -127,6 +127,112 @@ class GatedResidualNetwork(nn.Module):
 
 
 # ============================================================================
+# Variable Selection Network (TFT-style per-feature gating)
+# ============================================================================
+
+class VariableSelectionNetwork(nn.Module):
+    """TFT-style Variable Selection Network for individual features.
+
+    Each input variable is processed through its own GRN, then a softmax
+    selection network produces per-variable weights conditioned on an
+    optional context vector.  The output is the weighted sum of the
+    transformed variables.
+
+    Parameters
+    ----------
+    n_vars : int
+        Number of input variables (features).
+    d_model : int
+        Output dimension per variable after GRN transformation.
+    d_context : int, optional
+        Context vector dimension for conditioning the selection weights.
+        If None, selection is unconditional.
+    dropout : float
+        Dropout rate for GRNs and the flattened input projection.
+    """
+
+    def __init__(
+        self,
+        n_vars: int,
+        d_model: int,
+        d_context: Optional[int] = None,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.n_vars = n_vars
+        self.d_model = d_model
+
+        # Per-variable GRN: each scalar feature → d_model vector
+        self.var_grns = nn.ModuleList([
+            GatedResidualNetwork(
+                d_model=d_model, d_input=1, d_hidden=d_model, dropout=dropout,
+            )
+            for _ in range(n_vars)
+        ])
+
+        # Selection network: operates on flattened raw input + optional context
+        # to produce per-variable softmax weights
+        self.selection_grn = GatedResidualNetwork(
+            d_model=n_vars,
+            d_input=n_vars,
+            d_hidden=n_vars,
+            d_context=d_context,
+            dropout=dropout,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Parameters
+        ----------
+        x : Tensor
+            (B, L, n_vars) or (B, n_vars) raw feature values.
+        context : Tensor, optional
+            (B, d_context) context vector for conditioned selection.
+            Broadcast to match sequence length if x is 3D.
+
+        Returns
+        -------
+        selected : Tensor
+            (B, L, d_model) or (B, d_model) weighted combination.
+        weights : Tensor
+            (B, L, n_vars) or (B, n_vars) softmax selection weights.
+        """
+        has_seq = x.dim() == 3
+        if has_seq:
+            B, L, _ = x.shape
+        else:
+            B = x.shape[0]
+            L = None
+
+        # 1. Per-variable GRN transformation
+        # Split each feature as (*, 1) → GRN → (*, d_model)
+        transformed = []
+        for i, grn in enumerate(self.var_grns):
+            xi = x[..., i : i + 1]            # (B, L, 1) or (B, 1)
+            transformed.append(grn(xi))        # (B, L, d_model) or (B, d_model)
+
+        # Stack: (B, L, n_vars, d_model) or (B, n_vars, d_model)
+        transformed = torch.stack(transformed, dim=-2)
+
+        # 2. Selection weights from flattened input
+        ctx = context
+        if has_seq and ctx is not None and ctx.dim() == 2:
+            ctx = ctx.unsqueeze(1).expand(-1, L, -1)
+
+        weight_logits = self.selection_grn(x, context=ctx)  # (B, [L], n_vars)
+        weights = F.softmax(weight_logits, dim=-1)
+
+        # 3. Weighted sum: (*, n_vars, d_model) × (*, n_vars, 1) → (*, d_model)
+        selected = (transformed * weights.unsqueeze(-1)).sum(dim=-2)
+
+        return selected, weights
+
+
+# ============================================================================
 # Event Decay Encoding
 # ============================================================================
 

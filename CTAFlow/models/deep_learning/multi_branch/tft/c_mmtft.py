@@ -49,6 +49,7 @@ import torch.nn as nn
 from CTAFlow.models.deep_learning.multi_branch.market_context_models import (
     BranchVariableSelection,
     GatedResidualNetwork,
+    VariableSelectionNetwork,
 )
 from CTAFlow.models.deep_learning.multi_branch.tft.mmtf_v2_models import (
     BranchVariableSelectionV2,
@@ -207,12 +208,15 @@ class MMTFv3Core(nn.Module):
         bvs_entropy_weight: float = 0.1,
         bvs_min_weight: float = 0.05,
         bvs_pre_norm: bool = True,
+        # Variable Selection Network for tech features
+        use_vsn: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
         self.ae_type = ae_type
         self.recon_weight = recon_weight
         self.backbone_type = backbone
+        self.use_vsn = use_vsn
         self.spatial_encoder_type = spatial_encoder
         self.dropout = dropout
 
@@ -264,14 +268,26 @@ class MMTFv3Core(nn.Module):
 
         # ==============================================================
         # TECHNICAL FEATURE PROJECTION (backbone input)
-        # Projects raw tech features to d_model, then adds regime context
+        # Projects raw tech features to d_model, then adds regime context.
+        # When use_vsn=True, a VariableSelectionNetwork selects and
+        # transforms individual features before the backbone.
         # ==============================================================
-        self.tech_proj = nn.Sequential(
-            nn.LayerNorm(f_tech),
-            nn.Linear(f_tech, d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
+        if use_vsn:
+            self.tech_vsn = VariableSelectionNetwork(
+                n_vars=f_tech,
+                d_model=d_model,
+                d_context=d_model,   # conditioned on c_h (regime)
+                dropout=_grn_drop,
+            )
+            self.tech_proj = None
+        else:
+            self.tech_vsn = None
+            self.tech_proj = nn.Sequential(
+                nn.LayerNorm(f_tech),
+                nn.Linear(f_tech, d_model),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
 
         # ==============================================================
         # TEMPORAL FUSION BACKBONE (Mamba or Transformer)
@@ -439,7 +455,11 @@ class MMTFv3Core(nn.Module):
         # Project tech features → d_model, add regime context per bar,
         # then run through Mamba/Transformer backbone.
         # ==========================================================
-        z_tech = self.tech_proj(tech_features)                      # (B, L, d_model)
+        if self.tech_vsn is not None:
+            z_tech, vsn_weights = self.tech_vsn(tech_features, context=c_h)
+        else:
+            z_tech = self.tech_proj(tech_features)                  # (B, L, d_model)
+            vsn_weights = None
         z_regime_bar = self.regime_bar_proj(c_h)                    # (B, d_model)
         z_tech_enriched = z_tech + z_regime_bar.unsqueeze(1)        # (B, L, d_model)
 
@@ -542,6 +562,7 @@ class MMTFv3Core(nn.Module):
                 for i, name in enumerate(self.regime_encoder.var_names)
             } if self.regime_encoder.last_var_weights is not None else None,
             "spatial_fuse": spatial_importance,
+            "vsn_weights": vsn_weights.detach().mean(dim=1) if vsn_weights is not None else None,
             "temporal_attn": attn_weights.detach().squeeze(1),
             "backbone": dict(self.fusion_backbone.last_tracker),
             "seq_net": dict(self.seq_net.last_tracker),
@@ -1334,6 +1355,18 @@ def print_v3_diagnostics(tracker: dict, eval_metrics: dict, epoch: int = 0) -> N
             print(f"    ...")
             for idx, w in ranked[-5:]:
                 print(f"    feat[{idx:>3d}]: {w:.4f}")
+
+    vsn_w = tracker.get("vsn_weights")
+    if vsn_w is not None and hasattr(vsn_w, "cpu"):
+        vals = vsn_w.mean(dim=0).cpu().numpy()
+        ranked = sorted(enumerate(vals), key=lambda x: -x[1])
+        print(f"\n  Tech VSN Feature Importance (top-5 / bottom-5):")
+        for idx, w in ranked[:5]:
+            bar = "#" * int(w / max(vals.max(), 1e-8) * 30)
+            print(f"    feat[{idx:>3d}]: {w:.4f} {bar}")
+        print(f"    ...")
+        for idx, w in ranked[-5:]:
+            print(f"    feat[{idx:>3d}]: {w:.4f}")
 
     ae = tracker.get("ae_losses", {})
     if ae:

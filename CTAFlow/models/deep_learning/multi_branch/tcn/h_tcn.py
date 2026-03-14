@@ -374,6 +374,8 @@ class HybridTCN(nn.Module):
         regime_floor: float = 0.15,
         # Training
         dropout: float = 0.2,
+        # Variable Selection Network for tech features
+        use_vsn: bool = False,
         # Ignored kwargs for MMTFv3Core interface compat
         **_ignored,
     ):
@@ -386,9 +388,23 @@ class HybridTCN(nn.Module):
         self.regime_gate = regime_gate
         self.regime_floor = regime_floor
         self.spatial_encoder_type = spatial_encoder
+        self.use_vsn = use_vsn
 
         # ── 1. TCN backbone ──────────────────────────────────────────
-        self.tech_proj = nn.Linear(f_tech, tcn_channels[0])
+        if use_vsn:
+            from CTAFlow.models.deep_learning.multi_branch.market_context_models import (
+                VariableSelectionNetwork,
+            )
+            self.tech_vsn = VariableSelectionNetwork(
+                n_vars=f_tech,
+                d_model=tcn_channels[0],
+                d_context=d_model,   # conditioned on regime context
+                dropout=dropout,
+            )
+            self.tech_proj = None
+        else:
+            self.tech_vsn = None
+            self.tech_proj = nn.Linear(f_tech, tcn_channels[0])
         self.tcn = TCNBackbone(
             in_channels=tcn_channels[0],
             channels=tcn_channels,
@@ -499,8 +515,40 @@ class HybridTCN(nn.Module):
         B = tech_features.shape[0]
         device = tech_features.device
 
+        # ── 0. VAE regime (computed first so context is available for VSN)
+        if ae_input is not None:
+            z_regime, ae_losses = self.vae(ae_input)
+        else:
+            z_regime = torch.zeros(B, self.vae.fc_mu.out_features, device=device)
+            ae_losses = {
+                "total_ae_loss": torch.tensor(0.0, device=device),
+                "recon_loss": torch.tensor(0.0, device=device),
+                "kl_loss": torch.tensor(0.0, device=device),
+            }
+
         # ── 1. TCN path ──────────────────────────────────────────────
-        x_tech = self.tech_proj(tech_features)          # (B, L, C)
+        vsn_weights = None
+        if self.tech_vsn is not None:
+            # Project regime to d_model for VSN context
+            regime_ctx = self.static_proj(
+                torch.cat([
+                    self.ticker_emb(
+                        ticker_id if ticker_id is not None
+                        else torch.zeros(B, dtype=torch.long, device=device)
+                    ),
+                    self.class_emb(
+                        asset_class_id if asset_class_id is not None
+                        else torch.zeros(B, dtype=torch.long, device=device)
+                    ),
+                    self.subclass_emb(
+                        asset_subclass_id if asset_subclass_id is not None
+                        else torch.zeros(B, dtype=torch.long, device=device)
+                    ),
+                ], dim=-1)
+            )  # (B, d_model) — use static embedding as context
+            x_tech, vsn_weights = self.tech_vsn(tech_features, context=regime_ctx)
+        else:
+            x_tech = self.tech_proj(tech_features)          # (B, L, C)
         x_tech = x_tech.transpose(1, 2)                 # (B, C, L)
         tcn_out = self.tcn(x_tech)                       # (B, C, L)
         # Last valid timestep per sample
@@ -525,18 +573,7 @@ class HybridTCN(nn.Module):
         else:
             z_seq = torch.zeros(B, self.d_model, device=device)
 
-        # ── 4. VAE regime ────────────────────────────────────────────
-        if ae_input is not None:
-            z_regime, ae_losses = self.vae(ae_input)
-        else:
-            z_regime = torch.zeros(B, self.vae.fc_mu.out_features, device=device)
-            ae_losses = {
-                "total_ae_loss": torch.tensor(0.0, device=device),
-                "recon_loss": torch.tensor(0.0, device=device),
-                "kl_loss": torch.tensor(0.0, device=device),
-            }
-
-        # ── 5. Static context ────────────────────────────────────────
+        # ── 4. Static context ────────────────────────────────────────
         tid = ticker_id if ticker_id is not None else torch.zeros(B, dtype=torch.long, device=device)
         acid = asset_class_id if asset_class_id is not None else torch.zeros(B, dtype=torch.long, device=device)
         asid = asset_subclass_id if asset_subclass_id is not None else torch.zeros(B, dtype=torch.long, device=device)
@@ -575,6 +612,7 @@ class HybridTCN(nn.Module):
             "weight_seq_branch": gate_seq.detach().mean().item(),
             "weight_spatial_branch": gate_spatial.detach().mean().item(),
             "tcn_receptive_field": self.tcn.receptive_field,
+            "vsn_weights": vsn_weights.detach().mean(dim=1) if vsn_weights is not None else None,
         }
 
         # Match MMTFv3Core return signature

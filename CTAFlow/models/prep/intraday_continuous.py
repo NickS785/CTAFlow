@@ -83,6 +83,7 @@ class ContinuousIntradayPrep:
         add_time_features: bool = True,
         add_resample_precalc: bool = True,
         resample_rules: Tuple[str, ...] = ("15min", "30min", "60min"),
+        add_bid_ask: bool = True,
     ) -> List[str]:
         """Generate feature column names based on prepare() parameters.
 
@@ -122,6 +123,7 @@ class ContinuousIntradayPrep:
             for w in rv_lookbacks:
                 if w != 1:
                     cols.append(f"rv_{w}d_mean")
+            cols.extend(["macd_norm", "macd_signal_norm", "macd_hist_norm", "rsi_14"])
 
         # Deseasonalized features
         if add_deseas:
@@ -151,8 +153,13 @@ class ContinuousIntradayPrep:
                         f"rs_{suffix}_range",
                         f"rs_{suffix}_vwap_dist",
                         f"rs_{suffix}_logvol_z",
+                        f"rs_{suffix}_ret_deseas",
                     ]
                 )
+
+        # Bid/ask volume features
+        if add_bid_ask:
+            cols.extend(["ba_imbalance", "ba_imbalance_ema"])
 
         return cols
 
@@ -177,7 +184,7 @@ class ContinuousIntradayPrep:
         df = df.copy()
         colmap = {}
         for c in df.columns:
-            cl = c.lower()
+            cl = c.strip().lower().replace(" ", "_")
             if cl == "open":
                 colmap[c] = "Open"
             elif cl == "high":
@@ -188,6 +195,10 @@ class ContinuousIntradayPrep:
                 colmap[c] = "Close"
             elif cl in ("volume", "vol"):
                 colmap[c] = "Volume"
+            elif cl in ("bid_volume", "bidvolume", "bidvol", "bid_vol"):
+                colmap[c] = "BidVolume"
+            elif cl in ("ask_volume", "askvolume", "askvol", "ask_vol"):
+                colmap[c] = "AskVolume"
         df = df.rename(columns=colmap)
 
         req = ["Open", "High", "Low", "Close", "Volume"]
@@ -353,12 +364,21 @@ class ContinuousIntradayPrep:
             else:
                 rs_logvol_z = pd.Series(np.nan, index=rs.index)
 
+            # Deseasonalized return: logret / rolling abs-return mean
+            # Uses rolling window at the resampled frequency to avoid lookahead
+            abs_ret = rs_logret.abs()
+            rolling_vol = abs_ret.rolling(
+                vol_z_window, min_periods=max(8, vol_z_window // 4),
+            ).mean()
+            rs_ret_deseas = rs_logret / rolling_vol.clip(lower=self.eps)
+
             rs_feats = pd.DataFrame(
                 {
                     f"rs_{suffix}_logret": rs_logret,
                     f"rs_{suffix}_range": rs_range,
                     f"rs_{suffix}_vwap_dist": rs_vwap_dist,
                     f"rs_{suffix}_logvol_z": rs_logvol_z,
+                    f"rs_{suffix}_ret_deseas": rs_ret_deseas,
                 },
                 index=rs.index,
             )
@@ -480,6 +500,44 @@ class ContinuousIntradayPrep:
         return df
 
     # -------------------------
+    # Bid/Ask volume features
+    # -------------------------
+    def add_bid_ask_volume(
+        self,
+        df: pd.DataFrame,
+        imbalance_ema_bars: int = 20,
+    ) -> pd.DataFrame:
+        """Add bid/ask volume imbalance features.
+
+        Requires ``BidVolume`` and ``AskVolume`` columns (mapped
+        automatically from Sierra Chart style ``Bid Volume`` /
+        ``Ask Volume`` by ``_standardize_columns``).
+
+        Features added:
+        - ``ba_imbalance``: (ask - bid) / total, clipped to [-1, 1]
+        - ``ba_imbalance_ema``: EMA-smoothed imbalance
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            DataFrame with BidVolume and AskVolume columns.
+        imbalance_ema_bars : int, default 20
+            EMA span for smoothed imbalance.
+        """
+        df = df.copy()
+        bid = df["BidVolume"].astype(float)
+        ask = df["AskVolume"].astype(float)
+        total = bid + ask
+        imb = (ask - bid) / total.replace(0.0, np.nan)
+        df["ba_imbalance"] = imb.clip(-1, 1)
+        df["ba_imbalance_ema"] = (
+            df["ba_imbalance"]
+            .ewm(span=imbalance_ema_bars, min_periods=1)
+            .mean()
+        )
+        return df
+
+    # -------------------------
     # Safe daily features (shift(1) + ffill)
     # -------------------------
     def add_daily_features(
@@ -529,6 +587,32 @@ class ContinuousIntradayPrep:
                 continue  # Already added rv_1d
             rvw = daily_rv.rolling(w, min_periods=max(2, w // 3)).mean().shift(1)
             df[f"rv_{w}d_mean"] = rvw.reindex(df.index.normalize()).ffill().values
+
+        # MACD (12/26/9) — normalized by close to make scale-invariant
+        ema12 = daily_close.ewm(span=12, min_periods=12).mean()
+        ema26 = daily_close.ewm(span=26, min_periods=26).mean()
+        macd_line = ema12 - ema26
+        signal_line = macd_line.ewm(span=9, min_periods=9).mean()
+        macd_hist = macd_line - signal_line
+        # Normalize by close so values are comparable across assets
+        macd_norm = (macd_line / (daily_close + self.eps)).shift(1)
+        signal_norm = (signal_line / (daily_close + self.eps)).shift(1)
+        hist_norm = (macd_hist / (daily_close + self.eps)).shift(1)
+        df["macd_norm"] = macd_norm.reindex(df.index.normalize()).ffill().values
+        df["macd_signal_norm"] = signal_norm.reindex(df.index.normalize()).ffill().values
+        df["macd_hist_norm"] = hist_norm.reindex(df.index.normalize()).ffill().values
+
+        # RSI-14 — already bounded [0, 100], rescale to [-1, 1]
+        daily_ret = daily_close.diff()
+        gain = daily_ret.clip(lower=0)
+        loss = (-daily_ret).clip(lower=0)
+        avg_gain = gain.ewm(alpha=1.0 / 14, min_periods=14).mean()
+        avg_loss = loss.ewm(alpha=1.0 / 14, min_periods=14).mean()
+        rs = avg_gain / (avg_loss + self.eps)
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+        # Rescale [0, 100] → [-1, 1]
+        rsi_scaled = (rsi / 50.0 - 1.0).shift(1)
+        df["rsi_14"] = rsi_scaled.reindex(df.index.normalize()).ffill().values
 
         return df
 
@@ -833,6 +917,19 @@ class ContinuousIntradayPrep:
                     df[col] = df[col] * scale_factor
                 scaled_cols.add(col)
 
+        # --- MACD (normalized by close — small fractional, scale to bps) ---
+        for col in ("macd_norm", "macd_signal_norm", "macd_hist_norm"):
+            if col in df.columns and col not in scaled_cols:
+                if clip_outliers:
+                    df[col] = df[col].clip(-0.1, 0.1) * scale_factor
+                else:
+                    df[col] = df[col] * scale_factor
+                scaled_cols.add(col)
+
+        # --- RSI (already [-1, 1], no scaling needed) ---
+        if "rsi_14" in df.columns and "rsi_14" not in scaled_cols:
+            scaled_cols.add("rsi_14")
+
         # --- VOLATILITY FEATURES ---
         # RV features: small values, scale up
         for col in df.columns:
@@ -855,6 +952,20 @@ class ContinuousIntradayPrep:
             if clip_outliers:
                 df["deseasonalized_volume"] = df["deseasonalized_volume"].clip(-5, 5)
             scaled_cols.add("deseasonalized_volume")
+
+        # --- DESEASONALIZED RESAMPLED RETURNS ---
+        for col in df.columns:
+            if col.endswith("_ret_deseas") and col not in scaled_cols:
+                # Already z-scored (logret / rolling_vol), just clip
+                if clip_outliers:
+                    df[col] = df[col].clip(-5, 5)
+                scaled_cols.add(col)
+
+        # --- BID/ASK IMBALANCE ---
+        for col in ("ba_imbalance", "ba_imbalance_ema"):
+            if col in df.columns and col not in scaled_cols:
+                # Already in [-1, 1], no scaling needed
+                scaled_cols.add(col)
 
         # --- FINAL CLIP for any remaining numeric columns ---
         if clip_outliers:
@@ -924,6 +1035,7 @@ class ContinuousIntradayPrep:
         use_legacy_deseas: bool = False,
         apply_scaling: bool = False,
         scale_to_basis_points: bool = True,
+        add_bid_ask: bool = True,
     ) -> Tuple[pd.DataFrame, pd.Series, List[str]]:
         """Prepare full feature set and targets.
 
@@ -959,6 +1071,9 @@ class ContinuousIntradayPrep:
         scale_to_basis_points : bool, default True
             If apply_scaling=True, multiply relevant features by 100.
             Only used when apply_scaling=True.
+        add_bid_ask : bool, default True
+            Add bid/ask volume imbalance features (requires BidVolume/AskVolume
+            columns in raw data).
 
         Returns
         -------
@@ -1013,6 +1128,10 @@ class ContinuousIntradayPrep:
                     deseasonalize_returns=True,
                     vol_scale_returns=True,
                 )
+
+        # Bid/ask volume imbalance
+        if add_bid_ask and "BidVolume" in df.columns and "AskVolume" in df.columns:
+            df = self.add_bid_ask_volume(df)
 
         # Targets (continuous - do NOT filter before computing)
         df, target_cols = self.add_targets_multistep(df, steps=steps_60m)
