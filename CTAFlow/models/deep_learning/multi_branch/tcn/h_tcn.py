@@ -395,15 +395,19 @@ class HybridTCN(nn.Module):
             from CTAFlow.models.deep_learning.multi_branch.market_context_models import (
                 VariableSelectionNetwork,
             )
+            # VSN context = static identity + regime latent
+            vsn_ctx_dim = d_model + d_latent
+            self.vsn_ctx_proj = nn.Linear(vsn_ctx_dim, d_model)
             self.tech_vsn = VariableSelectionNetwork(
                 n_vars=f_tech,
                 d_model=tcn_channels[0],
-                d_context=d_model,   # conditioned on regime context
+                d_context=d_model,   # projected joint context
                 dropout=dropout,
             )
             self.tech_proj = None
         else:
             self.tech_vsn = None
+            self.vsn_ctx_proj = None
             self.tech_proj = nn.Linear(f_tech, tcn_channels[0])
         self.tcn = TCNBackbone(
             in_channels=tcn_channels[0],
@@ -529,8 +533,8 @@ class HybridTCN(nn.Module):
         # ── 1. TCN path ──────────────────────────────────────────────
         vsn_weights = None
         if self.tech_vsn is not None:
-            # Project regime to d_model for VSN context
-            regime_ctx = self.static_proj(
+            # Joint context: static identity + regime latent
+            z_static_early = self.static_proj(
                 torch.cat([
                     self.ticker_emb(
                         ticker_id if ticker_id is not None
@@ -545,8 +549,11 @@ class HybridTCN(nn.Module):
                         else torch.zeros(B, dtype=torch.long, device=device)
                     ),
                 ], dim=-1)
-            )  # (B, d_model) — use static embedding as context
-            x_tech, vsn_weights = self.tech_vsn(tech_features, context=regime_ctx)
+            )  # (B, d_model)
+            vsn_ctx = self.vsn_ctx_proj(
+                torch.cat([z_static_early, z_regime], dim=-1)
+            )  # (B, d_model) — identity + regime conditioning
+            x_tech, vsn_weights = self.tech_vsn(tech_features, context=vsn_ctx)
         else:
             x_tech = self.tech_proj(tech_features)          # (B, L, C)
         x_tech = x_tech.transpose(1, 2)                 # (B, C, L)
