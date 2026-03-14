@@ -622,6 +622,24 @@ class V3ContinuousPrep:
         n_valid = train_mask.sum() if hasattr(train_mask, "sum") else 0
         return int(n_valid)
 
+    def _align_sequential_cols(self):
+        """Intersect sequential VPIN columns across all loaded tickers."""
+        dfs = {t: df for t, df in self._seq_vpin.items() if not df.empty}
+        if len(dfs) <= 1:
+            return
+        common = None
+        for df in dfs.values():
+            cols = set(df.columns)
+            common = cols if common is None else common & cols
+        if not common:
+            return
+        # Preserve original column order from first non-empty ticker
+        first_df = next(iter(dfs.values()))
+        ordered = [c for c in first_df.columns if c in common]
+        for t in dfs:
+            self._seq_vpin[t] = self._seq_vpin[t][ordered]
+        print(f"  Sequential VPIN aligned: {len(ordered)} common columns across {len(dfs)} tickers")
+
     @staticmethod
     def _load_spatial_npz(path: Path) -> Dict[date, np.ndarray]:
         """Load NPZ as date->array dict (handles both indexed and date-keyed).
@@ -691,6 +709,7 @@ class V3ContinuousPrep:
                   f"rasters={len(obj._rasters.get(ticker, {}))}, "
                   f"ae_dates={len(obj._ae_features.get(ticker, {}))}, "
                   f"vpin_cols={len(obj._seq_vpin.get(ticker, pd.DataFrame()).columns)}")
+        obj._align_sequential_cols()
         shapes = []
         if obj._numbars_bar_shape:
             shapes.append(f"numbars_bar={obj._numbars_bar_shape}")
