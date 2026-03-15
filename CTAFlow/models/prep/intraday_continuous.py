@@ -21,7 +21,7 @@ Anti-leakage:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import time, timedelta
+from datetime import date as date_type, time, timedelta
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -84,6 +84,7 @@ class ContinuousIntradayPrep:
         add_resample_precalc: bool = True,
         resample_rules: Tuple[str, ...] = ("15min", "30min", "60min"),
         add_bid_ask: bool = True,
+        add_event_markers: bool = True,
     ) -> List[str]:
         """Generate feature column names based on prepare() parameters.
 
@@ -160,6 +161,10 @@ class ContinuousIntradayPrep:
         # Bid/ask volume features
         if add_bid_ask:
             cols.extend(["ba_imbalance", "ba_imbalance_ema"])
+
+        # Known-future event markers
+        if add_event_markers:
+            cols.extend(["evt_is_release_day", "evt_bars_to_release", "evt_is_pre_release"])
 
         return cols
 
@@ -535,6 +540,93 @@ class ContinuousIntradayPrep:
             .ewm(span=imbalance_ema_bars, min_periods=1)
             .mean()
         )
+        return df
+
+    # -------------------------
+    # Known-future event markers
+    # -------------------------
+    def add_event_markers(
+        self,
+        df: pd.DataFrame,
+        ticker: str,
+        pre_release_bars: int = 12,
+    ) -> pd.DataFrame:
+        """Add known-future event release markers for a ticker.
+
+        Uses ``event_presets`` to identify recurring release days (CPI, NFP,
+        EIA, etc.) based on weekday/week-of-month rules and adds:
+
+        - ``evt_is_release_day``: 1.0 on days matching any relevant event
+        - ``evt_bars_to_release``: normalised countdown [0, 1] on release days
+          (1 = far from release, 0 = at release time), -1 on non-event days
+        - ``evt_is_pre_release``: 1.0 within *pre_release_bars* bars before
+          release time on release days
+
+        These are **known-future** features — they depend only on the calendar
+        and do not leak any realised market data.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Intraday DataFrame with DatetimeIndex.
+        ticker : str
+            Ticker symbol used to look up relevant events.
+        pre_release_bars : int, default 12
+            Number of bars before release to flag as pre-release.
+        """
+        from CTAFlow.screeners.event_presets import (
+            get_events_for_ticker,
+            is_matching_event_slot,
+            EventDefinition,
+        )
+
+        df = df.copy()
+        events = get_events_for_ticker(ticker)
+        if not events:
+            df["evt_is_release_day"] = np.float32(0)
+            df["evt_bars_to_release"] = np.float32(-1)
+            df["evt_is_pre_release"] = np.float32(0)
+            return df
+
+        idx = df.index
+        dates = idx.date
+        unique_dates = np.unique(dates)
+
+        # Build set of (date, release_time_as_minutes) for matching days
+        release_info: Dict[date_type, int] = {}  # date -> earliest release minute
+        for d in unique_dates:
+            for ev in events:
+                if is_matching_event_slot(d, ev):
+                    release_min = ev.release_time_local.hour * 60 + ev.release_time_local.minute
+                    if d not in release_info or release_min < release_info[d]:
+                        release_info[d] = release_min
+
+        is_release_day = np.zeros(len(df), dtype=np.float32)
+        bars_to_release = np.full(len(df), -1.0, dtype=np.float32)
+        is_pre_release = np.zeros(len(df), dtype=np.float32)
+
+        bar_minutes_total = idx.hour * 60 + idx.minute
+
+        for d, rel_min in release_info.items():
+            day_mask = dates == d
+            is_release_day[day_mask] = 1.0
+
+            # Bars to release: normalised by session length
+            day_bar_mins = bar_minutes_total[day_mask]
+            diff = (rel_min - day_bar_mins).astype(np.float32)
+            # Normalise: 1 far away, 0 at release, keep negative for post-release
+            session_len = max(day_bar_mins.max() - day_bar_mins.min(), 1)
+            normalised = (diff / session_len).clip(-1, 1)
+            bars_to_release[day_mask] = normalised
+
+            # Pre-release window: bars within pre_release_bars * bar_minutes before release
+            pre_window_mins = pre_release_bars * self.bar_minutes
+            pre_mask = day_mask & (bar_minutes_total >= rel_min - pre_window_mins) & (bar_minutes_total < rel_min)
+            is_pre_release[pre_mask] = 1.0
+
+        df["evt_is_release_day"] = is_release_day
+        df["evt_bars_to_release"] = bars_to_release
+        df["evt_is_pre_release"] = is_pre_release
         return df
 
     # -------------------------
@@ -967,6 +1059,12 @@ class ContinuousIntradayPrep:
                 # Already in [-1, 1], no scaling needed
                 scaled_cols.add(col)
 
+        # --- EVENT MARKERS ---
+        for col in ("evt_is_release_day", "evt_bars_to_release", "evt_is_pre_release"):
+            if col in df.columns and col not in scaled_cols:
+                # Already in [-1, 1], no scaling needed
+                scaled_cols.add(col)
+
         # --- FINAL CLIP for any remaining numeric columns ---
         if clip_outliers:
             for col in df.columns:
@@ -1036,6 +1134,8 @@ class ContinuousIntradayPrep:
         apply_scaling: bool = False,
         scale_to_basis_points: bool = True,
         add_bid_ask: bool = True,
+        ticker: Optional[str] = None,
+        add_event_markers: bool = True,
     ) -> Tuple[pd.DataFrame, pd.Series, List[str]]:
         """Prepare full feature set and targets.
 
@@ -1074,6 +1174,10 @@ class ContinuousIntradayPrep:
         add_bid_ask : bool, default True
             Add bid/ask volume imbalance features (requires BidVolume/AskVolume
             columns in raw data).
+        ticker : str, optional
+            Ticker symbol for ticker-specific features (event markers).
+        add_event_markers : bool, default True
+            Add known-future event release markers (requires ticker).
 
         Returns
         -------
@@ -1132,6 +1236,10 @@ class ContinuousIntradayPrep:
         # Bid/ask volume imbalance
         if add_bid_ask and "BidVolume" in df.columns and "AskVolume" in df.columns:
             df = self.add_bid_ask_volume(df)
+
+        # Known-future event markers
+        if add_event_markers and ticker is not None:
+            df = self.add_event_markers(df, ticker=ticker)
 
         # Targets (continuous - do NOT filter before computing)
         df, target_cols = self.add_targets_multistep(df, steps=steps_60m)

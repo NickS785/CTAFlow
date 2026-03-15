@@ -540,6 +540,7 @@ class V3ContinuousPrep:
             keep_only_active=False,
             apply_scaling=True,
             scale_to_basis_points=True,
+            ticker=ticker,
         )
 
         # Resolve feature columns

@@ -360,6 +360,7 @@ class MMTFv3Core(nn.Module):
             entropy_weight=bvs_entropy_weight,
             min_weight=bvs_min_weight,
             use_pre_norm=bvs_pre_norm,
+
         )
 
         # ==============================================================
