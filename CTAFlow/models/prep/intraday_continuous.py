@@ -605,7 +605,7 @@ class ContinuousIntradayPrep:
         bars_to_release = np.full(len(df), -1.0, dtype=np.float32)
         is_pre_release = np.zeros(len(df), dtype=np.float32)
 
-        bar_minutes_total = idx.hour * 60 + idx.minute
+        bar_minutes_total = (idx.hour * 60 + idx.minute).values
 
         for d, rel_min in release_info.items():
             day_mask = dates == d
@@ -616,7 +616,7 @@ class ContinuousIntradayPrep:
             diff = (rel_min - day_bar_mins).astype(np.float32)
             # Normalise: 1 far away, 0 at release, keep negative for post-release
             session_len = max(day_bar_mins.max() - day_bar_mins.min(), 1)
-            normalised = (diff / session_len).clip(-1, 1)
+            normalised = np.clip(diff / session_len, -1, 1)
             bars_to_release[day_mask] = normalised
 
             # Pre-release window: bars within pre_release_bars * bar_minutes before release
