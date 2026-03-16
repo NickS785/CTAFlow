@@ -232,6 +232,87 @@ class VariableSelectionNetwork(nn.Module):
         return selected, weights
 
 
+class SharedVariableSelectionNetwork(nn.Module):
+    """Variable selector with a shared scalar encoder across features.
+
+    This keeps TFT-style per-feature selection weights but replaces the
+    ``n_vars`` independent 1D GRNs with one shared GRN. A learned feature
+    embedding conditions the shared encoder so each input can still learn a
+    distinct transformation without paying for a separate subnetwork.
+
+    Parameters
+    ----------
+    n_vars : int
+        Number of input variables (features).
+    d_model : int
+        Output dimension per variable after transformation.
+    d_context : int, optional
+        Context vector dimension for conditioning the selection weights.
+    dropout : float
+        Dropout rate for the shared encoder and selection GRN.
+    """
+
+    def __init__(
+        self,
+        n_vars: int,
+        d_model: int,
+        d_context: Optional[int] = None,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.n_vars = n_vars
+        self.d_model = d_model
+
+        self.shared_var_grn = GatedResidualNetwork(
+            d_model=d_model,
+            d_input=1,
+            d_hidden=d_model,
+            d_context=d_model,
+            dropout=dropout,
+        )
+        self.feature_embeddings = nn.Parameter(torch.empty(n_vars, d_model))
+        nn.init.normal_(self.feature_embeddings, mean=0.0, std=d_model ** -0.5)
+
+        self.selection_grn = GatedResidualNetwork(
+            d_model=n_vars,
+            d_input=n_vars,
+            d_hidden=n_vars,
+            d_context=d_context,
+            dropout=dropout,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply shared feature transforms and context-conditioned selection."""
+        has_seq = x.dim() == 3
+        if has_seq:
+            _, seq_len, _ = x.shape
+        else:
+            seq_len = None
+
+        feature_ctx = self.feature_embeddings.view(
+            *([1] * (x.dim() - 1)),
+            self.n_vars,
+            self.d_model,
+        )
+        transformed = self.shared_var_grn(
+            x.unsqueeze(-1),
+            context=feature_ctx,
+        )
+
+        ctx = context
+        if has_seq and ctx is not None and ctx.dim() == 2:
+            ctx = ctx.unsqueeze(1).expand(-1, seq_len, -1)
+
+        weight_logits = self.selection_grn(x, context=ctx)
+        weights = F.softmax(weight_logits, dim=-1)
+        selected = (transformed * weights.unsqueeze(-1)).sum(dim=-2)
+        return selected, weights
+
+
 # ============================================================================
 # Event Decay Encoding
 # ============================================================================

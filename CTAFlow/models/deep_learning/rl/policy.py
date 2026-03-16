@@ -44,7 +44,7 @@ from stable_baselines3.common.policies import MultiInputActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.type_aliases import Schedule
 
-from .features_extractor import WSPRExtractor
+from .features_extractor import WSPRExtractor, V3ContinuousExtractor
 from ..encoders import (
     MarketProfileResNet,
     RasterResNet,
@@ -462,9 +462,35 @@ def get_policy_kwargs(
             net_arch=net_arch,
         )
 
+    elif policy_type.lower() in ('v3', 'mmtfv3', 'v3continuous'):
+        # V3 infers all dims from observation_space, no `dims` needed
+        v3_kwargs = dict(
+            d_model=d_model,
+            dropout=dropout,
+        )
+        # Pass through V3-specific params
+        for k in (
+            'backbone', 'use_vsn', 'ae_type',
+            'd_static_emb', 'd_latent', 'd_ae_hidden',
+            'ae_n_layers', 'kl_weight', 'n_codes',
+            'n_heads', 'n_layers', 'd_ff',
+            'd_state', 'd_conv', 'expand',
+            'spatial_fuse_mode', 'spatial_fuse_temp',
+            'grn_dropout',
+            'bvs_temperature', 'bvs_entropy_weight',
+            'bvs_min_weight', 'bvs_pre_norm',
+        ):
+            if k in kwargs:
+                v3_kwargs[k] = kwargs.pop(k)
+        return dict(
+            features_extractor_class=V3ContinuousExtractor,
+            features_extractor_kwargs=v3_kwargs,
+            net_arch=net_arch,
+        )
+
     else:
         raise ValueError(f"Unknown policy type: {policy_type}. "
-                         f"Choose from: cnn_lstm, multi_input_lstm, wspr")
+                         f"Choose from: cnn_lstm, multi_input_lstm, wspr, v3")
 
 
 def make_ppo_policy(
@@ -556,8 +582,11 @@ def make_ppo_policy(
     >>> # Train
     >>> model.learn(total_timesteps=100_000)
     """
-    # Extract dimensions from env if not provided
-    if dims is None:
+    # V3 infers dims from observation_space directly — skip dims extraction
+    _is_v3 = policy_type.lower() in ('v3', 'mmtfv3', 'v3continuous')
+
+    # Extract dimensions from env if not provided (non-V3 policies only)
+    if dims is None and not _is_v3:
         obs_space = env.observation_space
         if isinstance(obs_space, gym.spaces.Dict):
             # Infer from observation space shapes
@@ -609,15 +638,106 @@ def make_ppo_policy(
     return model
 
 
+def make_v3_ppo(
+    prep,
+    backbone: str = "transformer",
+    use_vsn: bool = True,
+    ae_type: str = "vae",
+    d_model: int = 128,
+    learning_rate: float = 3e-4,
+    n_steps: int = 2048,
+    batch_size: int = 64,
+    n_epochs: int = 10,
+    gamma: float = 0.99,
+    ent_coef: float = 0.01,
+    device: str = "auto",
+    verbose: int = 1,
+    tensorboard_log: Optional[str] = None,
+    tech_lookback: int = 64,
+    seq_lookback_bars: int = 12,
+    val_ratio: float = 0.2,
+    val_cutoff_date: Optional[str] = None,
+    **kwargs,
+):
+    """Create a V3 PPO model from V3ContinuousPrep in one call.
+
+    Builds train/val environments via ``build_v3_rl_envs``, then
+    constructs a PPO with ``V3ContinuousExtractor`` (transformer
+    backbone + shared tech feature selection by default).
+
+    Parameters
+    ----------
+    prep : V3ContinuousPrep
+        Prepared data object.
+    backbone : str
+        'transformer' (default) or 'mamba'.
+    use_vsn : bool
+        Use shared per-feature selection for tech features (default True).
+    ae_type : str
+        Autoencoder type: 'deterministic', 'vae', 'vqvae'.
+    d_model : int
+        Base embedding dimension.
+    learning_rate, n_steps, batch_size, n_epochs, gamma, ent_coef
+        Standard PPO hyperparameters.
+    tech_lookback, seq_lookback_bars, val_ratio, val_cutoff_date
+        Passed to ``build_v3_rl_envs``.
+    **kwargs
+        Additional kwargs forwarded to ``make_ppo_policy`` / extractor.
+
+    Returns
+    -------
+    tuple[PPO, V3ContinuousPPOEnv, V3ContinuousPPOEnv, dict]
+        ``(ppo_model, train_env, val_env, info)``
+    """
+    from .env import build_v3_rl_envs
+
+    train_env, val_env, info = build_v3_rl_envs(
+        prep,
+        tech_lookback=tech_lookback,
+        seq_lookback_bars=seq_lookback_bars,
+        val_ratio=val_ratio,
+        val_cutoff_date=val_cutoff_date,
+        **{k: kwargs.pop(k) for k in list(kwargs) if k in (
+            'sample_session', 'sample_session_start',
+            'sample_session_end', 'stride',
+            'transaction_cost_bps', 'reward_scale',
+            'max_episode_steps',
+        )},
+    )
+
+    model = make_ppo_policy(
+        env=train_env,
+        policy_type="v3",
+        d_model=d_model,
+        learning_rate=learning_rate,
+        n_steps=n_steps,
+        batch_size=batch_size,
+        n_epochs=n_epochs,
+        gamma=gamma,
+        ent_coef=ent_coef,
+        device=device,
+        verbose=verbose,
+        tensorboard_log=tensorboard_log,
+        backbone=backbone,
+        use_vsn=use_vsn,
+        ae_type=ae_type,
+        **kwargs,
+    )
+
+    return model, train_env, val_env, info
+
+
 # Convenience exports
 __all__ = [
     'CnnLstmExtractor',
     'MultiInputLstmExtractor',
     'WSPRExtractor',
+    'V3ContinuousExtractor',
     'RecurrentActorCriticPolicy',
     'CnnLstmPolicy',
     'MultiInputLstmPolicy',
     'WSPRPolicy',
     'get_policy_kwargs',
     'make_ppo_policy',
+    'make_v3_ppo',
 ]

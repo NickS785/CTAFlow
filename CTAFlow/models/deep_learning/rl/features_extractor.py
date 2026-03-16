@@ -20,7 +20,9 @@ from ..multi_branch.tft.tft_encoders import (
 from ..multi_branch.market_context_models import (
     BranchVariableSelection,
     GatedResidualNetwork,
+    SharedVariableSelectionNetwork,
 )
+from ..multi_branch.tft.mmtf_v2_models import BranchVariableSelectionV2
 from ..multi_branch.tft.auto_mmtft import (
     DeterministicRegimeAE,
     VariationalRegimeAE,
@@ -558,6 +560,11 @@ class V3ContinuousExtractor(BaseFeaturesExtractor):
         spatial_fuse_temp: float = 2.0,
         dropout: float = 0.2,
         grn_dropout: float | None = None,
+        use_vsn: bool = False,
+        bvs_temperature: float = 1.5,
+        bvs_entropy_weight: float = 0.1,
+        bvs_min_weight: float = 0.05,
+        bvs_pre_norm: bool = True,
     ):
         # Output is cat[z_temporal, z_selected] = 2 * d_model
         features_dim = d_model * 2
@@ -638,12 +645,22 @@ class V3ContinuousExtractor(BaseFeaturesExtractor):
         # ==============================================================
         # PHASE 2: TECHNICAL FEATURE PROJECTION + BACKBONE
         # ==============================================================
-        self.tech_proj = nn.Sequential(
-            nn.LayerNorm(f_tech),
-            nn.Linear(f_tech, d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
+        if use_vsn:
+            self.tech_vsn = SharedVariableSelectionNetwork(
+                n_vars=f_tech,
+                d_model=d_model,
+                d_context=d_model,
+                dropout=_grn_drop,
+            )
+            self.tech_proj = None
+        else:
+            self.tech_vsn = None
+            self.tech_proj = nn.Sequential(
+                nn.LayerNorm(f_tech),
+                nn.Linear(f_tech, d_model),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
 
         if backbone == "transformer":
             self.fusion_backbone = TransformerTemporalBackbone(
@@ -680,13 +697,17 @@ class V3ContinuousExtractor(BaseFeaturesExtractor):
         )
 
         # ==============================================================
-        # PHASE 4: BRANCH VARIABLE SELECTION (regime-conditioned)
+        # PHASE 4: BRANCH VARIABLE SELECTION V2 (regime-conditioned)
         # ==============================================================
-        self.branch_selector = BranchVariableSelection(
+        self.branch_selector = BranchVariableSelectionV2(
             n_branches=3,
             d_branch=d_model,
             d_context=d_model,
             dropout=_grn_drop,
+            temperature=bvs_temperature,
+            entropy_weight=bvs_entropy_weight,
+            min_weight=bvs_min_weight,
+            use_pre_norm=bvs_pre_norm,
         )
 
         # ==============================================================
@@ -704,6 +725,7 @@ class V3ContinuousExtractor(BaseFeaturesExtractor):
         # Tracking for diagnostics
         self._last_branch_weights = None
         self._last_regime_var_weights = None
+        self._last_vsn_weights = None
 
     @staticmethod
     def _obs_to_index(x: torch.Tensor, n_max: int) -> torch.Tensor:
@@ -764,7 +786,12 @@ class V3ContinuousExtractor(BaseFeaturesExtractor):
         # ==============================================================
         # PHASE 2: BACKBONE — TEMPORAL FUSION OVER TECH STREAM
         # ==============================================================
-        z_tech = self.tech_proj(tech)                          # (B, L, d_model)
+        if self.tech_vsn is not None:
+            z_tech, vsn_weights = self.tech_vsn(tech, context=c_h)
+            self._last_vsn_weights = vsn_weights.detach()
+        else:
+            z_tech = self.tech_proj(tech)                      # (B, L, d_model)
+            self._last_vsn_weights = None
         z_regime_bar = self.regime_bar_proj(c_h)               # (B, d_model)
         z_tech_enriched = z_tech + z_regime_bar.unsqueeze(1)   # (B, L, d_model)
 
@@ -824,5 +851,21 @@ class V3ContinuousExtractor(BaseFeaturesExtractor):
                 name: self._last_regime_var_weights[:, i].mean().item()
                 for i, name in enumerate(names)
             }
+        if self._last_vsn_weights is not None:
+            # (B, L, n_vars) or (B, n_vars) → per-feature average
+            w = self._last_vsn_weights
+            if w.dim() == 3:
+                w = w.mean(dim=1)  # average across sequence
+            vals = w.mean(dim=0)  # average across batch → (n_vars,)
+            ranked = sorted(enumerate(vals.tolist()), key=lambda x: -x[1])
+            diag["vsn_top5"] = {
+                f"feat[{idx}]": v for idx, v in ranked[:5]
+            }
+            diag["vsn_bottom5"] = {
+                f"feat[{idx}]": v for idx, v in ranked[-5:]
+            }
+        # BVS V2 entropy loss for auxiliary regularization
+        if hasattr(self.branch_selector, 'get_entropy_loss'):
+            diag["bvs_entropy_loss"] = self.branch_selector.get_entropy_loss().item()
         diag["spatial_fuse"] = self.spatial_fuse.get_importance_stats()
         return diag

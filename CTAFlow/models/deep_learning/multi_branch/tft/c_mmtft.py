@@ -49,7 +49,7 @@ import torch.nn as nn
 from CTAFlow.models.deep_learning.multi_branch.market_context_models import (
     BranchVariableSelection,
     GatedResidualNetwork,
-    VariableSelectionNetwork,
+    SharedVariableSelectionNetwork,
 )
 from CTAFlow.models.deep_learning.multi_branch.tft.mmtf_v2_models import (
     BranchVariableSelectionV2,
@@ -269,11 +269,11 @@ class MMTFv3Core(nn.Module):
         # ==============================================================
         # TECHNICAL FEATURE PROJECTION (backbone input)
         # Projects raw tech features to d_model, then adds regime context.
-        # When use_vsn=True, a VariableSelectionNetwork selects and
-        # transforms individual features before the backbone.
+        # When use_vsn=True, a shared feature selector computes per-feature
+        # weights without instantiating one network per scalar input.
         # ==============================================================
         if use_vsn:
-            self.tech_vsn = VariableSelectionNetwork(
+            self.tech_vsn = SharedVariableSelectionNetwork(
                 n_vars=f_tech,
                 d_model=d_model,
                 d_context=d_model,   # conditioned on c_h (regime)

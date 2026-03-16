@@ -68,6 +68,7 @@ from .policy import (
     WSPRPolicy,
     get_policy_kwargs,
     make_ppo_policy,
+    make_v3_ppo,
 )
 
 __all__ = [
@@ -94,4 +95,5 @@ __all__ = [
     # Factory functions
     'get_policy_kwargs',
     'make_ppo_policy',
+    'make_v3_ppo',
 ]

@@ -14,6 +14,7 @@ tensors matching MMTFv3Core.forward() signature.
 from __future__ import annotations
 
 import bisect
+import pickle
 from datetime import date, time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -746,6 +747,24 @@ class V3ContinuousPrep:
             "vpin_bins": r[2],
         }
 
+    @staticmethod
+    def save_samples(samples: List[Dict], path: Union[str, Path]) -> None:
+        """Pickle a sample list to disk for fast reload."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump(samples, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"Saved {len(samples)} samples → {path} ({path.stat().st_size / 1e6:.1f} MB)")
+
+    @staticmethod
+    def load_samples(path: Union[str, Path]) -> List[Dict]:
+        """Load a previously-pickled sample list."""
+        path = Path(path)
+        with open(path, "rb") as f:
+            samples = pickle.load(f)
+        print(f"Loaded {len(samples)} samples ← {path}")
+        return samples
+
     def build_samples(
         self,
         tech_lookback: int = 64,
@@ -757,6 +776,7 @@ class V3ContinuousPrep:
         sample_session_start: Optional[str] = None,
         sample_session_end: Optional[str] = None,
         stride: int = 1,
+        cache_path: Optional[Union[str, Path]] = None,
     ) -> List[Dict]:
         """Build flat list of sample dicts for V3ContinuousDataset.
 
@@ -795,7 +815,16 @@ class V3ContinuousPrep:
             Take every *stride*-th eligible bar per day. Use stride=6
             with 5-min bars and a 30-min target to get non-overlapping
             samples.  Default 1 (every bar).
+        cache_path : str or Path, optional
+            If set, try loading samples from this pickle first.  On
+            cache miss the samples are built normally and saved for
+            next time.
         """
+        if cache_path is not None:
+            cache_path = Path(cache_path)
+            if cache_path.exists():
+                return self.load_samples(cache_path)
+
         samples = []
         for ticker in self.tickers:
             df = self._tech_dfs.get(ticker)
@@ -1111,6 +1140,9 @@ class V3ContinuousPrep:
                         f"ae_feats_type={type(list(ae_feats.keys())[0]) if ae_feats else 'empty'}, "
                         f"unique_dates_type={type(unique_dates[0])}"
                     )
+
+        if cache_path is not None:
+            self.save_samples(samples, cache_path)
 
         return samples
 
