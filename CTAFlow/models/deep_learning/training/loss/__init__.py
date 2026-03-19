@@ -97,6 +97,9 @@ from .regression import (
     TradingPnLLoss,
     WeightedDirectionalMSE,
     CombinedRegressionLoss,
+    # MDN density losses
+    MDNNLLLoss,
+    MDNEntropyRegularizer,
 )
 
 __all__ = [
@@ -125,4 +128,7 @@ __all__ = [
     'TradingPnLLoss',
     'WeightedDirectionalMSE',
     'CombinedRegressionLoss',
+    # MDN
+    'MDNNLLLoss',
+    'MDNEntropyRegularizer',
 ]

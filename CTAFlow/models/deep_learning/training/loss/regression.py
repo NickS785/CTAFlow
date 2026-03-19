@@ -769,6 +769,117 @@ class CombinedRegressionLoss(nn.Module):
         return loss
 
 
+
+# ---------------------------------------------------------------------------
+# MDN-specific losses
+# ---------------------------------------------------------------------------
+
+import math as _math
+
+
+class MDNNLLLoss(nn.Module):
+    """
+    Negative log-likelihood loss for a Gaussian Mixture Density Network.
+
+    p(y | x) = Σ_k π_k · N(y; μ_k, σ_k²)
+    Loss = -log p(y | x), computed via log-sum-exp for numerical stability.
+
+    Parameters
+    ----------
+    reduction : str
+        'mean' or 'sum'. Default 'mean'.
+
+    Usage
+    -----
+        criterion = MDNNLLLoss()
+        pi, mu, sigma = model(x)
+        loss = criterion(pi, mu, sigma, y)
+    """
+
+    def __init__(self, reduction: Literal["mean", "sum"] = "mean"):
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(
+        self,
+        pi: torch.Tensor,
+        mu: torch.Tensor,
+        sigma: torch.Tensor,
+        y: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            pi:    (B, K) mixing weights
+            mu:    (B, K) component means
+            sigma: (B, K) component std devs
+            y:     (B,) or (B, 1) targets
+
+        Returns:
+            Scalar NLL
+        """
+        if y.dim() == 1:
+            y = y.unsqueeze(-1)  # (B, 1)
+
+        log_pi = torch.log(pi + 1e-10)
+        log_normal = (
+            -0.5 * _math.log(2 * _math.pi)
+            - torch.log(sigma)
+            - 0.5 * ((y - mu) / sigma) ** 2
+        )
+        log_mix = torch.logsumexp(log_pi + log_normal, dim=-1)  # (B,)
+
+        if self.reduction == "mean":
+            return -log_mix.mean()
+        return -log_mix.sum()
+
+
+class MDNEntropyRegularizer(nn.Module):
+    """
+    Entropy regularization for MDN mixing weights.
+
+    Encourages component utilization by penalizing low entropy in π.
+    Prevents mode collapse where one component absorbs all the weight.
+
+    The penalty is a hinge loss: max(0, target_entropy − batch_entropy),
+    so it only activates when entropy falls below the target fraction of
+    the theoretical maximum log(K).
+
+    Parameters
+    ----------
+    target_entropy_frac : float
+        Target entropy as a fraction of max entropy log(K). Default 0.5.
+
+    Usage
+    -----
+        nll_loss  = MDNNLLLoss()
+        ent_reg   = MDNEntropyRegularizer(target_entropy_frac=0.5)
+
+        pi, mu, sigma = model(x)
+        loss = nll_loss(pi, mu, sigma, y) + 0.1 * ent_reg(pi)
+    """
+
+    def __init__(self, target_entropy_frac: float = 0.5):
+        super().__init__()
+        self.target_entropy_frac = target_entropy_frac
+
+    def forward(self, pi: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pi: (B, K) mixing weights
+
+        Returns:
+            Scalar hinge penalty
+        """
+        K = pi.shape[1]
+        max_entropy = _math.log(K)
+        target = self.target_entropy_frac * max_entropy
+
+        pi_avg = pi.mean(dim=0)                               # (K,)
+        entropy = -(pi_avg * torch.log(pi_avg + 1e-10)).sum()
+
+        return torch.relu(target - entropy)
+
+
 # Convenience exports
 __all__ = [
     'DirectionalMSE',
@@ -782,4 +893,7 @@ __all__ = [
     'TradingPnLLoss',
     'WeightedDirectionalMSE',
     'CombinedRegressionLoss',
+    # MDN
+    'MDNNLLLoss',
+    'MDNEntropyRegularizer',
 ]
