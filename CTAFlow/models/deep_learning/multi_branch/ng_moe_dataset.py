@@ -7,7 +7,8 @@ Two aligned feature streams built from price + EIA storage:
   x_seq    (seq_len, n_feat)   -- price technicals, momentum, vol
   ae_input (ae_window, 12)     -- regime features driven by storage state
 
-Sampled at **Monday close** to forecast the Thursday EIA storage report.
+Target: **1-day forward log return** (price_return) or storage_change.
+EIA storage data feeds regime features and daily storage inputs, not the target.
 
 Regime features (f_ae = 12):
   Returns & Vol:   ret_1d, ret_5d, ret_21d, rv_5d, rv_21d
@@ -428,7 +429,7 @@ class NGMoEDataBuilder:
         forward-filled to daily so every day in a given week has the same
         target (the upcoming report).
 
-        For ``price_return`` target: 5-day forward return from current close.
+        For ``price_return`` target: 1-day forward log return.
         """
         cfg = self.config
 
@@ -441,18 +442,22 @@ class NGMoEDataBuilder:
                 tgt_wkly.index.union(df.index)
             ).sort_index().ffill().reindex(df.index)
             df["target"] = tgt_daily.values
-        else:
-            # 5-day forward log return (Monday close -> Friday close)
-            df["target"] = df["log_ret"].rolling(5).sum().shift(-5)
 
-        # Target std: trailing 5-day realised std of storage change
-        # (proxy for forecast uncertainty)
-        sc = storage_wkly["storage_change"]
-        sc_std = sc.rolling(8, min_periods=4).std()
-        std_daily = sc_std.reindex(
-            sc_std.index.union(df.index)
-        ).sort_index().ffill().reindex(df.index)
-        df["target_std"] = std_daily.values
+            # Target std: trailing realised std of storage change
+            sc = storage_wkly["storage_change"]
+            sc_std = sc.rolling(8, min_periods=4).std()
+            std_daily = sc_std.reindex(
+                sc_std.index.union(df.index)
+            ).sort_index().ffill().reindex(df.index)
+            df["target_std"] = std_daily.values
+        else:
+            # 1-day forward log return
+            df["target"] = df["log_ret"].shift(-1)
+
+            # Target std: trailing realised vol of daily returns
+            df["target_std"] = df["log_ret"].rolling(
+                21, min_periods=10
+            ).std()
 
     # ============================================================ Helpers
     def get_monday_mask(self, df: pd.DataFrame) -> pd.Series:

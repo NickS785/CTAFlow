@@ -392,8 +392,7 @@ class BasicBlock(nn.Module):
                     self.expansion * planes,
                     kernel_size=1,
                     stride=stride,
-                    bias=False,
-                ),
+                    bias=False,                ),
                 nn.BatchNorm2d(self.expansion * planes),
             )
 
