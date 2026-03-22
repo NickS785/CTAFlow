@@ -42,7 +42,8 @@ class NGMoEDataConfig:
     ae_window: int = 21        # lookback window for regime encoder
 
     # Target
-    target: str = "storage_change"  # storage_change | surprise | price_return
+    target: str = "price_return"  # storage_change | surprise | price_return
+    target_horizon: int = 1       # forward days for price_return target (1=next day, 5=week)
 
     # Technical indicator windows
     vol_windows: List[int] = field(default_factory=lambda: [5, 10, 20, 60])
@@ -87,6 +88,7 @@ class NGMoEDataBuilder:
         price_df: pd.DataFrame,
         storage_wkly: pd.DataFrame,
         sarimax_features: pd.DataFrame | None = None,
+        daily_weather: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """Return a daily DataFrame ready for windowed sampling.
 
@@ -97,6 +99,8 @@ class NGMoEDataBuilder:
             ``storage_change``, and optionally ``consensus_est``, ``surprise``.
         sarimax_features : Output of ``NatGasStorageForecaster.build_features``
             (optional).  Used for forecast-vs-seasonal regime features.
+        daily_weather : Output of ``PopulationWeatherGrid.get_weighted_daily()``
+            (optional).  Adds degree-day features with spline HDD basis.
         """
         df = price_df.copy()
         if isinstance(df.columns, pd.MultiIndex):
@@ -114,6 +118,10 @@ class NGMoEDataBuilder:
         self._add_microstructure_features(df)
         self._add_temporal_features(df)
         self._add_storage_daily_features(df, storage_wkly)
+
+        # --- Weather features (degree days + spline HDD) ---
+        if daily_weather is not None:
+            self._add_weather_features(df, daily_weather)
 
         # --- Regime features (ae_input, storage-driven) ---
         self._add_regime_features(df, storage_wkly, sarimax_features)
@@ -310,6 +318,66 @@ class NGMoEDataBuilder:
             df[col] = daily_storage[col].values
             self.feature_cols.append(col)
 
+    # ============================================================ Weather
+    def _add_weather_features(
+        self, df: pd.DataFrame, daily_weather: pd.DataFrame,
+    ) -> None:
+        """Add population-weighted degree-day features with spline HDD basis.
+
+        Parameters
+        ----------
+        daily_weather : Output of ``PopulationWeatherGrid.get_weighted_daily()``
+            with at least ``wtd_TAVG`` column.  Index is DatetimeIndex.
+        """
+        from MacrOSINT.models.energy.natgas_storage_forecast import (
+            compute_degree_days,
+            compute_spline_hdd_basis,
+        )
+
+        # Compute daily degree days
+        dd = compute_degree_days(daily_weather)  # HDD, CDD, HDD_mild, HDD_extreme
+        dd = dd.reindex(df.index)
+
+        # Daily HDD and CDD
+        df["dd_hdd"] = dd["HDD"].values
+        df["dd_cdd"] = dd["CDD"].values
+        self.feature_cols.extend(["dd_hdd", "dd_cdd"])
+
+        # Rolling 7-day sums (weekly demand signal aligned to daily grid)
+        df["dd_hdd_7d"] = dd["HDD"].rolling(7, min_periods=3).sum().values
+        df["dd_cdd_7d"] = dd["CDD"].rolling(7, min_periods=3).sum().values
+        self.feature_cols.extend(["dd_hdd_7d", "dd_cdd_7d"])
+
+        # Spline HDD basis on rolling 7-day HDD (captures non-linear cold response)
+        hdd_7d = pd.Series(df["dd_hdd_7d"].values, index=df.index).fillna(0)
+        try:
+            spline_df, self._spline_transformer = compute_spline_hdd_basis(
+                hdd_7d,
+                n_knots=4,
+                transformer=getattr(self, "_spline_transformer", None),
+            )
+            for col in spline_df.columns:
+                df[col] = spline_df[col].values
+                self.feature_cols.append(col)
+        except Exception:
+            pass  # sklearn not available -- skip spline
+
+        # HDD/CDD momentum (weekly change)
+        df["dd_hdd_7d_chg"] = df["dd_hdd_7d"] - pd.Series(
+            df["dd_hdd_7d"].values, index=df.index
+        ).shift(7).values
+        df["dd_cdd_7d_chg"] = df["dd_cdd_7d"] - pd.Series(
+            df["dd_cdd_7d"].values, index=df.index
+        ).shift(7).values
+        self.feature_cols.extend(["dd_hdd_7d_chg", "dd_cdd_7d_chg"])
+
+        # Population-weighted temperature (raw signal)
+        if "wtd_TAVG" in daily_weather.columns:
+            tavg = daily_weather["wtd_TAVG"].reindex(df.index)
+            df["wtd_tavg"] = tavg.values
+            df["wtd_tavg_7d_ma"] = tavg.rolling(7, min_periods=3).mean().values
+            self.feature_cols.extend(["wtd_tavg", "wtd_tavg_7d_ma"])
+
     # ============================================================ Regime
     def _add_regime_features(
         self,
@@ -429,7 +497,7 @@ class NGMoEDataBuilder:
         forward-filled to daily so every day in a given week has the same
         target (the upcoming report).
 
-        For ``price_return`` target: 1-day forward log return.
+        For ``price_return`` target: forward log return over ``target_horizon`` days.
         """
         cfg = self.config
 
@@ -451,13 +519,16 @@ class NGMoEDataBuilder:
             ).sort_index().ffill().reindex(df.index)
             df["target_std"] = std_daily.values
         else:
-            # 1-day forward log return
-            df["target"] = df["log_ret"].shift(-1)
+            h = cfg.target_horizon
+            if h == 1:
+                df["target"] = df["log_ret"].shift(-1)
+            else:
+                # h-day forward cumulative log return
+                df["target"] = df["log_ret"].rolling(h).sum().shift(-h)
 
-            # Target std: trailing realised vol of daily returns
-            df["target_std"] = df["log_ret"].rolling(
-                21, min_periods=10
-            ).std()
+            # Target std: trailing realised vol scaled to horizon
+            daily_vol = df["log_ret"].rolling(21, min_periods=10).std()
+            df["target_std"] = daily_vol * np.sqrt(h)
 
     # ============================================================ Helpers
     def get_monday_mask(self, df: pd.DataFrame) -> pd.Series:
@@ -543,6 +614,7 @@ def build_datasets(
     price_df: pd.DataFrame,
     storage_wkly: pd.DataFrame,
     sarimax_features: pd.DataFrame | None = None,
+    daily_weather: pd.DataFrame | None = None,
     config: NGMoEDataConfig | None = None,
     train_frac: float = 0.70,
     val_frac: float = 0.15,
@@ -563,7 +635,7 @@ def build_datasets(
     """
     config = config or NGMoEDataConfig()
     builder = NGMoEDataBuilder(config)
-    daily = builder.build(price_df, storage_wkly, sarimax_features)
+    daily = builder.build(price_df, storage_wkly, sarimax_features, daily_weather)
 
     # Chronological split on the full daily df
     n = len(daily)
