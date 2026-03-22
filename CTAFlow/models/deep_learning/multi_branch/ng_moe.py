@@ -80,6 +80,14 @@ class MoEConfig:
     return_loss_weight: float = 1.0
     vol_loss_weight: float = 1.0
 
+    # --- Classification / Positioning head ---
+    n_classes: int = 0              # 0 = regression only, 4 = quartile classification
+    use_positioning_head: bool = False  # tanh exposure head on top of class logits
+    positioning_hidden_dim: int = 32
+    ce_weight: float = 1.0         # cross-entropy loss weight
+    positioning_pnl_weight: float = 1.0  # PnL-based positioning loss weight
+    tc_cost: float = 0.0           # transaction cost for positioning loss
+
     @property
     def n_routed_experts(self) -> int:
         return self.n_tcn_experts + self.n_mdn_experts
@@ -305,6 +313,49 @@ class SharedExpert(nn.Module):
 
 
 # ============================================================================
+# 5b. CLASSIFICATION + POSITIONING HEADS
+# ============================================================================
+
+class ClassificationHead(nn.Module):
+    """Maps MoE return/std embeddings to class logits."""
+
+    def __init__(self, input_dim: int, n_classes: int, dropout: float = 0.2):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Linear(input_dim, input_dim),
+            nn.LayerNorm(input_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(input_dim, n_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(x)  # (B, n_classes)
+
+
+class PositioningHead(nn.Module):
+    """Maps class logits -> tanh exposure in [-1, +1].
+
+    Architecture: softmax(logits) -> MLP -> tanh
+    The class probabilities encode the return distribution belief;
+    the MLP learns the optimal exposure mapping from that belief.
+    """
+
+    def __init__(self, n_classes: int, hidden_dim: int = 32, dropout: float = 0.2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_classes, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, logits: torch.Tensor) -> torch.Tensor:
+        probs = torch.softmax(logits, dim=-1)  # (B, n_classes)
+        return torch.tanh(self.net(probs)).squeeze(-1)  # (B,)
+
+
+# ============================================================================
 # 6. REGIME-CONDITIONED ROUTER
 # ============================================================================
 
@@ -423,6 +474,20 @@ class NatGasMoE(nn.Module):
         # Learned shared-vs-routed mixing weight
         self.shared_gate = nn.Parameter(torch.tensor(0.5))
 
+        # --- Classification + Positioning heads (optional) ---
+        self.class_head = None
+        self.pos_head = None
+        if config.n_classes > 0:
+            # Input: concatenated [pred_return, pred_std, z_regime] -> class logits
+            cls_input_dim = 2 + config.d_latent
+            self.class_head = ClassificationHead(
+                cls_input_dim, config.n_classes, config.dropout,
+            )
+            if config.use_positioning_head:
+                self.pos_head = PositioningHead(
+                    config.n_classes, config.positioning_hidden_dim, config.dropout,
+                )
+
     def forward(
         self,
         x_seq: torch.Tensor,       # (B, L, F)
@@ -481,7 +546,7 @@ class NatGasMoE(nn.Module):
         entropy = -(pi_avg * torch.log(pi_avg + 1e-10)).sum()
         entropy_loss = torch.relu(0.5 * math.log(self.config.n_routed_experts) - entropy)
 
-        return {
+        result = {
             "pred_return": pred_return,
             "pred_std": pred_std,
             "router_weights": weights,
@@ -492,6 +557,20 @@ class NatGasMoE(nn.Module):
             "shared_gate": alpha,
             "z_regime": z_regime,
         }
+
+        # --- Classification head ---
+        if self.class_head is not None:
+            cls_input = torch.cat([
+                pred_return.unsqueeze(-1),
+                pred_std.unsqueeze(-1),
+                z_regime,
+            ], dim=-1)
+            result["class_logits"] = self.class_head(cls_input)  # (B, n_classes)
+
+            if self.pos_head is not None:
+                result["position"] = self.pos_head(result["class_logits"])  # (B,)
+
+        return result
 
     @torch.no_grad()
     def compute_mdn_nll(
@@ -531,15 +610,23 @@ class NatGasMoE(nn.Module):
 class MoELoss(nn.Module):
     """Multi-task loss for TCN + MDN MoE.
 
-    L = λ_ret * Huber(return) + λ_vol * MSE(log_std)
-      + λ_nll * MDN_NLL + λ_bal * balance + λ_ent * entropy + AE_loss
+    Regression mode:
+      L = λ_ret * Huber(return) + λ_vol * MSE(log_std)
+        + λ_nll * MDN_NLL + λ_bal * balance + λ_ent * entropy + AE_loss
+
+    Classification mode (n_classes > 0):
+      Adds λ_ce * CrossEntropy(class_logits, target_class)
+
+    Positioning mode (use_positioning_head):
+      Adds λ_pnl * PositioningPnL  (sharpe-aware PnL from tanh exposure)
     """
 
     def __init__(self, config: MoEConfig):
         super().__init__()
         self.config = config
 
-    def forward(self, model_out, target_return, target_std):
+    def forward(self, model_out, target_return, target_std,
+                target_class=None):
         # Return loss (Huber for robustness to storage-surprise spikes)
         return_loss = F.huber_loss(
             model_out["pred_return"], target_return, delta=0.5,
@@ -563,7 +650,7 @@ class MoELoss(nn.Module):
             + ae["total_ae_loss"]
         )
 
-        return {
+        losses = {
             "total_loss": total,
             "return_loss": return_loss,
             "vol_loss": vol_loss,
@@ -573,6 +660,39 @@ class MoELoss(nn.Module):
             "ae_recon_loss": ae["recon_loss"],
             "ae_kl_loss": ae["kl_loss"],
         }
+
+        # --- Classification loss ---
+        if "class_logits" in model_out and target_class is not None:
+            ce_loss = F.cross_entropy(model_out["class_logits"], target_class)
+            losses["ce_loss"] = ce_loss
+            losses["total_loss"] = losses["total_loss"] + cfg.ce_weight * ce_loss
+
+            # Classification accuracy (for logging)
+            with torch.no_grad():
+                preds = model_out["class_logits"].argmax(dim=-1)
+                losses["class_accuracy"] = (preds == target_class).float().mean()
+
+        # --- Positioning PnL loss ---
+        if "position" in model_out:
+            position = model_out["position"]  # (B,) in [-1, 1]
+            strategy_ret = position * target_return
+
+            # Transaction cost penalty (approx position change)
+            tc_penalty = cfg.tc_cost * position.abs().mean()
+
+            # Negative Sharpe-like objective
+            mean_ret = strategy_ret.mean()
+            std_ret = strategy_ret.std().clamp(min=1e-6)
+            neg_sharpe = -(mean_ret - tc_penalty) / std_ret
+
+            losses["positioning_loss"] = neg_sharpe
+            losses["total_loss"] = losses["total_loss"] + cfg.positioning_pnl_weight * neg_sharpe
+
+            with torch.no_grad():
+                losses["mean_position"] = position.mean()
+                losses["mean_strategy_ret"] = strategy_ret.mean()
+
+        return losses
 
 
 # ============================================================================
@@ -584,6 +704,9 @@ def run_demo():
     print("NatGas MoE (TCN + MDN) — Smoke Test")
     print("=" * 70)
 
+    B = 32
+
+    # --- Regression mode ---
     config = MoEConfig(
         n_features=40, seq_len=20,
         f_ae=12, ae_window=21, d_latent=32,
@@ -592,42 +715,50 @@ def run_demo():
     model = NatGasMoE(config)
     loss_fn = MoELoss(config)
 
-    B = 32
     x_seq = torch.randn(B, config.seq_len, config.n_features)
     ae_input = torch.randn(B, config.ae_window, config.f_ae)
     target_ret = torch.randn(B) * 0.03
     target_std = torch.rand(B) * 0.02 + 0.01
 
-    print("\n[1] Forward pass...")
+    print("\n[1] Regression forward pass...")
     out = model(x_seq, ae_input)
     print(f"    pred_return:    {out['pred_return'].shape}")
     print(f"    pred_std:       {out['pred_std'].shape}")
-    print(f"    z_regime:       {out['z_regime'].shape}")
     print(f"    shared_gate:    {out['shared_gate'].item():.3f}")
 
-    w = out["router_weights"]
-    for etype in ["tcn", "mdn"]:
-        mask = [i for i, t in enumerate(model.expert_types) if t == etype]
-        print(f"    avg_weight_{etype}: {w[:, mask].sum(dim=-1).mean().item():.3f}")
-
-    print("\n[2] Loss computation...")
     losses = loss_fn(out, target_ret, target_std)
+    for k, v in losses.items():
+        print(f"    {k}: {v.item():.6f}")
+
+    # --- Classification + Positioning mode ---
+    print("\n[2] Classification + Positioning mode...")
+    cls_config = MoEConfig(
+        n_features=40, seq_len=20,
+        f_ae=12, ae_window=21, d_latent=32,
+        n_tcn_experts=3, n_mdn_experts=3, top_k=3,
+        n_classes=4, use_positioning_head=True,
+        ce_weight=1.0, positioning_pnl_weight=0.5,
+    )
+    cls_model = NatGasMoE(cls_config)
+    cls_loss_fn = MoELoss(cls_config)
+
+    out = cls_model(x_seq, ae_input)
+    target_class = torch.randint(0, 4, (B,))
+
+    print(f"    class_logits:   {out['class_logits'].shape}")
+    print(f"    position:       {out['position'].shape}")
+    print(f"    position range: [{out['position'].min().item():.3f}, {out['position'].max().item():.3f}]")
+
+    losses = cls_loss_fn(out, target_ret, target_std, target_class)
     for k, v in losses.items():
         print(f"    {k}: {v.item():.6f}")
 
     print("\n[3] Backward pass...")
     losses["total_loss"].backward()
-    n_params = sum(p.numel() for p in model.parameters())
-    n_grad = sum(p.numel() for p in model.parameters() if p.grad is not None)
+    n_params = sum(p.numel() for p in cls_model.parameters())
+    n_grad = sum(p.numel() for p in cls_model.parameters() if p.grad is not None)
     print(f"    Total params:   {n_params:,}")
     print(f"    Params w/ grad: {n_grad:,}")
-
-    vae_grad = model.vae.encoder[0].weight.grad
-    router_grad = model.router.gate[0].weight.grad
-    print(f"    VAE encoder grad norm:  {vae_grad.norm().item():.6f}")
-    print(f"    Router gate grad norm:  {router_grad.norm().item():.6f}")
-    print(f"    Router input dim:       {model.router.gate[0].in_features}"
-          f"  (trunk=64 + regime={config.d_latent})")
 
     print("\n" + "=" * 70)
     print("Smoke test PASSED")

@@ -45,6 +45,10 @@ class NGMoEDataConfig:
     target: str = "price_return"  # storage_change | surprise | price_return
     target_horizon: int = 1       # forward days for price_return target (1=next day, 5=week)
 
+    # Classification mode
+    n_classes: int = 0            # 0 = regression, 4 = quartile classification
+    class_boundaries: Optional[List[float]] = None  # custom quantile boundaries
+
     # Technical indicator windows
     vol_windows: List[int] = field(default_factory=lambda: [5, 10, 20, 60])
     momentum_windows: List[int] = field(default_factory=lambda: [1, 5, 10, 20])
@@ -131,6 +135,8 @@ class NGMoEDataBuilder:
 
         # Drop warm-up NaNs
         keep = self.feature_cols + self.regime_cols + ["target", "target_std"]
+        if "target_class" in df.columns:
+            keep.append("target_class")
         keep = [c for c in keep if c in df.columns]
         df = df.dropna(subset=keep)
 
@@ -498,20 +504,20 @@ class NGMoEDataBuilder:
         target (the upcoming report).
 
         For ``price_return`` target: forward log return over ``target_horizon`` days.
+
+        If ``n_classes > 0``, also computes ``target_class`` using expanding
+        quantile boundaries (causal -- no lookahead).
         """
         cfg = self.config
 
         if cfg.target in ("storage_change", "surprise"):
             col = cfg.target if cfg.target in storage_wkly.columns else "storage_change"
-            # Shift storage change back by 1 week so each week's rows
-            # point at the NEXT report (the one we're predicting)
             tgt_wkly = storage_wkly[col].shift(-1)
             tgt_daily = tgt_wkly.reindex(
                 tgt_wkly.index.union(df.index)
             ).sort_index().ffill().reindex(df.index)
             df["target"] = tgt_daily.values
 
-            # Target std: trailing realised std of storage change
             sc = storage_wkly["storage_change"]
             sc_std = sc.rolling(8, min_periods=4).std()
             std_daily = sc_std.reindex(
@@ -523,12 +529,59 @@ class NGMoEDataBuilder:
             if h == 1:
                 df["target"] = df["log_ret"].shift(-1)
             else:
-                # h-day forward cumulative log return
                 df["target"] = df["log_ret"].rolling(h).sum().shift(-h)
 
-            # Target std: trailing realised vol scaled to horizon
             daily_vol = df["log_ret"].rolling(21, min_periods=10).std()
             df["target_std"] = daily_vol * np.sqrt(h)
+
+        # --- Classification target (expanding quantile, causal) ---
+        if cfg.n_classes > 0:
+            df["target_class"] = self._compute_target_classes(
+                df["target"], cfg.n_classes, cfg.class_boundaries,
+            )
+
+    @staticmethod
+    def _compute_target_classes(
+        target: pd.Series,
+        n_classes: int,
+        fixed_boundaries: Optional[List[float]] = None,
+    ) -> pd.Series:
+        """Assign each return to a class via expanding quantile boundaries.
+
+        Default 4 classes: <25th, 25-50th, 50-75th, >75th percentile.
+        Uses expanding window so boundaries are causal (no lookahead).
+        """
+        classes = pd.Series(np.nan, index=target.index, dtype=np.float32)
+        if fixed_boundaries is not None:
+            boundaries = fixed_boundaries
+            for i, val in enumerate(target):
+                if np.isnan(val):
+                    continue
+                cls = n_classes - 1
+                for j, b in enumerate(boundaries):
+                    if val < b:
+                        cls = j
+                        break
+                classes.iloc[i] = cls
+        else:
+            quantiles = np.linspace(0, 1, n_classes + 1)[1:-1]  # e.g. [0.25, 0.5, 0.75]
+            min_obs = max(50, n_classes * 10)
+            vals = target.values.astype(np.float64)
+            for i in range(len(vals)):
+                if np.isnan(vals[i]):
+                    continue
+                history = vals[:i]
+                history = history[np.isfinite(history)]
+                if len(history) < min_obs:
+                    continue
+                boundaries = np.quantile(history, quantiles)
+                cls = n_classes - 1
+                for j, b in enumerate(boundaries):
+                    if vals[i] < b:
+                        cls = j
+                        break
+                classes.iloc[i] = cls
+        return classes
 
     # ============================================================ Helpers
     def get_monday_mask(self, df: pd.DataFrame) -> pd.Series:
@@ -541,7 +594,8 @@ class NGMoEDataBuilder:
 # ---------------------------------------------------------------------------
 
 class NGMoEWindowDataset(Dataset):
-    """Sliding-window dataset that yields (x_seq, ae_input, y_ret, y_std).
+    """Sliding-window dataset that yields (x_seq, ae_input, y_ret, y_std)
+    or (x_seq, ae_input, y_ret, y_std, y_class) when classification is enabled.
 
     Parameters
     ----------
@@ -566,6 +620,7 @@ class NGMoEWindowDataset(Dataset):
         self.seq_len = cfg.seq_len
         self.ae_window = cfg.ae_window
         self.monday_only = monday_only
+        self.n_classes = cfg.n_classes
         warmup = max(self.seq_len, self.ae_window)
 
         # Convert to arrays
@@ -573,6 +628,9 @@ class NGMoEWindowDataset(Dataset):
         self.R = daily_df[regime_cols].values.astype(np.float32)
         self.y_ret = daily_df["target"].values.astype(np.float32)
         self.y_std = daily_df["target_std"].values.astype(np.float32)
+        self.has_classes = "target_class" in daily_df.columns and cfg.n_classes > 0
+        if self.has_classes:
+            self.y_class = daily_df["target_class"].values.astype(np.int64)
         self.dates = daily_df.index
 
         # Valid indices (enough lookback + non-NaN target)
@@ -583,6 +641,8 @@ class NGMoEWindowDataset(Dataset):
 
         # Remove any with NaN target
         ok = np.isfinite(self.y_ret[valid]) & np.isfinite(self.y_std[valid])
+        if self.has_classes:
+            ok &= np.isfinite(self.y_class[valid].astype(np.float64))
         self.indices = valid[ok]
 
     def __len__(self) -> int:
@@ -599,6 +659,10 @@ class NGMoEWindowDataset(Dataset):
         )
         y_ret = torch.tensor(self.y_ret[t])
         y_std = torch.tensor(self.y_std[t])
+
+        if self.has_classes:
+            y_class = torch.tensor(self.y_class[t], dtype=torch.long)
+            return x_seq, ae_input, y_ret, y_std, y_class
 
         return x_seq, ae_input, y_ret, y_std
 
