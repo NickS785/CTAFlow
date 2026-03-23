@@ -85,6 +85,8 @@ class NGMoEDataBuilder:
         self.config = config or NGMoEDataConfig()
         self.feature_cols: List[str] = []
         self.regime_cols: List[str] = list(REGIME_COLS)
+        self.feature_groups: Dict[str, List[str]] = {}
+        self._current_group: Optional[str] = None
 
     # ------------------------------------------------------------------ build
     def build(
@@ -116,16 +118,37 @@ class NGMoEDataBuilder:
 
         # --- Technical features (x_seq) ---
         self.feature_cols = []
+        self.feature_groups = {}
+
+        self._begin_group("returns")
         self._add_return_features(df)
+        self._end_group("returns")
+
+        self._begin_group("volatility")
         self._add_volatility_features(df)
+        self._end_group("volatility")
+
+        self._begin_group("momentum")
         self._add_momentum_features(df)
+        self._end_group("momentum")
+
+        self._begin_group("microstructure")
         self._add_microstructure_features(df)
+        self._end_group("microstructure")
+
+        self._begin_group("temporal")
         self._add_temporal_features(df)
+        self._end_group("temporal")
+
+        self._begin_group("storage")
         self._add_storage_daily_features(df, storage_wkly)
+        self._end_group("storage")
 
         # --- Weather features (degree days + spline HDD) ---
         if daily_weather is not None:
+            self._begin_group("weather")
             self._add_weather_features(df, daily_weather)
+            self._end_group("weather")
 
         # --- Regime features (ae_input, storage-driven) ---
         self._add_regime_features(df, storage_wkly, sarimax_features)
@@ -583,6 +606,19 @@ class NGMoEDataBuilder:
                 classes.iloc[i] = cls
         return classes
 
+    # ============================================================ Group tracking
+    def _begin_group(self, name: str) -> None:
+        """Mark the start of a feature group for variable selection."""
+        self._current_group = name
+        self._group_start_idx = len(self.feature_cols)
+
+    def _end_group(self, name: str) -> None:
+        """Record which feature_cols belong to this group."""
+        cols = self.feature_cols[self._group_start_idx:]
+        if cols:
+            self.feature_groups[name] = list(cols)
+        self._current_group = None
+
     # ============================================================ Helpers
     def get_monday_mask(self, df: pd.DataFrame) -> pd.Series:
         """Boolean mask for Monday rows (forecast origin)."""
@@ -723,6 +759,7 @@ def build_datasets(
     meta = {
         "feature_cols": builder.feature_cols,
         "regime_cols": builder.regime_cols,
+        "feature_groups": builder.feature_groups,
         "n_features": len(builder.feature_cols),
         "daily_df": daily,
         "builder": builder,

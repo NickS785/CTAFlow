@@ -80,6 +80,14 @@ class MoEConfig:
     return_loss_weight: float = 1.0
     vol_loss_weight: float = 1.0
 
+    # --- Grouped Variable Selection ---
+    use_vsn: bool = False
+    vsn_d_model: int = 32           # output dim per group after GRN
+    vsn_temperature: float = 1.5    # softmax temperature (higher = softer)
+    vsn_entropy_weight: float = 0.1 # anti-collapse entropy regularization
+    vsn_min_weight: float = 0.05    # minimum per-group weight floor
+    # feature_group_sizes set at runtime from NGMoEDataBuilder.feature_groups
+
     # --- Classification / Positioning head ---
     n_classes: int = 0              # 0 = regression only, 4 = quartile classification
     use_positioning_head: bool = False  # tanh exposure head on top of class logits
@@ -313,7 +321,149 @@ class SharedExpert(nn.Module):
 
 
 # ============================================================================
-# 5b. CLASSIFICATION + POSITIONING HEADS
+# 5b. GROUPED VARIABLE SELECTION NETWORK
+# ============================================================================
+
+class GroupedFeatureVSN(nn.Module):
+    """Variable Selection over logical feature groups, conditioned on z_regime.
+
+    Each group (returns, volatility, momentum, microstructure, temporal,
+    storage, weather) is projected through its own GRN into a common d_model
+    space. A regime-conditioned selection network then produces per-group
+    softmax weights with anti-collapse mechanisms (temperature scaling,
+    entropy regularization, minimum weight floor).
+
+    Output: (B, L, d_model) selected representation replacing raw features.
+
+    Parameters
+    ----------
+    group_sizes : dict  {group_name: n_features_in_group}
+        Ordered dict mapping group names to feature counts.
+    d_model : int
+        Common output dimension per group.
+    d_context : int
+        Dimension of conditioning context (z_regime).
+    dropout : float
+    temperature : float
+        Softmax temperature for anti-collapse.
+    entropy_weight : float
+        Weight for entropy regularization loss.
+    min_weight : float
+        Minimum per-group weight floor.
+    """
+
+    def __init__(
+        self,
+        group_sizes: Dict[str, int],
+        d_model: int = 32,
+        d_context: int = 32,
+        dropout: float = 0.2,
+        temperature: float = 1.5,
+        entropy_weight: float = 0.1,
+        min_weight: float = 0.05,
+    ):
+        super().__init__()
+        self.group_names = list(group_sizes.keys())
+        self.group_sizes = list(group_sizes.values())
+        self.n_groups = len(self.group_names)
+        self.d_model = d_model
+        self.temperature = temperature
+        self.entropy_weight = entropy_weight
+        self.min_weight = min_weight
+
+        # Per-group GRN: projects group features -> d_model
+        self.group_grns = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(n_feat, d_model),
+                nn.LayerNorm(d_model),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_model, d_model),
+                nn.LayerNorm(d_model),
+            )
+            for n_feat in self.group_sizes
+        ])
+
+        # Selection network: [concat group embeddings + context] -> group weights
+        selection_input_dim = self.n_groups * d_model + d_context
+        self.selection_net = nn.Sequential(
+            nn.Linear(selection_input_dim, self.n_groups * 2),
+            nn.SiLU(),
+            nn.Linear(self.n_groups * 2, self.n_groups),
+        )
+
+        # Interpretability
+        self.last_weights: Optional[torch.Tensor] = None
+        self.last_entropy_loss: Optional[torch.Tensor] = None
+
+        # Precompute split indices
+        self._split_sizes = self.group_sizes
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Parameters
+        ----------
+        x : (B, L, F) raw feature sequence
+        context : (B, d_context) regime vector
+
+        Returns
+        -------
+        selected : (B, L, d_model) weighted group combination
+        weights : (B, n_groups) selection weights
+        """
+        B, L, _ = x.shape
+
+        # Split features into groups
+        groups = torch.split(x, self._split_sizes, dim=-1)
+
+        # Process each group through its GRN
+        processed = []
+        for grn, g in zip(self.group_grns, groups):
+            processed.append(grn(g))  # (B, L, d_model)
+
+        # Stack for weighted combination: (B, L, n_groups, d_model)
+        stacked = torch.stack(processed, dim=2)
+
+        # Selection weights from last-timestep group embeddings + context
+        # Use mean-pool over time for more stable selection signal
+        group_summaries = torch.stack(
+            [p.mean(dim=1) for p in processed], dim=1
+        )  # (B, n_groups, d_model)
+        flat = group_summaries.reshape(B, -1)  # (B, n_groups * d_model)
+        sel_input = torch.cat([flat, context], dim=-1)  # (B, n_groups*d_model + d_ctx)
+        logits = self.selection_net(sel_input)  # (B, n_groups)
+
+        # Temperature-scaled softmax
+        weights = F.softmax(logits / self.temperature, dim=-1)
+
+        # Minimum weight floor
+        if self.min_weight > 0:
+            weights = weights.clamp(min=self.min_weight)
+            weights = weights / weights.sum(dim=-1, keepdim=True)
+
+        # Entropy regularization loss
+        eps = 1e-8
+        entropy = -(weights * (weights + eps).log()).sum(dim=-1)  # (B,)
+        max_entropy = math.log(self.n_groups)
+        norm_entropy = entropy / max_entropy
+        entropy_loss = self.entropy_weight * (1.0 - norm_entropy).mean()
+
+        self.last_weights = weights.detach()
+        self.last_entropy_loss = entropy_loss.detach()
+
+        # Weighted combination: (B, L, n_groups, d_model) * (B, 1, n_groups, 1)
+        w_expanded = weights.unsqueeze(1).unsqueeze(-1)  # (B, 1, n_groups, 1)
+        selected = (stacked * w_expanded).sum(dim=2)  # (B, L, d_model)
+
+        return selected, entropy_loss
+
+
+# ============================================================================
+# 5c. CLASSIFICATION + POSITIONING HEADS
 # ============================================================================
 
 class ClassificationHead(nn.Module):
@@ -420,14 +570,32 @@ class NatGasMoE(nn.Module):
     penalises overconfidence in the tails.
     """
 
-    def __init__(self, config: MoEConfig):
+    def __init__(self, config: MoEConfig,
+                 feature_group_sizes: Optional[Dict[str, int]] = None):
         super().__init__()
         self.config = config
         trunk_dim = 64
 
+        # --- Grouped Variable Selection (optional) ---
+        self.vsn = None
+        if config.use_vsn and feature_group_sizes is not None:
+            self.vsn = GroupedFeatureVSN(
+                group_sizes=feature_group_sizes,
+                d_model=config.vsn_d_model,
+                d_context=config.d_latent,
+                dropout=config.dropout,
+                temperature=config.vsn_temperature,
+                entropy_weight=config.vsn_entropy_weight,
+                min_weight=config.vsn_min_weight,
+            )
+            # VSN projects features: n_features -> vsn_d_model
+            feat_dim = config.vsn_d_model
+        else:
+            feat_dim = config.n_features
+
         # Shared trunk
         self.trunk_encoder = nn.Sequential(
-            nn.Linear(config.n_features, 128),
+            nn.Linear(feat_dim, 128),
             nn.LayerNorm(128), nn.SiLU(), nn.Dropout(config.dropout),
             nn.Linear(128, trunk_dim),
             nn.LayerNorm(trunk_dim), nn.SiLU(),
@@ -457,7 +625,7 @@ class NatGasMoE(nn.Module):
         self.experts = nn.ModuleList()
         for _ in range(config.n_tcn_experts):
             self.experts.append(TCNExpert(
-                config.n_features, config.tcn_channels,
+                feat_dim, config.tcn_channels,
                 config.tcn_kernel_size, config.dropout,
             ))
         for _ in range(config.n_mdn_experts):
@@ -500,8 +668,15 @@ class NatGasMoE(nn.Module):
         # 1. VAE regime encoding
         z_regime, ae_losses = self.vae(ae_input)
 
-        # 2. Shared trunk
-        z_trunk = self.trunk_encoder(x_seq[:, -1, :])
+        # 1b. Grouped variable selection (optional)
+        vsn_entropy_loss = torch.tensor(0.0, device=device)
+        if self.vsn is not None:
+            x_selected, vsn_entropy_loss = self.vsn(x_seq, z_regime)
+        else:
+            x_selected = x_seq
+
+        # 2. Shared trunk (operates on last timestep)
+        z_trunk = self.trunk_encoder(x_selected[:, -1, :])
 
         # 3. Shared expert (regime-conditioned)
         shared_out = self.shared_expert(z_trunk, z_regime)
@@ -527,7 +702,7 @@ class NatGasMoE(nn.Module):
             if etype == "mdn":
                 out = expert(z_trunk[mask])
             else:
-                out = expert(x_seq[mask])
+                out = expert(x_selected[mask])
 
             w_active = w[mask]
             agg_return[mask] += out.pred_return * w_active
@@ -556,7 +731,10 @@ class NatGasMoE(nn.Module):
             "ae_losses": ae_losses,
             "shared_gate": alpha,
             "z_regime": z_regime,
+            "vsn_entropy_loss": vsn_entropy_loss,
         }
+        if self.vsn is not None and self.vsn.last_weights is not None:
+            result["vsn_weights"] = self.vsn.last_weights
 
         # --- Classification head ---
         if self.class_head is not None:
@@ -641,6 +819,8 @@ class MoELoss(nn.Module):
         cfg = self.config
         ae = model_out["ae_losses"]
 
+        vsn_entropy = model_out.get("vsn_entropy_loss", torch.tensor(0.0))
+
         total = (
             cfg.return_loss_weight * return_loss
             + cfg.vol_loss_weight * vol_loss
@@ -648,6 +828,7 @@ class MoELoss(nn.Module):
             + cfg.load_balance_weight * model_out["balance_loss"]
             + cfg.entropy_reg_weight * model_out["entropy_loss"]
             + ae["total_ae_loss"]
+            + vsn_entropy
         )
 
         losses = {
@@ -659,6 +840,7 @@ class MoELoss(nn.Module):
             "entropy_loss": model_out["entropy_loss"],
             "ae_recon_loss": ae["recon_loss"],
             "ae_kl_loss": ae["kl_loss"],
+            "vsn_entropy_loss": vsn_entropy,
         }
 
         # --- Classification loss ---
@@ -730,24 +912,33 @@ def run_demo():
     for k, v in losses.items():
         print(f"    {k}: {v.item():.6f}")
 
-    # --- Classification + Positioning mode ---
-    print("\n[2] Classification + Positioning mode...")
+    # --- Classification + Positioning + VSN mode ---
+    print("\n[2] Classification + Positioning + VSN mode...")
+    group_sizes = {
+        "returns": 12, "volatility": 8, "momentum": 10,
+        "temporal": 5, "storage": 5,
+    }
+    n_feat_total = sum(group_sizes.values())
     cls_config = MoEConfig(
-        n_features=40, seq_len=20,
+        n_features=n_feat_total, seq_len=20,
         f_ae=12, ae_window=21, d_latent=32,
         n_tcn_experts=3, n_mdn_experts=3, top_k=3,
         n_classes=4, use_positioning_head=True,
         ce_weight=1.0, positioning_pnl_weight=0.5,
+        use_vsn=True, vsn_d_model=32,
     )
-    cls_model = NatGasMoE(cls_config)
+    cls_model = NatGasMoE(cls_config, feature_group_sizes=group_sizes)
     cls_loss_fn = MoELoss(cls_config)
 
-    out = cls_model(x_seq, ae_input)
+    x_seq_vsn = torch.randn(B, cls_config.seq_len, n_feat_total)
+    out = cls_model(x_seq_vsn, ae_input)
     target_class = torch.randint(0, 4, (B,))
 
     print(f"    class_logits:   {out['class_logits'].shape}")
     print(f"    position:       {out['position'].shape}")
     print(f"    position range: [{out['position'].min().item():.3f}, {out['position'].max().item():.3f}]")
+    print(f"    vsn_weights:    {out['vsn_weights'].shape}  groups={list(group_sizes.keys())}")
+    print(f"    vsn avg weights: {out['vsn_weights'].mean(0).tolist()}")
 
     losses = cls_loss_fn(out, target_ret, target_std, target_class)
     for k, v in losses.items():
