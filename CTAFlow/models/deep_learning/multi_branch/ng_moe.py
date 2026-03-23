@@ -62,6 +62,7 @@ class MoEConfig:
     # --- TCN expert config ---
     tcn_channels: List[int] = field(default_factory=lambda: [64, 64, 64])
     tcn_kernel_size: int = 3
+    stride: int = 1  # causal downsampling before TCN layers (reduces seq_len by this factor)
 
     # --- MDN expert config ---
     mdn_hidden_dims: List[int] = field(default_factory=lambda: [64, 32])
@@ -133,10 +134,34 @@ class TemporalBlock(nn.Module):
         return self.act(self.net(x) + res)
 
 
+class CausalStride(nn.Module):
+    """Causal average pooling for sequence length reduction.
+
+    Reduces temporal dimension by ``stride`` factor while maintaining
+    causality — each output depends only on current + past inputs.
+    Applied once before the TCN layers so all subsequent computation
+    operates on the shorter sequence.
+    """
+
+    def __init__(self, stride: int):
+        super().__init__()
+        self.stride = stride
+        self.pad = stride - 1
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, C, L) -> (B, C, ceil(L / stride))"""
+        if self.stride <= 1:
+            return x
+        x = F.pad(x, (self.pad, 0))  # left-pad for causality
+        return F.avg_pool1d(x, kernel_size=self.stride, stride=self.stride)
+
+
 class TCNBackbone(nn.Module):
     def __init__(self, in_channels: int, channels: List[int],
-                 kernel_size: int = 3, dropout: float = 0.2):
+                 kernel_size: int = 3, dropout: float = 0.2,
+                 stride: int = 1):
         super().__init__()
+        self.stride_layer = CausalStride(stride) if stride > 1 else None
         layers = []
         for i, out_ch in enumerate(channels):
             in_ch = in_channels if i == 0 else channels[i - 1]
@@ -147,6 +172,8 @@ class TCNBackbone(nn.Module):
         self.out_dim = channels[-1]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.stride_layer is not None:
+            x = self.stride_layer(x)
         return self.network(x)
 
 
@@ -220,10 +247,11 @@ class TCNExpert(nn.Module):
     """TCN expert: sequence -> (return, std)."""
 
     def __init__(self, n_features: int, channels: List[int], kernel_size: int,
-                 dropout: float = 0.2):
+                 dropout: float = 0.2, stride: int = 1):
         super().__init__()
         self.input_proj = nn.Linear(n_features, channels[0])
-        self.tcn = TCNBackbone(channels[0], channels, kernel_size, dropout)
+        self.tcn = TCNBackbone(channels[0], channels, kernel_size, dropout,
+                               stride=stride)
         d = channels[-1]
         self.return_head = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 1))
         self.std_head = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 1), nn.Softplus())
@@ -627,6 +655,7 @@ class NatGasMoE(nn.Module):
             self.experts.append(TCNExpert(
                 feat_dim, config.tcn_channels,
                 config.tcn_kernel_size, config.dropout,
+                stride=config.stride,
             ))
         for _ in range(config.n_mdn_experts):
             self.experts.append(MDNExpert(
@@ -900,6 +929,7 @@ class HybridConfig:
     # --- TCN ---
     tcn_channels: List[int] = field(default_factory=lambda: [64, 64, 64])
     tcn_kernel_size: int = 3
+    stride: int = 1  # causal downsampling before TCN layers
 
     # --- MDN ---
     mdn_hidden_dims: List[int] = field(default_factory=lambda: [64, 32])
@@ -985,6 +1015,7 @@ class HybridMixtureNetwork(nn.Module):
         self.tcn = TCNBackbone(
             tcn_in_ch, config.tcn_channels,
             config.tcn_kernel_size, config.dropout,
+            stride=config.stride,
         )
         tcn_out_dim = config.tcn_channels[-1]
 

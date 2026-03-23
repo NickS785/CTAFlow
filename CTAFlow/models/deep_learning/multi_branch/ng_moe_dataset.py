@@ -640,6 +640,10 @@ class NGMoEWindowDataset(Dataset):
     regime_cols : Regime feature column names (for ae_input, default REGIME_COLS).
     cfg : NGMoEDataConfig for window sizes.
     monday_only : If True, only sample windows ending on a Monday.
+    stride : int
+        Step size between consecutive valid sample indices.
+        Training: stride=1 (maximum overlap).
+        Test/val: stride=target_horizon (non-overlapping forecast windows).
     """
 
     def __init__(
@@ -649,6 +653,7 @@ class NGMoEWindowDataset(Dataset):
         regime_cols: List[str] | None = None,
         cfg: NGMoEDataConfig | None = None,
         monday_only: bool = True,
+        stride: int = 1,
     ):
         cfg = cfg or NGMoEDataConfig()
         regime_cols = regime_cols or list(REGIME_COLS)
@@ -657,6 +662,7 @@ class NGMoEWindowDataset(Dataset):
         self.ae_window = cfg.ae_window
         self.monday_only = monday_only
         self.n_classes = cfg.n_classes
+        self.stride = max(1, stride)
         warmup = max(self.seq_len, self.ae_window)
 
         # Convert to arrays
@@ -670,7 +676,7 @@ class NGMoEWindowDataset(Dataset):
         self.dates = daily_df.index
 
         # Valid indices (enough lookback + non-NaN target)
-        valid = np.arange(warmup, len(daily_df))
+        valid = np.arange(warmup, len(daily_df), self.stride)
         if monday_only:
             is_mon = daily_df.index.dayofweek.values == 0
             valid = valid[is_mon[valid]]
@@ -719,6 +725,7 @@ def build_datasets(
     train_frac: float = 0.70,
     val_frac: float = 0.15,
     monday_only: bool = True,
+    test_stride: int = 1,
 ) -> Tuple[NGMoEWindowDataset, NGMoEWindowDataset, NGMoEWindowDataset, Dict]:
     """End-to-end: raw data -> three Datasets + metadata dict.
 
@@ -752,9 +759,9 @@ def build_datasets(
         cfg=config,
         monday_only=monday_only,
     )
-    train_ds = NGMoEWindowDataset(train_df, **kw)
-    val_ds = NGMoEWindowDataset(val_df, **kw)
-    test_ds = NGMoEWindowDataset(test_df, **kw)
+    train_ds = NGMoEWindowDataset(train_df, stride=1, **kw)
+    val_ds = NGMoEWindowDataset(val_df, stride=test_stride, **kw)
+    test_ds = NGMoEWindowDataset(test_df, stride=test_stride, **kw)
 
     meta = {
         "feature_cols": builder.feature_cols,
