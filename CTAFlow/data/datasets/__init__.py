@@ -36,6 +36,7 @@ from .macro_gat import (
     unpack_macro_gat_batch,
     build_macro_gat_loaders,
 )
+from .intraday_hybrid import IntradayHybridDataset
 __all__ = [
     "ContinuousWindowDataset",
     "ContinuousRasterAlignedDataset",
@@ -67,4 +68,5 @@ __all__ = [
     "macro_gat_collate_fn",
     "unpack_macro_gat_batch",
     "build_macro_gat_loaders",
+    "IntradayHybridDataset",
 ]
