@@ -878,7 +878,302 @@ class MoELoss(nn.Module):
 
 
 # ============================================================================
-# 9. DEMO
+# 9. HYBRID MIXTURE NETWORK (simplified single TCN+MDN)
+# ============================================================================
+
+@dataclass
+class HybridConfig:
+    """Config for HybridMixtureNetwork — single TCN + MDN with regime AE."""
+
+    # --- Input ---
+    n_features: int = 60
+    seq_len: int = 20
+
+    # --- VAE Regime Encoder ---
+    f_ae: int = 12
+    ae_window: int = 21
+    d_latent: int = 32
+    d_ae_hidden: int = 128
+    kl_weight: float = 0.01
+    recon_weight: float = 0.1
+
+    # --- TCN ---
+    tcn_channels: List[int] = field(default_factory=lambda: [64, 64, 64])
+    tcn_kernel_size: int = 3
+
+    # --- MDN ---
+    mdn_hidden_dims: List[int] = field(default_factory=lambda: [64, 32])
+    mdn_n_components: int = 4
+    mdn_min_sigma: float = 1e-4
+
+    # --- MLP head ---
+    head_hidden_dim: int = 128
+
+    # --- Training ---
+    dropout: float = 0.2
+    nll_weight: float = 0.1
+    return_loss_weight: float = 1.0
+    vol_loss_weight: float = 1.0
+
+    # --- Grouped Variable Selection ---
+    use_vsn: bool = False
+    vsn_d_model: int = 32
+    vsn_temperature: float = 1.5
+    vsn_entropy_weight: float = 0.1
+    vsn_min_weight: float = 0.05
+
+    # --- Classification / Positioning head ---
+    n_classes: int = 0
+    use_positioning_head: bool = False
+    positioning_hidden_dim: int = 32
+    ce_weight: float = 1.0
+    positioning_pnl_weight: float = 1.0
+    tc_cost: float = 0.0
+
+
+class HybridMixtureNetwork(nn.Module):
+    """Single TCN + MDN with regime autoencoder and MLP head.
+
+    Simplified alternative to NatGasMoE — no router, no expert pool.
+
+    Data flow:
+      x_seq (B,L,F)           ae_input (B,ae_win,f_ae)
+           |                         |
+      [opt VSN]              VAERegimeEncoder
+           |                   z_regime (d_latent)
+      TCNBackbone                    |
+       z_tcn (C)                     |
+           |                         |
+           +---------- concat -------+
+           |                         |
+      MDN(z_tcn, z_regime)     MLP Head(z_tcn, z_regime)
+       └─ NLL loss (aux)        └─ (pred_return, pred_std)
+       └─ density moments          final prediction
+    """
+
+    def __init__(self, config: HybridConfig,
+                 feature_group_sizes: Optional[Dict[str, int]] = None):
+        super().__init__()
+        self.config = config
+
+        # --- Grouped Variable Selection (optional) ---
+        self.vsn = None
+        if config.use_vsn and feature_group_sizes is not None:
+            self.vsn = GroupedFeatureVSN(
+                group_sizes=feature_group_sizes,
+                d_model=config.vsn_d_model,
+                d_context=config.d_latent,
+                dropout=config.dropout,
+                temperature=config.vsn_temperature,
+                entropy_weight=config.vsn_entropy_weight,
+                min_weight=config.vsn_min_weight,
+            )
+            feat_dim = config.vsn_d_model
+        else:
+            feat_dim = config.n_features
+
+        # --- VAE regime encoder ---
+        self.vae = VAERegimeEncoder(
+            f_ae=config.f_ae, ae_window=config.ae_window,
+            d_latent=config.d_latent, d_hidden=config.d_ae_hidden,
+            kl_weight=config.kl_weight, recon_weight=config.recon_weight,
+        )
+
+        # --- Input projection + TCN backbone ---
+        tcn_in_ch = config.tcn_channels[0]
+        self.input_proj = nn.Linear(feat_dim, tcn_in_ch)
+        self.tcn = TCNBackbone(
+            tcn_in_ch, config.tcn_channels,
+            config.tcn_kernel_size, config.dropout,
+        )
+        tcn_out_dim = config.tcn_channels[-1]
+
+        # --- MDN (density estimation on TCN features + regime) ---
+        mdn_input_dim = tcn_out_dim + config.d_latent
+        self.mdn = MDNExpert(
+            mdn_input_dim, config.mdn_hidden_dims,
+            config.mdn_n_components, config.mdn_min_sigma, config.dropout,
+        )
+
+        # --- MLP head: [z_tcn, z_regime] -> (return, std) ---
+        head_in = tcn_out_dim + config.d_latent
+        self.head = nn.Sequential(
+            nn.Linear(head_in, config.head_hidden_dim),
+            nn.LayerNorm(config.head_hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.head_hidden_dim, config.head_hidden_dim),
+            nn.LayerNorm(config.head_hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(config.dropout),
+        )
+        self.return_head = nn.Linear(config.head_hidden_dim, 1)
+        self.std_head = nn.Sequential(
+            nn.Linear(config.head_hidden_dim, 1), nn.Softplus(),
+        )
+
+        # --- Classification + Positioning heads (optional) ---
+        self.class_head = None
+        self.pos_head = None
+        if config.n_classes > 0:
+            cls_input_dim = 2 + config.d_latent
+            self.class_head = ClassificationHead(
+                cls_input_dim, config.n_classes, config.dropout,
+            )
+            if config.use_positioning_head:
+                self.pos_head = PositioningHead(
+                    config.n_classes, config.positioning_hidden_dim, config.dropout,
+                )
+
+    def forward(
+        self,
+        x_seq: torch.Tensor,       # (B, L, F)
+        ae_input: torch.Tensor,     # (B, ae_window, f_ae)
+    ) -> Dict[str, torch.Tensor]:
+
+        device = x_seq.device
+
+        # 1. VAE regime encoding
+        z_regime, ae_losses = self.vae(ae_input)
+
+        # 2. Variable selection (optional)
+        vsn_entropy_loss = torch.tensor(0.0, device=device)
+        if self.vsn is not None:
+            x_selected, vsn_entropy_loss = self.vsn(x_seq, z_regime)
+        else:
+            x_selected = x_seq
+
+        # 3. TCN backbone
+        h = self.input_proj(x_selected).transpose(1, 2)  # (B, C, L)
+        z_tcn = self.tcn(h)[:, :, -1]                     # (B, C)
+
+        # 4. MDN density estimation (auxiliary)
+        mdn_input = torch.cat([z_tcn, z_regime], dim=-1)
+        mdn_out = self.mdn(mdn_input)
+
+        # 5. MLP head prediction
+        head_input = torch.cat([z_tcn, z_regime], dim=-1)
+        h_head = self.head(head_input)
+        pred_return = self.return_head(h_head).squeeze(-1)
+        pred_std = self.std_head(h_head).squeeze(-1) + 1e-6
+
+        result = {
+            "pred_return": pred_return,
+            "pred_std": pred_std,
+            "mdn_pred_return": mdn_out.pred_return,
+            "mdn_pred_std": mdn_out.pred_std,
+            "mdn_params": mdn_out.mdn_params,
+            "ae_losses": ae_losses,
+            "z_regime": z_regime,
+            "vsn_entropy_loss": vsn_entropy_loss,
+        }
+        if self.vsn is not None and self.vsn.last_weights is not None:
+            result["vsn_weights"] = self.vsn.last_weights
+
+        # 6. Classification head (optional)
+        if self.class_head is not None:
+            cls_input = torch.cat([
+                pred_return.unsqueeze(-1),
+                pred_std.unsqueeze(-1),
+                z_regime,
+            ], dim=-1)
+            result["class_logits"] = self.class_head(cls_input)
+            if self.pos_head is not None:
+                result["position"] = self.pos_head(result["class_logits"])
+
+        return result
+
+
+class HybridLoss(nn.Module):
+    """Loss for HybridMixtureNetwork.
+
+    L = λ_ret * Huber(return) + λ_vol * MSE(log_std)
+      + λ_nll * MDN_NLL + AE_loss + VSN_entropy
+      + (optional) CE + positioning PnL
+    """
+
+    def __init__(self, config: HybridConfig):
+        super().__init__()
+        self.config = config
+        self._mdn_nll_fn = MDNExpert.__dict__["compute_nll"]
+
+    def forward(self, model_out, target_return, target_std,
+                target_class=None):
+        cfg = self.config
+
+        # Return loss
+        return_loss = F.huber_loss(
+            model_out["pred_return"], target_return, delta=0.5,
+        )
+
+        # Vol loss (log-space)
+        vol_loss = F.mse_loss(
+            torch.log(model_out["pred_std"] + 1e-6),
+            torch.log(target_std + 1e-6),
+        )
+
+        # MDN NLL
+        mdn_nll = torch.tensor(0.0, device=target_return.device)
+        if model_out["mdn_params"] is not None:
+            pi, mu, sigma = model_out["mdn_params"]
+            y = target_return
+            if y.dim() == 1:
+                y = y.unsqueeze(-1)
+            log_pi = torch.log(pi + 1e-10)
+            log_n = (-0.5 * math.log(2 * math.pi)
+                     - torch.log(sigma)
+                     - 0.5 * ((y - mu) / sigma) ** 2)
+            mdn_nll = -torch.logsumexp(log_pi + log_n, dim=-1).mean()
+
+        ae = model_out["ae_losses"]
+        vsn_entropy = model_out.get("vsn_entropy_loss", torch.tensor(0.0))
+
+        total = (
+            cfg.return_loss_weight * return_loss
+            + cfg.vol_loss_weight * vol_loss
+            + cfg.nll_weight * mdn_nll
+            + ae["total_ae_loss"]
+            + vsn_entropy
+        )
+
+        losses = {
+            "total_loss": total,
+            "return_loss": return_loss,
+            "vol_loss": vol_loss,
+            "mdn_nll_loss": mdn_nll,
+            "ae_recon_loss": ae["recon_loss"],
+            "ae_kl_loss": ae["kl_loss"],
+            "vsn_entropy_loss": vsn_entropy,
+        }
+
+        # Classification loss
+        if "class_logits" in model_out and target_class is not None:
+            ce_loss = F.cross_entropy(model_out["class_logits"], target_class)
+            losses["ce_loss"] = ce_loss
+            losses["total_loss"] = losses["total_loss"] + cfg.ce_weight * ce_loss
+            with torch.no_grad():
+                preds = model_out["class_logits"].argmax(dim=-1)
+                losses["class_accuracy"] = (preds == target_class).float().mean()
+
+        # Positioning PnL loss
+        if "position" in model_out:
+            position = model_out["position"]
+            strategy_ret = position * target_return
+            tc_penalty = cfg.tc_cost * position.abs().mean()
+            mean_ret = strategy_ret.mean()
+            std_ret = strategy_ret.std().clamp(min=1e-6)
+            neg_sharpe = -(mean_ret - tc_penalty) / std_ret
+            losses["positioning_loss"] = neg_sharpe
+            losses["total_loss"] = losses["total_loss"] + cfg.positioning_pnl_weight * neg_sharpe
+            with torch.no_grad():
+                losses["mean_position"] = position.mean()
+                losses["mean_strategy_ret"] = strategy_ret.mean()
+
+        return losses
+
+
+# ============================================================================
+# 10. DEMO
 # ============================================================================
 
 def run_demo():
@@ -902,7 +1197,7 @@ def run_demo():
     target_ret = torch.randn(B) * 0.03
     target_std = torch.rand(B) * 0.02 + 0.01
 
-    print("\n[1] Regression forward pass...")
+    print("\n[1] MoE Regression forward pass...")
     out = model(x_seq, ae_input)
     print(f"    pred_return:    {out['pred_return'].shape}")
     print(f"    pred_std:       {out['pred_std'].shape}")
@@ -912,8 +1207,8 @@ def run_demo():
     for k, v in losses.items():
         print(f"    {k}: {v.item():.6f}")
 
-    # --- Classification + Positioning + VSN mode ---
-    print("\n[2] Classification + Positioning + VSN mode...")
+    # --- MoE Classification + Positioning + VSN mode ---
+    print("\n[2] MoE Classification + Positioning + VSN mode...")
     group_sizes = {
         "returns": 12, "volatility": 8, "momentum": 10,
         "temporal": 5, "storage": 5,
@@ -944,15 +1239,69 @@ def run_demo():
     for k, v in losses.items():
         print(f"    {k}: {v.item():.6f}")
 
-    print("\n[3] Backward pass...")
+    print("\n[3] MoE Backward pass...")
     losses["total_loss"].backward()
     n_params = sum(p.numel() for p in cls_model.parameters())
     n_grad = sum(p.numel() for p in cls_model.parameters() if p.grad is not None)
     print(f"    Total params:   {n_params:,}")
     print(f"    Params w/ grad: {n_grad:,}")
 
+    # =================================================================
+    # HybridMixtureNetwork smoke test
+    # =================================================================
     print("\n" + "=" * 70)
-    print("Smoke test PASSED")
+    print("HybridMixtureNetwork (TCN + MDN + RegimeAE) — Smoke Test")
+    print("=" * 70)
+
+    # --- Regression ---
+    print("\n[4] Hybrid regression...")
+    h_cfg = HybridConfig(n_features=40, seq_len=20)
+    h_model = HybridMixtureNetwork(h_cfg)
+    h_loss_fn = HybridLoss(h_cfg)
+
+    h_x = torch.randn(B, h_cfg.seq_len, h_cfg.n_features)
+    h_ae = torch.randn(B, h_cfg.ae_window, h_cfg.f_ae)
+
+    h_out = h_model(h_x, h_ae)
+    print(f"    pred_return:      {h_out['pred_return'].shape}")
+    print(f"    pred_std:         {h_out['pred_std'].shape}")
+    print(f"    mdn_pred_return:  {h_out['mdn_pred_return'].shape}")
+
+    h_losses = h_loss_fn(h_out, target_ret, target_std)
+    for k, v in h_losses.items():
+        print(f"    {k}: {v.item():.6f}")
+
+    # --- Classification + VSN ---
+    print("\n[5] Hybrid classification + VSN...")
+    h_cls_cfg = HybridConfig(
+        n_features=n_feat_total, seq_len=20,
+        n_classes=4, use_positioning_head=True,
+        use_vsn=True, vsn_d_model=32,
+    )
+    h_cls_model = HybridMixtureNetwork(h_cls_cfg, feature_group_sizes=group_sizes)
+    h_cls_loss_fn = HybridLoss(h_cls_cfg)
+
+    h_x2 = torch.randn(B, h_cls_cfg.seq_len, n_feat_total)
+    h_out2 = h_cls_model(h_x2, h_ae)
+
+    print(f"    class_logits:   {h_out2['class_logits'].shape}")
+    print(f"    position:       {h_out2['position'].shape}")
+    print(f"    position range: [{h_out2['position'].min().item():.3f}, {h_out2['position'].max().item():.3f}]")
+    print(f"    vsn avg weights: {h_out2['vsn_weights'].mean(0).tolist()}")
+
+    h_losses2 = h_cls_loss_fn(h_out2, target_ret, target_std, target_class)
+    for k, v in h_losses2.items():
+        print(f"    {k}: {v.item():.6f}")
+
+    print("\n[6] Hybrid backward pass...")
+    h_losses2["total_loss"].backward()
+    n_params = sum(p.numel() for p in h_cls_model.parameters())
+    n_grad = sum(p.numel() for p in h_cls_model.parameters() if p.grad is not None)
+    print(f"    Total params:   {n_params:,}")
+    print(f"    Params w/ grad: {n_grad:,}")
+
+    print("\n" + "=" * 70)
+    print("All smoke tests PASSED")
     print("=" * 70)
 
 
