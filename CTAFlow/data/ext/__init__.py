@@ -3,4 +3,11 @@ try:
 except Exception:  # pragma: no cover - optional dependencies
     MacroClient = None  # type: ignore
 
-__all__ = ["MacroClient"]
+try:
+    from .ibkr_client import IBKRConfig, IBKRContract, IBKRTickDataSource
+except Exception:  # pragma: no cover - optional dependencies
+    IBKRConfig = None  # type: ignore
+    IBKRContract = None  # type: ignore
+    IBKRTickDataSource = None  # type: ignore
+
+__all__ = ["MacroClient", "IBKRConfig", "IBKRContract", "IBKRTickDataSource"]
