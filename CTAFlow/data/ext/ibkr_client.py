@@ -247,7 +247,7 @@ class IBKRTickDataSource:
         rows = []
         for bar in bars:
             rows.append({
-                "Datetime": pd.to_datetime(bar["t"], unit="ms"),
+                "Datetime": pd.to_datetime(bar["t"], unit="ms", utc=True),
                 "Open": bar.get("o", np.nan),
                 "High": bar.get("h", np.nan),
                 "Low": bar.get("l", np.nan),

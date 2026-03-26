@@ -15,7 +15,13 @@ from .live import (
     TradeLedger,
     TradeRecord,
 )
-from .ng_live import DailyContextPaths, NatGasLiveInterface, ng_default_config
+from .ng_live import (
+    DailyContextPaths,
+    NatGasLiveInterface,
+    WEATHER_FEATURE_COLS,
+    ng_default_config,
+    process_weather_features,
+)
 
 __all__ = [
     "CsvTickDataSource",
@@ -35,5 +41,7 @@ __all__ = [
     "TickDataSource",
     "TradeLedger",
     "TradeRecord",
+    "WEATHER_FEATURE_COLS",
     "ng_default_config",
+    "process_weather_features",
 ]
