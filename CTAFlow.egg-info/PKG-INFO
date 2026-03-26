@@ -37,3 +37,6 @@ Requires-Dist: flake8>=3.8; extra == "dev"
 Requires-Dist: mypy>=0.900; extra == "dev"
 Requires-Dist: jupyter>=1.0; extra == "dev"
 Requires-Dist: ipykernel>=6.0; extra == "dev"
+Provides-Extra: macro
+Requires-Dist: yfinance>=0.1.70; extra == "macro"
+Requires-Dist: fredapi>=0.5.0; extra == "macro"
