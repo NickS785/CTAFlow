@@ -8,8 +8,6 @@ from typing import Dict, List, Optional, Tuple, Literal, Iterable, Any
 import numpy as np
 import pandas as pd
 import torch
-import shap
-
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.inspection import permutation_importance
 from sklearn.feature_selection import mutual_info_regression
@@ -62,6 +60,7 @@ class FeatureXplainer:
         self.model.eval()
         self.background_data = background_data
         # Use DeepExplainer for PyTorch models
+        import shap
         self.explainer = shap.DeepExplainer(self.model, self.background_data)
 
     def compute_importances(self, test_data: torch.Tensor, feature_names: List[str]) -> pd.Series:
