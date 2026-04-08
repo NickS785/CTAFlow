@@ -51,6 +51,10 @@ _ORDERFLOW_BASE_COLS: Tuple[str, ...] = (
     "pd_val",
     "pd_vah",
 )
+_VPIN_SPATIAL_READ_COLS: Tuple[str, ...] = ("close", "vol", "signed_imbalance", "vpin")
+_DEFAULT_VPIN_READ_COLS: Tuple[str, ...] = tuple(
+    dict.fromkeys((*_ORDERFLOW_BASE_COLS, *_VPIN_SPATIAL_READ_COLS))
+)
 _VPIN_FOLD_SUM_COLS: Tuple[str, ...] = ("vol", "buy", "sell", "imbalance")
 _VPIN_FOLD_LAST_COLS: Tuple[str, ...] = (
     "close",
@@ -87,6 +91,14 @@ def rolling_zscore(
 def _normalize_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
     """Return a sorted, tz-naive DataFrame with a strict DatetimeIndex."""
     out = df.copy()
+    if out.empty:
+        return out
+    return _normalize_datetime_index_inplace(out)
+
+
+def _normalize_datetime_index_inplace(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize a DataFrame index without making an up-front full copy."""
+    out = df
     if not isinstance(out.index, pd.DatetimeIndex):
         if "ts_end" in out.columns:
             out.index = pd.to_datetime(out["ts_end"], errors="coerce")
@@ -107,12 +119,16 @@ def _normalize_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _fold_vpin_rows(df: pd.DataFrame, n_folds: int) -> pd.DataFrame:
+def _fold_vpin_rows(
+    df: pd.DataFrame,
+    n_folds: int,
+    normalize: bool = True,
+) -> pd.DataFrame:
     """Fold consecutive VPIN rows into coarser buckets."""
     if n_folds <= 1 or df.empty:
         return df
 
-    out = _normalize_datetime_index(df)
+    out = _normalize_datetime_index(df) if normalize else df
     numeric_cols = list(out.select_dtypes(include="number").columns)
     if not numeric_cols:
         return out
@@ -415,25 +431,58 @@ class CrackSpreadContinuousPrep(ContinuousIntradayPrep):
         columns: Optional[Sequence[str]] = None,
         fold: Optional[bool] = None,
         n_folds: Optional[int] = None,
+        start_ts: Optional[Union[str, pd.Timestamp]] = None,
+        end_ts: Optional[Union[str, pd.Timestamp]] = None,
     ) -> pd.DataFrame:
-        read_cols = None
-        if columns is not None:
-            read_cols = list(dict.fromkeys(["ts_end", *columns]))
-        df = pd.read_parquet(self._resolve_vpin_path(ticker), columns=read_cols)
-        df = _normalize_datetime_index(df)
+        selected_cols = _DEFAULT_VPIN_READ_COLS if columns is None else tuple(columns)
+        read_cols = list(dict.fromkeys(["ts_end", *selected_cols]))
+        filters = []
+        if start_ts is not None:
+            filters.append(("ts_end", ">=", pd.Timestamp(start_ts)))
+        if end_ts is not None:
+            filters.append(("ts_end", "<=", pd.Timestamp(end_ts)))
+        df = pd.read_parquet(
+            self._resolve_vpin_path(ticker),
+            columns=read_cols,
+            filters=filters or None,
+        )
+
+        float64_cols = list(df.select_dtypes(include="float64").columns)
+        for col in float64_cols:
+            df[col] = df[col].astype(np.float32, copy=False)
+
+        if not isinstance(df.index, pd.DatetimeIndex):
+            if "ts_end" in df.columns:
+                df.index = pd.to_datetime(df["ts_end"], errors="coerce")
+            elif "Datetime" in df.columns:
+                df.index = pd.to_datetime(df["Datetime"], errors="coerce")
+            elif "timestamp" in df.columns:
+                df.index = pd.to_datetime(df["timestamp"], errors="coerce")
+            else:
+                df.index = pd.to_datetime(df.index, errors="coerce")
+
         # Drop helper columns that should not become model inputs.
         for col in ("date", "ticker", "ts_end"):
             if col in df.columns:
                 df = df.drop(columns=col)
+
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        if df.index.hasnans:
+            df = df[~df.index.isna()]
+        if not df.index.is_monotonic_increasing:
+            df = df.sort_index()
+
         do_fold = self.fold if fold is None else bool(fold)
         fold_size = self.n_folds if n_folds is None else max(1, int(n_folds))
         if do_fold and fold_size > 1:
             before_rows = len(df)
-            df = _fold_vpin_rows(df, fold_size)
+            df = _fold_vpin_rows(df, fold_size, normalize=False)
             logger.info("[%s] folded VPIN rows %s -> %s using n_folds=%s", ticker, before_rows, len(df), fold_size)
+        df = _normalize_datetime_index_inplace(df)
         numeric_cols = df.select_dtypes(include="number").columns
         if len(numeric_cols) > 0:
-            df.loc[:, numeric_cols] = df.loc[:, numeric_cols].astype(np.float32)
+            df.loc[:, numeric_cols] = df.loc[:, numeric_cols].astype(np.float32, copy=False)
         return df
 
     def load_raw_inputs(
@@ -442,6 +491,8 @@ class CrackSpreadContinuousPrep(ContinuousIntradayPrep):
         orderflow_columns: Optional[Sequence[str]] = None,
         fold: Optional[bool] = None,
         n_folds: Optional[int] = None,
+        vpin_start_ts: Optional[Union[str, pd.Timestamp]] = None,
+        vpin_end_ts: Optional[Union[str, pd.Timestamp]] = None,
     ) -> Dict[str, object]:
         asset_intraday = {ticker: self._load_intraday_df(ticker) for ticker in self.tickers}
         out = {
@@ -455,6 +506,8 @@ class CrackSpreadContinuousPrep(ContinuousIntradayPrep):
                     columns=orderflow_columns,
                     fold=fold,
                     n_folds=n_folds,
+                    start_ts=vpin_start_ts,
+                    end_ts=vpin_end_ts,
                 )
                 for ticker in self.tickers
             }
@@ -646,6 +699,8 @@ class CrackSpreadContinuousPrep(ContinuousIntradayPrep):
         orderflow_columns: Optional[Sequence[str]] = None,
         fold: Optional[bool] = None,
         n_folds: Optional[int] = None,
+        start_ts: Optional[Union[str, pd.Timestamp]] = None,
+        end_ts: Optional[Union[str, pd.Timestamp]] = None,
     ) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
         """Load scaled per-asset VPIN streams without merging onto ``df_out``."""
         from CTAFlow.data.datasets.v3_continuous import scale_vpin_features
@@ -659,13 +714,18 @@ class CrackSpreadContinuousPrep(ContinuousIntradayPrep):
                 columns=orderflow_columns,
                 fold=fold,
                 n_folds=n_folds,
+                start_ts=start_ts,
+                end_ts=end_ts,
             )
             numeric = raw.select_dtypes(include="number")
             if numeric.empty:
                 frames[ticker] = pd.DataFrame(index=raw.index)
                 continue
+            del raw
             scaled = scale_vpin_features(numeric).astype(np.float32)
-            frames[ticker] = _normalize_datetime_index(scaled)
+            del numeric
+            frames[ticker] = _normalize_datetime_index_inplace(scaled)
+            del scaled
             cols = set(frames[ticker].columns)
             common_cols = cols if common_cols is None else common_cols & cols
 
@@ -787,6 +847,8 @@ class CrackSpreadContinuousPrep(ContinuousIntradayPrep):
         orderflow_columns: Optional[Sequence[str]] = None,
         fold: Optional[bool] = None,
         n_folds: Optional[int] = None,
+        vpin_start_ts: Optional[Union[str, pd.Timestamp]] = None,
+        vpin_end_ts: Optional[Union[str, pd.Timestamp]] = None,
         target_ticker: Optional[str] = None,
         spread_feature_cols: Optional[Sequence[str]] = None,
         known_temporal_cols: Optional[Sequence[str]] = None,
@@ -812,6 +874,8 @@ class CrackSpreadContinuousPrep(ContinuousIntradayPrep):
             orderflow_columns=orderflow_columns,
             fold=fold,
             n_folds=n_folds,
+            start_ts=vpin_start_ts,
+            end_ts=vpin_end_ts,
         )
         target_col = target_cols[-1]
         return build_crack_spread_indexed_dataset(

@@ -43,6 +43,12 @@ def _normalize_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
         return df.copy()
 
     out = df.copy()
+    return _normalize_datetime_index_inplace(out)
+
+
+def _normalize_datetime_index_inplace(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize a DataFrame index without an up-front full copy."""
+    out = df
     if not isinstance(out.index, pd.DatetimeIndex):
         out.index = pd.to_datetime(out.index)
     if out.index.tz is not None:
@@ -151,7 +157,8 @@ def _align_orderflow_frames(
         if frame is None or frame.empty:
             aligned[ticker] = pd.DataFrame()
             continue
-        work = _normalize_datetime_index(frame.select_dtypes(include="number")).astype(np.float32)
+        work = frame.select_dtypes(include="number").astype(np.float32)
+        work = _normalize_datetime_index_inplace(work)
         aligned[ticker] = work
         cols = set(work.columns)
         common_cols = cols if common_cols is None else common_cols & cols

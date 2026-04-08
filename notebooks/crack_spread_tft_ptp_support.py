@@ -107,9 +107,8 @@ def attach_known_future_sequences(
         stop = anchor_pos + decoder_steps
         if start < 0 or stop > len(known_df):
             continue
-        sample_out = dict(sample)
-        sample_out["known_future"] = known_df.iloc[start:stop].values.astype(np.float32)
-        enriched.append(sample_out)
+        sample["known_future"] = known_df.iloc[start:stop].values.astype(np.float32)
+        enriched.append(sample)
     return enriched
 
 
@@ -155,8 +154,8 @@ def split_crack_samples(
     max_val_samples: Optional[int] = None,
 ) -> Tuple[List[Dict], List[Dict]]:
     cutoff = pd.Timestamp(val_start)
-    train_samples = [dict(s) for s in samples if pd.Timestamp(s["anchor_ts"]) < cutoff]
-    val_samples = [dict(s) for s in samples if pd.Timestamp(s["anchor_ts"]) >= cutoff]
+    train_samples = [s for s in samples if pd.Timestamp(s["anchor_ts"]) < cutoff]
+    val_samples = [s for s in samples if pd.Timestamp(s["anchor_ts"]) >= cutoff]
 
     if max_train_samples is not None and len(train_samples) > max_train_samples:
         train_samples = train_samples[-int(max_train_samples):]
