@@ -160,6 +160,28 @@ CONTRACT_SPECS_RAW: Dict[str, dict] = {
         "notes": "Quoted in cents/lb."
     },
 
+    # --- Equity Index (CME) ---
+    "ES": {  # E-mini S&P 500
+        "name": "E-mini S&P 500",
+        "exchange": "CME",
+        "unit": "points",
+        "contract_unit": 50,       # $50 per index point
+        "min_tick": 0.25,          # quarter point
+        "tick_value_usd": 12.50,
+        "months": [3, 6, 9, 12],
+        "notes": "Cash-settled. Quarterly expiry (3rd Friday)."
+    },
+    "NQ": {  # E-mini Nasdaq 100
+        "name": "E-mini Nasdaq 100",
+        "exchange": "CME",
+        "unit": "points",
+        "contract_unit": 20,       # $20 per index point
+        "min_tick": 0.25,          # quarter point
+        "tick_value_usd": 5.00,
+        "months": [3, 6, 9, 12],
+        "notes": "Cash-settled. Quarterly expiry (3rd Friday)."
+    },
+
     # --- Livestock (CME) ---
     "LE": {  # Live Cattle
         "name": "Live Cattle",

@@ -7,6 +7,11 @@ from .event_release_dataset import (
 )
 
 try:
+    from .crack_spread_continuous import CrackSpreadContinuousPrep
+except ImportError:
+    CrackSpreadContinuousPrep = None
+
+try:
     from .tft_aligned import TFTAlignedPrepLayer
 except ImportError:
     TFTAlignedPrepLayer = None

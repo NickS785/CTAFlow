@@ -67,6 +67,25 @@ def get_default_tick_size(ticker: str) -> Optional[float]:
     return None
 
 
+def _normalize_tick_index(df: pd.DataFrame, tz: str) -> pd.DataFrame:
+    """Return a timezone-normalized, monotonic tick frame for safe label slicing."""
+    if df.empty:
+        return df
+
+    out = df.copy()
+    if out.index.tz is None:
+        out.index = out.index.tz_localize("UTC")
+    out.index = out.index.tz_convert(tz)
+    return out.sort_index(kind="stable")
+
+
+def _slice_time_window(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    """Slice a timestamp index by boolean mask to avoid DST label edge cases."""
+    if df.empty:
+        return df
+    return df.loc[(df.index >= start) & (df.index <= end)]
+
+
 def _extract_single_date_worker(args: tuple) -> Dict:
     """
     Worker function for multiprocessing. Creates fresh extractors per process.
@@ -168,15 +187,13 @@ def _extract_single_date_worker(args: tuple) -> Dict:
     if df_raw.empty:
         return results
 
-    if df_raw.index.tz is None:
-        df_raw.index = df_raw.index.tz_localize('UTC')
-    df_raw.index = df_raw.index.tz_convert(config.tz)
+    df_raw = _normalize_tick_index(df_raw, config.tz)
 
     # Profile: from profile_start to profile_end (full profile window)
     # Used for spatial profile output and NumberBars alignment
     profile_vwap = None
     if config.include_profile and profile_ext is not None and profile_start is not None:
-        profile_data = df_raw.loc[profile_start:profile_end]
+        profile_data = _slice_time_window(df_raw, profile_start, profile_end)
         if not profile_data.empty:
             try:
                 profile = profile_ext.calculate_volume_profile(
@@ -204,12 +221,12 @@ def _extract_single_date_worker(args: tuple) -> Dict:
             prev_date_str = prev_day.strftime('%Y-%m-%d')
             ps_start = pd.Timestamp(f"{prev_date_str} {config.profile_start_time}").tz_localize(tz)
             ps_end = pd.Timestamp(f"{prev_date_str} {config.profile_end_time}").tz_localize(tz)
-            ps_data = df_raw.loc[ps_start:ps_end]
+            ps_data = _slice_time_window(df_raw, ps_start, ps_end)
             ps_poc, ps_val, ps_vah, _ = _compute_profile_levels(ps_data, profile_ext, tick_sz, va_pct)
         # Previous 24h from VPIN start
         if config.include_prev_24h_profile:
             pd_start = vpin_start - pd.Timedelta(hours=24)
-            pd_data = df_raw.loc[pd_start:vpin_start]
+            pd_data = _slice_time_window(df_raw, pd_start, vpin_start)
             pd_poc, pd_val, pd_vah, _ = _compute_profile_levels(pd_data, profile_ext, tick_sz, va_pct)
 
     # Number Bars extraction - use calculate_number_bars with pre-fetched data
@@ -652,9 +669,7 @@ class MultiFeatureExtraction(ScidBaseExtractor):
         if df_raw.empty:
             return results
 
-        if df_raw.index.tz is None:
-            df_raw.index = df_raw.index.tz_localize('UTC')
-        df_raw.index = df_raw.index.tz_convert(self.config.tz)
+        df_raw = _normalize_tick_index(df_raw, self.config.tz)
 
         # Build time ranges
         vpin_start, vpin_end = self._build_time_range(
@@ -670,7 +685,7 @@ class MultiFeatureExtraction(ScidBaseExtractor):
             profile_start, profile_end = self._build_time_range(
                 dt, self.config.profile_start_time, self.config.profile_end_time
             )
-            profile_data = df_raw.loc[profile_start:profile_end]
+            profile_data = _slice_time_window(df_raw, profile_start, profile_end)
             if not profile_data.empty:
                 try:
                     profile = self.profile_extractor.calculate_volume_profile(
@@ -699,14 +714,14 @@ class MultiFeatureExtraction(ScidBaseExtractor):
                 ps_start, ps_end = self._build_time_range(
                     prev_day, self.config.profile_start_time, self.config.profile_end_time
                 )
-                ps_data = df_raw.loc[ps_start:ps_end]
+                ps_data = _slice_time_window(df_raw, ps_start, ps_end)
                 ps_poc, ps_val, ps_vah, _ = _compute_profile_levels(
                     ps_data, self.profile_extractor, tick_sz, va_pct
                 )
             # Previous 24h from VPIN start
             if self.config.include_prev_24h_profile:
                 pd_start = vpin_start - pd.Timedelta(hours=24)
-                pd_data = df_raw.loc[pd_start:vpin_start]
+                pd_data = _slice_time_window(df_raw, pd_start, vpin_start)
                 pd_poc, pd_val, pd_vah, _ = _compute_profile_levels(
                     pd_data, self.profile_extractor, tick_sz, va_pct
                 )
@@ -1184,7 +1199,8 @@ class MultiFeatureExtraction(ScidBaseExtractor):
             rasterized_dict = {}
             rasterized_dates = []
             for r in results:
-                if r['rasterized'].size > 0:
+                rast = r['rasterized']
+                if (hasattr(rast, 'numel') and rast.numel() > 0) or (hasattr(rast, 'size') and not callable(rast.size) and rast.size > 0):
                     date_key = r['date'].strftime('%Y-%m-%d')
                     rasterized_dict[date_key] = r['rasterized']
                     rasterized_dates.append(r['date'])
@@ -1197,3 +1213,308 @@ class MultiFeatureExtraction(ScidBaseExtractor):
 
         logger.info(f"Exported {len(valid_results)} days (fit on {n_train}) to {output_dir}")
         return paths
+
+
+# ---------------------------------------------------------------------------
+# CSV-based loader (alternative to SCID contract files)
+# ---------------------------------------------------------------------------
+
+_CSV_CACHE: Dict[tuple, pd.DataFrame] = {}
+_TIMESTAMP_ALIASES = ("datetime", "date time", "date_time", "scdatetime", "timestamp", "time", "ts")
+_PRICE_ALIASES = ("close", "last", "price", "lastprice", "settlement", "px")
+_TOTAL_VOLUME_ALIASES = ("totalvolume", "volume", "vol", "size", "tradevolume")
+_BID_VOLUME_ALIASES = ("bidvolume", "bid volume", "bid_trade_volume", "bidtradevolume", "sellvolume", "downvolume")
+_ASK_VOLUME_ALIASES = ("askvolume", "ask volume", "ask_trade_volume", "asktradevolume", "buyvolume", "upvolume")
+_NUM_TRADES_ALIASES = ("numtrades", "numberoftrades", "number_of_trades", "trades", "tradecount", "#trades", "#oftrades")
+
+
+def _normalized_column_map(columns: pd.Index) -> Dict[str, str]:
+    return {str(col).strip().lower().replace("_", "").replace(" ", ""): str(col) for col in columns}
+
+
+def _resolve_column(columns: pd.Index, aliases: tuple) -> Optional[str]:
+    normalized = _normalized_column_map(columns)
+    for alias in aliases:
+        key = alias.strip().lower().replace("_", "").replace(" ", "")
+        if key in normalized:
+            return normalized[key]
+    return None
+
+
+def _localize_timestamp_index(index: pd.DatetimeIndex, tz: str) -> pd.DatetimeIndex:
+    return index.tz_localize(tz) if index.tz is None else index.tz_convert(tz)
+
+
+def _extract_timestamp_index(raw: pd.DataFrame, tz: str) -> pd.DatetimeIndex:
+    date_col = _resolve_column(raw.columns, ("date",))
+    time_col = _resolve_column(raw.columns, ("time",))
+    if date_col and time_col and date_col != time_col:
+        ts = pd.to_datetime(
+            raw[date_col].astype(str).str.strip() + " " + raw[time_col].astype(str).str.strip(),
+            errors="coerce",
+        )
+        return _localize_timestamp_index(pd.DatetimeIndex(ts), tz)
+
+    timestamp_col = _resolve_column(raw.columns, _TIMESTAMP_ALIASES)
+    if timestamp_col:
+        return _localize_timestamp_index(pd.DatetimeIndex(pd.to_datetime(raw[timestamp_col], errors="coerce")), tz)
+
+    return _localize_timestamp_index(pd.DatetimeIndex(pd.to_datetime(raw.iloc[:, 0], errors="coerce")), tz)
+
+
+def _standardize_sierra_tick_frame(raw: pd.DataFrame, tz: str) -> pd.DataFrame:
+    if raw.empty:
+        return pd.DataFrame(columns=["Close", "TotalVolume", "BidVolume", "AskVolume", "NumTrades"])
+
+    raw = raw.copy()
+    raw.columns = [str(col).strip() for col in raw.columns]
+    frame = pd.DataFrame(index=_extract_timestamp_index(raw, tz))
+
+    close_col = _resolve_column(raw.columns, _PRICE_ALIASES)
+    if close_col is None:
+        raise ValueError(f"Could not detect a price column in Sierra CSV: {list(raw.columns)}")
+
+    total_col = _resolve_column(raw.columns, _TOTAL_VOLUME_ALIASES)
+    bid_col = _resolve_column(raw.columns, _BID_VOLUME_ALIASES)
+    ask_col = _resolve_column(raw.columns, _ASK_VOLUME_ALIASES)
+    num_trades_col = _resolve_column(raw.columns, _NUM_TRADES_ALIASES)
+
+    frame["Close"] = pd.to_numeric(raw[close_col], errors="coerce").to_numpy()
+    frame["BidVolume"] = pd.to_numeric(raw[bid_col], errors="coerce").to_numpy() if bid_col else 0.0
+    frame["AskVolume"] = pd.to_numeric(raw[ask_col], errors="coerce").to_numpy() if ask_col else 0.0
+    frame["TotalVolume"] = pd.to_numeric(raw[total_col], errors="coerce").to_numpy() if total_col else frame["BidVolume"] + frame["AskVolume"]
+    frame["NumTrades"] = pd.to_numeric(raw[num_trades_col], errors="coerce").to_numpy() if num_trades_col else ((frame["TotalVolume"] > 0) | (frame["BidVolume"] > 0) | (frame["AskVolume"] > 0)).astype(float)
+
+    frame = frame[~frame.index.isna()]
+    frame = frame[~frame.index.duplicated(keep="last")].sort_index().dropna(subset=["Close"])
+    for col in ["TotalVolume", "BidVolume", "AskVolume", "NumTrades"]:
+        frame[col] = pd.to_numeric(frame[col], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    inferred_total = frame["BidVolume"] + frame["AskVolume"]
+    frame.loc[frame["TotalVolume"] <= 0, "TotalVolume"] = inferred_total.loc[frame["TotalVolume"] <= 0]
+    return frame[["Close", "TotalVolume", "BidVolume", "AskVolume", "NumTrades"]]
+
+
+class SierraCSVTickLoader:
+    """Load tick data from a single Sierra Chart CSV export (e.g. ``es.csv``)."""
+
+    def __init__(self, data_dir: str, ticker: str, tz: str = "America/Chicago"):
+        from pathlib import Path
+        self.data_dir = Path(data_dir)
+        self.ticker = ticker
+        self.tz = tz
+
+    @property
+    def csv_path(self):
+        return self.data_dir / f"{self.ticker.lower()}.csv"
+
+    def _normalize_time(self, value) -> pd.Timestamp:
+        ts = pd.Timestamp(value)
+        return ts.tz_localize(self.tz) if ts.tz is None else ts.tz_convert(self.tz)
+
+    def load_all(self) -> pd.DataFrame:
+        cache_key = (str(self.csv_path.resolve()), self.tz)
+        if cache_key not in _CSV_CACHE:
+            if not self.csv_path.exists():
+                raise FileNotFoundError(f"Sierra CSV not found: {self.csv_path}")
+            _CSV_CACHE[cache_key] = _standardize_sierra_tick_frame(
+                pd.read_csv(self.csv_path, low_memory=False), self.tz
+            )
+        return _CSV_CACHE[cache_key]
+
+    def get_data(self, start_time, end_time, columns=None) -> pd.DataFrame:
+        data = self.load_all()
+        sliced = data.loc[self._normalize_time(start_time):self._normalize_time(end_time)]
+        if columns is None:
+            return sliced.copy()
+        return sliced.loc[:, [col for col in columns if col in sliced.columns]].copy()
+
+
+class CSVMultiFeatureExtraction:
+    """
+    CSV-based alternative to MultiFeatureExtraction.
+
+    Uses a single ``{ticker}.csv`` file instead of SCID contract files.
+    Provides the same ``extract_date`` / ``extract_all`` interface.
+    """
+
+    def __init__(self, config: FeatureExtractorConfig, dates: List[Union[str, pd.Timestamp, date]]):
+        self.config = config
+        self.dates = [pd.Timestamp(d) for d in dates]
+        self.loader = SierraCSVTickLoader(config.data_dir, config.ticker, config.tz)
+        self.vpin_extractor = VPINExtractor(
+            config.data_dir, config.ticker, config.tz,
+            config.vpin_bucket_size, config.vpin_window
+        )
+        self.profile_extractor = MarketProfileExtractor(
+            config.data_dir, config.ticker, config.tz
+        ) if config.include_profile else None
+        self.number_bars_extractor = NumberBarsExtractor(
+            config.data_dir, config.ticker, config.tz,
+            tick_size=config.profile_tick_size or 0.01,
+            interval=config.num_bars_interval,
+            vwap_window=config.num_bars_vwap_window,
+            num_levels=config.num_bars_levels,
+            centering_method=config.num_bars_centering,
+        ) if config.include_number_bars else None
+        self.rasterizer = SequenceRasterizer(
+            bins=config.raster_bins,
+            span_pct=config.raster_span_pct,
+            vol_scale=config.raster_vol_scale,
+            price_scale=config.raster_price_scale,
+        ) if config.include_rasterized else None
+        self._bucket_size_cache: Dict[int, int] = {}
+
+    def _build_time_range(self, dt: pd.Timestamp, start_time: str, end_time: str):
+        tz = self.config.tz
+        return (
+            pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {start_time}").tz_localize(tz),
+            pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {end_time}").tz_localize(tz),
+        )
+
+    def _get_combined_window(self, dt: pd.Timestamp):
+        starts, ends = [], []
+        vpin_start, vpin_end = self._build_time_range(dt, self.config.vpin_start_time, self.config.vpin_end_time)
+        starts.append(vpin_start); ends.append(vpin_end)
+        if self.config.include_profile:
+            s, e = self._build_time_range(dt, self.config.profile_start_time, self.config.profile_end_time)
+            starts.append(s); ends.append(e)
+        if self.config.include_number_bars:
+            s, e = self._build_time_range(dt, self.config.num_bars_start_time, self.config.num_bars_end_time)
+            starts.append(s); ends.append(e)
+        if self.config.include_pre_summary and self.config.pre_summary_start_time:
+            starts.append(pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {self.config.pre_summary_start_time}").tz_localize(self.config.tz))
+        earliest = min(starts)
+        return min(earliest, vpin_start - pd.Timedelta(hours=24)), max(ends)
+
+    def extract_date(self, dt: pd.Timestamp) -> Dict[str, Union[pd.DataFrame, np.ndarray]]:
+        """Extract all features for a single date from the CSV."""
+        start_dt, end_dt = self._get_combined_window(dt)
+        results = {
+            'date': dt, 'vpin': pd.DataFrame(), 'profile': pd.DataFrame(),
+            'number_bars': np.array([]), 'number_bars_meta': pd.DataFrame(),
+            'rasterized': np.array([]),
+        }
+        try:
+            df_raw = self.loader.get_data(start_dt, end_dt, columns=["Close", "TotalVolume", "BidVolume", "AskVolume", "NumTrades"])
+        except Exception as e:
+            logger.warning(f"CSV load failed for {dt.date()}: {e}")
+            return results
+        if df_raw.empty:
+            return results
+
+        tz = self.config.tz
+        vpin_start, vpin_end = self._build_time_range(dt, self.config.vpin_start_time, self.config.vpin_end_time)
+
+        # Profile
+        profile_start = profile_end = None
+        profile_vwap = None
+        if self.config.include_profile and self.profile_extractor is not None:
+            profile_start, profile_end = self._build_time_range(dt, self.config.profile_start_time, self.config.profile_end_time)
+            profile_data = _slice_time_window(df_raw, profile_start, profile_end)
+            if not profile_data.empty:
+                try:
+                    results['profile'] = self.profile_extractor.calculate_volume_profile(profile_data, tick_size=self.config.profile_tick_size)
+                    _, _, _, profile_vwap = _compute_profile_levels(profile_data, self.profile_extractor, self.config.profile_tick_size, self.config.value_area_pct)
+                except Exception as e:
+                    logger.warning(f"Profile failed for {dt.date()}: {e}")
+
+        # Causal profile levels
+        ps_poc, ps_val, ps_vah = np.nan, np.nan, np.nan
+        pd_poc, pd_val, pd_vah = np.nan, np.nan, np.nan
+        if self.config.include_profile and self.profile_extractor is not None:
+            if profile_start is not None:
+                prev_day = dt - pd.Timedelta(days=1)
+                ps_start, ps_end = self._build_time_range(prev_day, self.config.profile_start_time, self.config.profile_end_time)
+                ps_poc, ps_val, ps_vah, _ = _compute_profile_levels(
+                    _slice_time_window(df_raw, ps_start, ps_end),
+                    self.profile_extractor,
+                    self.config.profile_tick_size,
+                    self.config.value_area_pct,
+                )
+            if self.config.include_prev_24h_profile:
+                pd_start = vpin_start - pd.Timedelta(hours=24)
+                pd_poc, pd_val, pd_vah, _ = _compute_profile_levels(
+                    _slice_time_window(df_raw, pd_start, vpin_start),
+                    self.profile_extractor,
+                    self.config.profile_tick_size,
+                    self.config.value_area_pct,
+                )
+
+        # Number bars
+        if self.config.include_number_bars and self.number_bars_extractor is not None:
+            nb_start, nb_end = self._build_time_range(dt, self.config.num_bars_start_time, self.config.num_bars_end_time)
+            try:
+                lookback = pd.Timedelta(self.config.num_bars_vwap_window) * 2
+                nb_data = df_raw.loc[(df_raw.index >= nb_start - lookback) & (df_raw.index <= nb_end)]
+                if not nb_data.empty:
+                    tensor, meta = self.number_bars_extractor.calculate_number_bars(
+                        df=nb_data, start_time=nb_start, interval=self.config.num_bars_interval,
+                        tick_size=self.config.profile_tick_size, vwap_window=self.config.num_bars_vwap_window,
+                        num_levels=self.config.num_bars_levels, fixed_center=profile_vwap,
+                    )
+                    results['number_bars'] = tensor
+                    results['number_bars_meta'] = meta
+            except Exception as e:
+                logger.warning(f"Number bars failed for {dt.date()}: {e}")
+
+        # VPIN
+        vpin_data = _slice_time_window(df_raw, vpin_start, vpin_end)
+        ib_high, ib_low = np.nan, np.nan
+        if self.config.include_ib and profile_start is not None:
+            ib_end_ts = profile_start + pd.Timedelta(minutes=self.config.ib_minutes)
+            ib_data = _slice_time_window(df_raw, profile_start, ib_end_ts)
+            if not ib_data.empty:
+                ib_high, ib_low = float(ib_data["Close"].max()), float(ib_data["Close"].min())
+
+        pre_summary: Dict[str, float] = {}
+        if self.config.include_pre_summary and self.config.pre_summary_start_time:
+            pre_start = pd.Timestamp(f"{dt.strftime('%Y-%m-%d')} {self.config.pre_summary_start_time}").tz_localize(tz)
+            pre_data = df_raw.loc[(df_raw.index >= pre_start) & (df_raw.index < vpin_start)]
+            if not pre_data.empty:
+                tv = pre_data["TotalVolume"].sum()
+                pre_summary = {
+                    'pre_vwap': float((pre_data["Close"] * pre_data["TotalVolume"]).sum() / tv) if tv > 0 else np.nan,
+                    'pre_volume': float(tv),
+                    'pre_delta': float(pre_data["AskVolume"].sum()) - float(pre_data["BidVolume"].sum()),
+                    'pre_high': float(pre_data["Close"].max()),
+                    'pre_low': float(pre_data["Close"].min()),
+                }
+
+        bucket_size = self.config.vpin_bucket_size or self.vpin_extractor.bucket_volume
+        if not vpin_data.empty:
+            try:
+                vpin_df = self.vpin_extractor.calculate_vpin(
+                    vpin_data, bucket_volume=bucket_size, window=self.config.vpin_window,
+                    include_sequence_features=self.config.include_sequence_features,
+                )
+                if not vpin_df.empty:
+                    vpin_df['ps_poc'] = ps_poc; vpin_df['ps_val'] = ps_val; vpin_df['ps_vah'] = ps_vah
+                    if self.config.include_prev_24h_profile:
+                        vpin_df['pd_poc'] = pd_poc; vpin_df['pd_val'] = pd_val; vpin_df['pd_vah'] = pd_vah
+                    if self.config.include_ib:
+                        vpin_df['ib_high'] = ib_high; vpin_df['ib_low'] = ib_low
+                    for k, v in pre_summary.items():
+                        vpin_df[k] = v
+                results['vpin'] = vpin_df
+
+                if self.config.include_rasterized and self.rasterizer is not None and not vpin_df.empty:
+                    try:
+                        results['rasterized'] = self.rasterizer.rasterize(
+                            vpin_df, session_start=self.config.raster_session_start,
+                            interval_mins=self.config.raster_interval_mins, num_bars=self.config.raster_num_bars,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Rasterization failed for {dt.date()}: {e}")
+            except Exception as e:
+                logger.warning(f"VPIN failed for {dt.date()}: {e}")
+
+        return results
+
+    def extract_all(self, verbose: bool = False, n_jobs: int = 1) -> List[Dict]:
+        results = []
+        for i, dt in enumerate(self.dates):
+            if verbose:
+                print(f"Extracting {i+1}/{len(self.dates)}: {dt.date()}")
+            results.append(self.extract_date(dt))
+        return results

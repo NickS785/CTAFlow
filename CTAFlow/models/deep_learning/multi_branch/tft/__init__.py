@@ -10,6 +10,10 @@ from .tft_encoders import (
 )
 from .tft_models import TFTAlignedWSPR, TFTAlignedMamba
 from .tft_simple import TFTAlignedMambaSimple
+from .crack_spread_tft import (
+    CrackSpreadTFT,
+    crack_spread_classification_loss,
+)
 from .event_phase_tft import (
     DEFAULT_EVENT_PHASE_QUANTILES,
     EventPhaseTFT,
@@ -68,6 +72,8 @@ __all__ = [
     "TFTAlignedWSPR",
     "TFTAlignedMamba",
     "TFTAlignedMambaSimple",
+    "CrackSpreadTFT",
+    "crack_spread_classification_loss",
     "DEFAULT_EVENT_PHASE_QUANTILES",
     "EventPhaseTFT",
     "EventPhaseTFTConfig",

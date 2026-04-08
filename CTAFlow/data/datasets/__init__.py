@@ -36,6 +36,13 @@ from .macro_gat import (
     unpack_macro_gat_batch,
     build_macro_gat_loaders,
 )
+from .crack_spread_continuous import (
+    CrackSpreadContinuousDataset,
+    build_crack_spread_samples,
+    crack_spread_collate_fn,
+    unpack_crack_spread_batch,
+    loaders_from_crack_samples,
+)
 from .intraday_hybrid import IntradayHybridDataset
 __all__ = [
     "ContinuousWindowDataset",
@@ -68,5 +75,10 @@ __all__ = [
     "macro_gat_collate_fn",
     "unpack_macro_gat_batch",
     "build_macro_gat_loaders",
+    "CrackSpreadContinuousDataset",
+    "build_crack_spread_samples",
+    "crack_spread_collate_fn",
+    "unpack_crack_spread_batch",
+    "loaders_from_crack_samples",
     "IntradayHybridDataset",
 ]
