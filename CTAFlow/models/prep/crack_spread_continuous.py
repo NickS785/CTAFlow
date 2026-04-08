@@ -627,3 +627,45 @@ class CrackSpreadContinuousPrep(ContinuousIntradayPrep):
             )
 
         return df_out, train_mask, target_cols
+
+    def build_indexed_dataset_from_root(
+        self,
+        spread_lookback: int = 64,
+        orderflow_lookback: int = 128,
+        orderflow_columns: Optional[Sequence[str]] = None,
+        spread_feature_cols: Optional[Sequence[str]] = None,
+        known_temporal_cols: Optional[Sequence[str]] = None,
+        session_only: bool = True,
+        sample_session: Optional[str] = None,
+        sample_session_start: Optional[str] = None,
+        sample_session_end: Optional[str] = None,
+        stride: int = 1,
+        require_all_assets: bool = True,
+        include_known_temporal_features: bool = True,
+        **prepare_kwargs,
+    ):
+        """Prepare root inputs and return a lazy indexed crack-spread dataset."""
+        from CTAFlow.data.datasets.crack_spread_continuous import (
+            build_crack_spread_indexed_dataset,
+        )
+
+        df_out, _, target_cols = self.prepare_from_root(**prepare_kwargs)
+        orderflow_frames, _ = self.load_orderflow_frames(orderflow_columns=orderflow_columns)
+        target_col = target_cols[-1]
+        return build_crack_spread_indexed_dataset(
+            df_out=df_out,
+            orderflow_frames=orderflow_frames,
+            target_col=target_col,
+            spread_feature_cols=spread_feature_cols,
+            known_temporal_cols=known_temporal_cols,
+            tickers=self.tickers,
+            spread_lookback=spread_lookback,
+            orderflow_lookback=orderflow_lookback,
+            session_only=session_only,
+            sample_session=sample_session,
+            sample_session_start=sample_session_start,
+            sample_session_end=sample_session_end,
+            stride=stride,
+            require_all_assets=require_all_assets,
+            include_known_temporal_features=include_known_temporal_features,
+        )

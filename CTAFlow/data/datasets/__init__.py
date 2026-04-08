@@ -38,6 +38,8 @@ from .macro_gat import (
 )
 from .crack_spread_continuous import (
     CrackSpreadContinuousDataset,
+    CrackSpreadContinuousIndexedDataset,
+    build_crack_spread_indexed_dataset,
     build_crack_spread_samples,
     crack_spread_collate_fn,
     unpack_crack_spread_batch,
@@ -76,6 +78,8 @@ __all__ = [
     "unpack_macro_gat_batch",
     "build_macro_gat_loaders",
     "CrackSpreadContinuousDataset",
+    "CrackSpreadContinuousIndexedDataset",
+    "build_crack_spread_indexed_dataset",
     "build_crack_spread_samples",
     "crack_spread_collate_fn",
     "unpack_crack_spread_batch",

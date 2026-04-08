@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import bisect
 import pickle
+from dataclasses import dataclass
 from datetime import date, time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -349,6 +350,59 @@ def rasterize_vpin_to_grid(
     return grid
 
 
+def rasterize_vpin_arrays_to_grid(
+    close: np.ndarray,
+    vol: np.ndarray,
+    signed_imbalance: np.ndarray,
+    vpin: np.ndarray,
+    price_offsets: np.ndarray,
+    center_price: float,
+    price_scale: float = 100.0,
+    fallback_span: float = 2.0,
+) -> np.ndarray:
+    """Rasterize pre-extracted VPIN arrays onto a NumberBars-aligned grid."""
+    offsets = np.asarray(price_offsets, dtype=np.float32).reshape(-1)
+    n_bins = len(offsets)
+    grid = np.zeros((3, n_bins), dtype=np.float32)
+    if n_bins == 0 or len(close) == 0 or not np.isfinite(center_price) or center_price == 0:
+        return grid
+
+    if (not np.all(np.isfinite(offsets))) or np.nanstd(offsets) < 1e-6:
+        offsets = np.linspace(-fallback_span, fallback_span, n_bins, dtype=np.float32)
+
+    close_arr = np.asarray(close, dtype=np.float32)
+    vol_arr = np.nan_to_num(np.asarray(vol, dtype=np.float32))
+    imb_arr = np.nan_to_num(np.asarray(signed_imbalance, dtype=np.float32))
+    vpin_arr = np.nan_to_num(np.asarray(vpin, dtype=np.float32))
+
+    cp = float(center_price)
+    ps = float(price_scale)
+    rel_price = ((close_arr - cp) / cp) * ps
+    valid = np.isfinite(rel_price) & (vol_arr > 0)
+    if not np.any(valid):
+        return grid
+
+    rel_valid = rel_price[valid]
+    vol_valid = vol_arr[valid]
+    imb_valid = imb_arr[valid]
+    vpin_valid = vpin_arr[valid]
+    bin_idx = np.abs(rel_valid[:, None] - offsets[None, :]).argmin(axis=1)
+
+    vol_sum = np.bincount(bin_idx, weights=vol_valid, minlength=n_bins).astype(np.float32)
+    imb_num = np.bincount(bin_idx, weights=imb_valid * vol_valid, minlength=n_bins).astype(np.float32)
+    vpin_sum = np.bincount(bin_idx, weights=vpin_valid, minlength=n_bins).astype(np.float32)
+    vpin_count = np.bincount(bin_idx, minlength=n_bins).astype(np.float32)
+
+    total_vol = vol_sum.sum()
+    if total_vol > 0:
+        grid[0] = vol_sum / total_vol
+    nonzero_vol = vol_sum > 0
+    grid[1, nonzero_vol] = imb_num[nonzero_vol] / vol_sum[nonzero_vol]
+    nonzero_count = vpin_count > 0
+    grid[2, nonzero_count] = vpin_sum[nonzero_count] / vpin_count[nonzero_count]
+    return grid
+
+
 # ---------------------------------------------------------------------------
 # AE daily feature computation
 # ---------------------------------------------------------------------------
@@ -438,6 +492,43 @@ def compute_ae_daily_features(
 # ---------------------------------------------------------------------------
 # V3ContinuousPrep — multi-ticker alignment layer
 # ---------------------------------------------------------------------------
+
+@dataclass
+class _V3IndexedTickerStore:
+    """Shared per-ticker arrays for lazy V3 dataset slicing."""
+    ticker: str
+    tech: np.ndarray
+    target: np.ndarray
+    timestamps: np.ndarray
+    nb_ts: np.ndarray
+    nb_vals: np.ndarray
+    rasters_by_anchor_ordinal: Dict[int, np.ndarray]
+    ae_by_anchor_ordinal: Dict[int, np.ndarray]
+    vpin_ts: np.ndarray
+    vpin_vals: np.ndarray
+    vpin_spatial_ts: np.ndarray
+    vpin_spatial_close: np.ndarray
+    vpin_spatial_vol: np.ndarray
+    vpin_spatial_signed_imbalance: np.ndarray
+    vpin_spatial_vpin: np.ndarray
+    vpin_spatial_vwap: np.ndarray
+    ticker_id: int
+    asset_class_id: int
+    asset_subclass_id: int
+
+
+@dataclass
+class _V3SampleTable:
+    """Compact sample index referencing shared ticker arrays."""
+    ticker_indices: np.ndarray
+    bar_indices: np.ndarray
+    nb_cuts: np.ndarray
+    vpin_cuts: np.ndarray
+    anchor_ordinals: np.ndarray
+
+    def __len__(self) -> int:
+        return int(len(self.bar_indices))
+
 
 class V3ContinuousPrep:
     """Prepare and align all modalities for MMTFv3Core across tickers.
@@ -764,6 +855,258 @@ class V3ContinuousPrep:
             samples = pickle.load(f)
         print(f"Loaded {len(samples)} samples ← {path}")
         return samples
+
+    def build_indexed_dataset(
+        self,
+        tech_lookback: int = 64,
+        seq_lookback_bars: int = 12,
+        numbars_lookback: int = 8,
+        use_fused_spatial: bool = False,
+        session_only: bool = True,
+        sample_session: Optional[str] = None,
+        sample_session_start: Optional[str] = None,
+        sample_session_end: Optional[str] = None,
+        stride: int = 1,
+        release_source_data: bool = False,
+    ) -> "V3ContinuousIndexedDataset":
+        """Build a lazy indexed dataset that avoids per-sample materialization."""
+        ticker_stores: List[Optional[_V3IndexedTickerStore]] = [None] * len(self.tickers)
+        ticker_indices: List[np.ndarray] = []
+        bar_indices_all: List[np.ndarray] = []
+        nb_cuts_all: List[np.ndarray] = []
+        vpin_cuts_all: List[np.ndarray] = []
+        anchor_ordinals_all: List[np.ndarray] = []
+
+        for ticker_idx, ticker in enumerate(self.tickers):
+            df = self._tech_dfs.get(ticker)
+            if df is None or df.empty:
+                continue
+
+            meta = self.registry[ticker]
+            feat_cols = self._tech_feature_cols
+            target_col = self._target_col
+            rasters = self._rasters.get(ticker, {})
+            ae_feats = self._ae_features.get(ticker, {})
+            vpin_df = self._seq_vpin.get(ticker, pd.DataFrame())
+            vpin_spatial_df = self._vpin_spatial.get(ticker, pd.DataFrame())
+            nb_ts_arr, nb_vals_arr = self._numbars_ts.get(
+                ticker,
+                (
+                    np.array([], dtype="datetime64[ns]"),
+                    np.empty((0,) + self.numbars_bar_shape, dtype=np.float32),
+                ),
+            )
+
+            tech_arr = np.asarray(df[feat_cols].values, dtype=np.float32)
+            target_arr = np.asarray(df[target_col].values, dtype=np.float32)
+            timestamps = df.index.values.astype("datetime64[ns]")
+            dates = df.index.date
+            bar_times = df.index.time
+
+            if sample_session_start is not None and sample_session_end is not None:
+                t_start = time(
+                    int(sample_session_start.split(":")[0]),
+                    int(sample_session_start.split(":")[1]),
+                )
+                t_end = time(
+                    int(sample_session_end.split(":")[0]),
+                    int(sample_session_end.split(":")[1]),
+                )
+                session_mask = np.array(
+                    [(t >= t_start) & (t <= t_end) for t in bar_times],
+                    dtype=bool,
+                )
+            elif sample_session is not None:
+                col_map = {
+                    "usa": "is_usa",
+                    "london": "is_london",
+                    "overlap": "is_session_overlap",
+                }
+                col = col_map.get(sample_session.lower())
+                if col is None or col not in df.columns:
+                    raise ValueError(
+                        f"Unknown sample_session={sample_session!r}. "
+                        f"Use 'usa', 'london', 'overlap', or set "
+                        f"sample_session_start/end for custom windows."
+                    )
+                session_mask = df[col].values.astype(bool)
+                if not session_mask.any() and "is_active" in df.columns:
+                    session_mask = df["is_active"].values.astype(bool)
+                    print(f"    [WARN] '{col}' all-zero, falling back to is_active")
+            elif session_only:
+                session_mask = (
+                    df["is_active"].values.astype(bool)
+                    if "is_active" in df.columns
+                    else np.ones(len(df), dtype=bool)
+                )
+            else:
+                session_mask = np.ones(len(df), dtype=bool)
+
+            if not vpin_df.empty:
+                vpin_sorted = _normalize_datetime_index(vpin_df)
+                vpin_ts = vpin_sorted.index.values.astype("datetime64[ns]")
+                vpin_vals = np.asarray(vpin_sorted.values, dtype=np.float32)
+            else:
+                vpin_ts = np.array([], dtype="datetime64[ns]")
+                vpin_vals = np.empty((0, 1), dtype=np.float32)
+
+            if not vpin_spatial_df.empty:
+                vpin_spatial_sorted = _normalize_datetime_index(vpin_spatial_df)
+                vpin_spatial_ts = vpin_spatial_sorted.index.values.astype("datetime64[ns]")
+                vpin_spatial_close = np.asarray(vpin_spatial_sorted["close"].values, dtype=np.float32)
+                vpin_spatial_vol = np.asarray(vpin_spatial_sorted["vol"].values, dtype=np.float32)
+                vpin_spatial_signed_imbalance = np.asarray(
+                    vpin_spatial_sorted["signed_imbalance"].values,
+                    dtype=np.float32,
+                )
+                vpin_spatial_vpin = np.asarray(vpin_spatial_sorted["vpin"].values, dtype=np.float32)
+                vpin_spatial_vwap = np.asarray(
+                    vpin_spatial_sorted["rolling_vwap_2h"].values,
+                    dtype=np.float32,
+                )
+            else:
+                vpin_spatial_ts = np.array([], dtype="datetime64[ns]")
+                vpin_spatial_close = np.array([], dtype=np.float32)
+                vpin_spatial_vol = np.array([], dtype=np.float32)
+                vpin_spatial_signed_imbalance = np.array([], dtype=np.float32)
+                vpin_spatial_vpin = np.array([], dtype=np.float32)
+                vpin_spatial_vwap = np.array([], dtype=np.float32)
+
+            unique_dates = sorted(set(dates))
+            date_to_idx = {d: i for i, d in enumerate(unique_dates)}
+            ae_sorted = sorted(ae_feats.keys())
+            ae_sorted_ords = [d.toordinal() for d in ae_sorted]
+
+            ae_by_anchor_ordinal: Dict[int, np.ndarray] = {}
+            rasters_by_anchor_ordinal: Dict[int, np.ndarray] = {}
+            ticker_bar_indices: List[int] = []
+            ticker_anchor_ordinals: List[int] = []
+
+            day_bars: Dict[date, List[int]] = {}
+            for bar_idx in range(tech_lookback, len(df)):
+                if not session_mask[bar_idx]:
+                    continue
+                if np.isnan(target_arr[bar_idx]):
+                    continue
+                day_bars.setdefault(dates[bar_idx], []).append(bar_idx)
+
+            if stride > 1:
+                for current_date in day_bars:
+                    day_bars[current_date] = day_bars[current_date][::stride]
+
+            for current_date, current_bar_indices in day_bars.items():
+                date_ord = date_to_idx.get(current_date, -1)
+                prev_date = unique_dates[date_ord - 1] if date_ord > 0 else None
+                if prev_date is None:
+                    continue
+                if (not use_fused_spatial) and len(nb_ts_arr) == 0 and prev_date not in rasters:
+                    continue
+
+                ae_end_idx = date_ord
+                ae_start_idx = ae_end_idx - self.ae_window
+                if ae_start_idx < 0:
+                    continue
+                ae_dates_window = unique_dates[ae_start_idx:ae_end_idx]
+
+                ae_vec_list = []
+                for ae_date in ae_dates_window:
+                    if ae_date in ae_feats:
+                        ae_vec_list.append(ae_feats[ae_date])
+                    else:
+                        pos = bisect.bisect_right(ae_sorted_ords, ae_date.toordinal()) - 1
+                        if pos < 0:
+                            break
+                        ae_vec_list.append(ae_feats[ae_sorted[pos]])
+
+                if len(ae_vec_list) < len(ae_dates_window):
+                    continue
+
+                current_ord = current_date.toordinal()
+                ae_by_anchor_ordinal[current_ord] = np.stack(ae_vec_list).astype(np.float32)
+                if not use_fused_spatial:
+                    rasters_by_anchor_ordinal[current_ord] = rasters.get(prev_date)
+                ticker_bar_indices.extend(current_bar_indices)
+                ticker_anchor_ordinals.extend([current_ord] * len(current_bar_indices))
+
+            if ticker_bar_indices:
+                ticker_bar_indices_arr = np.asarray(ticker_bar_indices, dtype=np.int32)
+                anchor_ts_all = timestamps[ticker_bar_indices_arr]
+                if len(nb_ts_arr) > 0:
+                    ticker_nb_cuts = np.searchsorted(nb_ts_arr, anchor_ts_all, side="left").astype(np.int32)
+                else:
+                    ticker_nb_cuts = np.zeros(len(ticker_bar_indices_arr), dtype=np.int32)
+                ticker_vpin_cuts = np.searchsorted(vpin_ts, anchor_ts_all, side="left").astype(np.int32)
+
+                ticker_indices.append(
+                    np.full(len(ticker_bar_indices_arr), ticker_idx, dtype=np.int16)
+                )
+                bar_indices_all.append(ticker_bar_indices_arr)
+                nb_cuts_all.append(ticker_nb_cuts)
+                vpin_cuts_all.append(ticker_vpin_cuts)
+                anchor_ordinals_all.append(np.asarray(ticker_anchor_ordinals, dtype=np.int32))
+
+            ticker_stores[ticker_idx] = _V3IndexedTickerStore(
+                ticker=ticker,
+                tech=tech_arr,
+                target=target_arr,
+                timestamps=timestamps,
+                nb_ts=nb_ts_arr,
+                nb_vals=nb_vals_arr,
+                rasters_by_anchor_ordinal=rasters_by_anchor_ordinal,
+                ae_by_anchor_ordinal=ae_by_anchor_ordinal,
+                vpin_ts=vpin_ts,
+                vpin_vals=vpin_vals,
+                vpin_spatial_ts=vpin_spatial_ts,
+                vpin_spatial_close=vpin_spatial_close,
+                vpin_spatial_vol=vpin_spatial_vol,
+                vpin_spatial_signed_imbalance=vpin_spatial_signed_imbalance,
+                vpin_spatial_vpin=vpin_spatial_vpin,
+                vpin_spatial_vwap=vpin_spatial_vwap,
+                ticker_id=meta.ticker_id,
+                asset_class_id=meta.asset_class_id,
+                asset_subclass_id=meta.asset_subclass_id,
+            )
+
+            if release_source_data:
+                self._tech_dfs[ticker] = pd.DataFrame()
+                self._numbars_ts[ticker] = (
+                    np.array([], dtype="datetime64[ns]"),
+                    np.empty((0,) + self.numbars_bar_shape, dtype=np.float32),
+                )
+                self._rasters[ticker] = {}
+                self._seq_vpin[ticker] = pd.DataFrame()
+                self._vpin_spatial[ticker] = pd.DataFrame()
+                self._ae_features[ticker] = {}
+
+        if bar_indices_all:
+            sample_table = _V3SampleTable(
+                ticker_indices=np.concatenate(ticker_indices),
+                bar_indices=np.concatenate(bar_indices_all),
+                nb_cuts=np.concatenate(nb_cuts_all),
+                vpin_cuts=np.concatenate(vpin_cuts_all),
+                anchor_ordinals=np.concatenate(anchor_ordinals_all),
+            )
+        else:
+            sample_table = _V3SampleTable(
+                ticker_indices=np.array([], dtype=np.int16),
+                bar_indices=np.array([], dtype=np.int32),
+                nb_cuts=np.array([], dtype=np.int32),
+                vpin_cuts=np.array([], dtype=np.int32),
+                anchor_ordinals=np.array([], dtype=np.int32),
+            )
+
+        return V3ContinuousIndexedDataset(
+            ticker_stores=ticker_stores,
+            sample_table=sample_table,
+            tech_lookback=tech_lookback,
+            seq_lookback_bars=seq_lookback_bars,
+            numbars_lookback=numbars_lookback,
+            use_fused_spatial=use_fused_spatial,
+            target_steps=self.target_steps,
+            profile_shape=self.profile_shape,
+            raster_shape=self.raster_shape,
+            fused_tail_shape=(self.numbars_bar_shape[0] + 3, self.numbars_bar_shape[1]),
+        )
 
     def build_samples(
         self,
@@ -1150,6 +1493,125 @@ class V3ContinuousPrep:
 # ---------------------------------------------------------------------------
 # PyTorch Dataset
 # ---------------------------------------------------------------------------
+
+class V3ContinuousIndexedDataset(Dataset):
+    """Lazy V3 dataset backed by shared arrays plus a compact sample index."""
+
+    def __init__(
+        self,
+        ticker_stores: List[Optional[_V3IndexedTickerStore]],
+        sample_table: _V3SampleTable,
+        tech_lookback: int,
+        seq_lookback_bars: int,
+        numbars_lookback: int,
+        use_fused_spatial: bool,
+        target_steps: int,
+        profile_shape: Tuple[int, ...] = (4, 96),
+        raster_shape: Tuple[int, ...] = (12, 4, 128),
+        fused_tail_shape: Tuple[int, ...] = (7, 32),
+    ):
+        self._ticker_stores = ticker_stores
+        self._sample_table = sample_table
+        self.tech_lookback = tech_lookback
+        self.seq_lookback_bars = seq_lookback_bars
+        self.numbars_lookback = numbars_lookback
+        self.use_fused_spatial = use_fused_spatial
+        self.target_steps = target_steps
+        self.profile_shape = profile_shape
+        self.raster_shape = raster_shape
+        self.fused_tail_shape = fused_tail_shape
+        self._default_numbars_shape = (
+            max(1, fused_tail_shape[0] - 3),
+            fused_tail_shape[1],
+        )
+        self._one_hour = np.timedelta64(1, "h")
+
+    @property
+    def sample_dates(self) -> List[date]:
+        return [date.fromordinal(int(x)) for x in self._sample_table.anchor_ordinals]
+
+    def __len__(self) -> int:
+        return len(self._sample_table)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        ticker_store = self._ticker_stores[int(self._sample_table.ticker_indices[idx])]
+        if ticker_store is None:
+            raise IndexError("Sample references an unloaded ticker store.")
+        bar_idx = int(self._sample_table.bar_indices[idx])
+        nb_cut = int(self._sample_table.nb_cuts[idx])
+        vpin_cut = int(self._sample_table.vpin_cuts[idx])
+        anchor_ordinal = int(self._sample_table.anchor_ordinals[idx])
+
+        tech_window = ticker_store.tech[bar_idx - self.tech_lookback:bar_idx]
+        ae_input = ticker_store.ae_by_anchor_ordinal[anchor_ordinal]
+
+        if nb_cut > 0:
+            nb_lo = max(0, nb_cut - self.numbars_lookback)
+            nb_ts = ticker_store.nb_ts[nb_lo:nb_cut]
+            nb_data = ticker_store.nb_vals[nb_lo:nb_cut]
+        else:
+            nb_ts = ticker_store.timestamps[bar_idx:bar_idx + 1]
+            nb_shape = ticker_store.nb_vals.shape[1:] if ticker_store.nb_vals.ndim == 3 else self._default_numbars_shape
+            nb_data = np.zeros((1,) + nb_shape, dtype=np.float32)
+
+        if vpin_cut > 0:
+            vpin_lo = max(0, vpin_cut - self.seq_lookback_bars)
+            seq_data = ticker_store.vpin_vals[vpin_lo:vpin_cut]
+        else:
+            vpin_dim = ticker_store.vpin_vals.shape[1] if ticker_store.vpin_vals.ndim == 2 and ticker_store.vpin_vals.shape[1] > 0 else 1
+            seq_data = np.zeros((1, vpin_dim), dtype=np.float32)
+
+        out = {
+            "tech_features": torch.tensor(tech_window, dtype=torch.float32),
+            "tech_lens": torch.tensor(self.tech_lookback, dtype=torch.long),
+            "seq_vpin": torch.tensor(seq_data, dtype=torch.float32),
+            "seq_vpin_lens": torch.tensor(len(seq_data), dtype=torch.long),
+            "ae_input": torch.tensor(ae_input, dtype=torch.float32),
+            "ticker_id": torch.tensor(ticker_store.ticker_id, dtype=torch.long),
+            "asset_class_id": torch.tensor(ticker_store.asset_class_id, dtype=torch.long),
+            "asset_subclass_id": torch.tensor(ticker_store.asset_subclass_id, dtype=torch.long),
+            "target": torch.tensor(ticker_store.target[bar_idx], dtype=torch.float32),
+        }
+
+        if self.use_fused_spatial:
+            vpin_spatial = np.zeros(
+                (nb_data.shape[0], 3, nb_data.shape[2]),
+                dtype=np.float32,
+            )
+            if ticker_store.vpin_spatial_ts.size > 0:
+                nb_ends64 = nb_ts.astype("datetime64[ns]")
+                nb_starts64 = nb_ends64 - self._one_hour
+                vpin_los = np.searchsorted(ticker_store.vpin_spatial_ts, nb_starts64, side="right")
+                vpin_his = np.searchsorted(ticker_store.vpin_spatial_ts, nb_ends64, side="right")
+                for nb_i in range(len(nb_ts)):
+                    vpin_hi = int(vpin_his[nb_i])
+                    if vpin_hi <= 0:
+                        continue
+                    vpin_lo = int(vpin_los[nb_i])
+                    center_price = float(ticker_store.vpin_spatial_vwap[vpin_hi - 1])
+                    vpin_spatial[nb_i] = rasterize_vpin_arrays_to_grid(
+                        close=ticker_store.vpin_spatial_close[vpin_lo:vpin_hi],
+                        vol=ticker_store.vpin_spatial_vol[vpin_lo:vpin_hi],
+                        signed_imbalance=ticker_store.vpin_spatial_signed_imbalance[vpin_lo:vpin_hi],
+                        vpin=ticker_store.vpin_spatial_vpin[vpin_lo:vpin_hi],
+                        price_offsets=nb_data[nb_i, 3],
+                        center_price=center_price,
+                    )
+            fused = np.concatenate([nb_data, vpin_spatial], axis=1).astype(np.float32)
+            out["fused_spatial"] = torch.tensor(fused, dtype=torch.float32)
+        else:
+            out["numbars_recent"] = torch.tensor(nb_data, dtype=torch.float32)
+            raster = ticker_store.rasters_by_anchor_ordinal.get(anchor_ordinal)
+            if raster is None:
+                out["vpin_raster_recent"] = torch.zeros(self.raster_shape, dtype=torch.float32)
+            else:
+                out["vpin_raster_recent"] = torch.tensor(
+                    np.asarray(raster, dtype=np.float32),
+                    dtype=torch.float32,
+                )
+
+        return out
+
 
 class V3ContinuousDataset(Dataset):
     """PyTorch dataset producing bar-level samples for MMTFv3Core."""
