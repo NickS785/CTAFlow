@@ -605,17 +605,24 @@ def prepare_crack_data(
     tickers: Sequence[str] = DEFAULT_CRACK_TICKERS,
     bar_minutes: int = 15,
     target_mode: str = "logret",
-    steps_60m: int = 4,
+    target_horizon_minutes: int = 60,
+    target_ticker: str = "CRACK",
+    fold: bool = False,
+    n_folds: int = 3,
     orderflow_columns: Optional[Sequence[str]] = None,
 ) -> Tuple[CrackSpreadContinuousPrep, pd.DataFrame, pd.Series, List[str], Dict[str, pd.DataFrame], List[str]]:
+    target_steps = max(1, int(target_horizon_minutes) // int(bar_minutes))
     prep = CrackSpreadContinuousPrep(
         root_features_dir=data_root,
         tickers=tuple(t.upper() for t in tickers),
         bar_minutes=bar_minutes,
         target_mode=target_mode,
+        fold=fold,
+        n_folds=n_folds,
     )
     df_out, train_mask, target_cols = prep.prepare_from_root(
-        steps_60m=steps_60m,
+        steps_60m=target_steps,
+        target_ticker=target_ticker,
         keep_only_active=False,
         add_daily=True,
         add_overnight=True,
@@ -626,5 +633,9 @@ def prepare_crack_data(
         apply_scaling=False,
         add_bid_ask=True,
     )
-    orderflow_frames, orderflow_cols = prep.load_orderflow_frames(orderflow_columns=orderflow_columns)
+    orderflow_frames, orderflow_cols = prep.load_orderflow_frames(
+        orderflow_columns=orderflow_columns,
+        fold=fold,
+        n_folds=n_folds,
+    )
     return prep, df_out, train_mask, target_cols, orderflow_frames, orderflow_cols
