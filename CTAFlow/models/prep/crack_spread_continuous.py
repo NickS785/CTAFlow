@@ -24,6 +24,7 @@ from .intraday_continuous import ContinuousIntradayPrep, SessionSpec
 logger = logging.getLogger(__name__)
 
 DEFAULT_CRACK_TICKERS: Tuple[str, str, str] = ("CL", "HO", "RB")
+DEFAULT_TARGET_TICKER = "CRACK"
 _SPREAD_PATH_CANDIDATES: Tuple[str, ...] = (
     "synthetic/crack_spread.csv",
     "synthetics/crack_spread.csv",
@@ -42,6 +43,16 @@ _ORDERFLOW_BASE_COLS: Tuple[str, ...] = (
     "buy",
     "sell",
     "imbalance",
+    "close",
+    "ps_poc",
+    "ps_val",
+    "ps_vah",
+    "pd_poc",
+    "pd_val",
+    "pd_vah",
+)
+_VPIN_FOLD_SUM_COLS: Tuple[str, ...] = ("vol", "buy", "sell", "imbalance")
+_VPIN_FOLD_LAST_COLS: Tuple[str, ...] = (
     "close",
     "ps_poc",
     "ps_val",
@@ -96,6 +107,37 @@ def _normalize_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _fold_vpin_rows(df: pd.DataFrame, n_folds: int) -> pd.DataFrame:
+    """Fold consecutive VPIN rows into coarser buckets."""
+    if n_folds <= 1 or df.empty:
+        return df
+
+    out = _normalize_datetime_index(df)
+    numeric_cols = list(out.select_dtypes(include="number").columns)
+    if not numeric_cols:
+        return out
+
+    n_rows = len(out)
+    group_ids = np.arange(n_rows, dtype=np.int32) // int(n_folds)
+    agg_map = {}
+    for col in numeric_cols:
+        if col in _VPIN_FOLD_SUM_COLS:
+            agg_map[col] = "sum"
+        elif col in _VPIN_FOLD_LAST_COLS:
+            agg_map[col] = "last"
+        else:
+            agg_map[col] = "mean"
+
+    folded = out.loc[:, numeric_cols].groupby(group_ids, sort=False).agg(agg_map)
+    last_positions = np.minimum(
+        (np.arange(len(folded), dtype=np.int32) + 1) * int(n_folds),
+        n_rows,
+    ) - 1
+    folded.index = out.index.values[last_positions]
+    folded.index.name = out.index.name
+    return folded
+
+
 def _load_event_presets_module():
     """Load event presets directly to avoid importing the full screeners package."""
     module_name = "_ctaflow_event_presets_direct"
@@ -113,6 +155,18 @@ def _load_event_presets_module():
 
 class CrackSpreadContinuousPrep(ContinuousIntradayPrep):
     """Continuous prep for a synthetic 3-2-1 crack spread anchor series."""
+
+    @staticmethod
+    def normalize_target_ticker(
+        target_ticker: Optional[str],
+    ) -> str:
+        """Normalize target source names to CRACK or an uppercase ticker."""
+        if target_ticker is None:
+            return DEFAULT_TARGET_TICKER
+        normalized = str(target_ticker).strip().upper()
+        if normalized in {"", "CRACK", "SPREAD", "CRACK_SPREAD"}:
+            return DEFAULT_TARGET_TICKER
+        return normalized
 
     @staticmethod
     def get_known_temporal_cols(
@@ -224,11 +278,15 @@ class CrackSpreadContinuousPrep(ContinuousIntradayPrep):
         bar_minutes: int = 5,
         eps: float = 1e-8,
         target_mode: str = "delta",
+        fold: bool = False,
+        n_folds: int = 3,
     ):
         super().__init__(sessions=sessions, bar_minutes=bar_minutes, eps=eps)
         self.root_features_dir = Path(root_features_dir)
         self.tickers = tuple(t.upper() for t in tickers)
         self.target_mode = target_mode
+        self.fold = bool(fold)
+        self.n_folds = max(1, int(n_folds))
 
     def _resample_ohlcv_frame(self, df: pd.DataFrame) -> pd.DataFrame:
         """Resample a 5-minute OHLCV frame onto the configured master clock."""
@@ -293,10 +351,70 @@ class CrackSpreadContinuousPrep(ContinuousIntradayPrep):
     def _load_intraday_df(self, ticker: str) -> pd.DataFrame:
         return self._standardize_columns(read_exported_df(self._resolve_intraday_path(ticker)))
 
+    def _build_target_frame(
+        self,
+        target_ticker: Optional[str],
+        spread_df: pd.DataFrame,
+        asset_intraday: Dict[str, pd.DataFrame],
+        anchor_idx: pd.DatetimeIndex,
+    ) -> pd.DataFrame:
+        """Build the OHLCV frame used to calculate targets on the master clock."""
+        resolved_target = self.normalize_target_ticker(target_ticker)
+        if resolved_target == DEFAULT_TARGET_TICKER:
+            target_df = self._resample_ohlcv_frame(spread_df)
+        else:
+            if resolved_target not in asset_intraday:
+                raise ValueError(
+                    f"Unknown target_ticker={target_ticker!r}. "
+                    f"Expected one of {self.tickers} or 'CRACK'."
+                )
+            target_df = self._resample_ohlcv_frame(asset_intraday[resolved_target])
+
+        if not target_df.index.equals(anchor_idx):
+            target_df = target_df.reindex(anchor_idx)
+        return target_df
+
+    def _apply_target_frame(
+        self,
+        df: pd.DataFrame,
+        target_df: pd.DataFrame,
+        steps: int,
+        prefix: str = "y_fwd",
+    ) -> Tuple[pd.DataFrame, List[str]]:
+        """Overwrite target columns using an alternate OHLCV target source."""
+        out = df.copy()
+        close = target_df["Close"].astype(float)
+        logp = np.log(close.clip(lower=self.eps))
+        target_cols: List[str] = []
+
+        rv = None
+        if self.target_mode == "vol_norm_delta":
+            logret = logp.diff()
+            daily_rv = (logret ** 2).groupby(target_df.index.normalize()).sum().pipe(np.sqrt)
+            rv = daily_rv.shift(1).reindex(target_df.index.normalize()).ffill().values.astype(np.float32)
+
+        for h in range(1, steps + 1):
+            col = f"{prefix}_{h}"
+            if self.target_mode == "logret":
+                out[col] = logp.shift(-h) - logp
+            elif self.target_mode == "vol_norm_delta":
+                raw_delta = close.shift(-h) - close
+                if rv is not None:
+                    out[col] = raw_delta / (rv + self.eps)
+                else:
+                    out[col] = raw_delta
+            else:
+                out[col] = close.shift(-h) - close
+            target_cols.append(col)
+
+        return out, target_cols
+
     def _load_vpin_df(
         self,
         ticker: str,
         columns: Optional[Sequence[str]] = None,
+        fold: Optional[bool] = None,
+        n_folds: Optional[int] = None,
     ) -> pd.DataFrame:
         read_cols = None
         if columns is not None:
@@ -307,6 +425,12 @@ class CrackSpreadContinuousPrep(ContinuousIntradayPrep):
         for col in ("date", "ticker", "ts_end"):
             if col in df.columns:
                 df = df.drop(columns=col)
+        do_fold = self.fold if fold is None else bool(fold)
+        fold_size = self.n_folds if n_folds is None else max(1, int(n_folds))
+        if do_fold and fold_size > 1:
+            before_rows = len(df)
+            df = _fold_vpin_rows(df, fold_size)
+            logger.info("[%s] folded VPIN rows %s -> %s using n_folds=%s", ticker, before_rows, len(df), fold_size)
         numeric_cols = df.select_dtypes(include="number").columns
         if len(numeric_cols) > 0:
             df.loc[:, numeric_cols] = df.loc[:, numeric_cols].astype(np.float32)
@@ -316,6 +440,8 @@ class CrackSpreadContinuousPrep(ContinuousIntradayPrep):
         self,
         load_orderflow: bool = False,
         orderflow_columns: Optional[Sequence[str]] = None,
+        fold: Optional[bool] = None,
+        n_folds: Optional[int] = None,
     ) -> Dict[str, object]:
         asset_intraday = {ticker: self._load_intraday_df(ticker) for ticker in self.tickers}
         out = {
@@ -324,7 +450,12 @@ class CrackSpreadContinuousPrep(ContinuousIntradayPrep):
         }
         if load_orderflow:
             out["asset_vpin"] = {
-                ticker: self._load_vpin_df(ticker, columns=orderflow_columns)
+                ticker: self._load_vpin_df(
+                    ticker,
+                    columns=orderflow_columns,
+                    fold=fold,
+                    n_folds=n_folds,
+                )
                 for ticker in self.tickers
             }
         return out
@@ -513,6 +644,8 @@ class CrackSpreadContinuousPrep(ContinuousIntradayPrep):
     def load_orderflow_frames(
         self,
         orderflow_columns: Optional[Sequence[str]] = None,
+        fold: Optional[bool] = None,
+        n_folds: Optional[int] = None,
     ) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
         """Load scaled per-asset VPIN streams without merging onto ``df_out``."""
         from CTAFlow.data.datasets.v3_continuous import scale_vpin_features
@@ -521,7 +654,12 @@ class CrackSpreadContinuousPrep(ContinuousIntradayPrep):
         common_cols: Optional[set[str]] = None
 
         for ticker in self.tickers:
-            raw = self._load_vpin_df(ticker, columns=orderflow_columns)
+            raw = self._load_vpin_df(
+                ticker,
+                columns=orderflow_columns,
+                fold=fold,
+                n_folds=n_folds,
+            )
             numeric = raw.select_dtypes(include="number")
             if numeric.empty:
                 frames[ticker] = pd.DataFrame(index=raw.index)
@@ -571,6 +709,7 @@ class CrackSpreadContinuousPrep(ContinuousIntradayPrep):
     def prepare_from_root(
         self,
         steps_60m: int = 12,
+        target_ticker: Optional[str] = None,
         keep_only_active: bool = False,
         add_daily: bool = True,
         add_overnight: bool = True,
@@ -587,6 +726,12 @@ class CrackSpreadContinuousPrep(ContinuousIntradayPrep):
     ) -> Tuple[pd.DataFrame, pd.Series, List[str]]:
         raw = self.load_raw_inputs(load_orderflow=False)
         anchor = self.build_spread_anchor_df(raw["spread"], raw["asset_intraday"])
+        target_df = self._build_target_frame(
+            target_ticker=target_ticker,
+            spread_df=raw["spread"],
+            asset_intraday=raw["asset_intraday"],
+            anchor_idx=anchor.index,
+        )
 
         df_out, train_mask, target_cols = super().prepare(
             anchor,
@@ -609,6 +754,13 @@ class CrackSpreadContinuousPrep(ContinuousIntradayPrep):
         )
 
         df_out = self.add_spread_specific_features(df_out)
+        resolved_target = self.normalize_target_ticker(target_ticker)
+        if resolved_target != DEFAULT_TARGET_TICKER:
+            df_out, target_cols = self._apply_target_frame(
+                df_out,
+                target_df=target_df,
+                steps=steps_60m,
+            )
 
         # Refresh mask after added feature/target transforms.
         train_mask = df_out["is_active"].astype(bool)
@@ -633,6 +785,9 @@ class CrackSpreadContinuousPrep(ContinuousIntradayPrep):
         spread_lookback: int = 64,
         orderflow_lookback: int = 128,
         orderflow_columns: Optional[Sequence[str]] = None,
+        fold: Optional[bool] = None,
+        n_folds: Optional[int] = None,
+        target_ticker: Optional[str] = None,
         spread_feature_cols: Optional[Sequence[str]] = None,
         known_temporal_cols: Optional[Sequence[str]] = None,
         session_only: bool = True,
@@ -649,8 +804,15 @@ class CrackSpreadContinuousPrep(ContinuousIntradayPrep):
             build_crack_spread_indexed_dataset,
         )
 
-        df_out, _, target_cols = self.prepare_from_root(**prepare_kwargs)
-        orderflow_frames, _ = self.load_orderflow_frames(orderflow_columns=orderflow_columns)
+        df_out, _, target_cols = self.prepare_from_root(
+            target_ticker=target_ticker,
+            **prepare_kwargs,
+        )
+        orderflow_frames, _ = self.load_orderflow_frames(
+            orderflow_columns=orderflow_columns,
+            fold=fold,
+            n_folds=n_folds,
+        )
         target_col = target_cols[-1]
         return build_crack_spread_indexed_dataset(
             df_out=df_out,
