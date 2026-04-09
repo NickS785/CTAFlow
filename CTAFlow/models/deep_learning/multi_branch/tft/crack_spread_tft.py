@@ -536,6 +536,23 @@ class CrackSpreadTFT(nn.Module):
             )
         return known_future
 
+    @staticmethod
+    def _align_temporal_length(
+        x: torch.Tensor,
+        target_steps: int,
+    ) -> torch.Tensor:
+        """Pool/interpolate a [B,T,D] branch to the encoder time length."""
+        if x.size(1) == target_steps:
+            return x
+        if x.size(1) <= 0:
+            return x.new_zeros(x.size(0), target_steps, x.size(2))
+        return F.interpolate(
+            x.transpose(1, 2),
+            size=target_steps,
+            mode="linear",
+            align_corners=False,
+        ).transpose(1, 2)
+
     def _causal_mask(self, total_steps: int, device: torch.device) -> torch.Tensor:
         return torch.triu(
             torch.ones(total_steps, total_steps, dtype=torch.bool, device=device),
@@ -575,15 +592,12 @@ class CrackSpreadTFT(nn.Module):
             orderflow,
             orderflow_mask=orderflow_mask,
         )
-        if normalized_orderflow.size(1) != encoder_steps:
-            raise ValueError(
-                f"orderflow encoder length {normalized_orderflow.size(1)} does not match past_observed {encoder_steps}"
-            )
 
         static_ctx = self._encode_static(static_context)
         static_ctx_t = static_ctx.unsqueeze(1) if static_ctx is not None else None
 
         of_fused, asset_weights = self.of_fusion(normalized_orderflow, valid_mask=normalized_mask)
+        of_fused = self._align_temporal_length(of_fused, encoder_steps)
         past_vars = self._project_scalars(past_observed, self.past_proj)
         past_vars.append(of_fused)
         past_selected, past_weights = self.past_vsn(past_vars, static_ctx_t)

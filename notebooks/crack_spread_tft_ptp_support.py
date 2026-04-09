@@ -119,19 +119,21 @@ def build_windowed_crack_samples(
     known_temporal_cols: Sequence[str],
     tickers: Sequence[str] = DEFAULT_CRACK_TICKERS,
     encoder_steps: int = 48,
+    orderflow_lookback: Optional[int] = None,
     decoder_steps: int = 4,
     session_only: bool = True,
     sample_session: Optional[str] = None,
     stride: int = 1,
     require_all_assets: bool = True,
 ) -> List[Dict]:
+    resolved_orderflow_lookback = int(orderflow_lookback or encoder_steps)
     base_samples = build_crack_spread_samples(
         df_out=df_out,
         orderflow_frames=orderflow_frames,
         target_col=target_col,
         tickers=tickers,
         spread_lookback=encoder_steps,
-        orderflow_lookback=encoder_steps,
+        orderflow_lookback=resolved_orderflow_lookback,
         session_only=session_only,
         sample_session=sample_session,
         stride=stride,
