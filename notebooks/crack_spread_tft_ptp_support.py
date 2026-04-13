@@ -731,9 +731,13 @@ def compute_trading_metrics(
         pred_dir = (pred >= 2).long() - (pred < 2).long()
         true_dir = (targets_t >= 2).long() - (targets_t < 2).long()
         metrics["cls_dir_accuracy"] = float((pred_dir == true_dir).float().mean().item() * 100.0)
+        for class_idx, label in enumerate(PredictionToPosition.ACTION_LABELS):
+            metrics[f"pred_{label}_rate"] = float((pred == class_idx).float().mean().item())
     else:
         metrics["cls_accuracy"] = 0.0
         metrics["cls_dir_accuracy"] = 0.0
+        for label in PredictionToPosition.ACTION_LABELS:
+            metrics[f"pred_{label}_rate"] = 0.0
     return metrics
 
 

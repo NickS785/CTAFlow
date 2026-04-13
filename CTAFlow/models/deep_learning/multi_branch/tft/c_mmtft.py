@@ -22,7 +22,7 @@ Proper Temporal Fusion architecture:
            enrichment_ctx = GRN(c_e)
            temporal_attn(query=enrichment_ctx, K/V=fused_seq) → z_temporal
 
-  Phase 6: head(cat[z_temporal, z_selected]) → tanh → position ∈ [-1, 1]
+  Phase 6: head(cat[z_temporal, z_selected]) → position head → tradeable position
 
 The backbone IS the model — it processes the primary temporal stream
 (intraday technical indicators from ContinuousIntradayPrep), while the
@@ -40,7 +40,7 @@ Data shapes:
 from __future__ import annotations
 
 import math
-from typing import Dict, Iterable, Literal, Optional, Tuple
+from typing import Dict, Iterable, Literal, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -627,7 +627,7 @@ class MMTFv3MambaVQVAE(MMTFv3Core):
 
 
 # ============================================================================
-# PredictionToPosition — 5-class quantile → continuous position
+# PredictionToPosition — 4-class quantile → discrete position
 # ============================================================================
 
 def returns_to_classes(
@@ -663,15 +663,22 @@ def returns_to_classes(
 
 
 class PredictionToPosition(nn.Module):
-    """Convert 4-class quantile logits → continuous position ∈ [-1, 1].
+    """Convert 4-class logits into discrete tradeable position levels.
 
-    Classes: 0=strong_neg, 1=weak_neg, 2=weak_pos, 3=strong_pos
+    Classes:
+      0 = ``sell_2`` → ``-1.0``
+      1 = ``sell_1`` → ``-0.5``
+      2 = ``buy_1`` → ``+0.5``
+      3 = ``buy_2`` → ``+1.0``
 
-    Position = tanh(temperature * sum(p_i * anchor_i))
-    where anchors are learnable, initialized to [-1.0, -0.33, +0.33, +1.0].
+    Forward uses a straight-through estimator: the emitted position is always
+    one of the fixed levels above, while gradients still flow through the
+    softmax probabilities during training.
     """
 
     N_CLASSES = 4
+    ACTION_LABELS = ("sell_2", "sell_1", "buy_1", "buy_2")
+    DEFAULT_POSITION_LEVELS = (-1.0, -0.5, 0.5, 1.0)
 
     def __init__(
         self,
@@ -679,15 +686,21 @@ class PredictionToPosition(nn.Module):
         context_dim: int = 0,
         max_anchor_shift: float = 0.35,
         max_temp_scale: float = 0.30,
+        position_levels: Optional[Sequence[float]] = None,
     ):
         super().__init__()
         self.temperature = temperature
         self.context_dim = context_dim
         self.max_anchor_shift = max_anchor_shift
         self.max_temp_scale = max_temp_scale
-        self.anchors = nn.Parameter(
-            torch.tensor([-1.0, -0.33, 0.33, 1.0]),
-        )
+        levels = self.DEFAULT_POSITION_LEVELS if position_levels is None else tuple(float(v) for v in position_levels)
+        if len(levels) != self.N_CLASSES:
+            raise ValueError(
+                f"position_levels must have {self.N_CLASSES} entries, got {len(levels)}"
+            )
+        if any(levels[idx] >= levels[idx + 1] for idx in range(len(levels) - 1)):
+            raise ValueError("position_levels must be strictly increasing")
+        self.register_buffer("position_levels", torch.tensor(levels, dtype=torch.float32))
         if context_dim > 0:
             ctx_hidden = max(16, min(128, context_dim))
             self.context_to_anchor = nn.Sequential(
@@ -723,31 +736,36 @@ class PredictionToPosition(nn.Module):
         logits : Tensor (B, 4) — passed through for multi-loss
         """
         batch_size = logits.size(0)
-        anchors = self.anchors.unsqueeze(0).expand(batch_size, -1)
+        levels = self.position_levels.to(device=logits.device, dtype=logits.dtype)
+        level_grid = levels.unsqueeze(0).expand(batch_size, -1)
         temperature = torch.full(
             (batch_size, 1),
             fill_value=self.temperature,
             dtype=logits.dtype,
             device=logits.device,
         )
-        anchor_shift = torch.zeros_like(anchors)
+        anchor_shift = torch.zeros_like(level_grid)
+        shifted_logits = logits
 
         if context is not None and self.context_to_anchor is not None:
             anchor_shift = self.max_anchor_shift * torch.tanh(
                 self.context_to_anchor(context),
             )
-            anchors = anchors + anchor_shift
+            shifted_logits = shifted_logits + anchor_shift
             temperature = temperature * (
                 1.0 + self.max_temp_scale * self.context_to_temp(context)
             ).clamp(min=0.5, max=1.5)
 
-        probs = torch.softmax(logits / temperature, dim=-1)         # (B, 5)
-        weighted = (probs * anchors).sum(dim=-1)                    # (B,)
-        position = torch.tanh(weighted).unsqueeze(-1)                # (B, 1)
+        scaled_logits = shifted_logits / temperature
+        probs = torch.softmax(scaled_logits, dim=-1)                # (B, 4)
+        hard_idx = scaled_logits.argmax(dim=-1)
+        hard_one_hot = nn.functional.one_hot(hard_idx, num_classes=self.N_CLASSES).to(probs.dtype)
+        selector = hard_one_hot - probs.detach() + probs
+        position = (selector * level_grid).sum(dim=-1, keepdim=True)  # (B, 1)
         self._last_stats = {
             "anchor_shift_mean": anchor_shift.detach().abs().mean().item(),
             "temperature_mean": temperature.detach().mean().item(),
-            "anchor_mean": anchors.detach().mean().item(),
+            "anchor_mean": levels.detach().mean().item(),
         }
         return position, logits
 
@@ -756,7 +774,7 @@ class PredictionToPosition(nn.Module):
 
 
 class QuantilePositionHead(nn.Module):
-    """MLP → 4-class logits → PredictionToPosition → continuous position.
+    """MLP → 4-class logits → PredictionToPosition → discrete position.
 
     Classes: 0=strong_neg, 1=weak_neg, 2=weak_pos, 3=strong_pos.
     Replaces the standard Tanh head in MMTFv3Core when quantile_head=True.
@@ -907,7 +925,7 @@ class StatefulMMTFv3Core(nn.Module):
         Number of tickers for position state tracking.
     quantile_head : bool
         If True, replace the base model's head with a QuantilePositionHead
-        that produces 5-class logits → continuous position via PTP.
+        that produces 4-class logits → discrete position via PTP.
         Forward returns ``(position, ae_losses, logits)`` when True.
     ptp_temperature : float
         Temperature for PredictionToPosition sharpness. Default 1.5.
@@ -1395,7 +1413,7 @@ class PTPLoss(nn.Module):
 
     Components:
       1. Profit-weighted CE on 4-class logits (classification quality)
-      2. ContinuousTradingLoss on continuous position (PnL/Sharpe)
+      2. ContinuousTradingLoss on the emitted position levels (PnL/Sharpe)
 
     The CE uses 4-class direction mapping: classes {0,1} → negative,
     classes {2,3} → positive. No neutral class.
@@ -1467,7 +1485,7 @@ class PTPLoss(nn.Module):
         Parameters
         ----------
         position : Tensor (B, 1)
-            Continuous position from PTP.
+            Position from PTP.
         logits : Tensor (B, 4)
             Raw class logits for CE loss.
         forward_return : Tensor (B,) or (B, 1)
@@ -1490,7 +1508,7 @@ class PTPLoss(nn.Module):
         # 1. Classification loss (profit-weighted CE on 4-class logits)
         ce = self._profit_weighted_ce(logits, class_labels, fwd)
 
-        # 2. Trading loss (PnL/Sharpe on continuous position)
+        # 2. Trading loss (PnL/Sharpe on emitted position levels)
         trading, trading_metrics = self.trading_loss(
             position, fwd, prev_position=prev_position,
         )
