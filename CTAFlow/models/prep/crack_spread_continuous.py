@@ -482,7 +482,8 @@ class CrackSpreadContinuousPrep(ContinuousIntradayPrep):
         df = _normalize_datetime_index_inplace(df)
         numeric_cols = df.select_dtypes(include="number").columns
         if len(numeric_cols) > 0:
-            df.loc[:, numeric_cols] = df.loc[:, numeric_cols].astype(np.float32, copy=False)
+            for col in numeric_cols:
+                df[col] = df[col].astype(np.float32, copy=False)
         return df
 
     def load_raw_inputs(

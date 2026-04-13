@@ -11,6 +11,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
+from CTAFlow.models.deep_learning.gru import GRUAttnClassifier
 
 from CTAFlow.data.datasets.crack_spread_continuous import (
     build_crack_spread_samples,
@@ -28,6 +29,53 @@ from CTAFlow.models.deep_learning.training.loss.clf import SharpeScheduler
 from CTAFlow.models.prep.crack_spread_continuous import (
     DEFAULT_CRACK_TICKERS,
     CrackSpreadContinuousPrep,
+)
+
+TIME_CONTEXT_COLS: Tuple[str, ...] = (
+    "tod_sin",
+    "tod_cos",
+    "dow_sin",
+    "dow_cos",
+    "doy_sin",
+    "doy_cos",
+    "is_active",
+    "is_london",
+    "is_usa",
+    "is_session_overlap",
+    "is_london_session",
+    "is_usa_session",
+    "is_overlap_session",
+)
+COMPACT_SPREAD_COLS: Tuple[str, ...] = (
+    "spread_log_ret",
+    "spread_ret_3",
+    "spread_ret_6",
+    "spread_ret_12",
+    "spread_roll_vol_12",
+    "spread_roll_vol_24",
+    "spread_z_1d",
+    "spread_z_5d",
+    "spread_volume_z36",
+    "spread_london_open_rel_close",
+    "spread_usa_open_rel_close",
+)
+COMPACT_TICKER_COLS: Tuple[str, ...] = (
+    "mom_5d",
+    "mom_10d",
+    "mom_20d",
+    "dist_sma_50d",
+    "dist_sma_200d",
+    "rv_1d",
+    "rv_5d_mean",
+    "rv_20d_mean",
+    "macd_norm",
+    "macd_signal_norm",
+    "macd_hist_norm",
+    "rsi_14",
+    "overnight_return",
+    "rs_30m_ret_deseas",
+    "rs_60m_ret_deseas",
+    "deseasonalized_volume",
 )
 
 
@@ -56,6 +104,181 @@ def infer_spread_feature_cols(
     if not cols:
         raise ValueError("Unable to infer spread feature columns from df_out.")
     return cols
+
+
+def _select_existing_columns(df: pd.DataFrame, cols: Sequence[str]) -> List[str]:
+    return [col for col in cols if col in df.columns]
+
+
+def _build_compact_ticker_feature_frame(
+    prep: CrackSpreadContinuousPrep,
+    ticker: str,
+    anchor_index: pd.DatetimeIndex,
+    rolling_days_deseas: int = 252,
+    refit_interval: int = 10,
+    use_legacy_deseas: bool = False,
+) -> pd.DataFrame:
+    ticker_df = prep._resample_ohlcv_frame(prep._load_intraday_df(ticker))
+    ticker_df["tod_slot"] = prep._slot_index(ticker_df.index).astype(int).values
+    ticker_df = prep.add_sessions(ticker_df)
+    ticker_df = prep.add_resample_precalcs(ticker_df, rules=("30min", "60min"))
+    ticker_df = prep.add_daily_features(ticker_df)
+    ticker_df = prep.add_overnight_returns(ticker_df)
+    if use_legacy_deseas:
+        ticker_df = prep.add_deseasonalized_features_legacy(
+            ticker_df,
+            rolling_days=rolling_days_deseas,
+            refit_interval=refit_interval,
+        )
+    else:
+        try:
+            ticker_df = prep.add_deseasonalized_features(
+                ticker_df,
+                rolling_days=rolling_days_deseas,
+                refit_interval=refit_interval,
+            )
+        except ImportError:
+            ticker_df = prep.add_deseasonalized_features_legacy(
+                ticker_df,
+                rolling_days=rolling_days_deseas,
+                refit_interval=refit_interval,
+            )
+
+    selected_cols = _select_existing_columns(ticker_df, COMPACT_TICKER_COLS)
+    compact = ticker_df.loc[:, selected_cols].astype(np.float32)
+    compact = compact.reindex(anchor_index).ffill().bfill().fillna(0.0)
+    return compact.add_prefix(f"{ticker.lower()}_")
+
+
+def prepare_time_only_crack_data(
+    data_root: str | bytes | "os.PathLike[str]",
+    tickers: Sequence[str] = DEFAULT_CRACK_TICKERS,
+    bar_minutes: int = 15,
+    target_mode: str = "logret",
+    target_horizon_minutes: int = 60,
+    target_ticker: str = "CRACK",
+    rolling_days_deseas: int = 252,
+    refit_interval: int = 10,
+    use_legacy_deseas: bool = False,
+) -> Tuple[CrackSpreadContinuousPrep, pd.DataFrame, pd.Series, List[str], List[str]]:
+    target_steps = max(1, int(target_horizon_minutes) // int(bar_minutes))
+    prep = CrackSpreadContinuousPrep(
+        root_features_dir=data_root,
+        tickers=tuple(t.upper() for t in tickers),
+        bar_minutes=bar_minutes,
+        target_mode=target_mode,
+        fold=False,
+        n_folds=1,
+    )
+    df_out, train_mask, target_cols = prep.prepare_from_root(
+        steps_60m=target_steps,
+        target_ticker=target_ticker,
+        keep_only_active=False,
+        add_daily=True,
+        add_overnight=True,
+        add_deseas=True,
+        add_time_features=True,
+        add_resample_precalc=True,
+        resample_rules=("15min", "30min", "60min"),
+        rolling_days_deseas=rolling_days_deseas,
+        refit_interval=refit_interval,
+        use_legacy_deseas=use_legacy_deseas,
+        apply_scaling=False,
+        add_bid_ask=True,
+    )
+
+    anchor_index = df_out.index
+    base_cols = _select_existing_columns(df_out, (*TIME_CONTEXT_COLS, *COMPACT_SPREAD_COLS))
+    base_frame = df_out.loc[:, base_cols].astype(np.float32).copy()
+    leg_frames = [
+        _build_compact_ticker_feature_frame(
+            prep,
+            ticker=ticker.upper(),
+            anchor_index=anchor_index,
+            rolling_days_deseas=rolling_days_deseas,
+            refit_interval=refit_interval,
+            use_legacy_deseas=use_legacy_deseas,
+        )
+        for ticker in tickers
+    ]
+    feature_df = pd.concat([base_frame, *leg_frames], axis=1)
+    feature_df = feature_df.ffill().bfill().fillna(0.0)
+    model_df = pd.concat([feature_df, df_out.loc[:, target_cols]], axis=1)
+    feature_cols = list(feature_df.columns)
+    return prep, model_df, train_mask, target_cols, feature_cols
+
+
+def build_time_only_samples(
+    df_out: pd.DataFrame,
+    target_col: str,
+    feature_cols: Sequence[str],
+    lookback: int = 48,
+    session_only: bool = True,
+    sample_session: Optional[str] = None,
+    stride: int = 1,
+) -> List[Dict]:
+    if target_col not in df_out.columns:
+        raise KeyError(f"Missing target column {target_col!r} in df_out")
+
+    df = df_out.sort_index()
+    feat_df = df.loc[:, list(feature_cols)].copy()
+    feat_df = feat_df.ffill().bfill().fillna(0.0)
+    feature_arr = feat_df.values.astype(np.float32)
+    target_arr = pd.to_numeric(df[target_col], errors="coerce").values.astype(np.float32)
+    dates = df.index.date
+
+    if sample_session is not None:
+        session_name = str(sample_session).strip().lower()
+        if session_name == "london":
+            session_mask = df.get("is_london", pd.Series(0, index=df.index)).astype(bool).values
+        elif session_name == "usa":
+            session_mask = df.get("is_usa", pd.Series(0, index=df.index)).astype(bool).values
+        else:
+            raise ValueError(f"Unknown sample_session={sample_session!r}")
+    elif session_only:
+        session_mask = df.get("is_active", pd.Series(1, index=df.index)).astype(bool).values
+    else:
+        session_mask = np.ones(len(df), dtype=bool)
+
+    target_steps = 0
+    if target_col.startswith("y_fwd_"):
+        try:
+            target_steps = int(target_col.split("_")[-1])
+        except ValueError:
+            target_steps = 0
+
+    samples: List[Dict] = []
+    for bar_idx in range(int(lookback), len(df), max(1, int(stride))):
+        if not session_mask[bar_idx] or np.isnan(target_arr[bar_idx]):
+            continue
+        samples.append(
+            {
+                "features": feature_arr[bar_idx - lookback:bar_idx],
+                "target": target_arr[bar_idx],
+                "date": dates[bar_idx],
+                "anchor_ts": pd.Timestamp(df.index[bar_idx]),
+                "target_end_ts": (
+                    pd.Timestamp(df.index[bar_idx + target_steps])
+                    if target_steps > 0 and (bar_idx + target_steps) < len(df)
+                    else pd.NaT
+                ),
+            }
+        )
+    return samples
+
+
+def split_time_samples(
+    samples: Sequence[Dict],
+    val_start: str | pd.Timestamp,
+    max_train_samples: Optional[int] = None,
+    max_val_samples: Optional[int] = None,
+) -> Tuple[List[Dict], List[Dict]]:
+    return split_crack_samples(
+        samples=samples,
+        val_start=val_start,
+        max_train_samples=max_train_samples,
+        max_val_samples=max_val_samples,
+    )
 
 
 def hybrid_selection_score(
@@ -198,6 +421,31 @@ class CrackSpreadPTPDataset(Dataset):
         return out
 
 
+class TimeOnlyPTPDataset(Dataset):
+    def __init__(
+        self,
+        samples: Sequence[Dict],
+        return_metadata: bool = False,
+    ):
+        self.samples = list(samples)
+        self.return_metadata = return_metadata
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Dict[str, object]:
+        sample = self.samples[idx]
+        out: Dict[str, object] = {
+            "features": torch.tensor(sample["features"], dtype=torch.float32),
+            "target": torch.tensor(sample["target"], dtype=torch.float32),
+        }
+        if self.return_metadata:
+            out["_anchor_ts"] = sample["anchor_ts"]
+            out["_date"] = sample["date"]
+            out["_target_end_ts"] = sample["target_end_ts"]
+        return out
+
+
 def crack_ptp_collate_fn(
     batch: List[Dict[str, object]],
     tickers: Sequence[str] = DEFAULT_CRACK_TICKERS,
@@ -209,6 +457,18 @@ def crack_ptp_collate_fn(
         orderflow_lookback=orderflow_lookback,
     )
     out["known_future"] = torch.stack([sample["known_future"] for sample in batch])
+    return out
+
+
+def time_ptp_collate_fn(batch: List[Dict[str, object]]) -> Dict[str, object]:
+    out: Dict[str, object] = {
+        "features": torch.stack([sample["features"] for sample in batch]),
+        "target": torch.stack([sample["target"] for sample in batch]),
+    }
+    if "_anchor_ts" in batch[0]:
+        out["_anchor_ts"] = [sample["_anchor_ts"] for sample in batch]
+        out["_date"] = [sample["_date"] for sample in batch]
+        out["_target_end_ts"] = [sample["_target_end_ts"] for sample in batch]
     return out
 
 
@@ -246,16 +506,47 @@ def make_crack_loaders(
     return train_loader, val_loader
 
 
+def make_time_loaders(
+    train_samples: Sequence[Dict],
+    val_samples: Sequence[Dict],
+    batch_size: int = 64,
+    num_workers: int = 0,
+    return_metadata: bool = False,
+) -> Tuple[DataLoader, DataLoader]:
+    train_ds = TimeOnlyPTPDataset(train_samples, return_metadata=return_metadata)
+    val_ds = TimeOnlyPTPDataset(val_samples, return_metadata=return_metadata)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=time_ptp_collate_fn,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=time_ptp_collate_fn,
+    )
+    return train_loader, val_loader
+
+
 def batch_to_device(
     batch: Dict[str, object],
     device: torch.device,
 ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-    inputs = {
-        "spread_time_features": batch["spread_time_features"].to(device),
-        "known_future": batch["known_future"].to(device),
-        "orderflow_cube": batch["orderflow_cube"].to(device),
-        "orderflow_mask": batch["orderflow_mask"].to(device),
-    }
+    if "features" in batch:
+        inputs = {
+            "features": batch["features"].to(device),
+        }
+    else:
+        inputs = {
+            "spread_time_features": batch["spread_time_features"].to(device),
+            "known_future": batch["known_future"].to(device),
+            "orderflow_cube": batch["orderflow_cube"].to(device),
+            "orderflow_mask": batch["orderflow_mask"].to(device),
+        }
     targets = batch["target"].to(device)
     return inputs, targets
 
@@ -304,6 +595,53 @@ class CrackSpreadPTP(nn.Module):
 
     def get_aux_loss(self) -> torch.Tensor:
         return self.base_model.get_aux_loss()
+
+
+class TimeOnlyCrackPTP(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        hidden: int = 64,
+        layers: int = 1,
+        dropout: float = 0.1,
+        num_classes: int = 4,
+        ptp_temperature: float = 1.5,
+    ):
+        super().__init__()
+        self.num_classes = int(num_classes)
+        self.base_model = GRUAttnClassifier(
+            in_channels=in_channels,
+            num_classes=self.num_classes,
+            hidden=hidden,
+            layers=layers,
+            dropout=dropout,
+        )
+        self.refiner = nn.Sequential(
+            nn.Linear(self.num_classes, 16),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(16, self.num_classes),
+        )
+        self.ptp = PredictionToPosition(temperature=ptp_temperature)
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        return_tracker: bool = False,
+    ):
+        logits = self.base_model(features.transpose(1, 2))
+        refined_logits = logits + self.refiner(logits)
+        position, ptp_logits = self.ptp(refined_logits)
+        if return_tracker:
+            tracker = {f"ptp_{k}": v for k, v in self.ptp.get_last_stats().items()}
+            tracker["decoder_steps"] = 1.0
+            return position, ptp_logits, refined_logits, tracker
+        return position, ptp_logits, refined_logits
+
+    def get_aux_loss(self) -> torch.Tensor:
+        param = next(self.parameters(), None)
+        device = param.device if param is not None else torch.device("cpu")
+        return torch.zeros((), dtype=torch.float32, device=device)
 
 
 def build_crack_ptp_param_groups(
