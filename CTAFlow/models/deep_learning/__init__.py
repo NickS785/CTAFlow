@@ -11,8 +11,11 @@ from .training import (
     create_classification_targets,
     evaluate,
     BacktestAttributionResult,
+    DetailedBacktestResult,
     predictions_to_positions,
     backtest_from_predictions,
+    run_detailed_backtest,
+    save_detailed_backtest_artifacts,
 )
 from .training.loss import *
 from .training import loss as loss
@@ -76,8 +79,11 @@ __all__ = [
     "compute_class_weights",
     "create_classification_targets",
     "BacktestAttributionResult",
+    "DetailedBacktestResult",
     "predictions_to_positions",
     "backtest_from_predictions",
+    "run_detailed_backtest",
+    "save_detailed_backtest_artifacts",
     # Encoders
     "AttnPool",
     "GatedFusion",

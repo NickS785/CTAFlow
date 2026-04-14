@@ -93,6 +93,7 @@ class GRUAttnClassifier(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(32, num_classes),
         )
+        self.last_tracker: dict = {}
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass.
@@ -115,6 +116,12 @@ class GRUAttnClassifier(nn.Module):
         w = self.attn(h).squeeze(-1)  # (B, L)
         w = torch.softmax(w, dim=-1)
         pooled = (h * w.unsqueeze(-1)).sum(dim=1)  # (B, H)
+        self.last_tracker = {
+            "attn_weights": w.detach(),
+            "attn_entropy": float(-(w * (w + 1e-8).log()).sum(dim=-1).mean().item()),
+            "attn_max_weight": float(w.max(dim=-1).values.mean().item()),
+            "pooled_norm": float(pooled.detach().norm(dim=-1).mean().item()),
+        }
 
         return self.head(pooled)  # (B, num_classes)
 

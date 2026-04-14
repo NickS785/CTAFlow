@@ -15,6 +15,11 @@ from .backtest import (
     backtest_eod_momentum,
     predictions_to_positions,
 )
+from .detailed_backtest import (
+    DetailedBacktestResult,
+    run_detailed_backtest,
+    save_detailed_backtest_artifacts,
+)
 from .loss import (
     ConfidencePenalizedCE,
     CostAwareCE,
@@ -42,10 +47,13 @@ __all__ = [
     "evaluate_regression",
     "evaluate",  # Legacy
     "BacktestAttributionResult",
+    "DetailedBacktestResult",
     "TradingMode",
     "predictions_to_positions",
     "backtest_from_predictions",
     "backtest_eod_momentum",
+    "run_detailed_backtest",
+    "save_detailed_backtest_artifacts",
     # Classification losses
     "ConfidencePenalizedCE",
     "CostAwareCE",
