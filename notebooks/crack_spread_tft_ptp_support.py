@@ -4,8 +4,10 @@ import math
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import joblib
 import numpy as np
 import pandas as pd
 import torch
@@ -444,6 +446,46 @@ class TimeOnlyPTPDataset(Dataset):
             out["_date"] = sample["date"]
             out["_target_end_ts"] = sample["target_end_ts"]
         return out
+
+
+def load_time_only_export_split(
+    export_dir: str | Path,
+    study_name: str,
+    split: str = "val",
+    return_metadata: bool = True,
+) -> Tuple[List[Dict], TimeOnlyPTPDataset]:
+    """Load an exported train/validation split without rebuilding features."""
+    export_path = Path(export_dir)
+    samples_path = export_path / f"{study_name}_{split}_samples.joblib"
+    if not samples_path.exists():
+        raise FileNotFoundError(f"Missing exported split file: {samples_path}")
+    samples = joblib.load(samples_path)
+    if not isinstance(samples, list):
+        raise TypeError(f"Expected list of samples in {samples_path}, got {type(samples)!r}")
+    return samples, TimeOnlyPTPDataset(samples, return_metadata=return_metadata)
+
+
+def load_time_only_ptp_checkpoint(
+    checkpoint_path: str | Path,
+    device: Optional[torch.device] = None,
+) -> Tuple["TimeOnlyCrackPTP", Dict[str, object]]:
+    """Reconstruct a trained time-only crack PTP model from its checkpoint."""
+    resolved_device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt = torch.load(Path(checkpoint_path), map_location=resolved_device)
+    feature_cols = ckpt.get("feature_cols")
+    best_params = ckpt.get("best_params", {})
+    if not feature_cols:
+        raise KeyError("Checkpoint is missing feature_cols required to rebuild the model.")
+    model = TimeOnlyCrackPTP(
+        in_channels=len(feature_cols),
+        hidden=int(best_params.get("hidden", 64)),
+        layers=int(best_params.get("n_layers", 1)),
+        ptp_temperature=float(best_params.get("ptp_temperature", 1.5)),
+        dropout=float(best_params.get("dropout", 0.1)),
+    ).to(resolved_device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    return model, ckpt
 
 
 def crack_ptp_collate_fn(
